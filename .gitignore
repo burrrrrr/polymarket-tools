@@ -1,0 +1,8 @@
+.env
+snapshots/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
