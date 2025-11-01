@@ -87,6 +87,136 @@ def get_existing_orders(client):
         return []
 
 
+def get_market_name(client, market_id, market_cache=None):
+    """Get market name from market ID, with caching."""
+    if market_cache is None:
+        market_cache = {}
+
+    if market_id in market_cache:
+        return market_cache[market_id]
+
+    try:
+        market_info = client.get_market(market_id)
+        # Market name is typically in 'question' or 'title' field
+        market_name = (
+            market_info.get("question") or
+            market_info.get("title") or
+            market_info.get("marketName") or
+            f"Market {market_id[:20]}..."
+        )
+        market_cache[market_id] = market_name
+        return market_name
+    except Exception:
+        # If we can't fetch market info, return a truncated market ID
+        market_name = f"Market {market_id[:20]}..."
+        market_cache[market_id] = market_name
+        return market_name
+
+
+def get_best_bid_ask(client, token_id, bid_ask_cache=None):
+    """Get best bid and ask prices for a token, with caching.
+
+    Returns:
+        tuple: (best_bid, best_ask) where:
+            - best_bid: float or None (highest buy price)
+            - best_ask: float or None (lowest sell price)
+    """
+    if bid_ask_cache is None:
+        bid_ask_cache = {}
+
+    if token_id in bid_ask_cache:
+        return bid_ask_cache[token_id]
+
+    try:
+        order_book = client.get_order_book(token_id)
+
+        # Extract best bid (highest buy price) from bids
+        best_bid = None
+        if hasattr(order_book, 'bids') and order_book.bids:
+            # Find the highest price among all bids
+            bid_prices = [float(bid.price) for bid in order_book.bids]
+            best_bid = max(bid_prices) if bid_prices else None
+        elif isinstance(order_book, dict):
+            bids = order_book.get('bids', [])
+            if bids:
+                bid_prices = []
+                for bid in bids:
+                    if isinstance(bid, dict):
+                        bid_prices.append(float(bid.get('price', bid)))
+                    else:
+                        bid_prices.append(float(bid))
+                best_bid = max(bid_prices) if bid_prices else None
+
+        # Extract best ask (lowest sell price) from asks
+        best_ask = None
+        if hasattr(order_book, 'asks') and order_book.asks:
+            # Find the lowest price among all asks
+            ask_prices = [float(ask.price) for ask in order_book.asks]
+            best_ask = min(ask_prices) if ask_prices else None
+        elif isinstance(order_book, dict):
+            asks = order_book.get('asks', [])
+            if asks:
+                ask_prices = []
+                for ask in asks:
+                    if isinstance(ask, dict):
+                        ask_prices.append(float(ask.get('price', ask)))
+                    else:
+                        ask_prices.append(float(ask))
+                best_ask = min(ask_prices) if ask_prices else None
+
+        result = (best_bid, best_ask)
+        bid_ask_cache[token_id] = result
+        return result
+    except Exception as e:
+        # If we can't fetch order book, return None values (fail open)
+        # This ensures network issues don't block all order restoration
+        result = (None, None)
+        bid_ask_cache[token_id] = result
+        return result
+
+
+def would_fill_immediately(client, order, bid_ask_cache=None):
+    """Check if an order would fill immediately based on current market prices.
+
+    Args:
+        client: ClobClient instance
+        order: Order dict with 'asset_id'/'token_id', 'side', and 'price'
+        bid_ask_cache: Optional cache dict for bid/ask prices
+
+    Returns:
+        bool: True if order would fill immediately, False otherwise
+    """
+    token_id = order.get("asset_id") or order.get("token_id")
+    if not token_id:
+        return False  # Can't check without token ID
+
+    side_str = order.get("side", "").upper()
+    if side_str not in ("BUY", "SELL"):
+        return False  # Invalid side
+
+    try:
+        order_price = float(order.get("price", 0))
+        if order_price <= 0:
+            return False  # Invalid price
+    except (ValueError, TypeError):
+        return False  # Invalid price format
+
+    # Get best bid/ask for this token
+    best_bid, best_ask = get_best_bid_ask(client, token_id, bid_ask_cache)
+
+    # Check if order would fill immediately
+    if side_str == "BUY":
+        # BUY order fills immediately if order_price >= best_ask
+        if best_ask is not None and order_price >= best_ask:
+            return True
+    elif side_str == "SELL":
+        # SELL order fills immediately if order_price <= best_bid
+        if best_bid is not None and order_price <= best_bid:
+            return True
+
+    return False
+
+
 def normalize_order_key(order):
     """Create a normalized key for order comparison."""
     token_id = order.get("asset_id") or order.get("token_id", "")
@@ -208,6 +338,9 @@ def restore_orders(client, orders, dry_run=False):
     total = len(orders)
     successful = []
     failed = []
+    skipped_immediate_fill = []
+    market_cache = {}  # Cache market names to avoid repeated API calls
+    bid_ask_cache = {}  # Cache bid/ask prices to avoid repeated API calls
 
     action = "Validating" if dry_run else "Restoring"
     print(f"\n{action} {total} order(s)...")
@@ -222,6 +355,34 @@ def restore_orders(client, orders, dry_run=False):
         exp_info = format_expiration(expiration)
 
         print(f"[{i}/{total}] Processing order ({exp_info})...", end=" ", flush=True)
+
+        # Check if order would fill immediately
+        if would_fill_immediately(client, order, bid_ask_cache):
+            skipped_immediate_fill.append(order)
+            # Extract order details for skip message
+            market_id = order.get("market", "")
+            token_id = order.get("asset_id") or order.get("token_id", "unknown")
+            side = order.get("side", "unknown")
+            size = order.get("original_size") or order.get("size", "unknown")
+            price = order.get("price", "unknown")
+
+            # Get market name if we have a market ID
+            if market_id:
+                market_name = get_market_name(client, market_id, market_cache)
+            else:
+                market_name = f"Token {token_id[:20]}..."
+
+            # Get best bid/ask to show what price would cause immediate fill
+            best_bid, best_ask = get_best_bid_ask(client, token_id, bid_ask_cache)
+            matching_price = best_ask if side.upper() == "BUY" else best_bid
+
+            print(f"⊘ Skipped (would fill immediately)")
+            print(f"    Details: {side} {size} shares @ ${price} (Market: {market_name})")
+            if matching_price is not None:
+                price_type = "ask" if side.upper() == "BUY" else "bid"
+                print(f"    Reason: Best {price_type} is ${matching_price}")
+            continue
+
         result = restore_order(client, order, i, dry_run=dry_run)
 
         if result["success"]:
@@ -233,23 +394,45 @@ def restore_orders(client, orders, dry_run=False):
                 print(f"✓ Success (Order ID: {order_id})")
         else:
             failed.append(result)
+            # Extract order details for error message
+            order_info = result.get("order", {})
+            market_id = order_info.get("market", "")
+            token_id = order_info.get("asset_id") or order_info.get("token_id", "unknown")
+            side = order_info.get("side", "unknown")
+            size = order_info.get("original_size") or order_info.get("size", "unknown")
+            price = order_info.get("price", "unknown")
+
+            # Get market name if we have a market ID
+            if market_id:
+                market_name = get_market_name(client, market_id, market_cache)
+            else:
+                market_name = f"Token {token_id[:20]}..."
+
             print(f"✗ Failed: {result['error']}")
+            print(f"    Details: {side} {size} shares @ ${price} (Market: {market_name})")
 
-    return successful, failed
+    return successful, failed, skipped_immediate_fill
 
 
-def print_summary(successful, failed, skipped=None, dry_run=False):
+def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None, dry_run=False, client=None):
     """Print restoration summary."""
     print("\n" + "=" * 60)
     title = "DRY RUN SUMMARY" if dry_run else "RESTORATION SUMMARY"
     print(title)
     print("=" * 60)
 
-    total_in_snapshot = len(successful) + len(failed) + (len(skipped) if skipped else 0)
+    total_in_snapshot = (
+        len(successful) + len(failed) +
+        (len(skipped) if skipped else 0) +
+        (len(skipped_immediate_fill) if skipped_immediate_fill else 0)
+    )
     print(f"Total orders in snapshot: {total_in_snapshot}")
 
     if skipped:
         print(f"Skipped (already exist): {len(skipped)}")
+
+    if skipped_immediate_fill:
+        print(f"Skipped (would fill immediately): {len(skipped_immediate_fill)}")
 
     print(f"Total orders processed: {len(successful) + len(failed)}")
     if dry_run:
@@ -272,6 +455,34 @@ def print_summary(successful, failed, skipped=None, dry_run=False):
         if len(skipped) > 10:
             print(f"  ... and {len(skipped) - 10} more")
 
+    if skipped_immediate_fill:
+        print("\nSkipped orders (would fill immediately):")
+        market_cache = {}  # Cache market names to avoid repeated API calls
+        bid_ask_cache = {}  # Cache bid/ask prices to avoid repeated API calls
+        for order in skipped_immediate_fill[:10]:  # Show first 10
+            market_id = order.get("market", "")
+            token_id = order.get("asset_id") or order.get("token_id", "unknown")
+            side = order.get("side", "unknown")
+            size = order.get("original_size") or order.get("size", "unknown")
+            price = order.get("price", "unknown")
+
+            # Get market name if we have a market ID and client
+            if market_id and client:
+                market_name = get_market_name(client, market_id, market_cache)
+            else:
+                market_name = f"Token {token_id[:20]}..."
+
+            # Get best bid/ask to show matching price
+            best_bid, best_ask = get_best_bid_ask(client, token_id, bid_ask_cache) if client else (None, None)
+            matching_price = best_ask if side.upper() == "BUY" else best_bid
+
+            print(f"  - {side} {size} shares @ ${price} (Market: {market_name})")
+            if matching_price is not None:
+                price_type = "ask" if side.upper() == "BUY" else "bid"
+                print(f"    Best {price_type}: ${matching_price}")
+        if len(skipped_immediate_fill) > 10:
+            print(f"  ... and {len(skipped_immediate_fill) - 10} more")
+
     if successful:
         label = "Valid orders (would restore):" if dry_run else "Successfully restored orders:"
         print(f"\n{label}")
@@ -292,10 +503,24 @@ def print_summary(successful, failed, skipped=None, dry_run=False):
 
     if failed:
         print("\nFailed orders:")
+        market_cache = {}  # Cache market names to avoid repeated API calls
         for result in failed:
             order_info = result.get("order", {})
+            market_id = order_info.get("market", "")
             token_id = order_info.get("asset_id") or order_info.get("token_id", "unknown")
-            print(f"  - Order #{result['order_index']} (Token: {token_id[:20]}...): {result['error']}")
+            side = order_info.get("side", "unknown")
+            size = order_info.get("original_size") or order_info.get("size", "unknown")
+            price = order_info.get("price", "unknown")
+
+            # Get market name if we have a market ID and client
+            if market_id and client:
+                market_name = get_market_name(client, market_id, market_cache)
+            else:
+                market_name = f"Token {token_id[:20]}..."
+
+            print(f"  - Order #{result['order_index']}: {side} {size} shares @ ${price}")
+            print(f"    Market: {market_name}")
+            print(f"    Error: {result['error']}")
 
 
 def main():
@@ -363,10 +588,10 @@ Examples:
             return
 
         # Restore orders
-        successful, failed = restore_orders(client, orders_to_restore, dry_run=args.dry_run)
+        successful, failed, skipped_immediate_fill = restore_orders(client, orders_to_restore, dry_run=args.dry_run)
 
         # Print summary
-        print_summary(successful, failed, skipped=skipped_orders, dry_run=args.dry_run)
+        print_summary(successful, failed, skipped=skipped_orders, skipped_immediate_fill=skipped_immediate_fill, dry_run=args.dry_run, client=client)
 
         if failed:
             sys.exit(1)

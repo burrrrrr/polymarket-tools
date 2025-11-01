@@ -194,7 +194,6 @@ def _unlock_bitwarden_vault():
             check=True
         )
         session = result.stdout.strip()
-        print(f"Session: {session}")
         os.environ["BW_SESSION"] = session
         return session
     except subprocess.CalledProcessError as e:
