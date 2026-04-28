@@ -13,11 +13,54 @@ import os
 import sys
 from datetime import datetime
 
-from py_clob_client.clob_types import OrderArgs, OrderType, OpenOrderParams
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client_v2.clob_types import OrderArgsV2, OrderType, OpenOrderParams
 
 from config import load_config, create_client
 from key_loader import cleanup_key_source
+
+
+def get_order_token_id(order):
+    """Extract token id across snapshot/API variants."""
+    return (
+        order.get("asset_id")
+        or order.get("token_id")
+        or order.get("tokenID")
+        or order.get("tokenId")
+    )
+
+
+def get_order_size(order):
+    """Extract order size across snapshot/API variants."""
+    return (
+        order.get("original_size")
+        or order.get("size")
+        or order.get("amount")
+        or order.get("makerAmount")
+        or 0
+    )
+
+
+def parse_expiration(order):
+    """Extract expiration from snapshot order with safe coercion."""
+    expiration_raw = (
+        order.get("expiration")
+        if "expiration" in order
+        else order.get("expires_at", 0)
+    )
+    if isinstance(expiration_raw, str):
+        return int(expiration_raw) if expiration_raw else 0
+    return int(expiration_raw) if expiration_raw else 0
+
+
+def get_market_ref(order):
+    """Extract market identifier for display/caching."""
+    return (
+        order.get("market")
+        or order.get("market_id")
+        or order.get("condition_id")
+        or order.get("conditionId")
+        or ""
+    )
 
 
 def load_snapshot(filename):
@@ -53,12 +96,12 @@ def load_snapshot(filename):
 
 
 def convert_side(side_str):
-    """Convert side string to BUY/SELL constant."""
+    """Convert side string to canonical BUY/SELL values."""
     side_upper = side_str.upper() if isinstance(side_str, str) else str(side_str).upper()
     if side_upper == "BUY":
-        return BUY
+        return "BUY"
     elif side_upper == "SELL":
-        return SELL
+        return "SELL"
     else:
         raise ValueError(f"Invalid side value: {side_str}")
 
@@ -78,7 +121,7 @@ def get_existing_orders(client):
     """Fetch all existing open orders from Polymarket."""
     try:
         print("Fetching existing open orders...")
-        existing_orders = client.get_orders(OpenOrderParams())
+        existing_orders = client.get_open_orders(OpenOrderParams())
         print(f"Found {len(existing_orders)} existing open order(s)")
         return existing_orders
     except Exception as e:
@@ -186,7 +229,7 @@ def would_fill_immediately(client, order, bid_ask_cache=None):
     Returns:
         bool: True if order would fill immediately, False otherwise
     """
-    token_id = order.get("asset_id") or order.get("token_id")
+    token_id = get_order_token_id(order)
     if not token_id:
         return False  # Can't check without token ID
 
@@ -219,10 +262,10 @@ def would_fill_immediately(client, order, bid_ask_cache=None):
 
 def normalize_order_key(order):
     """Create a normalized key for order comparison."""
-    token_id = order.get("asset_id") or order.get("token_id", "")
+    token_id = get_order_token_id(order) or ""
     side = order.get("side", "").upper()
     price = float(order.get("price", 0))
-    size = float(order.get("original_size") or order.get("size", 0))
+    size = float(get_order_size(order))
 
     # Round to avoid floating point precision issues
     price = round(price, 8)
@@ -257,17 +300,13 @@ def restore_order(client, order, order_index, dry_run=False):
     try:
         # Extract order fields
         # The API returns 'asset_id' but OrderArgs expects 'token_id'
-        token_id = order.get("asset_id") or order.get("token_id")
+        token_id = get_order_token_id(order)
         price = float(order.get("price", 0))
-        size = float(order.get("original_size") or order.get("size", 0))
+        size = float(get_order_size(order))
         side_str = order.get("side", "")
 
         # Extract expiration (can be string or int, default to 0 for GTC orders)
-        expiration_raw = order.get("expiration", 0)
-        if isinstance(expiration_raw, str):
-            expiration = int(expiration_raw) if expiration_raw else 0
-        else:
-            expiration = int(expiration_raw) if expiration_raw else 0
+        expiration = parse_expiration(order)
 
         if not token_id:
             raise ValueError("Missing token_id/asset_id in order")
@@ -285,7 +324,7 @@ def restore_order(client, order, order_index, dry_run=False):
         order_type = OrderType.GTD if expiration > 0 else OrderType.GTC
 
         # Create order with expiration
-        order_args = OrderArgs(
+        order_args = OrderArgsV2(
             token_id=token_id,
             price=price,
             size=size,
@@ -350,8 +389,7 @@ def restore_orders(client, orders, dry_run=False):
 
     for i, order in enumerate(orders, 1):
         # Show expiration info if available
-        expiration_raw = order.get("expiration", 0)
-        expiration = int(expiration_raw) if expiration_raw else 0
+        expiration = parse_expiration(order)
         exp_info = format_expiration(expiration)
 
         print(f"[{i}/{total}] Processing order ({exp_info})...", end=" ", flush=True)
@@ -360,10 +398,10 @@ def restore_orders(client, orders, dry_run=False):
         if would_fill_immediately(client, order, bid_ask_cache):
             skipped_immediate_fill.append(order)
             # Extract order details for skip message
-            market_id = order.get("market", "")
-            token_id = order.get("asset_id") or order.get("token_id", "unknown")
+            market_id = get_market_ref(order)
+            token_id = get_order_token_id(order) or "unknown"
             side = order.get("side", "unknown")
-            size = order.get("original_size") or order.get("size", "unknown")
+            size = get_order_size(order) or "unknown"
             price = order.get("price", "unknown")
 
             # Get market name if we have a market ID
@@ -396,10 +434,10 @@ def restore_orders(client, orders, dry_run=False):
             failed.append(result)
             # Extract order details for error message
             order_info = result.get("order", {})
-            market_id = order_info.get("market", "")
-            token_id = order_info.get("asset_id") or order_info.get("token_id", "unknown")
+            market_id = get_market_ref(order_info)
+            token_id = get_order_token_id(order_info) or "unknown"
             side = order_info.get("side", "unknown")
-            size = order_info.get("original_size") or order_info.get("size", "unknown")
+            size = get_order_size(order_info) or "unknown"
             price = order_info.get("price", "unknown")
 
             # Get market name if we have a market ID
@@ -444,9 +482,9 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
     if skipped:
         print("\nSkipped orders (already exist on Polymarket):")
         for order in skipped[:10]:  # Show first 10
-            token_id = order.get("asset_id") or order.get("token_id", "unknown")
+            token_id = get_order_token_id(order) or "unknown"
             side = order.get("side", "unknown")
-            size = order.get("original_size") or order.get("size", "unknown")
+            size = get_order_size(order) or "unknown"
             price = order.get("price", "unknown")
             print(
                 f"  - {side} {size} @ ${price} "
@@ -460,10 +498,10 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
         market_cache = {}  # Cache market names to avoid repeated API calls
         bid_ask_cache = {}  # Cache bid/ask prices to avoid repeated API calls
         for order in skipped_immediate_fill[:10]:  # Show first 10
-            market_id = order.get("market", "")
-            token_id = order.get("asset_id") or order.get("token_id", "unknown")
+            market_id = get_market_ref(order)
+            token_id = get_order_token_id(order) or "unknown"
             side = order.get("side", "unknown")
-            size = order.get("original_size") or order.get("size", "unknown")
+            size = get_order_size(order) or "unknown"
             price = order.get("price", "unknown")
 
             # Get market name if we have a market ID and client
@@ -506,10 +544,10 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
         market_cache = {}  # Cache market names to avoid repeated API calls
         for result in failed:
             order_info = result.get("order", {})
-            market_id = order_info.get("market", "")
-            token_id = order_info.get("asset_id") or order_info.get("token_id", "unknown")
+            market_id = get_market_ref(order_info)
+            token_id = get_order_token_id(order_info) or "unknown"
             side = order_info.get("side", "unknown")
-            size = order_info.get("original_size") or order_info.get("size", "unknown")
+            size = get_order_size(order_info) or "unknown"
             price = order_info.get("price", "unknown")
 
             # Get market name if we have a market ID and client
