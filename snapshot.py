@@ -12,7 +12,7 @@ import os
 import sys
 from datetime import datetime
 
-from py_clob_client.clob_types import OpenOrderParams
+from py_clob_client_v2.clob_types import OpenOrderParams
 
 from config import load_config, create_client
 from key_loader import cleanup_key_source
@@ -22,7 +22,7 @@ def snapshot_orders(client):
     """Fetch all open orders and return them as a list."""
     try:
         print("Fetching open orders...")
-        open_orders = client.get_orders(OpenOrderParams())
+        open_orders = client.get_open_orders(OpenOrderParams())
         print(f"Found {len(open_orders)} open order(s)")
         return open_orders
     except Exception as e:
