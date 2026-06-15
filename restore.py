@@ -13,10 +13,17 @@ import os
 import sys
 from datetime import datetime
 
+import httpx
+
 from py_clob_client_v2.clob_types import OrderArgsV2, OrderType, OpenOrderParams
 
 from config import load_config, create_client
 from key_loader import cleanup_key_source
+
+# Gamma is Polymarket's read-only metadata API. Unlike the CLOB API it can
+# resolve many markets in a single request (by condition id), which avoids
+# firing one request per market when naming a large batch of orders.
+GAMMA_HOST = os.getenv("POLYMARKET_GAMMA_HOST", "https://gamma-api.polymarket.com")
 
 
 def get_order_token_id(order):
@@ -156,6 +163,152 @@ def get_market_name(client, market_id, market_cache=None):
         return market_name
 
 
+def fetch_market_names_bulk(condition_ids, batch_size=40, timeout=20):
+    """Resolve market names for many markets at once via the Gamma API.
+
+    The CLOB API resolves only one market per request, which is slow and
+    timeout-prone for large snapshots. Gamma accepts many `condition_ids` in
+    a single call, collapsing N requests into ~ceil(N / batch_size).
+
+    Returns a dict {condition_id: market_name}. Fully non-fatal: any batch
+    that errors is skipped and simply omitted, so callers can fall back to
+    per-market lookups for whatever is missing.
+    """
+    names = {}
+    # Dedupe while preserving order; drop falsy ids.
+    unique = list(dict.fromkeys(c for c in condition_ids if c))
+    if not unique:
+        return names
+
+    url = f"{GAMMA_HOST}/markets"
+    for start in range(0, len(unique), batch_size):
+        batch = unique[start:start + batch_size]
+        params = [("condition_ids", c) for c in batch]
+        # `limit` must be >= batch size or Gamma caps the response at 20.
+        params.append(("limit", str(len(batch))))
+        try:
+            resp = httpx.get(url, params=params, timeout=timeout)
+            resp.raise_for_status()
+            for market in resp.json():
+                cid = market.get("conditionId")
+                name = market.get("question") or market.get("title")
+                if cid and name:
+                    names[cid] = name
+        except Exception as e:
+            print(f"Warning: Gamma market-name batch failed ({e}); "
+                  f"falling back to per-market lookups for those markets")
+            continue
+    return names
+
+
+def prefetch_market_names(orders, market_cache):
+    """Bulk-resolve names for orders lacking a snapshot-saved name.
+
+    Fills `market_cache` keyed by condition id so subsequent resolve calls
+    (via get_market_name) hit the cache instead of the CLOB API.
+    """
+    condition_ids = {
+        get_market_ref(order)
+        for order in orders
+        if not get_saved_market_name(order) and get_market_ref(order)
+    }
+    if not condition_ids:
+        return
+    market_cache.update(fetch_market_names_bulk(condition_ids))
+
+
+def get_saved_market_name(order):
+    """Return the market name stored in the snapshot order, if present."""
+    return order.get("market_name") or order.get("event_name")
+
+
+def resolve_market_name(client, order, market_cache=None):
+    """Resolve a market name for display.
+
+    Prefers the name saved in the snapshot; otherwise queries the API by
+    market id. Falls back to a truncated token id when neither is available.
+    """
+    saved = get_saved_market_name(order)
+    if saved:
+        return saved
+
+    market_id = get_market_ref(order)
+    if market_id and client:
+        return get_market_name(client, market_id, market_cache)
+
+    token_id = get_order_token_id(order) or "unknown"
+    return f"Token {token_id[:20]}..."
+
+
+def _level_price(level):
+    """Extract a float price from an order book level (dict, object, or scalar)."""
+    if isinstance(level, dict):
+        return float(level.get("price", level))
+    if hasattr(level, "price"):
+        return float(level.price)
+    return float(level)
+
+
+def _extract_best_bid_ask(order_book):
+    """Compute (best_bid, best_ask) from an order book (dict or object).
+
+    best_bid is the highest buy price, best_ask the lowest sell price.
+    Returns (None, None) for an empty/missing book.
+    """
+    if order_book is None:
+        return (None, None)
+
+    if isinstance(order_book, dict):
+        bids = order_book.get("bids") or []
+        asks = order_book.get("asks") or []
+    else:
+        bids = getattr(order_book, "bids", None) or []
+        asks = getattr(order_book, "asks", None) or []
+
+    best_bid = max((_level_price(b) for b in bids), default=None)
+    best_ask = min((_level_price(a) for a in asks), default=None)
+    return (best_bid, best_ask)
+
+
+def _order_book_asset_id(order_book):
+    """Extract the token/asset id a bulk order book entry belongs to."""
+    if isinstance(order_book, dict):
+        return order_book.get("asset_id") or order_book.get("token_id")
+    return getattr(order_book, "asset_id", None) or getattr(order_book, "token_id", None)
+
+
+def prefetch_bid_ask(client, orders, bid_ask_cache):
+    """Bulk-fetch order books for every token in `orders` in a single request.
+
+    Populates `bid_ask_cache` keyed by token id. This replaces what would
+    otherwise be one `get_order_book` call per unique token. On failure it
+    leaves the cache empty so callers transparently fall back to per-token
+    lookups via get_best_bid_ask.
+    """
+    token_ids = []
+    seen = set()
+    for order in orders:
+        token_id = get_order_token_id(order)
+        if token_id and token_id not in seen:
+            seen.add(token_id)
+            token_ids.append(token_id)
+
+    if not token_ids:
+        return
+
+    try:
+        # The /books endpoint expects a list of {"token_id": ...} objects.
+        books = client.get_order_books([{"token_id": t} for t in token_ids])
+    except Exception as e:
+        print(f"Warning: bulk order book fetch failed ({e}); using per-token lookups")
+        return
+
+    for book in books or []:
+        asset_id = _order_book_asset_id(book)
+        if asset_id:
+            bid_ask_cache[asset_id] = _extract_best_bid_ask(book)
+
+
 def get_best_bid_ask(client, token_id, bid_ask_cache=None):
     """Get best bid and ask prices for a token, with caching.
 
@@ -172,50 +325,14 @@ def get_best_bid_ask(client, token_id, bid_ask_cache=None):
 
     try:
         order_book = client.get_order_book(token_id)
-
-        # Extract best bid (highest buy price) from bids
-        best_bid = None
-        if hasattr(order_book, 'bids') and order_book.bids:
-            # Find the highest price among all bids
-            bid_prices = [float(bid.price) for bid in order_book.bids]
-            best_bid = max(bid_prices) if bid_prices else None
-        elif isinstance(order_book, dict):
-            bids = order_book.get('bids', [])
-            if bids:
-                bid_prices = []
-                for bid in bids:
-                    if isinstance(bid, dict):
-                        bid_prices.append(float(bid.get('price', bid)))
-                    else:
-                        bid_prices.append(float(bid))
-                best_bid = max(bid_prices) if bid_prices else None
-
-        # Extract best ask (lowest sell price) from asks
-        best_ask = None
-        if hasattr(order_book, 'asks') and order_book.asks:
-            # Find the lowest price among all asks
-            ask_prices = [float(ask.price) for ask in order_book.asks]
-            best_ask = min(ask_prices) if ask_prices else None
-        elif isinstance(order_book, dict):
-            asks = order_book.get('asks', [])
-            if asks:
-                ask_prices = []
-                for ask in asks:
-                    if isinstance(ask, dict):
-                        ask_prices.append(float(ask.get('price', ask)))
-                    else:
-                        ask_prices.append(float(ask))
-                best_ask = min(ask_prices) if ask_prices else None
-
-        result = (best_bid, best_ask)
-        bid_ask_cache[token_id] = result
-        return result
-    except Exception as e:
+        result = _extract_best_bid_ask(order_book)
+    except Exception:
         # If we can't fetch order book, return None values (fail open)
         # This ensures network issues don't block all order restoration
         result = (None, None)
-        bid_ask_cache[token_id] = result
-        return result
+
+    bid_ask_cache[token_id] = result
+    return result
 
 
 def would_fill_immediately(client, order, bid_ask_cache=None):
@@ -381,6 +498,13 @@ def restore_orders(client, orders, dry_run=False):
     market_cache = {}  # Cache market names to avoid repeated API calls
     bid_ask_cache = {}  # Cache bid/ask prices to avoid repeated API calls
 
+    # Prefetch all order books in a single bulk request so the per-order
+    # immediate-fill checks below hit the cache instead of one call each.
+    prefetch_bid_ask(client, orders, bid_ask_cache)
+    # Bulk-resolve market names (via Gamma) for any order without a saved name,
+    # so naming below doesn't fire one CLOB request per market.
+    prefetch_market_names(orders, market_cache)
+
     action = "Validating" if dry_run else "Restoring"
     print(f"\n{action} {total} order(s)...")
     if dry_run:
@@ -398,17 +522,12 @@ def restore_orders(client, orders, dry_run=False):
         if would_fill_immediately(client, order, bid_ask_cache):
             skipped_immediate_fill.append(order)
             # Extract order details for skip message
-            market_id = get_market_ref(order)
             token_id = get_order_token_id(order) or "unknown"
             side = order.get("side", "unknown")
             size = get_order_size(order) or "unknown"
             price = order.get("price", "unknown")
 
-            # Get market name if we have a market ID
-            if market_id:
-                market_name = get_market_name(client, market_id, market_cache)
-            else:
-                market_name = f"Token {token_id[:20]}..."
+            market_name = resolve_market_name(client, order, market_cache)
 
             # Get best bid/ask to show what price would cause immediate fill
             best_bid, best_ask = get_best_bid_ask(client, token_id, bid_ask_cache)
@@ -424,27 +543,24 @@ def restore_orders(client, orders, dry_run=False):
         result = restore_order(client, order, i, dry_run=dry_run)
 
         if result["success"]:
+            market_name = resolve_market_name(client, order, market_cache)
+            result["market_name"] = market_name
             successful.append(result)
             order_id = result.get('order_id', 'N/A')
             if dry_run:
-                print(f"✓ Valid (would restore)")
+                print(f"✓ Valid (would restore) (Market: {market_name})")
             else:
-                print(f"✓ Success (Order ID: {order_id})")
+                print(f"✓ Success (Order ID: {order_id}) (Market: {market_name})")
         else:
             failed.append(result)
             # Extract order details for error message
             order_info = result.get("order", {})
-            market_id = get_market_ref(order_info)
             token_id = get_order_token_id(order_info) or "unknown"
             side = order_info.get("side", "unknown")
             size = get_order_size(order_info) or "unknown"
             price = order_info.get("price", "unknown")
 
-            # Get market name if we have a market ID
-            if market_id:
-                market_name = get_market_name(client, market_id, market_cache)
-            else:
-                market_name = f"Token {token_id[:20]}..."
+            market_name = resolve_market_name(client, order_info, market_cache)
 
             print(f"✗ Failed: {result['error']}")
             print(f"    Details: {side} {size} shares @ ${price} (Market: {market_name})")
@@ -497,18 +613,16 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
         print("\nSkipped orders (would fill immediately):")
         market_cache = {}  # Cache market names to avoid repeated API calls
         bid_ask_cache = {}  # Cache bid/ask prices to avoid repeated API calls
+        # Bulk-fetch order books for the orders we'll actually display.
+        if client:
+            prefetch_bid_ask(client, skipped_immediate_fill[:10], bid_ask_cache)
         for order in skipped_immediate_fill[:10]:  # Show first 10
-            market_id = get_market_ref(order)
             token_id = get_order_token_id(order) or "unknown"
             side = order.get("side", "unknown")
             size = get_order_size(order) or "unknown"
             price = order.get("price", "unknown")
 
-            # Get market name if we have a market ID and client
-            if market_id and client:
-                market_name = get_market_name(client, market_id, market_cache)
-            else:
-                market_name = f"Token {token_id[:20]}..."
+            market_name = resolve_market_name(client, order, market_cache)
 
             # Get best bid/ask to show matching price
             best_bid, best_ask = get_best_bid_ask(client, token_id, bid_ask_cache) if client else (None, None)
@@ -528,15 +642,16 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
             order_id = result.get('order_id', 'N/A')
             expiration = result.get('expiration', 0)
             exp_info = format_expiration(expiration)
+            market_name = result.get('market_name', f"Token {result['token_id'][:20]}...")
             if dry_run:
                 print(
                     f"  - {result['side']} {result['size']} @ ${result['price']:.4f} "
-                    f"(Token: {result['token_id'][:20]}..., {exp_info})"
+                    f"(Market: {market_name}, {exp_info})"
                 )
             else:
                 print(
                     f"  - {result['side']} {result['size']} @ ${result['price']:.4f} "
-                    f"(Token: {result['token_id'][:20]}..., ID: {order_id}, {exp_info})"
+                    f"(Market: {market_name}, ID: {order_id}, {exp_info})"
                 )
 
     if failed:
@@ -544,17 +659,11 @@ def print_summary(successful, failed, skipped=None, skipped_immediate_fill=None,
         market_cache = {}  # Cache market names to avoid repeated API calls
         for result in failed:
             order_info = result.get("order", {})
-            market_id = get_market_ref(order_info)
-            token_id = get_order_token_id(order_info) or "unknown"
             side = order_info.get("side", "unknown")
             size = get_order_size(order_info) or "unknown"
             price = order_info.get("price", "unknown")
 
-            # Get market name if we have a market ID and client
-            if market_id and client:
-                market_name = get_market_name(client, market_id, market_cache)
-            else:
-                market_name = f"Token {token_id[:20]}..."
+            market_name = resolve_market_name(client, order_info, market_cache)
 
             print(f"  - Order #{result['order_index']}: {side} {size} shares @ ${price}")
             print(f"    Market: {market_name}")

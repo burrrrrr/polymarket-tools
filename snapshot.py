@@ -16,6 +16,7 @@ from py_clob_client_v2.clob_types import OpenOrderParams
 
 from config import load_config, create_client
 from key_loader import cleanup_key_source
+from restore import get_market_ref, fetch_market_names_bulk
 
 
 def snapshot_orders(client):
@@ -28,6 +29,53 @@ def snapshot_orders(client):
     except Exception as e:
         print(f"Error fetching orders: {e}")
         sys.exit(1)
+
+
+def add_market_names(client, orders):
+    """Attach the market name to each order so restore can always display it.
+
+    Names are resolved in bulk via the Gamma API (one request per ~40 unique
+    markets) rather than one CLOB request per market, which is fast and avoids
+    read timeouts on large snapshots. Anything Gamma doesn't return falls back
+    to per-market CLOB lookups. Failures are non-fatal: an order left without a
+    name will simply have it resolved at restore time.
+    """
+    unique_market_ids = {
+        get_market_ref(order) for order in orders if get_market_ref(order)
+    }
+    print(
+        f"Fetching market names for {len(unique_market_ids)} unique market(s) "
+        f"across {len(orders)} order(s)..."
+    )
+
+    # Bulk-resolve via Gamma.
+    market_cache = fetch_market_names_bulk(unique_market_ids)
+
+    # Fall back to per-market CLOB lookups for anything Gamma didn't return.
+    missing = unique_market_ids - market_cache.keys()
+    if missing:
+        print(f"Resolving {len(missing)} remaining market(s) individually...")
+        for market_id in missing:
+            try:
+                info = client.get_market(market_id)
+                name = (
+                    info.get("question")
+                    or info.get("title")
+                    or info.get("marketName")
+                )
+                if name:
+                    market_cache[market_id] = name
+            except Exception:
+                # Leave it unresolved; restore.py will fetch it on demand.
+                pass
+
+    # Stamp resolved names onto every order.
+    for order in orders:
+        market_id = get_market_ref(order)
+        if market_id and market_id in market_cache:
+            order["market_name"] = market_cache[market_id]
+
+    return orders
 
 
 def save_snapshot(orders):
@@ -82,6 +130,9 @@ def main():
         if len(orders) == 0:
             print("No open orders to snapshot.")
             return
+
+        # Enrich orders with market names so restore can always display them
+        add_market_names(client, orders)
 
         filename = save_snapshot(orders)
         print(f"\nSnapshot complete! Use the following command to restore:")
