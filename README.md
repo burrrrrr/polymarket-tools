@@ -22,6 +22,39 @@ This tool allows you to take a snapshot of all your open Polymarket orders and r
 pip install -r requirements.txt
 ```
 
+## NixOS Installation
+
+### Prerequisites
+
+- Flake support enabled
+- [direnv](https://direnv.net/) (optional, for automatic shell activation)
+
+### Quick Start
+
+```bash
+# Enter development environment
+nix develop
+
+# Install Python dependencies (first time only)
+pip install -r requirements.txt
+```
+
+### With direnv (Recommended)
+
+For automatic shell activation when entering the project directory, configure `.envrc`:
+
+```bash
+use flake
+```
+
+Then run:
+
+```bash
+direnv allow
+```
+
+Now the development environment activates automatically when you `cd` into the project directory.
+
 ## Setup
 
 1. Copy the example environment file:
