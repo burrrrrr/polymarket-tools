@@ -12,7 +12,7 @@ from urllib.parse import quote, urlencode
 
 import reward_farmer
 from farm_db import EventKind, FarmerStatus, resting_order
-from reward_screener import Skip, adjusted_mid, created_mid, floor_to_tick
+from reward_screener import Skip, adjusted_mid, best_price, created_mid, floor_to_tick
 from reward_screener import score as share_score
 
 from .forms import P_TRUE_ERROR
@@ -511,7 +511,7 @@ def _not_running(snap, now):
 ALERT_RULES = (
     AlertRule("Not running", "t-r", "Farmer status", _not_running, "/settings"),
     AlertRule("Naked fill", "t-r", "Naked leg controls", _naked_fill),
-    AlertRule("Cooldown", "t-c", "View market", _in_phase("COOLDOWN", "mid drop")),
+    AlertRule("Cooldown", "t-c", "View market", _in_phase("COOLDOWN", "ask drop")),
     AlertRule("Below range", "t-b", "View market",
               _in_phase("BELOW_RANGE", "the mid is under min_fav")),
     AlertRule("Paused", "t-n", "Resume", _in_phase("PAUSED", "paused")),
@@ -1024,7 +1024,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
         obs = reward_farmer.Observation(
-            mid=book_mid, recent_mids=(),
+            mid=book_mid, ask=best_price(levels.asks, info.min_size), recent_asks=(),
             rewards_active=reward_farmer.rewards_active(info, fm.condition_id, total_rates),
             accepting_orders=info.accepting_orders, closed=info.closed, approved=True,
             expires_at=fm.expires_at)
@@ -1152,9 +1152,10 @@ def ev_check(metrics, p_true, budget_text, ev_margin):
                                  f"{cents(cap)} ({margin}). {then}"]
     budget = _float(budget_text)
     long_cost = plan["low_price"] * plan["low_size"]
-    if plan.get("mode") == "budget" and budget is not None and budget < long_cost:
+    if budget is not None and budget < long_cost - 1e-9:
         tone = "c-warn"
-        lines.append(f"BUDGET market: the planned longshot bid ties up {usd(long_cost)}, "
-                     f"above your {usd(budget)} naked budget. The farmer shrinks it to the "
-                     f"budget and trims the favorite bid to match.")
+        lines.append(f"The planned longshot bid ties up {usd(long_cost)}, above your "
+                     f"{usd(budget)} naked budget. The farmer re-prices it within the budget, "
+                     f"never above the cheapest price scoring the min longshot score, and "
+                     f"trims the favorite bid if it still falls short.")
     return EvCheck(tone, lines)

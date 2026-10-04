@@ -17,9 +17,11 @@ from farm_db import CommandKind
 from reward_screener import Levels, RewardMarket, ScreenConfig
 from test_farm_console import A, B, C, ORIGIN, Console
 
-# Favorite mid 0.96, tick 0.001: the longshot bid must sit at 1.7c to score (BUDGET),
-# and the favorite bid rests at 94.9c. Each book's deepest bid sits outside the
-# band, so it scores nothing but keeps the midpoint above min_fav (not fragile).
+# Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
+# sits at 1.7c, the cheapest price scoring 0.10 (BUDGET), sized to the budget, and the
+# favorite bid rests at 94.9c. Each book's deepest bid sits outside the
+# band, so it scores nothing, but if the best bid left it would keep the midpoint
+# above min_fav and less than 3c down (not fragile).
 BUDGET_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0), (0.90, 1000.0)],
                      asks=[(0.97, 1000.0)], tick=0.001)
 # Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at 97.9c.
@@ -513,10 +515,10 @@ class ReviewTest(Writes):
     def test_ev_check_warns_when_budget_is_below_the_longshot_leg(self):
         plan = json.loads(self.row("0xddd")["metrics"])["plan"]
         cost = plan["low_price"] * plan["low_size"]
-        self.assertIn(f"ties up ${cost:,.2f}, above your $25.00 naked budget",
-                      self.ev("0xddd", "97", "25"))
-        self.assertNotIn("BUDGET market", self.ev("0xddd", "97", str(cost + 1)))
-        self.assertNotIn("BUDGET market", self.ev("0xeee", "99", "0"))
+        self.assertIn(f"ties up ${cost:,.2f}, above your $5.00 naked budget",
+                      self.ev("0xddd", "97", "5"))
+        self.assertNotIn("ties up", self.ev("0xddd", "97", str(cost)))
+        self.assertIn("above your $0.00 naked budget", self.ev("0xeee", "99", "0"))
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
         from farm_console.app import utc_now
@@ -629,7 +631,7 @@ class ScanTest(Writes):
     def test_invalid_parameters_start_nothing_and_persist_nothing(self):
         for name, value in (("min_fav", "2"), ("capital", "0"), ("max_lead", "abc"),
                             ("fav_target_score", "0"),
-                            ("min_rate", "-1")):
+                            ("min_rate", "-1"), ("fragile_drop", "-0.01")):
             with self.subTest(name=name):
                 resp = self.post("/discover/scan", **scan_form(**{name: value}))
                 self.assertEqual(resp.status_code, 422)
@@ -640,6 +642,8 @@ class ScanTest(Writes):
         page = self.client.get("/discover").text
         self.assertIn('name="min_fav" value="0.9"', page)
         self.assertIn('name="horizon_cap_days" value="90"', page)
+        self.assertIn('name="fragile_drop" value="0.03"', page)
+        self.assertIn('name="naked_budget" value="10"', page)
 
     def test_stored_parameters_from_an_older_screener_still_load(self):
         farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01},
@@ -649,6 +653,8 @@ class ScanTest(Writes):
         self.assertIn('name="capital" value="300"', resp.text)
         self.assertIn('name="fav_target_score" value="0.45"', resp.text)
         self.assertIn('name="max_lead" value="0.005"', resp.text)
+        self.assertIn('name="fragile_drop" value="0.03"', resp.text)
+        self.assertIn('name="naked_budget" value="10"', resp.text)
         self.assertNotIn("bid_offset", resp.text)
 
 

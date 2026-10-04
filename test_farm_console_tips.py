@@ -87,8 +87,8 @@ class RenderedTipsTest(Writes):
     PAGES = {
         "/": {"capital_in_bids", "naked_at_risk", "farm_inventory", "est_daily",
               "earned_today", "q1_q2", "QUOTING"},
-        "/discover": {"min_fav", "min_rate", "mode", "favorite", "pool", "band", "est_daily",
-                      "planned_capital", "apr", "days", "ahead", "vol24h"},
+        "/discover": {"min_fav", "min_rate", "fragile_drop", "mode", "favorite", "pool", "band",
+                      "est_daily", "planned_capital", "apr", "days", "ahead", "vol24h"},
         "/review/0xddd": {"budget", "band", "min_size", "band_strip", "est_share", "ahead",
                           "holding_rewards", "p_true", "naked_budget", "capital_cap",
                           "ev_check", "start_paused"},

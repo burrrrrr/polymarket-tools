@@ -33,8 +33,6 @@ FARMER_DEFAULTS = reward_farmer.config_from(reward_farmer.build_parser().parse_a
 CONTROLS_EVENT = "controls"
 # How often an open Review page re-reads the live book and re-plans the orders.
 LIVE_POLL_S = 5
-# The naked budget a new review starts with, and what the quotable check assumes.
-DEFAULT_NAKED_BUDGET = 10.0
 # Skipping to the next quotable candidate reads at most QUOTABLE_SCAN books,
 # QUOTABLE_BATCH at a time.
 QUOTABLE_SCAN = 40
@@ -359,7 +357,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "p_true": views.number_text(market.p_true * 100) if market.p_true is not None else "",
             "naked_budget": views.number_text(market.naked_budget_usd
                                               if market.naked_budget_usd is not None
-                                              else DEFAULT_NAKED_BUDGET),
+                                              else reward_screener.DEFAULT_NAKED_BUDGET),
             "capital": views.number_text(market.capital_usd)
             if market.capital_usd is not None else "",
             "note": "",
@@ -412,7 +410,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         with closing(connect()) as conn:
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
-    def plan_now(row, cfg, p_true=None, budget=DEFAULT_NAKED_BUDGET, capital=None):
+    def plan_now(row, cfg, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
+                 capital=None):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None plans without the EV cap."""
         terms = {"p_true": 1.0 if p_true is None else p_true, "naked_budget_usd": budget,

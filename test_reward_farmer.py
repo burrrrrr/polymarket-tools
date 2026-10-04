@@ -5,6 +5,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
+import httpx
+
 import farm_db
 import reward_farmer
 from farm_db import CommandKind
@@ -37,6 +39,7 @@ from reward_farmer import (
     without_backed_off,
 )
 from reward_screener import Levels
+from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 FAV, LONG = "fav-token", "long-token"
@@ -84,7 +87,8 @@ def market(**changes):
 
 # Favorite mid 0.99: the cheapest scoring longshot bid is 0.1c (FLOOR).
 FLOOR_BOOK = Levels(bids=[(0.985, 1000.0)], asks=[(0.995, 1000.0)], tick=0.001)
-# Favorite mid 0.96: the longshot bid must sit at 1.7c to score (BUDGET).
+# Favorite mid 0.96: no longshot bid under 0.6c scores and the cheapest scoring
+# 0.10 is 1.7c (BUDGET). Balancing the full favorite bid there costs $35.83.
 BUDGET_BOOK = Levels(bids=[(0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
 
 # The favorite bid sits 1.1c under the midpoint in both books, the deepest
@@ -94,6 +98,11 @@ SCORE_FAV = (0.024 / 0.035) ** 2
 SCORE_LOW_FLOOR = (0.026 / 0.035) ** 2
 # Longshot bid at 1.7c against a 4c longshot mid: (1.2 / 3.5)^2.
 SCORE_LOW_BUDGET = (0.012 / 0.035) ** 2
+
+
+# The Mistral market on its approved terms.
+MISTRAL = market(v=0.085, min_size=20.0, p_true=0.96, naked_budget_usd=10.0)
+MISTRAL_CFG = CFG._replace(ev_margin=0.02)
 
 
 def by_slot(target):
@@ -162,12 +171,42 @@ class TargetOrdersTest(unittest.TestCase):
         q_one, q_two = q_sums(target)
         self.assertLessEqual(q_one, q_two + 1e-9)
 
+    def test_short_budget_never_lifts_long_bid_above_the_min_score_price(self):
+        # From $10.24 up, a price between 2.1c and 3.9c would balance the full
+        # favorite bid within the budget. The bid stays at 1.7c, the cheapest
+        # price scoring 0.10, and the favorite bid shrinks instead.
+        for budget in (5.0, 10.0, 15.0, 25.0, 35.0):
+            with self.subTest(budget=budget):
+                fm = market(p_true=0.98, naked_budget_usd=budget)
+                intents = by_slot(target_orders(fm, BUDGET_BOOK, Position(), CFG, True))
+                self.assertEqual(intents[Slot.LONG_BID].price, 0.017)
+                self.assertLess(intents[Slot.FAV_BID].size, 526.87)
+
     def test_budget_counts_longshot_shares_already_held(self):
         fm = market(p_true=0.98, naked_budget_usd=25.0)
         held = Position(long_shares=10.0, long_avg=1.0)
         low = by_slot(target_orders(fm, BUDGET_BOOK, held, CFG, True))[Slot.LONG_BID]
         self.assertLessEqual(low.price * low.size + 10.0, 25.0)
         self.assertEqual(low.size, 882.35)
+
+    def test_floor_bid_covers_the_fav_bid_after_the_big_bid_leaves(self):
+        # Mistral's favorite bid 0.855 x 584.79 scores 0.0271, 15.86 of Q_one. At 0.1c
+        # the longshot bid scores 0.0199 and covers it with 795.97 shares for $0.80.
+        # The cheapest price scoring 0.10 is 1.6c, first in line for a No buyer.
+        target = target_orders(MISTRAL, MISTRAL_BOOK_BID_GONE, Position(), MISTRAL_CFG, True)
+        intents = by_slot(target)
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((fav.price, fav.size), (0.855, 584.79))
+        self.assertEqual((low.price, low.size), (0.001, 795.97))
+        self.assertLessEqual(low.price * low.size, MISTRAL.naked_budget_usd)
+        q_one, q_two = q_sums(target)
+        self.assertGreaterEqual(q_two, q_one)
+
+    def test_floor_bid_scoring_over_min_low_score_stays_at_the_floor(self):
+        target = target_orders(MISTRAL, MISTRAL_BOOK, Position(), MISTRAL_CFG, True)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual(low.price, 0.001)
+        self.assertGreaterEqual(low.score, MISTRAL_CFG.min_low_score)
 
     def test_p_true_caps_fav_bid_price(self):
         fm = market(p_true=0.985)
@@ -289,7 +328,8 @@ class ReconcileTest(unittest.TestCase):
 def observe(**changes):
     fields = dict(
         mid=0.96,
-        recent_mids=(),
+        ask=0.97,
+        recent_asks=(),
         rewards_active=True,
         accepting_orders=True,
         closed=False,
@@ -303,18 +343,37 @@ def observe(**changes):
 QUOTING = State(Phase.QUOTING)
 
 
-class StepStateTest(unittest.TestCase):
-    def test_mid_drop_within_window_starts_cooldown(self):
-        obs = observe(mid=0.94, recent_mids=((NOW - timedelta(seconds=30), 0.97),))
-        state = step_state(QUOTING, obs, NOW, CFG)
-        self.assertEqual(state, State(Phase.COOLDOWN, NOW + timedelta(seconds=600), "mid drop"))
+def asked(price, seconds_ago=30):
+    """recent_asks holding one best ask seen seconds_ago."""
+    return ((NOW - timedelta(seconds=seconds_ago), price),)
 
-    def test_mid_drop_outside_window_is_ignored(self):
-        obs = observe(mid=0.94, recent_mids=((NOW - timedelta(seconds=120), 0.97),))
+
+class StepStateTest(unittest.TestCase):
+    def test_ask_drop_within_window_starts_cooldown(self):
+        obs = observe(ask=0.97, recent_asks=asked(1.0))
+        state = step_state(QUOTING, obs, NOW, CFG)
+        self.assertEqual(state, State(Phase.COOLDOWN, NOW + timedelta(seconds=600), "ask drop"))
+
+    def test_ask_falling_a_tick_less_than_the_threshold_keeps_quoting(self):
+        obs = observe(ask=0.971, recent_asks=asked(1.0))
         self.assertEqual(step_state(QUOTING, obs, NOW, CFG), QUOTING)
 
+    def test_ask_drop_outside_window_is_ignored(self):
+        obs = observe(ask=0.97, recent_asks=asked(1.0, seconds_ago=61))
+        self.assertEqual(step_state(QUOTING, obs, NOW, CFG), QUOTING)
+
+    def test_mid_falling_with_the_ask_steady_keeps_quoting(self):
+        # The Mistral book losing its 0.93 bid: the mid falls 0.9635 -> 0.9235.
+        obs = observe(mid=0.9235, ask=0.997, recent_asks=asked(0.997))
+        self.assertEqual(step_state(QUOTING, obs, NOW, CFG), QUOTING)
+
+    def test_cooldown_rearms_while_the_ask_keeps_falling(self):
+        cooling = State(Phase.COOLDOWN, NOW + timedelta(seconds=10), "ask drop")
+        state = step_state(cooling, observe(ask=0.94, recent_asks=asked(0.97)), NOW, CFG)
+        self.assertEqual(state, State(Phase.COOLDOWN, NOW + timedelta(seconds=600), "ask drop"))
+
     def test_cooldown_holds_until_expiry_then_quotes(self):
-        cooling = State(Phase.COOLDOWN, NOW + timedelta(seconds=10), "mid drop")
+        cooling = State(Phase.COOLDOWN, NOW + timedelta(seconds=10), "ask drop")
         self.assertEqual(step_state(cooling, observe(), NOW, CFG), cooling)
         later = NOW + timedelta(seconds=11)
         self.assertEqual(step_state(cooling, observe(), later, CFG), QUOTING)
@@ -360,7 +419,7 @@ class StepStateTest(unittest.TestCase):
         self.assertEqual(step_state(paused, observe(mid=None), NOW, CFG), QUOTING)
 
     def test_pause_overrides_cooldown_and_below_range(self):
-        cooling = State(Phase.COOLDOWN, NOW + timedelta(seconds=10), "mid drop")
+        cooling = State(Phase.COOLDOWN, NOW + timedelta(seconds=10), "ask drop")
         for state in (cooling, State(Phase.BELOW_RANGE)):
             self.assertEqual(step_state(state, observe(paused=True), NOW, CFG).phase, Phase.PAUSED)
 
@@ -492,6 +551,37 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(fill_events(before, after), [(Slot.FAV_ASK, 40.0), (Slot.LONG_BID, 300.0)])
 
 
+def positions_api(*statuses):
+    """An httpx client whose /positions answers with statuses in turn, then 200."""
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        status = statuses[len(calls) - 1] if len(calls) <= len(statuses) else 200
+        if status == 429:
+            return httpx.Response(429, headers={"retry-after": "1"},
+                                  json={"error": "Too Many Requests"})
+        return httpx.Response(status, json=[{"asset": FAV, "size": "120", "avgPrice": "0.97"}])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+class FetchHoldingsTest(unittest.TestCase):
+    def test_a_rate_limited_read_waits_and_retries(self):
+        http, calls = positions_api(429, 429)
+        with mock.patch("time.sleep") as sleep:
+            holdings = reward_farmer.fetch_holdings(http, "0xme")
+        self.assertEqual(holdings, {FAV: (120.0, 0.97)})
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([c.args for c in sleep.call_args_list], [(1.0,), (1.0,)])
+
+    def test_a_read_still_rate_limited_after_the_retries_raises(self):
+        http, calls = positions_api(*[429] * 10)
+        with mock.patch("time.sleep"), self.assertRaises(httpx.HTTPStatusError):
+            reward_farmer.fetch_holdings(http, "0xme")
+        self.assertEqual(len(calls), reward_farmer.RATE_LIMIT_RETRIES + 1)
+
+
 CID = "0xc0nd"
 INFO = MarketInfo((FAV, LONG), 5.0, 0.035, 50.0, 0.001, False, True, False)
 METRICS = {"market": {"fav_token_id": FAV, "slug": "test-market", "question": "Test?",
@@ -519,8 +609,10 @@ class FarmerCycleTest(unittest.TestCase):
         farm_db.approve_market(self.ui, CID, 0.995, 25.0)
         self.book_fetches = 0
         self.on_book_fetch = lambda count: None
+        self.info = mock.Mock(return_value=INFO)
+        self.book = FLOOR_BOOK
         for name, fake in (
-            ("fetch_market_info", mock.Mock(return_value=INFO)),
+            ("fetch_market_info", self.info),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
@@ -534,7 +626,7 @@ class FarmerCycleTest(unittest.TestCase):
     def fake_levels(self, http, token_ids):
         self.book_fetches += 1
         self.on_book_fetch(self.book_fetches)
-        return {FAV: FLOOR_BOOK}
+        return {FAV: self.book}
 
     def started_farmer(self):
         farmer = Farmer(self.args, config_from(self.args))
@@ -747,6 +839,40 @@ class FarmerCycleTest(unittest.TestCase):
         farmer.cycle()
         self.assertEqual([r[0] for r in self.query("SELECT condition_id FROM farm_state")], [CID])
 
+    def replay(self, *books):
+        """Cycle a market on the Mistral terms once per book. Returns, per cycle,
+        (phase, reason, {slot: (price, size)} of the bids it targets), and the
+        events of all the cycles."""
+        self.info.return_value = INFO._replace(v=0.085, min_size=20.0)
+        farmer = self.started_farmer()
+        before = self.last_event_id()
+        seen = []
+        for book in books:
+            self.book = book
+            farmer.cycle()
+            row, slots = self.farm_state()
+            bids = {slot: (s["target"]["price"], s["target"]["size"])
+                    for slot, s in slots.items() if slot.endswith("_BID") and s["target"]}
+            seen.append((row["phase"], row["phase_reason"], bids))
+        return seen, [(e["kind"], e["message"]) for e in self.events(before)]
+
+    def test_a_bid_leaving_keeps_quoting_and_follows_the_bids_that_remain(self):
+        (before, after), events = self.replay(MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE)
+        self.assertEqual((before[0], before[2]["FAV_BID"][0]), ("QUOTING", 0.935))
+        self.assertEqual(after[:2], ("QUOTING", ""))
+        self.assertEqual(after[2], {"FAV_BID": (0.855, 584.79), "LONG_BID": (0.001, 795.97)})
+        self.assertNotIn("PHASE", [kind for kind, _ in events])
+
+    def test_best_ask_falling_by_the_threshold_cools_down(self):
+        fallen = MISTRAL_BOOK._replace(asks=[(0.967, 150.0)] + MISTRAL_BOOK.asks[1:])
+        (_, after), events = self.replay(MISTRAL_BOOK, fallen)
+        self.assertEqual(after, ("COOLDOWN", "ask drop", {}))
+        self.assertIn("PHASE", [kind for kind, _ in events])
+
+    def test_a_dust_ask_far_below_does_not_cool_down(self):
+        dusted = MISTRAL_BOOK._replace(asks=[(0.95, 5.0)] + MISTRAL_BOOK.asks)
+        (_, after), _ = self.replay(MISTRAL_BOOK, dusted)
+        self.assertEqual((after[0], after[2]["FAV_BID"][0]), ("QUOTING", 0.935))
 
     def test_mid_history_is_sampled_at_most_once_a_minute(self):
         clock = [NOW]

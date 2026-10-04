@@ -24,9 +24,11 @@ farmer rests on both sides, in four slots per market:
   FAV_ASK   favorite SELL, Q_two, covered by favorite shares. Exits favorite
             inventory above its average cost and frees the capital again.
   LONG_BID  longshot BUY, Q_two, naked. It exists only to make Q_one count.
-            On a FLOOR market it sits at 0.1c-0.2c and almost never fills; on
-            a BUDGET market it must sit higher to score, and the market's
-            naked_budget_usd caps its cost plus any longshot shares held.
+            It takes the cheapest price whose size covering the rest of Q_one
+            fits the market's naked_budget_usd, less longshot shares held, but
+            never above the cheapest price scoring --min-low-score: 0.1c-0.2c
+            on a FLOOR market, where it almost never fills, higher on a BUDGET
+            market.
 
 Q_two comes from the covered FAV_ASK first and only the remainder from the
 naked LONG_BID. When the budget leaves Q_two short, the favorite bid shrinks
@@ -40,9 +42,11 @@ market's end date minus the expiry buffer (7 days), when the market retires.
 Each market has a lifecycle, advanced every cycle by `step_state`:
 
   QUOTING      orders rest as planned.
-  COOLDOWN     the favorite midpoint fell fast; quotes come down for a while,
-               because a falling favorite is how a bid gets filled right
-               before the news arrives.
+  COOLDOWN     the favorite's best ask fell fast; quotes come down for a while,
+               because sellers repricing the favorite down is how a bid gets
+               filled right before the news arrives. A bid leaving never
+               cools down: it looks the same cancelled or sold into, and the
+               plan just follows the bids that remain.
   BELOW_RANGE  the midpoint fell under --min-fav, where the strategy does not
                apply; it resumes a little above the threshold.
   PAUSED       a human paused the market (markets.paused). It leaves the
@@ -132,16 +136,16 @@ from reward_screener import (
     _make_output_safe,
     adjust_levels,
     adjusted_mid,
+    best_price,
     fav_bid_price,
     fetch_gamma,
     fetch_levels,
     fetch_total_rates,
     floor_to_tick,
-    lowest_scoring_bid,
+    longshot_bid,
     parse_time,
     resolution_signal,
     round_size_down,
-    round_size_up,
     score,
     tick_decimals,
 )
@@ -174,6 +178,10 @@ BACKOFF_MAX_S = 900
 # Most orders the CLOB accepts in one batch POST.
 POST_BATCH_LIMIT = 15
 POSITIONS_PAGE = 500
+# The data API answers about one read in thirty with a 429 and Retry-After: 1,
+# even at one read every two seconds.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_WAIT_MAX_S = 5.0
 
 
 def log(message):
@@ -334,12 +342,15 @@ class State(NamedTuple):
 class Observation(NamedTuple):
     """What step_state and naked_allowed see of a market in one cycle.
 
-    paused and naked_paused are the human's flags on the market row;
-    naked_cooldown_until is set by the farmer after a longshot fill.
+    mid and ask are the adjusted midpoint and the best ask of at least
+    min_size in the book without our orders; recent_asks holds (time, ask)
+    from earlier cycles. paused and naked_paused are the human's flags on the
+    market row; naked_cooldown_until is set by the farmer after a longshot fill.
     """
 
     mid: Optional[float]
-    recent_mids: tuple
+    ask: Optional[float]
+    recent_asks: tuple
     rewards_active: bool
     accepting_orders: bool
     closed: bool
@@ -469,10 +480,13 @@ def target_orders(fm, levels, position, cfg, naked_allowed):
 
     `levels` is the favorite book without our own resting orders. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
-    LONG_BID up to the budget, then the favorite bid shrinks to whatever
-    Q_two reached. A bid that ends below the reward minimum size is dropped,
-    because an order that does not score is risk without reward; the two
-    asks are exits and stay regardless.
+    LONG_BID at the cheapest price that covers the rest within the budget, no
+    higher than the min_low_score price (longshot_bid), then the favorite bid
+    shrinks to whatever Q_two reached.
+    The LONG_BID is re-derived when the favorite bid is dropped, because the
+    cheapest covering price depends on what it must cover. A bid that ends
+    below the reward minimum size is dropped, because an order that does not
+    score is risk without reward; the two asks are exits and stay regardless.
     """
     book_mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
     if book_mid is None:
@@ -516,30 +530,24 @@ def target_orders(fm, levels, position, cfg, naked_allowed):
 
     q_one_exits, q_two_covered = q(Slot.LONG_ASK), q(Slot.FAV_ASK)
 
-    low = lowest_scoring_bid(levels, mid, v, tick, cfg.min_low_score)
+    def long_bid(q_one):
+        if not naked_allowed:
+            return None
+        return longshot_bid(levels, mid, v, tick, fm.min_size, q_one - q_two_covered,
+                            naked_room(fm, position), cfg.min_low_score)
 
-    def long_bid_size(q_one):
-        if not naked_allowed or low is None or q_one <= q_two_covered:
-            return 0.0
-        price, low_score = low
-        size = min(
-            round_size_up((q_one - q_two_covered) / low_score),
-            round_size_down(naked_room(fm, position) / price),
-        )
-        return size if size >= fm.min_size else 0.0
-
-    long_size = long_bid_size(q_one_exits + fav_score * fav_size)
-    q_two = q_two_covered + (low[1] * long_size if long_size else 0.0)
+    low = long_bid(q_one_exits + fav_score * fav_size)
+    q_two = q_two_covered + (low.score * low.size if low else 0.0)
     if fav_score > 0 and q_one_exits + fav_score * fav_size > q_two:
         fav_size = round_size_down(max(0.0, q_two - q_one_exits) / fav_score)
     if fav_size < fm.min_size:
         fav_size = 0.0
-        long_size = min(long_size, long_bid_size(q_one_exits))
+        low = long_bid(q_one_exits)
 
     if fav_size > 0:
         add(Slot.FAV_BID, fav_bid[0], fav_size, fav_score)
-    if long_size > 0:
-        add(Slot.LONG_BID, low[0], long_size, low[1])
+    if low:
+        add(Slot.LONG_BID, low.price, low.size, low.score)
     return Target(mid, [intents[slot] for slot in Slot if slot in intents])
 
 
@@ -604,10 +612,15 @@ RETIRE_CHECKS = (
 )
 
 
-def mid_dropped(recent_mids, mid, now, cfg):
-    """Whether the mid fell by drop_threshold from any point in the window."""
-    window = [m for t, m in recent_mids if (now - t).total_seconds() <= cfg.drop_window_s]
-    return bool(window) and max(window) - mid >= cfg.drop_threshold - 1e-9
+def ask_dropped(recent_asks, ask, now, cfg):
+    """Whether the best ask fell by drop_threshold from any point in the window.
+
+    Only the ask counts. A bid leaving looks the same whether it was cancelled
+    or sold into, and the farmer re-plans against the bids that remain, while
+    a falling offer is sellers repricing the favorite down.
+    """
+    window = [a for t, a in recent_asks if (now - t).total_seconds() <= cfg.drop_window_s]
+    return bool(window) and max(window) - ask >= cfg.drop_threshold - 1e-9
 
 
 def step_state(state, obs, now, cfg):
@@ -622,8 +635,8 @@ def step_state(state, obs, now, cfg):
         state = State(Phase.QUOTING)
     if obs.mid is None:
         return state
-    if mid_dropped(obs.recent_mids, obs.mid, now, cfg):
-        return State(Phase.COOLDOWN, now + timedelta(seconds=cfg.cooldown_s), "mid drop")
+    if ask_dropped(obs.recent_asks, obs.ask, now, cfg):
+        return State(Phase.COOLDOWN, now + timedelta(seconds=cfg.cooldown_s), "ask drop")
     if state.phase is Phase.COOLDOWN and now < state.until:
         return state
     if obs.mid < cfg.min_fav:
@@ -926,12 +939,17 @@ def fetch_holdings(http, user, timeout=30):
     """{token_id: (shares, avg_price)} for every position the user holds."""
     holdings, offset = {}, 0
     while True:
-        resp = http.get(
-            f"{DATA_API_HOST}/positions",
-            params={"user": user, "limit": POSITIONS_PAGE, "offset": offset,
-                    "sizeThreshold": 0},
-            timeout=timeout,
-        )
+        for attempt in range(RATE_LIMIT_RETRIES + 1):
+            resp = http.get(
+                f"{DATA_API_HOST}/positions",
+                params={"user": user, "limit": POSITIONS_PAGE, "offset": offset,
+                        "sizeThreshold": 0},
+                timeout=timeout,
+            )
+            if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+                break
+            time.sleep(min(_float(resp.headers.get("retry-after")) or 1.0,
+                           RATE_LIMIT_WAIT_MAX_S))
         resp.raise_for_status()
         page = resp.json() or []
         for p in page:
@@ -1019,7 +1037,7 @@ class Managed:
         self.backoffs = {}
         self.approved = True
         self.state = State(Phase.QUOTING)
-        self.recent_mids = deque()
+        self.recent_asks = deque()
         self.naked_paused_until = None
         self.held = None
         self.position = None
@@ -1318,9 +1336,11 @@ class Farmer:
         orders = managed.orders = self.open_orders(managed)
         book = strip_own(levels, orders, fm) if self.live else levels
         book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
+        book_ask = best_price(book.asks, fm.min_size)
         obs = Observation(
             mid=book_mid,
-            recent_mids=tuple(managed.recent_mids),
+            ask=book_ask,
+            recent_asks=tuple(managed.recent_asks),
             rewards_active=rewards_active(managed.info, fm.condition_id,
                                           self.total_rates.rates),
             accepting_orders=managed.info.accepting_orders,
@@ -1333,12 +1353,12 @@ class Farmer:
             resolution=self.resolutions.get(fm.condition_id),
         )
         previous, managed.state = managed.state, step_state(managed.state, obs, now, self.cfg)
-        if book_mid is not None:
-            managed.recent_mids.append((now, book_mid))
-        while managed.recent_mids and (
-            now - managed.recent_mids[0][0]
+        if book_ask is not None:
+            managed.recent_asks.append((now, book_ask))
+        while managed.recent_asks and (
+            now - managed.recent_asks[0][0]
         ).total_seconds() > self.cfg.drop_window_s:
-            managed.recent_mids.popleft()
+            managed.recent_asks.popleft()
         if managed.state != previous:
             state = managed.state
             self.emit(EventKind.PHASE, f"{fm.label}: {previous} -> {state}", fm.condition_id,
@@ -1661,12 +1681,14 @@ Examples:
         ("--min-capture", float, 0.005, "Favorite ask minimum above average cost"),
         ("--ev-margin", float, 0.02, "Favorite bid maximum is p_true minus this"),
         ("--min-fav", float, 0.90, "Stop quoting below this favorite midpoint"),
-        ("--min-low-score", float, 0.10, "Minimum per-share score of the longshot bid"),
+        ("--min-low-score", float, 0.10, "The longshot bid never sits above the cheapest "
+                                         "price scoring this per share"),
         ("--keep-ratio", float, 0.8, "Keep an order scoring at least this share "
                                      "of its target"),
-        ("--drop-threshold", float, 0.03, "Midpoint fall that triggers a cooldown"),
-        ("--drop-window", float, 60.0, "Seconds over which the fall is measured"),
-        ("--cooldown", float, 600.0, "Seconds without quotes after a midpoint drop"),
+        ("--drop-threshold", float, 0.03, "Fall in the favorite's best ask that triggers "
+                                          "a cooldown"),
+        ("--drop-window", float, 60.0, "Seconds over which the ask's fall is measured"),
+        ("--cooldown", float, 600.0, "Seconds without quotes after an ask drop"),
         ("--naked-cooldown", float, 3600.0, "Seconds without a longshot bid after "
                                             "a longshot fill"),
         ("--expiry-buffer-days", float, 7.0, "Retire this many days before the end date"),

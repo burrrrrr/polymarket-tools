@@ -19,13 +19,14 @@ class Term(NamedTuple):
 GLOSSARY = {
     # modes and outcomes
     "mode": Term("Mode", "Floor or budget: whether the longshot bid can sit at the 0.1–0.2c "
-                         "floor and still earn rewards."),
-    "floor": Term("Floor", "The reward band reaches all the way down to 0.1–0.2c on the "
-                           "longshot side, so the longshot bid can sit there and still earn "
-                           "rewards. It costs under a dollar and almost never fills."),
-    "budget": Term("Budget", "The reward band doesn't reach 0.2c, so the longshot bid has to "
-                             "sit higher to earn rewards. That bid is real risk, capped by the "
-                             "market's naked budget."),
+                         "floor and still balance the favorite bid within the naked budget."),
+    "floor": Term("Floor", "The reward band reaches down to 0.1–0.2c on the longshot side, "
+                           "and the shares that balance the favorite bid there fit the naked "
+                           "budget. The longshot bid sits there and almost never fills."),
+    "budget": Term("Budget", "At 0.1–0.2c the longshot bid scores nothing, or too little to "
+                             "balance the favorite bid within the naked budget, so it sits "
+                             "higher. That bid is real risk, capped by the market's naked "
+                             "budget."),
     "favorite": Term("Favorite", "The outcome priced at 90c or more. The farmer bids on it and "
                                  "is happy to be filled below your p_true."),
     "longshot": Term("Longshot", "The other outcome. The farmer bids on it only so the "
@@ -72,7 +73,9 @@ GLOSSARY = {
     "naked_budget": Term("Naked budget", "The most USD the longshot side may risk: resting "
                                          "longshot bids plus longshot shares held. It's your "
                                          "worst-case loss on that side if every longshot bid "
-                                         "fills and the longshot loses."),
+                                         "fills and the longshot loses. A scan prices every "
+                                         "market's longshot bid within the scan's naked "
+                                         "budget, so set it to what you'd approve with."),
     "capital_cap": Term("Capital cap", "The most USD this market may tie up on the favorite "
                                        "side: resting favorite bids plus favorite shares held, "
                                        "at cost. Leave blank to use the farmer's default."),
@@ -136,9 +139,9 @@ GLOSSARY = {
 
     # phases
     "QUOTING": Term("Quoting", "Orders are resting and earning rewards."),
-    "COOLDOWN": Term("Cooldown", "The midpoint fell sharply (by at least the drop threshold "
-                                 "within the drop window). All orders are pulled until the "
-                                 "cooldown ends."),
+    "COOLDOWN": Term("Cooldown", "The favorite's best ask fell sharply (by at least the drop "
+                                 "threshold within the drop window). All orders are pulled "
+                                 "until the cooldown ends."),
     "BELOW_RANGE": Term("Below range", "The favorite's midpoint is below the minimum. All "
                                        "orders are pulled until it recovers 0.5c above it."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "
@@ -172,15 +175,24 @@ GLOSSARY = {
     "min_fav": Term("Min favorite mid", "Markets whose favorite trades below this are skipped "
                                         "by the screener and pulled to BELOW_RANGE by the "
                                         "farmer."),
-    "min_low_score": Term("Min longshot score", "Cheapest longshot price that still scores "
-                                                "at least this per share."),
+    "min_low_score": Term("Min longshot score", "The longshot bid never sits above the "
+                                                "cheapest price scoring at least this per "
+                                                "share. A cheaper price is used when the size "
+                                                "covering the favorite bid there fits the "
+                                                "naked budget. Otherwise the bid sits at that "
+                                                "price, sized to the budget, and the favorite "
+                                                "bid shrinks to match."),
     "keep_ratio": Term("Keep ratio", "Keep a resting order while it scores at least this "
                                      "fraction of its target."),
-    "drop_threshold": Term("Mid drop threshold", "A fall in the midpoint this large within "
-                                                 "the drop window starts a cooldown."),
-    "drop_window_s": Term("Drop window", "How many seconds back the midpoint's fall is "
+    "drop_threshold": Term("Ask drop threshold", "A fall this large in the favorite's best "
+                                                 "ask within the drop window starts a "
+                                                 "cooldown. Only the ask counts, because a "
+                                                 "bid leaving looks the same cancelled or "
+                                                 "sold into, and the farmer re-plans against "
+                                                 "the bids that remain."),
+    "drop_window_s": Term("Drop window", "How many seconds back the best ask's fall is "
                                          "measured."),
-    "cooldown_s": Term("Cooldown", "Seconds all orders stay pulled after a midpoint drop."),
+    "cooldown_s": Term("Cooldown", "Seconds all orders stay pulled after an ask drop."),
     "naked_cooldown_s": Term("Naked cooldown", "Pause the naked leg this long, in seconds, "
                                                "after a longshot fill."),
     "expiry_buffer_days": Term("Expiry buffer", "Days before the end date when every order "
@@ -192,6 +204,10 @@ GLOSSARY = {
                                             "alone."),
     "min_rate": Term("Min pool", "Skip markets whose daily reward pool is smaller than this, "
                                  "in USD."),
+    "fragile_drop": Term("Fragile mid drop", "Skip markets whose midpoint would fall this "
+                                             "much if their best bid left. Our favorite bid "
+                                             "would follow the next bid down and its score "
+                                             "would collapse."),
     "heartbeat": Term("Heartbeat", "If the farmer stops sending heartbeats for 10s, "
                                    "Polymarket cancels every order owned by these API "
                                    "credentials, possibly including your other tools' "

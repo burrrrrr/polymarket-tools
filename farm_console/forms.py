@@ -33,7 +33,9 @@ SCAN_FIELDS = {
     "fav_target_score": Field("Favorite target score", bound=Bound(0, 1, low_open=True)),
     "max_lead": Field("Max lead", bound=Bound(0, 0.5)),
     "min_low_score": Field("Min longshot score", bound=Bound(0, 1, low_open=True)),
+    "naked_budget": Field("Naked budget ($)", bound=Bound(0)),
     "min_rate": Field("Min pool ($/day)", bound=Bound(0)),
+    "fragile_drop": Field("Fragile mid drop", bound=Bound(0, 1)),
 }
 
 QUOTING, SAFETY = "Quoting", "Safety"
@@ -48,7 +50,7 @@ SETTING_FIELDS = {
     "ev_margin": Field("EV margin", QUOTING),
     "min_low_score": Field("Min longshot score", QUOTING),
     "keep_ratio": Field("Keep ratio", QUOTING),
-    "drop_threshold": Field("Mid drop threshold", SAFETY),
+    "drop_threshold": Field("Ask drop threshold", SAFETY),
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),
     "naked_cooldown_s": Field("Naked cooldown (s)", SAFETY),

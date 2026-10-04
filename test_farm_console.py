@@ -99,11 +99,11 @@ class AlertRuleTest(unittest.TestCase):
         self.assertEqual(kinds(snap([state(A)], [market(A, "a")])), [])
 
     def test_cooldown_names_reason_and_until(self):
-        s = snap([state(A, "COOLDOWN", "mid drop", until=NOW + timedelta(minutes=10))],
+        s = snap([state(A, "COOLDOWN", "ask drop", until=NOW + timedelta(minutes=10))],
                  [market(A, "a")])
         found = views.alerts(s, NOW)
         self.assertEqual([a.kind for a in found], ["Cooldown"])
-        self.assertIn("mid drop until", found[0].text)
+        self.assertIn("ask drop until", found[0].text)
         self.assertEqual(found[0].href, f"/markets/{A}")
 
     def test_below_range_fires(self):

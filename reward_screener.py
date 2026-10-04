@@ -18,9 +18,11 @@ tick a longshot bid at 0.1c-0.2c almost never fills and costs nearly nothing,
 but it only scores if it sits inside the reward band. That splits markets
 into two modes:
 
-  FLOOR   the longshot bid scores at <= 0.2c; its capital and risk are noise.
-  BUDGET  the longshot bid must sit higher to score; the naked risk on that
-          leg is budgeted per market at approval time.
+  FLOOR   the longshot bid scores at <= 0.2c, and the size that balances the
+          favorite bid there fits the naked budget; its risk is noise.
+  BUDGET  the longshot bid must sit higher to score or to fit the budget, at
+          most at the cheapest price scoring min_low_score; the naked risk on
+          that leg is budgeted per market at approval time.
 
 Reward scoring follows Polymarket's published formula. An order at distance
 s from the adjusted midpoint scores S(v, s) = ((v - s) / v)^2 inside the max
@@ -84,6 +86,9 @@ GAMMA_REQUEST_LIMIT = 100
 
 # A longshot bid at or below this price is the FLOOR mode.
 FLOOR_PRICE = 0.002
+# The naked budget a scan prices each longshot bid within, and the one a new
+# review and the console's quotable check start with.
+DEFAULT_NAKED_BUDGET = 10.0
 # Above this midpoint only two-sided liquidity scores.
 TWO_SIDED_ABOVE = 0.90
 
@@ -104,8 +109,14 @@ SCAN_HELP = {
                         "price that still reaches it",
     "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
                 "0 joins it",
-    "min_low_score": "Minimum per-share score of the longshot bid",
+    "min_low_score": "The longshot bid never sits above the cheapest price scoring this per "
+                     "share, and sits there when no cheaper price covers the favorite bid "
+                     "within the naked budget",
+    "naked_budget": "USD the longshot bid may cost. Each market's longshot bid is priced "
+                    "within it, as the farmer would with this budget approved",
     "min_rate": "Minimum daily reward pool in USD",
+    "fragile_drop": "Skip a market whose midpoint falls this much once its best bid "
+                      "leaves",
 }
 
 
@@ -167,6 +178,12 @@ class Levels(NamedTuple):
     tick: Optional[float] = None
 
 
+class LongshotBid(NamedTuple):
+    price: float
+    size: float
+    score: float
+
+
 class QuotePlan(NamedTuple):
     mid: float
     fav_bid_price: float
@@ -217,7 +234,9 @@ class ScreenConfig(NamedTuple):
     fav_target_score: float = 0.45
     max_lead: float = 0.005
     min_low_score: float = 0.10
+    naked_budget: float = DEFAULT_NAKED_BUDGET
     min_rate: float = 0.0
+    fragile_drop: float = 0.03
 
 
 class ScanResult(NamedTuple):
@@ -275,6 +294,12 @@ def q_min(q_one, q_two, mid):
     return min(q_one, q_two)
 
 
+def best_price(side, min_size):
+    """Price of the first level on one side of the book with at least min_size,
+    or None. Levels under the reward minimum are dust that cannot score."""
+    return next((p for p, s in side if s >= min_size), None)
+
+
 def adjusted_mid(bids, asks, min_size):
     """Midpoint of the best bid and ask among levels of at least min_size.
 
@@ -284,20 +309,23 @@ def adjusted_mid(bids, asks, min_size):
     level of small orders that sum past min_size still counts. Returns None
     when either side has no qualifying level.
     """
-    bid = next((p for p, s in bids if s >= min_size), None)
-    ask = next((p for p, s in asks if s >= min_size), None)
+    bid = best_price(bids, min_size)
+    ask = best_price(asks, min_size)
     if bid is None or ask is None:
         return None
     return (bid + ask) / 2
 
 
-def fragile_mid(levels, min_size, min_fav):
-    """Whether pulling the best qualifying bid level drops the midpoint under
-    min_fav (or leaves no bid). In a thin book one maker's bid can hold the
-    favorite above the threshold; once it goes the farmer stops quoting."""
+def fragile_mid(levels, min_size, min_fav, fragile_drop):
+    """Whether pulling the best qualifying bid level leaves no bid, drops the
+    midpoint under min_fav, or drops it by fragile_drop. In a thin book one
+    maker's bid can hold the midpoint up. When that maker leaves, the farmer
+    stops quoting below min_fav, and above it our bid follows the next bid down
+    and the reward score collapses."""
     best = next(((p, s) for p, s in levels.bids if s >= min_size), None)
-    mid = adjusted_mid([lvl for lvl in levels.bids if lvl != best], levels.asks, min_size)
-    return mid is None or mid < min_fav
+    mid = adjusted_mid(levels.bids, levels.asks, min_size)
+    pulled = adjusted_mid([lvl for lvl in levels.bids if lvl != best], levels.asks, min_size)
+    return pulled is None or pulled < min_fav or mid - pulled >= fragile_drop - 1e-9
 
 
 def adjust_levels(levels, bids=(), asks=()):
@@ -342,8 +370,8 @@ def fav_bid_price(levels, v, tick, min_size, target_score, max_lead):
     first miss. A ceiling that misses the target is still the answer, since
     the target is a depth preference and a low score still earns a share.
     """
-    best_bid = next((p for p, s in levels.bids if s >= min_size), None)
-    best_ask = next((p for p, s in levels.asks if s >= min_size), None)
+    best_bid = best_price(levels.bids, min_size)
+    best_ask = best_price(levels.asks, min_size)
     if best_bid is None or best_ask is None:
         return Skip("one-sided book")
     price = min(floor_to_tick(best_bid + max_lead, tick),
@@ -359,25 +387,51 @@ def fav_bid_price(levels, v, tick, min_size, target_score, max_lead):
     return price
 
 
-def lowest_scoring_bid(levels, mid, v, tick, min_score):
-    """Cheapest longshot bid scoring at least min_score, as (price, score), or None.
+def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
+    """The naked longshot bid adding `need` to Q_two for at most `room` USD.
+    LongshotBid, or None when need is not positive or nothing fits.
+
+    The bid never prices above the ceiling, the cheapest price scoring at
+    least min_score. Up to the ceiling it takes the cheapest price whose
+    covering size, round_size_up(need / score) and at least min_size, costs at
+    most room. The cheaper the bid, the deeper it shows on the favorite's ask
+    side and the more No buyers fill ahead of it, so a 0.1c bid scoring 0.02
+    beats a 1.6c bid scoring 0.10. When no price up to the ceiling covers, the
+    bid sits at the ceiling with the size room buys, and the caller trims the
+    favorite bid to the Q_two that reaches; None when room buys less than
+    min_size there. With no ceiling under the crossing limit there is no bid,
+    even if a lower-scoring price could cover.
+
+    Near the band edge a small move of the midpoint changes the score, and so
+    the covering size, a lot, and KEEP_SIZE_RANGE replaces the bid more
+    often. That is accepted: at the floor, losing queue position only makes a
+    fill less likely.
 
     `levels` is the favorite book and `mid` the favorite midpoint. The
     longshot ask is the mirror of the raw favorite best bid; a longshot bid
     at or above it would cross.
     """
+    if need <= 0:
+        return None
     low_mid = 1 - mid
     low_limit = low_mid if not levels.bids else min(low_mid, 1 - levels.bids[0][0])
     decimals = tick_decimals(tick)
-    n = 1
-    while True:
-        price = round(n * tick, decimals)
-        if price >= low_limit - 1e-9:
-            return None
-        s = score(v, low_mid - price)
-        if s >= min_score:
-            return price, s
+    scored, n = [], 1
+    while (price := round(n * tick, decimals)) < low_limit - 1e-9:
+        scored.append((price, score(v, low_mid - price)))
+        if scored[-1][1] >= min_score:
+            break
         n += 1
+    if not scored or scored[-1][1] < min_score:
+        return None
+    for price, s in scored:
+        if s > 0:
+            size = max(min_size, round_size_up(need / s))
+            if size * price <= room + 1e-9:
+                return LongshotBid(price, size, s)
+    price, s = scored[-1]
+    size = round_size_down(room / price)
+    return LongshotBid(price, size, s) if size >= min_size else None
 
 
 def competing_score(levels, mid, v, min_size):
@@ -401,9 +455,10 @@ def competing_score(levels, mid, v, min_size):
 def plan_quotes(market, levels, config):
     """Price and size our favorite bid and longshot bid. Returns QuotePlan or Skip.
 
-    The longshot bid takes the lowest price that still scores at least
-    min_low_score, then is sized so its score matches the favorite bid's:
-    score beyond the smaller side earns nothing.
+    The longshot bid is longshot_bid within config.naked_budget, covering the
+    favorite bid's score, as the farmer prices it. When the budget leaves it
+    short, the favorite bid shrinks to match, as the farmer's does: score
+    beyond the smaller side earns nothing.
 
     A favorite bid above the best bid drags the midpoint up toward itself, so
     both legs are scored against the midpoint that includes it (QuotePlan.mid),
@@ -420,22 +475,22 @@ def plan_quotes(market, levels, config):
     fav_score = score(v, mid - fav_price)
     if fav_score <= 0:
         return Skip("favorite bid outside band")
-    q_one = fav_score * fav_size
-
-    low = lowest_scoring_bid(levels, mid, v, tick, config.min_low_score)
-    if low is None:
-        return Skip("no scoring longshot bid")
-    low_price, low_score = low
+    low = longshot_bid(levels, mid, v, tick, market.min_size, fav_score * fav_size,
+                       config.naked_budget, config.min_low_score)
+    if low is not None:
+        fav_size = min(fav_size, round_size_down(low.score * low.size / fav_score))
+    if low is None or fav_size < market.min_size:
+        return Skip("no scoring longshot bid within the naked budget")
 
     return QuotePlan(
         mid=mid,
         fav_bid_price=fav_price,
         fav_bid_size=fav_size,
         fav_bid_score=fav_score,
-        low_price=low_price,
-        low_size=max(market.min_size, round_size_up(q_one / low_score)),
-        low_score=low_score,
-        mode=Mode.FLOOR if low_price <= FLOOR_PRICE + 1e-9 else Mode.BUDGET,
+        low_price=low.price,
+        low_size=low.size,
+        low_score=low.score,
+        mode=Mode.FLOOR if low.price <= FLOOR_PRICE + 1e-9 else Mode.BUDGET,
     )
 
 
@@ -453,7 +508,7 @@ def assess(market, levels, config, now):
         return Skip("one-sided book")
     if book_mid < config.min_fav:
         return Skip("favorite too cheap")
-    if fragile_mid(levels, market.min_size, config.min_fav):
+    if fragile_mid(levels, market.min_size, config.min_fav, config.fragile_drop):
         return Skip("fragile midpoint")
 
     plan = plan_quotes(market, levels, config)
@@ -494,8 +549,8 @@ def assess(market, levels, config, now):
         depth_ahead_ratio=depth_ahead / plan.low_size,
         floor_score=score(market.v, (1 - mid) - market.tick),
         single_sided_ok=mid <= TWO_SIDED_ABOVE,
-        best_bid=next((p for p, s in levels.bids if s >= market.min_size), None),
-        best_ask=next((p for p, s in levels.asks if s >= market.min_size), None),
+        best_bid=best_price(levels.bids, market.min_size),
+        best_ask=best_price(levels.asks, market.min_size),
     )
 
 
@@ -871,7 +926,9 @@ def config_from(args):
         fav_target_score=args.fav_target_score,
         max_lead=args.max_lead,
         min_low_score=args.min_low_score,
+        naked_budget=args.naked_budget,
         min_rate=args.min_rate,
+        fragile_drop=args.fragile_drop,
     )
 
 
@@ -954,10 +1011,10 @@ def cmd_approve(args):
             f"at or above p_true {args.p_true * 100:.1f}c; a fill would be -EV"
         )
     low_capital = plan["low_size"] * plan["low_price"]
-    if plan["mode"] == Mode.BUDGET.value and args.budget < low_capital:
+    if args.budget < low_capital - 1e-9:
         print(
-            f"Warning: BUDGET market; planned longshot leg ties up "
-            f"${low_capital:.2f}, above the ${args.budget:.2f} naked budget"
+            f"Warning: planned longshot leg ties up ${low_capital:.2f}, above the "
+            f"${args.budget:.2f} naked budget"
         )
 
     farm_db.approve_market(conn, row["condition_id"], args.p_true, args.budget, args.capital)
