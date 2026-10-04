@@ -58,7 +58,6 @@ import argparse
 import json
 import math
 import os
-import sqlite3
 import sys
 import time
 from collections import Counter
@@ -68,6 +67,8 @@ from enum import Enum
 from typing import NamedTuple, Optional
 
 import httpx
+
+import farm_db
 
 CLOB_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
 GAMMA_HOST = os.getenv("POLYMARKET_GAMMA_HOST", "https://gamma-api.polymarket.com")
@@ -91,7 +92,6 @@ TWO_SIDED_ABOVE = 0.90
 # midpoint check happens on the book.
 PREFILTER_SLACK = 0.03
 
-STATUSES = ("candidate", "approved", "rejected", "retired")
 COMMANDS = ("scan", "list", "approve", "reject")
 
 
@@ -264,6 +264,71 @@ def adjusted_mid(bids, asks, min_size):
     return (bid + ask) / 2
 
 
+def adjust_levels(levels, bids=(), asks=()):
+    """Add (price, size) entries to a book's levels; a negative size removes.
+
+    Used to put our planned quotes into a book to find the midpoint they
+    create, and to take our resting orders out of a live book so we never
+    price off our own quotes. A level left with no size disappears.
+    """
+    def merge(side, extra, descending):
+        sizes = dict(side)
+        for price, size in extra:
+            sizes[price] = sizes.get(price, 0.0) + size
+        return sorted(
+            ((p, s) for p, s in sizes.items() if s > 1e-9), reverse=descending
+        )
+
+    return levels._replace(
+        bids=merge(levels.bids, bids, descending=True),
+        asks=merge(levels.asks, asks, descending=False),
+    )
+
+
+def fav_bid_price(mid, levels, tick, bid_offset, min_size):
+    """Favorite bid about bid_offset under the midpoint it creates. Price or Skip.
+
+    The reward midpoint counts only levels of at least min_size. When
+    mid - offset lands at or below the best such bid, the bid does not move
+    the midpoint. Above it, the bid becomes the best bid and the midpoint
+    becomes (p + a) / 2 for best ask a, so the bid sits (a - p) / 2 from it;
+    p = a - 2 * offset puts it the intended distance from the midpoint it
+    creates rather than far below it.
+    """
+    offset = max(bid_offset, tick)
+    price = floor_to_tick(mid - offset, tick)
+    best_bid = next((p for p, s in levels.bids if s >= min_size), None)
+    best_ask = next((p for p, s in levels.asks if s >= min_size), None)
+    if best_bid is not None and best_ask is not None and price > best_bid:
+        price = floor_to_tick(best_ask - 2 * offset, tick)
+    if price < tick:
+        return Skip("favorite bid below one tick")
+    if levels.asks and price >= levels.asks[0][0]:
+        return Skip("favorite bid would cross")
+    return price
+
+
+def lowest_scoring_bid(levels, mid, v, tick, min_score):
+    """Cheapest longshot bid scoring at least min_score, as (price, score), or None.
+
+    `levels` is the favorite book and `mid` the favorite midpoint. The
+    longshot ask is the mirror of the raw favorite best bid; a longshot bid
+    at or above it would cross.
+    """
+    low_mid = 1 - mid
+    low_limit = low_mid if not levels.bids else min(low_mid, 1 - levels.bids[0][0])
+    decimals = tick_decimals(tick)
+    n = 1
+    while True:
+        price = round(n * tick, decimals)
+        if price >= low_limit - 1e-9:
+            return None
+        s = score(v, low_mid - price)
+        if s >= min_score:
+            return price, s
+        n += 1
+
+
 def competing_score(levels, mid, v, min_size):
     """Score already resting in the book, as one maker's Q_min.
 
@@ -294,43 +359,21 @@ def plan_quotes(market, levels, mid, config):
     that includes it (QuotePlan.mid), not the one it was placed from.
     """
     tick, v = market.tick, market.v
-    best_bid = levels.bids[0][0] if levels.bids else None
-    best_ask = levels.asks[0][0] if levels.asks else None
-
-    fav_price = floor_to_tick(mid - max(config.bid_offset, tick), tick)
-    if fav_price < tick:
-        return Skip("favorite bid below one tick")
-    if best_ask is not None and fav_price >= best_ask:
-        return Skip("favorite bid would cross")
+    fav_price = fav_bid_price(mid, levels, tick, config.bid_offset, market.min_size)
+    if isinstance(fav_price, Skip):
+        return fav_price
     fav_size = max(market.min_size, round_size_down(config.capital / fav_price))
-    mid = adjusted_mid(
-        sorted(levels.bids + [(fav_price, fav_size)], reverse=True),
-        levels.asks,
-        market.min_size,
-    )
+    quoted = adjust_levels(levels, bids=[(fav_price, fav_size)])
+    mid = adjusted_mid(quoted.bids, quoted.asks, market.min_size)
     fav_score = score(v, mid - fav_price)
     if fav_score <= 0:
         return Skip("favorite bid outside band")
     q_one = fav_score * fav_size
 
-    low_mid = 1 - mid
-    # The longshot ask is the mirror of the raw favorite best bid; a longshot
-    # bid at or above it would cross.
-    low_limit = low_mid if best_bid is None else min(low_mid, 1 - best_bid)
-    decimals = tick_decimals(tick)
-    low_price = low_score = None
-    n = 1
-    while True:
-        price = round(n * tick, decimals)
-        if price >= low_limit - 1e-9:
-            break
-        s = score(v, low_mid - price)
-        if s >= config.min_low_score:
-            low_price, low_score = price, s
-            break
-        n += 1
-    if low_price is None:
+    low = lowest_scoring_bid(levels, mid, v, tick, config.min_low_score)
+    if low is None:
         return Skip("no scoring longshot bid")
+    low_price, low_score = low
 
     return QuotePlan(
         mid=mid,
@@ -673,6 +716,18 @@ def assessment_record(a):
     return record
 
 
+def scan_row(a):
+    m = a.market
+    return farm_db.ScanRow(
+        condition_id=m.condition_id,
+        slug=m.slug,
+        question=m.question,
+        end_date=m.end_date.isoformat(),
+        rank_score=a.rank_score,
+        metrics=json.dumps(assessment_record(a)),
+    )
+
+
 def print_table(assessments):
     header = (
         f"{'#':>3} {'mode':6} {'fav':>14} {'pool$':>6} {'v':>4} {'min':>4} "
@@ -692,91 +747,6 @@ def print_table(assessments):
             f"{a.depth_ahead_ratio:>6.1f} {human_volume(a.volume24hr):>7} "
             f"{holding:1} {m.question[:40]:40} {m.slug}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Storage: the seam to the farmer
-# ---------------------------------------------------------------------------
-
-SCHEMA = f"""
-CREATE TABLE IF NOT EXISTS markets (
-    condition_id TEXT PRIMARY KEY,
-    slug TEXT,
-    question TEXT,
-    status TEXT NOT NULL DEFAULT 'candidate'
-        CHECK (status IN ({", ".join(f"'{s}'" for s in STATUSES)})),
-    p_true REAL,
-    naked_budget_usd REAL,
-    note TEXT,
-    end_date TEXT,
-    rewards_active INTEGER,
-    rank_score REAL,
-    metrics TEXT,
-    first_seen TEXT,
-    last_scanned TEXT
-)
-"""
-
-
-def open_db(path):
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute(SCHEMA)
-    return conn
-
-
-def store_scan(conn, assessments, reward_ids, now):
-    """Upsert this scan's assessments and flag markets that left the reward set.
-
-    Human decisions (status, p_true, naked_budget_usd, note) are never
-    touched, so rescanning is always safe. Retiring is the farmer's call.
-    """
-    stamp = now.isoformat()
-    with conn:
-        conn.executemany(
-            """
-            INSERT INTO markets (condition_id, slug, question, end_date,
-                rewards_active, rank_score, metrics, first_seen, last_scanned)
-            VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT (condition_id) DO UPDATE SET
-                slug = excluded.slug,
-                question = excluded.question,
-                end_date = excluded.end_date,
-                rewards_active = 1,
-                rank_score = excluded.rank_score,
-                metrics = excluded.metrics,
-                last_scanned = excluded.last_scanned
-            """,
-            [
-                (
-                    a.market.condition_id,
-                    a.market.slug,
-                    a.market.question,
-                    a.market.end_date.isoformat(),
-                    a.rank_score,
-                    json.dumps(assessment_record(a)),
-                    stamp,
-                    stamp,
-                )
-                for a in assessments
-            ],
-        )
-        conn.execute("CREATE TEMP TABLE IF NOT EXISTS reward_ids (id TEXT PRIMARY KEY)")
-        conn.execute("DELETE FROM reward_ids")
-        conn.executemany(
-            "INSERT OR IGNORE INTO reward_ids VALUES (?)",
-            [(c,) for c in reward_ids if c],
-        )
-        conn.execute(
-            "UPDATE markets SET rewards_active = "
-            "(condition_id IN (SELECT id FROM reward_ids))"
-        )
-
-
-def find_market(conn, key):
-    return conn.execute(
-        "SELECT * FROM markets WHERE condition_id = ? OR slug = ?", (key, key)
-    ).fetchone()
 
 
 # ---------------------------------------------------------------------------
@@ -800,8 +770,8 @@ def cmd_scan(args):
     now = datetime.now(timezone.utc)
     assessments, reward_ids = run_scan(config_from(args), now)
 
-    conn = open_db(args.db)
-    store_scan(conn, assessments, reward_ids, now)
+    conn = farm_db.open_db(args.db)
+    farm_db.store_scan(conn, [scan_row(a) for a in assessments], reward_ids, now)
     conn.close()
     print(f"Stored {len(assessments):,} assessments in {args.db}")
 
@@ -819,15 +789,9 @@ def cmd_scan(args):
 
 
 def cmd_list(args):
-    conn = open_db(args.db)
-    latest = conn.execute("SELECT MAX(last_scanned) FROM markets").fetchone()[0]
-    query = "SELECT * FROM markets"
-    params = ()
-    if args.status != "all":
-        query += " WHERE status = ?"
-        params = (args.status,)
-    query += " ORDER BY rank_score DESC LIMIT ?"
-    rows = conn.execute(query, params + (args.top,)).fetchall()
+    conn = farm_db.open_db(args.db)
+    latest = farm_db.latest_scan(conn)
+    rows = farm_db.list_markets(conn, args.status, args.top)
     conn.close()
 
     if not rows:
@@ -864,8 +828,11 @@ def cmd_approve(args):
     if not 0 < args.p_true < 1:
         print("Error: --p-true must be strictly between 0 and 1")
         sys.exit(2)
-    conn = open_db(args.db)
-    row = find_market(conn, args.market)
+    if args.capital is not None and not args.capital > 0:
+        print("Error: --capital must be positive")
+        sys.exit(2)
+    conn = farm_db.open_db(args.db)
+    row = farm_db.find_market(conn, args.market)
     if row is None:
         print(f"Error: no market {args.market!r} in {args.db}; run a scan first")
         sys.exit(1)
@@ -883,28 +850,21 @@ def cmd_approve(args):
             f"${low_capital:.2f}, above the ${args.budget:.2f} naked budget"
         )
 
-    with conn:
-        conn.execute(
-            "UPDATE markets SET status = 'approved', p_true = ?, "
-            "naked_budget_usd = ? WHERE condition_id = ?",
-            (args.p_true, args.budget, row["condition_id"]),
-        )
+    farm_db.approve_market(conn, row["condition_id"], args.p_true, args.budget, args.capital)
+    capital = farm_db.find_market(conn, row["condition_id"])["capital_usd"]
     conn.close()
-    print(f"Approved {row['slug']} (p_true {args.p_true}, budget ${args.budget:.2f})")
+    capital = f"${capital:.2f}" if capital is not None else "the farmer's --capital"
+    print(f"Approved {row['slug']} (p_true {args.p_true}, budget ${args.budget:.2f}, "
+          f"capital {capital})")
 
 
 def cmd_reject(args):
-    conn = open_db(args.db)
-    row = find_market(conn, args.market)
+    conn = farm_db.open_db(args.db)
+    row = farm_db.find_market(conn, args.market)
     if row is None:
         print(f"Error: no market {args.market!r} in {args.db}; run a scan first")
         sys.exit(1)
-    with conn:
-        conn.execute(
-            "UPDATE markets SET status = 'rejected', note = COALESCE(?, note) "
-            "WHERE condition_id = ?",
-            (args.note, row["condition_id"]),
-        )
+    farm_db.reject_market(conn, row["condition_id"], args.note)
     conn.close()
     print(f"Rejected {row['slug']}")
 
@@ -923,6 +883,7 @@ Examples:
   python reward_screener.py scan --mode floor --top 20 --json scan.json
   python reward_screener.py list --status approved
   python reward_screener.py approve some-market-slug --p-true 0.97 --budget 25
+  python reward_screener.py approve some-market-slug --p-true 0.97 --capital 200
   python reward_screener.py reject some-market-slug --note "resolution risk"
         """,
     )
@@ -949,7 +910,7 @@ Examples:
     scan.add_argument("--json", metavar="PATH", help="Also dump every assessment here")
 
     lst = sub.add_parser("list", parents=[db], help="Show stored markets")
-    lst.add_argument("--status", choices=STATUSES[:3] + ("all",), default="candidate")
+    lst.add_argument("--status", choices=farm_db.STATUSES[:3] + ("all",), default="candidate")
     lst.add_argument("--top", type=int, default=40)
 
     approve = sub.add_parser("approve", parents=[db], help="Approve a market to farm")
@@ -958,6 +919,9 @@ Examples:
                          help="Your probability the favorite resolves YES")
     approve.add_argument("--budget", type=float, default=25.0,
                          help="Naked USD risk allowed on the longshot leg (default: 25)")
+    approve.add_argument("--capital", type=float,
+                         help="USD behind this market's favorite bid (default: keep the "
+                              "current value, else the farmer's --capital)")
 
     reject = sub.add_parser("reject", parents=[db], help="Reject a market")
     reject.add_argument("market", help="Slug or condition id")

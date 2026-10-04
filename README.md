@@ -472,7 +472,7 @@ score. Each market lands in one of two modes:
 - `budget`: the longshot bid must sit higher to score. Its capital is naked
   risk, which you cap per market when you approve it.
 
-A future farmer daemon reads the approved rows. The screener never changes
+`reward_farmer.py` reads the approved rows. The screener never changes
 your decisions, so rescanning is always safe.
 
 ```bash
@@ -480,6 +480,7 @@ python reward_screener.py                     # same as 'scan' with defaults
 python reward_screener.py scan --mode floor --top 20 --json scan.json
 python reward_screener.py list --status approved
 python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --budget 25
+python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --capital 200
 python reward_screener.py reject <slug-or-condition-id> --note "resolution risk"
 ```
 
@@ -521,7 +522,10 @@ is the reward return you can expect over the farm horizon, so long-dated
 markets rank higher than short ones with the same yield.
 
 `approve` takes your probability that the favorite wins (`--p-true`) and the
-longshot risk budget (`--budget`, default $25). It warns, but still approves,
+longshot risk budget (`--budget`, default $25). `--capital` sets the USD
+behind this market's favorite bid, in place of the farmer's `--capital`.
+Without it, a market keeps the capital it already has, or uses the farmer's
+default if it has none. `approve` warns, but still approves,
 when the planned favorite bid is at or above `--p-true`, because a fill would
 lose money. It also warns when a `budget` market's longshot leg needs more
 than the budget.
@@ -537,18 +541,278 @@ than the budget.
 - The two outcome books are exact mirrors, so the screener reads only the
   favorite's book.
 - In a wide book the planned favorite bid becomes the best bid and pulls the
-  midpoint toward itself. Both legs and the competition are scored against
-  that shifted midpoint, so a bid placed 1c under the book's midpoint can sit
-  further than 1c from the midpoint that counts.
+  midpoint toward itself. The bid is then priced two offsets under the best
+  ask, which puts it one offset under the midpoint it creates. Both legs and
+  the competition are scored against that shifted midpoint.
 - `est$/d` assumes the book stays as it was at scan time, and that no other
   farmer reacts to your orders. Thin books show very high APRs that will not
   survive competition, so read them as a ranking, not a forecast.
 
-The `markets` table in `farm.db` is the interface to the farmer. A scan
-updates the metrics, rank, end date, and `rewards_active` flag. It never
-touches `status`, `p_true`, `naked_budget_usd`, or `note`. A market that
-leaves the reward set gets `rewards_active = 0` and keeps its status.
-Retiring markets is the farmer's job.
+The `markets` table in `farm.db` is the interface to the farmer (see
+[The farm.db contract](#the-farmdb-contract)). A scan updates the metrics,
+rank, end date, and `rewards_active` flag. It never touches your decisions:
+`status`, `p_true`, `naked_budget_usd`, `note`, `paused`, `naked_paused`, or
+`capital_usd`. A market that leaves the reward set gets `rewards_active = 0`
+and keeps its status. Retiring markets is the farmer's job.
+
+### Reward Farmer
+
+`reward_farmer.py` farms the liquidity rewards on the markets you approved
+with the screener. It runs as a daemon. Every cycle it reads each market's
+order book, plans the orders it wants resting, compares them with the orders
+it has, and cancels or places the difference.
+
+It is a dry run by default. A dry run reads live public data (books, market
+records, and your positions) but sends nothing and needs no private key. It
+keeps a simulated order set that never fills, so you can watch orders being
+placed once and then held or replaced as the book moves. `--live` signs and
+posts real orders.
+
+Both modes publish what the farmer does to `farm_state`, `farmer_status`,
+`farm_events`, and `farm_mids` in `farm.db`, so a dry run shows up in the
+console the same way a live run does. A dry run still never writes to `markets`.
+
+```bash
+python reward_farmer.py                       # dry run on farm.db, forever
+python reward_farmer.py --once                # one dry-run cycle, then exit
+python reward_farmer.py --db scratch.db       # dry run on another database
+python reward_farmer.py --live                # real orders
+python reward_farmer.py --live --heartbeat    # real orders with the dead-man switch
+```
+
+Each cycle prints one summary line per market, then one line per action:
+
+```text
+[16:36:06] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | hold 0 cancel 0 place 2
+[16:36:06]   PLACE  FAV_BID    94.9c x    526.87  score 0.585  some-market
+[16:36:06]   PLACE  LONG_BID    0.1c x    735.88  score 0.419  some-market
+[16:36:11] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | hold 2 cancel 0 place 0
+```
+
+`score` is the per-share reward score at the current midpoint. `Q1` and `Q2`
+are the planned score on each side. Polymarket pays on the smaller one.
+
+#### The four slots
+
+Above a 0.90 midpoint Polymarket pays only for two-sided liquidity:
+min(Q_one, Q_two). Q_one sums favorite bids and longshot asks. Q_two sums
+favorite asks and longshot bids. The farmer can rest one order in each of
+four slots per market:
+
+| Slot | Order | Side | Purpose |
+| --- | --- | --- | --- |
+| `FAV_BID` | Buy the favorite | Q_one | The main quote. A fill is wanted, because the bid never prices above your `p_true` minus `--ev-margin`. Uses cash. |
+| `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same. |
+| `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
+| `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. On a `floor` market it rests at 0.1c to 0.2c and almost never fills. On a `budget` market it rests higher, and its cost plus any longshot shares held stays within the market's approved budget. |
+
+Q_two comes from the covered `FAV_ASK` first, and only the remainder from the
+naked `LONG_BID`. When the budget leaves Q_two short of Q_one, the favorite
+bid shrinks to match, because score on one side beyond the other earns
+nothing. A bid smaller than the market's reward minimum size is dropped,
+because it would carry risk without scoring.
+
+The farmer never buys at market. All inventory comes from passive fills of
+these orders.
+
+#### Market lifecycle
+
+Each market is in one of five states:
+
+- `QUOTING`: orders rest as planned.
+- `COOLDOWN`: the favorite midpoint fell by `--drop-threshold` within
+  `--drop-window` seconds. All orders come down for `--cooldown` seconds.
+- `BELOW_RANGE`: the midpoint is below `--min-fav`. All orders come down.
+  Quoting resumes once the midpoint is 0.5c above `--min-fav`.
+- `PAUSED`: you set `paused = 1` on the market. All orders come down. When
+  you clear it, the market goes through the checks above again, so it can go
+  straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
+- `RETIRED`: the market's rewards were removed, it closed or stopped
+  accepting orders, you no longer approve it, or it reached its end date
+  minus `--expiry-buffer-days`. All orders are cancelled. In live mode the
+  database row becomes `retired` with a note. A row you rejected keeps its
+  `rejected` status. Retirement wins over a pause.
+
+Every cycle the farmer re-reads the approved rows, their controls, the
+settings, and the commands from `farm.db`. A new approval, a rejection, a
+pause, or a setting therefore takes effect within one `--interval`. The farmer
+reads positions every 60 seconds and each market's CLOB record (reward terms,
+tick, trading status) every 5 minutes.
+
+#### Pausing, settings, and stopping
+
+The console (or any process with write access to `farm.db`) controls a
+running farmer through the database. Per-market controls are columns on
+`markets` that hold a level, not one-off commands. Setting one twice does
+the same as setting it once, and a farmer that restarts reads the same level.
+
+- `paused = 1` puts the market in `PAUSED`, which cancels its orders. Set it
+  back to 0 to resume.
+- `naked_paused = 1` takes down the `LONG_BID` for as long as it stays set,
+  the same way a longshot fill does for `--naked-cooldown` seconds. The
+  favorite bid shrinks to whatever the covered `FAV_ASK` still balances.
+- `capital_usd` replaces `--capital` for that market only. NULL uses
+  `--capital`.
+- To retire a market, set its `status` to `retired`. To cancel everything,
+  set `paused = 1` on every approved market.
+
+The `settings` table overrides the farmer's command-line options. The
+command-line flags give the defaults, and each row replaces one of them
+while it exists. The keys are the option names with underscores, and the
+seconds options end in `_s`: `capital`, `bid_offset`, `ask_offset`,
+`min_capture`, `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`,
+`drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
+`expiry_buffer_days`. Each value is a JSON number. `farm_db.put_setting`
+refuses an unknown key or an out-of-range value. A bad row written another
+way is ignored, with an `ALERT` event. When the effective config changes, the
+farmer logs a `SETTINGS` event with the old and new values. A changed setting
+moves the targets at once, but a resting order that still passes the keep
+checks below stays where it is.
+
+To stop the farmer, insert a `stop` row into `commands`. The farmer reads it
+on its next cycle, stamps `consumed_at` and `result`, and shuts down the same
+way as on Ctrl+C. A stop sent while no farmer runs is marked expired when the
+next farmer starts, so it does not stop that farmer.
+
+#### Safety mechanisms
+
+- Every order is post-only, so a fill is always a maker fill.
+- Every order is good-till-date. It expires at the market's end date minus
+  `--expiry-buffer-days`, even if the farmer dies.
+- The favorite bid never prices above `p_true - --ev-margin`.
+- `--capital` caps each market's favorite exposure. Favorite shares already
+  held count against it at cost.
+- The approved budget caps the naked longshot leg: the resting longshot bid
+  plus longshot shares held, at cost.
+- A longshot fill (your longshot shares went up) prints an `ALERT` and pauses
+  the longshot bid for `--naked-cooldown` seconds. Without it, the favorite
+  bid shrinks to whatever the covered favorite ask still balances.
+- An order that is still close to its target stays in place. It must sit on
+  the current tick, score at least `--keep-ratio` of the target, keep a size
+  within -20% and +25% of the target, and stay within the price cap or
+  budget. Otherwise it is replaced. This keeps queue position and avoids
+  churning orders on every small move of the midpoint.
+- An order the CLOB rejects, such as a post-only cross or an unfunded bid,
+  backs off that market's slot for 30 seconds. Each further rejection doubles
+  the wait, up to 15 minutes, and an accepted order resets it. The backoff is
+  logged once per rejection.
+- In live mode, Ctrl+C, SIGTERM, or a `stop` command cancels every order on
+  the managed markets before the farmer exits. A normal `--once` exit leaves
+  the orders resting.
+
+#### Positions and existing orders
+
+The farmer reads your positions from the public data API for
+`POLYMARKET_FUNDER_ADDRESS` in `.env`. It never sells shares that were in your
+wallet before it started managing a market:
+
+- The first time it sees an approved market, it records your holdings of both
+  tokens as a baseline (0 when you hold none). In live mode the baseline goes
+  into the `baseline_fav` and `baseline_long` columns of `markets`, so it
+  survives restarts. A dry run keeps it in memory only.
+- On every positions refresh the baseline drops to your current holdings if
+  those are lower. A manual sale therefore does not leave shares reserved that
+  are gone.
+- The farm's inventory is your holdings above the baseline. Only those shares
+  are offered through `FAV_ASK` or `LONG_ASK`, or count against the capital
+  and budget.
+
+At startup it prints a `holding` line with your holdings, the baseline, and
+the farm's share for every managed market where you have a position.
+
+Approximation: the data API reports one average price per token, blended
+across baseline and farm shares. The farmer uses that blended average as the
+farm inventory's cost, for the `FAV_ASK` exit floor and the capital and budget
+caps. When your earlier shares cost more or less than the farm's fills, the
+exit floor is off by that difference.
+
+In live mode the farmer adopts the open orders on the markets it manages. It
+keeps the ones that match a slot target and cancels the rest, including
+orders you placed there by hand. It never reads or touches orders on markets
+it does not manage.
+
+#### Key options
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--db` | `farm.db` | SQLite file written by the screener |
+| `--live` | off | Sign and post real orders |
+| `--once` | off | Run one cycle and exit |
+| `--interval` | 5 | Seconds between cycles |
+| `--capital` | 500 | USD per market behind the favorite bid, held favorite shares included at cost |
+| `--bid-offset` | 0.01 | Favorite bid distance below the midpoint |
+| `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
+| `--min-capture` | 0.005 | Favorite ask minimum above its average cost |
+| `--ev-margin` | 0.01 | The favorite bid stays at or below `p_true` minus this |
+| `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
+| `--min-low-score` | 0.10 | Minimum per-share score of the longshot bid |
+| `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target |
+| `--drop-threshold` | 0.03 | Midpoint fall that starts a cooldown |
+| `--drop-window` | 60 | Seconds over which that fall is measured |
+| `--cooldown` | 600 | Seconds without orders after a midpoint drop |
+| `--naked-cooldown` | 3600 | Seconds without a longshot bid after a longshot fill |
+| `--expiry-buffer-days` | 7 | Retire this many days before the end date |
+| `--heartbeat` | off | Live only. See the warning below |
+
+#### The heartbeat warning
+
+`--heartbeat` posts a heartbeat to Polymarket every 5 seconds. If the
+heartbeats then stop for 10 seconds, because the farmer crashed, the network
+dropped, or the machine slept, Polymarket cancels **all** open orders owned by
+these API credentials. That may include orders placed by your other tools.
+Polymarket does not document whether the scope is the API key or the whole
+account. Without `--heartbeat`, a dead farmer leaves its orders resting until
+their good-till-date expiry.
+
+#### Going live
+
+1. Run a scan and approve the markets you want, with your `--p-true` and
+   `--budget` for each.
+2. Run a dry run on the same database and read the output for a few cycles.
+   Check the prices, sizes, and the `holding` lines.
+3. Make sure the wallet holds enough USDC. At startup the live farmer compares
+   your collateral balance with the favorite bids it plans and warns if the
+   balance is short.
+4. Start `python reward_farmer.py --live`. It loads the private key the same
+   way the other tools do (environment or Bitwarden) and locks Bitwarden again
+   on exit.
+5. Stop it with Ctrl+C or a `stop` command, which cancel the orders on the
+   managed markets.
+
+#### The farm.db contract
+
+`farm_db.py` owns the schema and every SQL statement the tools run against
+`farm.db`. Opening the file migrates an older one in place: missing columns
+are added with `ALTER TABLE` and missing tables are created, so opening it
+twice changes nothing. The file runs in WAL mode with a 5-second busy
+timeout, because the farmer and the console write at the same time.
+
+Each column has exactly one writer process:
+
+| Table | Writer | Purpose |
+| --- | --- | --- |
+| `markets` | Screener: scan columns. Console or CLI: `status`, `p_true`, `naked_budget_usd`, `note`, `paused`, `naked_paused`, `capital_usd`. Farmer, live only: `baseline_fav`, `baseline_long` | Candidate markets, your decisions, and the per-market controls |
+| `farm_state` | Farmer | One row per managed market, replaced every cycle: phase and reason, midpoints, Q1 and Q2, capital, naked USD in use, and JSON for the position, the four slots (resting order, target, live score, decision and reason), the favorite book inside the reward band with your orders marked, backoffs, and `scoring_pct` (live only) |
+| `farmer_status` | Farmer | One row: mode, pid, start time, last cycle, interval, heartbeat, managed count, effective config, and `stopped_at` once it exits |
+| `farm_events` | Farmer | Changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`, `ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, `SETTINGS`. Rows older than 30 days are deleted at startup |
+| `settings` | Console or CLI | Overrides of the farmer's command-line options |
+| `commands` | Console inserts, farmer stamps `consumed_at` and `result` | One-off requests. `stop` is the only kind |
+| `rewards_daily` | Farmer, live only | Your reward earnings per market per day, fetched every 10 minutes |
+| `farm_mids` | Farmer | At most one row per managed market per minute, in dry run too: the midpoint, the book midpoint, and the prices the `FAV_BID` and `LONG_BID` rest at after that cycle (NULL when the slot rests nothing). Rows older than 7 days are deleted at startup. The console draws its midpoint chart from it |
+
+The one exception to one writer per column: the live farmer retires a market
+by changing `status` from `approved` to `retired` and writing a `note`, in a
+single conditional `UPDATE`. A status you already changed is never
+overwritten.
+
+A `FILL` event comes from a change in your positions, because the data API
+reports no fills. Its price is the price of the order that rested in that
+slot at the previous cycle, and its `data` says so.
+
+`scoring_pct` and `rewards_daily` come from authenticated reward endpoints
+whose response fields Polymarket does not document. The farmer reads them
+defensively, logs a warning when the shape does not match, and keeps
+farming.
 
 ## Important Notes
 
