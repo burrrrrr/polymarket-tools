@@ -579,6 +579,12 @@ class FarmerCycleTest(unittest.TestCase):
         farmer.cycle()
         self.assertEqual(len([e for e in self.events(before) if e["kind"] == "SETTINGS"]), 1)
 
+    def test_console_scan_rows_in_settings_raise_no_alert(self):
+        farm_db.put_scan_params(self.ui, {"min_fav": 0.92}, NOW)
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.assertEqual([e["message"] for e in self.events() if e["kind"] == "ALERT"], [])
+
     def test_market_capital_overrides_the_configured_capital(self):
         farm_db.set_capital(self.ui, CID, 98.0)
         farmer = self.started_farmer()
@@ -618,6 +624,50 @@ class FarmerCycleTest(unittest.TestCase):
         farmer.cycle()
         self.assertIsNone(farmer.stop_reason)
         self.assertTrue(self.query("SELECT result FROM commands")[0][0].startswith("expired"))
+
+    def phase_and_kinds(self, farmer, before):
+        farmer.cycle()
+        row, _ = self.farm_state()
+        return row["phase"], [e["kind"] for e in self.events(before)]
+
+    def test_retired_market_approved_again_is_managed_afresh(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        before = self.last_event_id()
+
+        farm_db.retire_market(self.ui, CID, "console")
+        self.assertEqual(self.phase_and_kinds(farmer, before),
+                         ("RETIRED", ["PHASE", "CANCEL", "CANCEL", "RETIRE"]))
+        before = self.last_event_id()
+        self.assertEqual(self.phase_and_kinds(farmer, before), ("RETIRED", []))
+
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None)
+        phase, kinds = self.phase_and_kinds(farmer, before)
+        self.assertEqual((phase, kinds), ("QUOTING", ["PHASE", "PLACE", "PLACE"]))
+        self.assertIn("Managing test-market", self.events(before)[0]["message"])
+
+    def test_approved_again_still_retires_on_expiry(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        farm_db.retire_market(self.ui, CID, "console")
+        farmer.cycle()
+        farm_db.put_setting(self.ui, "expiry_buffer_days", 1000, NOW)
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None)
+        before = self.last_event_id()
+        farmer.cycle()
+        row, _ = self.farm_state()
+        self.assertEqual((row["phase"], row["phase_reason"]), ("RETIRED", "expiry buffer reached"))
+        self.assertNotIn("PLACE", [e["kind"] for e in self.events(before)])
+
+    def test_dry_run_retirement_of_an_approved_row_does_not_restart(self):
+        farm_db.put_setting(self.ui, "expiry_buffer_days", 1000, NOW)
+        farmer = self.started_farmer()
+        farmer.cycle()
+        before = self.last_event_id()
+        for _ in range(3):
+            farmer.cycle()
+        self.assertEqual(farm_db.find_market(self.ui, CID)["status"], "approved")
+        self.assertEqual(self.events(before), [])
 
     def test_rows_of_markets_no_longer_managed_are_deleted(self):
         with self.ui:

@@ -94,6 +94,17 @@ PREFILTER_SLACK = 0.03
 
 COMMANDS = ("scan", "list", "approve", "reject")
 
+SCAN_HELP = {
+    "min_fav": "Minimum favorite midpoint",
+    "expiry_buffer_days": "Stop farming this many days before end",
+    "min_window_days": "Minimum farmable days left",
+    "horizon_cap_days": "Cap on days counted toward rank",
+    "capital": "USD behind the favorite bid",
+    "bid_offset": "Favorite bid distance below the midpoint",
+    "min_low_score": "Minimum per-share score of the longshot bid",
+    "min_rate": "Minimum daily reward pool in USD",
+}
+
 
 def _make_output_safe():
     """Replace unencodable characters instead of crashing on them.
@@ -184,6 +195,8 @@ class Assessment(NamedTuple):
     single_sided_ok: bool
     volume24hr: Optional[float] = None
     holding_rewards: Optional[bool] = None
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
 
 
 class Skip(NamedTuple):
@@ -191,14 +204,22 @@ class Skip(NamedTuple):
 
 
 class ScreenConfig(NamedTuple):
-    min_fav: float
-    expiry_buffer_days: float
-    min_window_days: float
-    horizon_cap_days: float
-    capital: float
-    bid_offset: float
-    min_low_score: float
-    min_rate: float
+    """The scan parameters; the defaults are the CLI's and the console's."""
+
+    min_fav: float = 0.90
+    expiry_buffer_days: float = 7.0
+    min_window_days: float = 30.0
+    horizon_cap_days: float = 90.0
+    capital: float = 500.0
+    bid_offset: float = 0.01
+    min_low_score: float = 0.10
+    min_rate: float = 0.0
+
+
+class ScanResult(NamedTuple):
+    assessments: list
+    reward_ids: set
+    funnel: farm_db.ScanFunnel
 
 
 class GammaInfo(NamedTuple):
@@ -440,6 +461,8 @@ def assess(market, levels, config, now):
         depth_ahead_ratio=depth_ahead / plan.low_size,
         floor_score=score(market.v, (1 - mid) - market.tick),
         single_sided_ok=mid <= TWO_SIDED_ABOVE,
+        best_bid=next((p for p, s in levels.bids if s >= market.min_size), None),
+        best_ask=next((p for p, s in levels.asks if s >= market.min_size), None),
     )
 
 
@@ -645,9 +668,11 @@ def fetch_gamma(http, condition_ids, timeout=20):
 # Scan
 # ---------------------------------------------------------------------------
 
-def run_scan(config, now):
-    """Fetch, screen, and assess. Returns (assessments, reward condition ids)."""
+def run_scan(config, now, on_stage=lambda stage: None):
+    """Fetch, screen, and assess, naming each stage to on_stage as it starts."""
+    scan_started = time.monotonic()
     with httpx.Client() as http:
+        on_stage("listing reward markets")
         started = time.monotonic()
         with ThreadPoolExecutor(2) as pool:
             listing_job = pool.submit(fetch_paginated, http, "/sampling-markets")
@@ -670,7 +695,9 @@ def run_scan(config, now):
             else:
                 survivors.append(result)
         print(f"Prefilter: {len(survivors):,} kept; skipped {tally(skipped)}")
+        prefilter_skips = dict(skipped.most_common())
 
+        on_stage(f"fetching books and Gamma records for {len(survivors):,} markets")
         started = time.monotonic()
         with ThreadPoolExecutor(2) as pool:
             books_job = pool.submit(
@@ -683,6 +710,7 @@ def run_scan(config, now):
         print(f"Books: {len(books):,} fetched, Gamma: {len(gamma):,} enriched "
               f"({time.monotonic() - started:.1f}s)")
 
+    on_stage("assessing")
     assessments, skipped = [], Counter()
     for market in survivors:
         levels = books.get(market.fav_token_id)
@@ -704,7 +732,12 @@ def run_scan(config, now):
         assessments.append(result)
     assessments.sort(key=lambda a: a.rank_score, reverse=True)
     print(f"Assessed: {len(assessments):,} kept; skipped {tally(skipped)}")
-    return assessments, {item.get("condition_id") for item in listing}
+    funnel = farm_db.ScanFunnel(
+        at=now, duration_s=round(time.monotonic() - scan_started, 1), listed=len(listing),
+        prefiltered=len(survivors), assessed=len(assessments),
+        prefilter_skips=prefilter_skips, assess_skips=dict(skipped.most_common()),
+    )
+    return ScanResult(assessments, {item.get("condition_id") for item in listing}, funnel)
 
 
 def assessment_record(a):
@@ -726,6 +759,12 @@ def scan_row(a):
         rank_score=a.rank_score,
         metrics=json.dumps(assessment_record(a)),
     )
+
+
+def store(conn, result, now):
+    """Keep a scan in farm.db: its rows, the reward set, and its funnel."""
+    farm_db.store_scan(conn, [scan_row(a) for a in result.assessments], result.reward_ids,
+                       now, result.funnel)
 
 
 def print_table(assessments):
@@ -768,10 +807,11 @@ def config_from(args):
 
 def cmd_scan(args):
     now = datetime.now(timezone.utc)
-    assessments, reward_ids = run_scan(config_from(args), now)
+    result = run_scan(config_from(args), now)
+    assessments = result.assessments
 
     conn = farm_db.open_db(args.db)
-    farm_db.store_scan(conn, [scan_row(a) for a in assessments], reward_ids, now)
+    store(conn, result, now)
     conn.close()
     print(f"Stored {len(assessments):,} assessments in {args.db}")
 
@@ -892,17 +932,9 @@ Examples:
     sub = parser.add_subparsers(dest="command", required=True)
 
     scan = sub.add_parser("scan", parents=[db], help="Screen and rank reward markets")
-    for flag, default, help_text in (
-        ("--min-fav", 0.90, "Minimum favorite midpoint"),
-        ("--expiry-buffer-days", 7.0, "Stop farming this many days before end"),
-        ("--min-window-days", 30.0, "Minimum farmable days left"),
-        ("--horizon-cap-days", 90.0, "Cap on days counted toward rank"),
-        ("--capital", 500.0, "USD behind the favorite bid"),
-        ("--bid-offset", 0.01, "Favorite bid distance below the midpoint"),
-        ("--min-low-score", 0.10, "Minimum per-share score of the longshot bid"),
-        ("--min-rate", 0.0, "Minimum daily reward pool in USD"),
-    ):
-        scan.add_argument(flag, type=float, default=default,
+    for field, help_text in SCAN_HELP.items():
+        default = ScreenConfig._field_defaults[field]
+        scan.add_argument(f"--{field.replace('_', '-')}", type=float, default=default,
                           help=f"{help_text} (default: {default})")
     scan.add_argument("--mode", choices=("any", "floor", "budget"), default="any",
                       help="Show only this mode in the table (all are stored)")

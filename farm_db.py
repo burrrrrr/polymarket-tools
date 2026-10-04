@@ -25,7 +25,10 @@ a busy timeout, and every column has exactly one writer process:
                   in dry run too, kept 7 days, for the console's mid chart.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
-                  config, read every cycle.
+                  config, read every cycle. Keys under the `scan.` prefix
+                  are not farmer config and the farmer skips them:
+                  scan.params (console) holds the last scan parameters,
+                  scan.last (screener) the last scan's funnel.
   commands        the console inserts rows; the farmer only stamps
                   consumed_at and result.
 
@@ -198,15 +201,33 @@ class ScanRow(NamedTuple):
     metrics: str
 
 
-def store_scan(conn, rows, reward_ids, now):
+class ScanFunnel(NamedTuple):
+    """How a scan narrowed the reward markets down; skips map reason to count."""
+
+    at: datetime
+    duration_s: float
+    listed: int
+    prefiltered: int
+    assessed: int
+    prefilter_skips: dict
+    assess_skips: dict
+
+
+SCAN_PARAMS_KEY = "scan.params"
+SCAN_LAST_KEY = "scan.last"
+
+
+def store_scan(conn, rows, reward_ids, now, funnel=None):
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
     naked_paused, capital_usd) are never touched, so rescanning is always
-    safe. Retiring is the farmer's call.
+    safe. Retiring is the farmer's call. A funnel is kept as the last scan's.
     """
     at = stamp(now)
     with conn:
+        if funnel is not None:
+            _put_json(conn, SCAN_LAST_KEY, {**funnel._asdict(), "at": stamp(funnel.at)}, now)
         conn.executemany(
             """
             INSERT INTO markets (condition_id, slug, question, end_date,
@@ -246,6 +267,58 @@ def latest_scan(conn):
     return conn.execute("SELECT MAX(last_scanned) FROM markets").fetchone()[0]
 
 
+def load_scan_funnel(conn):
+    value = _get_json(conn, SCAN_LAST_KEY)
+    if value is None:
+        return None
+    return ScanFunnel(**{**value, "at": _time(value["at"])})
+
+
+def put_scan_params(conn, params, now):
+    """The scan parameters the console last ran with, as {field: number}."""
+    with conn:
+        _put_json(conn, SCAN_PARAMS_KEY, params, now)
+
+
+def load_scan_params(conn):
+    return _get_json(conn, SCAN_PARAMS_KEY) or {}
+
+
+def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, limit,
+                   offset):
+    """(markets, total) by rank, filtered; each filter applies only when given.
+
+    mode is the planned mode ('floor' or 'budget'). min_days counts from now to
+    the end date less buffer_days, the farmer's cutoff.
+    """
+    where, params = [], []
+    if statuses:
+        where.append(f"status IN ({', '.join('?' * len(statuses))})")
+        params.extend(statuses)
+    if mode:
+        where.append("json_extract(metrics, '$.plan.mode') = ?")
+        params.append(mode)
+    if text:
+        pattern = "%" + "".join("!" + c if c in "!%_" else c for c in text) + "%"
+        where.append("(question LIKE ? ESCAPE '!' OR slug LIKE ? ESCAPE '!')")
+        params.extend([pattern, pattern])
+    if min_days is not None:
+        where.append("julianday(end_date) - julianday(?) - ? >= ?")
+        params.extend([stamp(now), buffer_days, min_days])
+    sql = " FROM markets" + (" WHERE " + " AND ".join(where) if where else "")
+    total = conn.execute("SELECT COUNT(*)" + sql, params).fetchone()[0]
+    rows = conn.execute("SELECT *" + sql + " ORDER BY rank_score DESC LIMIT ? OFFSET ?",
+                        params + [limit, offset]).fetchall()
+    return [_market(r) for r in rows], total
+
+
+def candidate_queue(conn):
+    """Condition ids of the undecided candidates, best rank first."""
+    return [r[0] for r in conn.execute(
+        "SELECT condition_id FROM markets WHERE status = 'candidate' "
+        "ORDER BY rank_score DESC")]
+
+
 def list_markets(conn, status, limit):
     """Markets by rank; status 'all' lists every status."""
     where, params = ("", ()) if status == "all" else (" WHERE status = ?", (status,))
@@ -265,6 +338,19 @@ def approve_market(conn, condition_id, p_true, budget, capital_usd=None):
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
             "capital_usd = COALESCE(?, capital_usd) WHERE condition_id = ?",
+            (p_true, budget, capital_usd, condition_id),
+        )
+
+
+def set_approval(conn, condition_id, p_true, budget, capital_usd):
+    """Approve with exactly these terms; capital_usd None means the farmer's capital.
+
+    Re-approving a retired market makes the farmer manage it afresh.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
+            "capital_usd = ? WHERE condition_id = ?",
             (p_true, budget, capital_usd, condition_id),
         )
 
@@ -309,9 +395,14 @@ def set_capital(conn, condition_id, capital_usd):
 
 
 def cancel_all(conn):
-    """Pause every approved market, which takes all their orders down."""
+    """Pause every approved market, which takes all their orders down.
+
+    Returns how many approved markets were not paused before.
+    """
     with conn:
-        conn.execute("UPDATE markets SET paused = 1 WHERE status = 'approved'")
+        return conn.execute(
+            "UPDATE markets SET paused = 1 WHERE status = 'approved' AND paused = 0"
+        ).rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -364,14 +455,16 @@ def parse_setting(key, text):
 
 
 def put_setting(conn, key, value, now):
-    parse_setting(key, json.dumps(value))
+    put_settings(conn, {key: value}, now)
+
+
+def put_settings(conn, values, now):
+    """Write {key: value} overrides in one transaction, or none if any is invalid."""
+    for key, value in values.items():
+        parse_setting(key, json.dumps(value))
     with conn:
-        conn.execute(
-            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
-            "updated_at = excluded.updated_at",
-            (key, json.dumps(value), stamp(now)),
-        )
+        for key, value in values.items():
+            _put_json(conn, key, value, now)
 
 
 def delete_setting(conn, key):
@@ -380,14 +473,32 @@ def delete_setting(conn, key):
 
 
 def load_settings(conn):
-    """({key: value} of the valid rows, {key: error} of the rest)."""
+    """({key: value} of the valid rows, {key: error} of the rest).
+
+    Rows under the scan. prefix are the console's and the screener's, not
+    farmer config, so they are neither.
+    """
     values, errors = {}, {}
-    for row in conn.execute("SELECT key, value FROM settings"):
+    for row in conn.execute("SELECT key, value FROM settings WHERE key NOT LIKE 'scan.%'"):
         try:
             values[row["key"]] = parse_setting(row["key"], row["value"])
         except ValueError as e:
             errors[row["key"]] = str(e)
     return values, errors
+
+
+def _put_json(conn, key, value, now):
+    conn.execute(
+        "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT (key) DO UPDATE SET value = excluded.value, "
+        "updated_at = excluded.updated_at",
+        (key, json.dumps(value), stamp(now)),
+    )
+
+
+def _get_json(conn, key):
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return json.loads(row[0]) if row else None
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +540,24 @@ def consume_command(conn, command_id, result, now):
             "WHERE id = ? AND consumed_at IS NULL",
             (stamp(now), result, command_id),
         )
+
+
+class CommandRecord(NamedTuple):
+    id: int
+    at: datetime
+    kind: str
+    consumed_at: Optional[datetime]
+    result: Optional[str]
+
+
+def latest_command(conn, kind):
+    row = conn.execute(
+        "SELECT * FROM commands WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind.value,)
+    ).fetchone()
+    if row is None:
+        return None
+    return CommandRecord(row["id"], _time(row["at"]), row["kind"],
+                         _time(row["consumed_at"]), row["result"])
 
 
 def expire_commands(conn, now):
@@ -544,6 +673,19 @@ class FarmerStatus(NamedTuple):
     stopped_at: Optional[datetime] = None
 
 
+def resting_order(view):
+    """(price, size) a farm_state slot rests at once that cycle's actions landed.
+
+    None when the slot rests nothing: its order was cancelled, or a place is
+    waiting out a backoff.
+    """
+    if not view:
+        return None
+    order = {"hold": view.get("order"), "place": view.get("target"),
+             "replace": view.get("target")}.get(view["decision"])
+    return (order["price"], order["size"]) if order else None
+
+
 def _json(value):
     return json.dumps(value) if value is not None else None
 
@@ -616,3 +758,152 @@ def store_rewards(conn, date, earnings, now):
             "fetched_at) VALUES (?, ?, ?, ?)",
             [(date, cid, usd, stamp(now)) for cid, usd in earnings.items()],
         )
+
+
+# ---------------------------------------------------------------------------
+# Console: reads, parsed into the types above
+# ---------------------------------------------------------------------------
+
+class MarketRecord(NamedTuple):
+    """A markets row with its JSON and times parsed."""
+
+    condition_id: str
+    slug: Optional[str]
+    question: Optional[str]
+    status: str
+    p_true: Optional[float]
+    naked_budget_usd: Optional[float]
+    note: Optional[str]
+    end_date: Optional[datetime]
+    rewards_active: bool
+    rank_score: Optional[float]
+    metrics: dict
+    first_seen: Optional[datetime]
+    last_scanned: Optional[datetime]
+    baseline_fav: Optional[float]
+    baseline_long: Optional[float]
+    paused: bool
+    naked_paused: bool
+    capital_usd: Optional[float]
+
+
+class StoredEvent(NamedTuple):
+    id: int
+    at: datetime
+    kind: EventKind
+    message: str
+    condition_id: Optional[str]
+    slot: Optional[str]
+    price: Optional[float]
+    size: Optional[float]
+    score: Optional[float]
+    data: Optional[dict]
+
+
+def _time(text):
+    return datetime.fromisoformat(text) if text else None
+
+
+def _load(text):
+    return json.loads(text) if text is not None else None
+
+
+def _market(row):
+    return MarketRecord(
+        condition_id=row["condition_id"], slug=row["slug"], question=row["question"],
+        status=row["status"], p_true=row["p_true"],
+        naked_budget_usd=row["naked_budget_usd"], note=row["note"],
+        end_date=_time(row["end_date"]), rewards_active=bool(row["rewards_active"]),
+        rank_score=row["rank_score"], metrics=_load(row["metrics"]) or {},
+        first_seen=_time(row["first_seen"]), last_scanned=_time(row["last_scanned"]),
+        baseline_fav=row["baseline_fav"], baseline_long=row["baseline_long"],
+        paused=bool(row["paused"]), naked_paused=bool(row["naked_paused"]),
+        capital_usd=row["capital_usd"],
+    )
+
+
+def read_markets(conn, condition_ids=(), statuses=()):
+    """Markets whose id is in condition_ids or whose status is in statuses."""
+    ids, sts = list(condition_ids), list(statuses)
+    rows = conn.execute(
+        f"SELECT * FROM markets WHERE condition_id IN ({', '.join('?' * len(ids))}) "
+        f"OR status IN ({', '.join('?' * len(sts))}) ORDER BY rank_score DESC",
+        ids + sts,
+    ).fetchall()
+    return [_market(r) for r in rows]
+
+
+def status_counts(conn):
+    return dict(conn.execute("SELECT status, COUNT(*) FROM markets GROUP BY status"))
+
+
+def read_farmer_status(conn):
+    row = conn.execute("SELECT * FROM farmer_status WHERE id = 1").fetchone()
+    if row is None:
+        return None
+    return FarmerStatus(
+        mode=row["mode"], pid=row["pid"], started_at=_time(row["started_at"]),
+        last_cycle_at=_time(row["last_cycle_at"]), interval_s=row["interval_s"],
+        heartbeat=bool(row["heartbeat"]), managed=row["managed"],
+        config=_load(row["config"]) or {}, stopped_at=_time(row["stopped_at"]),
+    )
+
+
+def read_farm_states(conn):
+    """{condition_id: FarmState} of every managed market."""
+    return {
+        r["condition_id"]: FarmState(
+            condition_id=r["condition_id"], updated_at=_time(r["updated_at"]),
+            phase=r["phase"], phase_reason=r["phase_reason"] or "",
+            phase_until=_time(r["phase_until"]), book_mid=r["book_mid"], mid=r["mid"],
+            q1=r["q1"] or 0.0, q2=r["q2"] or 0.0, capital_usd=r["capital_usd"],
+            naked_used_usd=r["naked_used_usd"] or 0.0, position=_load(r["position"]),
+            slots=_load(r["slots"]) or {}, book=_load(r["book"]) or {},
+            naked_paused_until=_time(r["naked_paused_until"]),
+            backoff=_load(r["backoff"]) or {}, scoring_pct=_load(r["scoring_pct"]),
+        )
+        for r in conn.execute("SELECT * FROM farm_state")
+    }
+
+
+def read_events(conn, *, condition_id=None, kinds=(), since=None, after_id=None,
+                before_id=None, limit=100):
+    """farm_events newest first, each filter applied only when given."""
+    where, params = [], []
+    for clause, value in (("condition_id = ?", condition_id), ("at >= ?", stamp(since)),
+                          ("id > ?", after_id), ("id < ?", before_id)):
+        if value is not None:
+            where.append(clause)
+            params.append(value)
+    if kinds:
+        where.append(f"kind IN ({', '.join('?' * len(kinds))})")
+        params.extend(k.value for k in kinds)
+    sql = "SELECT * FROM farm_events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    rows = conn.execute(sql + " ORDER BY id DESC LIMIT ?", params + [limit]).fetchall()
+    return [StoredEvent(r["id"], _time(r["at"]), EventKind(r["kind"]), r["message"],
+                        r["condition_id"], r["slot"], r["price"], r["size"], r["score"],
+                        _load(r["data"])) for r in rows]
+
+
+def last_event_id(conn):
+    return conn.execute("SELECT COALESCE(MAX(id), 0) FROM farm_events").fetchone()[0]
+
+
+def read_mids(conn, condition_id, since):
+    """A market's farm_mids samples from `since` on, oldest first."""
+    rows = conn.execute(
+        "SELECT * FROM farm_mids WHERE condition_id = ? AND at >= ? ORDER BY at",
+        (condition_id, stamp(since)),
+    ).fetchall()
+    return [MidSample(r["condition_id"], _time(r["at"]), r["mid"], r["book_mid"],
+                      r["fav_bid"], r["long_bid"]) for r in rows]
+
+
+def read_rewards(conn, since_date):
+    """[(date, condition_id, earnings_usd)] from since_date (YYYY-MM-DD) on."""
+    return [tuple(r) for r in conn.execute(
+        "SELECT date, condition_id, earnings_usd FROM rewards_daily WHERE date >= ? "
+        "ORDER BY date, condition_id", (since_date,),
+    )]

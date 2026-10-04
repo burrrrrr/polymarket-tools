@@ -631,7 +631,12 @@ Each market is in one of five states:
   accepting orders, you no longer approve it, or it reached its end date
   minus `--expiry-buffer-days`. All orders are cancelled. In live mode the
   database row becomes `retired` with a note. A row you rejected keeps its
-  `rejected` status. Retirement wins over a pause.
+  `rejected` status. Retirement wins over a pause. If you approve a retired
+  market again after the farmer has seen it unapproved, the farmer manages it
+  afresh, from a new lifecycle state through the same checks, so an expired
+  market retires again at once. A dry run that retires a market leaves its
+  row `approved`, so that market stays retired until you retire it and
+  approve it again.
 
 Every cycle the farmer re-reads the approved rows, their controls, the
 settings, and the commands from `farm.db`. A new approval, a rejection, a
@@ -795,7 +800,7 @@ Each column has exactly one writer process:
 | `farm_state` | Farmer | One row per managed market, replaced every cycle: phase and reason, midpoints, Q1 and Q2, capital, naked USD in use, and JSON for the position, the four slots (resting order, target, live score, decision and reason), the favorite book inside the reward band with your orders marked, backoffs, and `scoring_pct` (live only) |
 | `farmer_status` | Farmer | One row: mode, pid, start time, last cycle, interval, heartbeat, managed count, effective config, and `stopped_at` once it exits |
 | `farm_events` | Farmer | Changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`, `ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, `SETTINGS`. Rows older than 30 days are deleted at startup |
-| `settings` | Console or CLI | Overrides of the farmer's command-line options |
+| `settings` | Console or CLI | Overrides of the farmer's command-line options. Keys starting with `scan.` are not farmer options and the farmer ignores them: `scan.params` holds the console's last scan parameters, `scan.last` the last scan's funnel, written by every scan |
 | `commands` | Console inserts, farmer stamps `consumed_at` and `result` | One-off requests. `stop` is the only kind |
 | `rewards_daily` | Farmer, live only | Your reward earnings per market per day, fetched every 10 minutes |
 | `farm_mids` | Farmer | At most one row per managed market per minute, in dry run too: the midpoint, the book midpoint, and the prices the `FAV_BID` and `LONG_BID` rest at after that cycle (NULL when the slot rests nothing). Rows older than 7 days are deleted at startup. The console draws its midpoint chart from it |
@@ -813,6 +818,133 @@ slot at the previous cycle, and its `data` says so.
 whose response fields Polymarket does not document. The farmer reads them
 defensively, logs a warning when the shape does not match, and keeps
 farming.
+
+### Farm Console
+
+`farm_console` is a local web console for the reward farmer. It shows what
+the farmer is doing, live, and it is where you run scans, approve markets, and
+control the farmer. Every change it makes goes through `farm_db` into
+`farm.db`, and the farmer picks it up on its next cycle.
+
+```bash
+python -m farm_console --db farm.db --port 8787   # then open http://127.0.0.1:8787
+```
+
+Run it next to the farmer on the same database, in its own terminal. Neither
+process needs the other: the console shows the last state the farmer
+published, with a banner when the farmer is not running. The console reads
+`POLYMARKET_FUNDER_ADDRESS` from `.env` to show your holdings on the Review
+page. It never reads or handles a private key.
+
+Pages:
+
+| Page | Shows | Actions |
+| --- | --- | --- |
+| Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids against the budgets, farm inventory, the screener's $/day estimate, today's earnings), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
+| Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode, text in the question or slug, status, and minimum days to the farmer's cutoff | Run a scan |
+| Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures, the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, and capital; reject with a note; retire an approved market; re-approve a retired one |
+| Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, edit p_true and budget, retire |
+| Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
+| Activity (`/activity?tab=`) | `rewards`: earnings per day and market against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
+| Settings (`/settings`) | The farmer process (mode, pid, start, last cycle, interval, heartbeat) and every setting with its effective value and where it comes from: your override, the farmer's own value, or the built-in default | Stop the farmer, save or reset settings, cancel all managed orders |
+
+#### Running a scan from the console
+
+The Discover page runs the same scan as `python reward_screener.py scan`, in a
+background thread of the console. It takes about a minute. The page shows
+the current stage while it runs, then the counts and the duration, or the
+error. Only one scan runs at a time: a second request while one runs gets
+"A scan is already in progress". The form starts from the parameters of the
+last scan run from the console, or the screener's defaults. A scan stores its
+rows and its funnel in one transaction and never changes your decisions.
+
+#### Decisions and controls
+
+- **Approve** sets `status` to `approved` with the p_true, naked budget, and
+  capital you entered. A blank capital means the farmer's `capital` setting.
+  On a market that is already approved, the same form edits those terms.
+  After a decision on a candidate, the console opens the next undecided
+  candidate. After an edit, it opens the market's page.
+- **EV check.** While you type p_true, the Review page shows what the farmer
+  will do with it. The farmer never bids above p_true minus `ev_margin`,
+  rounded down to the tick. When the planned bid is above that cap, the
+  check shows the price the farmer bids instead and its lower score, or that
+  the cap is outside the band. On a BUDGET market it also warns when your
+  naked budget is below the planned longshot leg. It uses the effective
+  `ev_margin`: your override, else the farmer's last value, else the default.
+- **Pause and naked leg** set `paused` or `naked_paused` to the level the
+  button names, so pressing twice changes nothing. Each button names the
+  action it takes, such as Resume while the market is paused.
+- **Retire** asks first, naming the market, then sets `status` to `retired`.
+  The farmer cancels the market's orders on its next cycle.
+- **Cancel all** pauses every approved market. You must type `CANCEL`, and
+  the server checks it.
+- **Stop farmer** asks first, then inserts a `stop` command. The Settings
+  page shows when the farmer consumed it.
+- **Settings** forms check each value with the same rules the farmer uses
+  and write only the fields you changed, all in one transaction. A value
+  that fails shows its error next to the field and nothing is saved.
+  **Reset** deletes the override, so the farmer's own value applies again.
+
+There is no live switch. Live mode needs the private key, which the farmer
+unlocks from Bitwarden in its own terminal, so you start it there:
+`python reward_farmer.py --live --db farm.db`.
+
+#### Security
+
+The console has no login and controls real orders, so it must only be
+reachable from your own machine, and only by its own pages:
+
+- It binds `127.0.0.1` only. To reach it from another machine, use an SSH
+  tunnel. Never change the bind address.
+- Every request must carry `Host: 127.0.0.1:<port>` or `localhost:<port>`.
+  Anything else gets 400. This blocks DNS rebinding, where a hostile site
+  points its own domain at 127.0.0.1.
+- Every request other than GET or HEAD needs the console's token, a random
+  value made fresh each time the console starts. The pages carry it in a
+  `<meta>` tag, htmx sends it as the `X-Console-Token` header, and plain forms
+  send it as the `console_token` field. A missing or wrong token gets 403.
+  Another web site open in your browser cannot read the token, so it cannot
+  forge a request.
+- A request other than GET or HEAD whose `Origin` header names another origin
+  gets 403, even with the token.
+- Every change is a POST. No GET request writes anything.
+
+`farm_console/security.py` holds all of these checks, as a middleware in
+front of every route.
+
+#### Live updates
+
+The pages update without a reload. `GET /stream` is a server-sent event
+stream that polls `farm.db` once a second and sends three signals with no
+HTML: `cycle` when the farmer finishes a cycle, `farm-event` when a new event
+appears, and `status` when the farmer starts or stops running. Each live region
+of a page requests its own HTML fragment from `/partials/...` when its signal
+arrives, using htmx and its SSE extension. After a market control, the regions
+that show that market reload at once. There is no client-side state and no
+chart JavaScript: the charts are SVG drawn on the server.
+
+The alerts come from a rule table in `farm_console/views.py`: cooldown, below
+range, paused, naked budget at 99% or more, a favorite bid scoring under 0.10,
+a slot in backoff, a longshot-bid fill in the last 24 hours, and the farmer not
+running. The farmer counts as not running when its last cycle is older than
+three intervals, or when it has stopped.
+
+`/api/overview`, `/api/markets`, `/api/markets/<condition_id>`,
+`/api/events?after=&before=&limit=&condition_id=`, and `/api/activity?tab=`
+return the same data the pages show, as JSON.
+
+The midpoint chart reads `farm_mids`, which the farmer fills with one sample
+per market per minute. A market's chart is empty until the farmer has run for
+a minute. The resolution rules come from Gamma when you open a Review page
+and are kept for 10 minutes. If Gamma or the data API is unreachable, that
+panel says so and offers a retry; the rest of the page still works.
+
+htmx 2.0.11 and htmx-ext-sse 2.2.4 are vendored in `farm_console/static/`, so
+the console works offline except for the IBM Plex fonts, which fall back to
+system fonts, and the Review page's rules and holdings. To upgrade, download
+`dist/htmx.min.js` from the `htmx.org` package and `dist/sse.min.js` from the
+`htmx-ext-sse` package, and update the versions here.
 
 ## Important Notes
 

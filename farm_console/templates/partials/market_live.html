@@ -1,0 +1,63 @@
+{%- set c = vm.card -%}
+{%- if c.phase != 'WAITING' %}
+<div class="stack" style="gap: 18px">
+  <div class="row">
+    <section class="panel pad stack grow">
+      <h2>Order slots</h2>
+      <div class="scroll">
+        <table class="tbl tight">
+          <thead><tr><th>Slot</th><th>Resting order</th><th>Score now</th><th>Target</th><th>Decision</th><th>Backoff</th></tr></thead>
+          <tbody>
+            {%- for s in c.slots %}
+            <tr>
+              <td><span class="badge {{ s.tone }}">{{ s.slot }}</span></td>
+              <td class="mono">{% if s.order %}{{ s.order.price | cents }} × {{ s.order.size | shares }}{% else %}--{% endif %}</td>
+              <td class="mono">{{ s.live_score | score }}</td>
+              <td class="mono">{% if s.target %}{{ s.target.price | cents }} × {{ s.target.size | shares }} @ {{ s.target_score | score }}{% else %}--{% endif %}</td>
+              <td class="wrap" style="color: var(--ink-2)">{{ s.decision }}{% if s.reason %}: {{ s.reason }}{% endif %}</td>
+              <td class="mono">{% if s.backoff_until %}{{ s.backoff_attempts }}× until {{ s.backoff_until[11:19] }} UTC{% else %}--{% endif %}</td>
+            </tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel pad stack side">
+      <h2>Book inside the band</h2>
+      <table class="tbl tight">
+        <thead><tr><th>Price</th><th>Size</th><th>Ours</th><th>Score</th></tr></thead>
+        <tbody>
+          {%- for b in vm.book %}
+          {%- if b.side == 'mid' %}
+          <tr class="midrow"><td class="mono">{{ b.price | cents }}</td><td colspan="3">midpoint</td></tr>
+          {%- else %}
+          <tr class="{{ 'ours' if b.ours else '' }}"><td class="mono {{ 'c-fav' if b.side == 'bid' else '' }}">{{ b.price | cents }}</td><td class="mono">{{ b.size | shares }}</td><td class="mono">{{ b.ours | shares if b.ours else '' }}</td><td class="mono">{{ b.score | score }}</td></tr>
+          {%- endif %}
+          {%- else %}
+          <tr><td colspan="4" class="muted">No book levels inside the band.</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+      <span class="small muted">Favorite book. Our longshot orders show at their mirror price. Highlighted rows hold our orders.</span>
+    </section>
+  </div>
+
+  <section class="panel pad stack">
+    <h2>Position</h2>
+    {%- if c.position %}
+    <div class="scroll">
+      <table class="tbl tight">
+        <thead><tr><th></th><th>Wallet</th><th>Baseline (never sold)</th><th>Farm</th><th>Avg cost</th></tr></thead>
+        <tbody>
+          {%- for key, label in (('fav', 'Favorite'), ('long', 'Longshot')) %}
+          <tr><td>{{ label }}</td><td class="mono">{{ c.position.wallet[key] | shares }}</td><td class="mono">{{ c.position.baseline[key] | shares }}</td><td class="mono">{{ c.position.farm[key] | shares }}</td><td class="mono">{{ c.position.avg_cost[key] | cents }}</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+    </div>
+    {%- else %}
+    <div class="empty">No position read yet.</div>
+    {%- endif %}
+  </section>
+</div>
+{%- endif %}

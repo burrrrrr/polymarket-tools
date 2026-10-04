@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region %}
+{% block title %}Live markets{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Live markets</h1>
+    <p class="sub">Updates every farmer cycle. The band strip is in favorite price; orange is the longshot bid at its mirror.</p>
+  </div>
+  <nav class="actions" aria-label="Phase filter">
+    {%- for f in vm.filters %}
+    <a class="chip {{ 'on' if f == vm.phase }}" href="/markets{{ '?phase=' ~ f if f }}">{{ (f or 'All') | replace('_', ' ') | title }}</a>
+    {%- endfor %}
+  </nav>
+</header>
+{% call region("/partials/markets" ~ ('?phase=' ~ vm.phase if vm.phase else ''), "sse:cycle, " ~ CONTROLS_EVENT ~ " from:body") %}{% include "partials/cards.html" %}{% endcall %}
+{% endblock %}

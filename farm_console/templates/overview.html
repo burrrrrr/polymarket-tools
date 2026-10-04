@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Overview</h1>
+    <p class="sub">What the farmer is doing right now, and anything that needs you.</p>
+  </div>
+  <div class="actions">
+    <a class="btn" href="/discover">Run scan</a>
+    <a class="btn btn-strong" href="/settings">Farmer controls</a>
+  </div>
+</header>
+
+{% call region("/partials/overview/kpis") %}{% include "partials/kpis.html" %}{% endcall %}
+
+{% call region("/partials/overview/alerts") %}{% include "partials/alerts.html" %}{% endcall %}
+
+<div class="row">
+  <section class="panel pad-table grow">
+    <div class="head">
+      <h2>Tracked markets</h2>
+      <a href="/markets" style="font-size: 13px">Open live view</a>
+    </div>
+    {% call region("/partials/overview/tracked") %}{% include "partials/tracked.html" %}{% endcall %}
+  </section>
+  <section class="panel pad feed-panel stack">
+    <div style="display: flex; justify-content: space-between; align-items: center">
+      <h2>Live events</h2>
+      <span class="streaming"><span class="dot" style="width: 6px; height: 6px; background: #63D3A6"></span>streaming</span>
+    </div>
+    {% call region("/partials/overview/events", "sse:farm-event") %}{% include "partials/events.html" %}{% endcall %}
+    <a href="/activity?tab=log" style="font-size: 13px; margin-top: 4px">Full activity log</a>
+  </section>
+</div>
+{% endblock %}

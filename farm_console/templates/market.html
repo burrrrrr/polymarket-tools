@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region %}
+{% block title %}{{ vm.card.name | truncate(40, True) }}{% endblock %}
+{% block content %}
+{%- set base = "/partials/markets/" ~ vm.card.condition_id -%}
+<a href="/markets" style="font-size: 13px">Live markets</a>
+<div class="stack" style="gap: 6px">
+  <h1 class="question">{{ vm.card.name }}</h1>
+  <span class="mono small muted">{{ vm.slug or '' }} · {{ vm.card.condition_id }}</span>
+</div>
+{% call region(base ~ "/summary", "sse:cycle, " ~ CONTROLS_EVENT ~ " from:body") %}{% include "partials/market_summary.html" %}{% endcall %}
+<section class="panel pad stack">
+  <div style="display: flex; justify-content: space-between; align-items: baseline; flex-wrap: wrap; gap: 8px">
+    <h2>Midpoint, band and our quotes</h2>
+    <span class="legend">
+      <span><i class="swatch" style="background: #E6E3DD"></i>mid</span>
+      <span><i class="swatch box" style="background: #2A3F57"></i>reward band</span>
+      <span><i class="swatch" style="background: #8DBBEA"></i>our favorite bid</span>
+      <span><i class="swatch" style="background: #F0AE66"></i>our longshot bid (mirror)</span>
+      <span><i class="swatch box" style="background: #F2A3A3; border-radius: 50%"></i>fill</span>
+      <span><i class="swatch box" style="background: #F2C14E; border-radius: 50%"></i>phase change</span>
+    </span>
+  </div>
+  {% call region(base ~ "/chart") %}{% include "partials/market_chart.html" %}{% endcall %}
+</section>
+{% call region(base ~ "/live") %}{% include "partials/market_live.html" %}{% endcall %}
+{% call region(base ~ "/history", "sse:farm-event") %}{% include "partials/market_history.html" %}{% endcall %}
+{% endblock %}

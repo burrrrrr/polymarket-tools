@@ -1,0 +1,29 @@
+<section class="stack" style="gap: 16px">
+  <div class="panel pad-table">
+    <div class="scroll">
+      <table class="tbl">
+        <thead><tr><th>Market</th><th>Wallet fav / long</th><th>Baseline fav / long</th><th>Farm (tradable) fav / long</th><th>Avg cost fav / long</th><th>Exit orders</th></tr></thead>
+        <tbody>
+          {%- for r in vm %}
+          {%- set p = r.position %}
+          <tr>
+            <td><a href="/markets/{{ r.condition_id }}">{{ r.name | truncate(48, True) }}</a></td>
+            {%- if p %}
+            <td class="mono">{{ p.wallet.fav | shares }} / {{ p.wallet.long | shares }}</td>
+            <td class="mono">{{ p.baseline.fav | shares }} / {{ p.baseline.long | shares }}</td>
+            <td class="mono">{{ p.farm.fav | shares }} / {{ p.farm.long | shares }}</td>
+            <td class="mono">{{ p.avg_cost.fav | cents }} / {{ p.avg_cost.long | cents }}</td>
+            {%- else %}
+            <td class="muted" colspan="4">no position read yet</td>
+            {%- endif %}
+            <td class="mono">{% for slot, o in r.exits.items() %}<span class="{{ 'c-fav' if slot == 'FAV_ASK' else 'c-long' }}">{{ slot }} {{ o.price | cents }} × {{ o.size | shares }}</span> {% else %}<span class="muted">none</span>{% endfor %}</td>
+          </tr>
+          {%- else %}
+          <tr><td colspan="6" class="muted">No managed markets.</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <div class="panel pad small muted" style="line-height: 1.6">The farmer never trades shares that were in the wallet before it managed a market. Only shares above a market's baseline are farm inventory. Average cost is the wallet's, blended across baseline and farm shares.</div>
+</section>

@@ -1,0 +1,36 @@
+<div class="stack" style="gap: 16px">
+  <div class="row">
+    <section class="panel pad stack side">
+      <h2>Lifecycle</h2>
+      {%- for t in vm.timeline %}
+      <div class="timeline-item {{ 'upcoming' if t.upcoming }}"><span class="mono when">{{ t.at | stamp_local }}</span><span>{{ t.text }}</span></div>
+      {%- endfor %}
+    </section>
+    <section class="panel pad stack side">
+      <h2>Fills</h2>
+      {%- if vm.fills %}
+      <div class="scroll">
+        <table class="tbl tight">
+          <thead><tr><th>Time</th><th>Slot</th><th>Price</th><th>Size</th><th>Edge vs p_true</th></tr></thead>
+          <tbody>
+            {%- for f in vm.fills %}
+            <tr><td class="mono">{{ f.at | stamp_local }}</td><td><span class="badge {{ f.tone }}">{{ f.slot }}</span></td><td class="mono">≈ {{ f.price | cents }}</td><td class="mono">{{ f.size | shares }}</td><td class="mono">{% if f.edge is not none %}≈ {{ f.edge | cents }}{% else %}--{% endif %}</td></tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+      <span class="small muted">Fill prices are approximate: the farmer infers fills from position changes and prices them at the order resting in the slot.</span>
+      {%- else %}
+      <div class="empty">No fills yet. A favorite-bid fill adds farm inventory and a FAV_ASK appears. A longshot-bid fill pauses the naked leg for the naked cooldown and raises an alert.</div>
+      {%- endif %}
+    </section>
+  </div>
+  <section class="panel pad stack">
+    <h2>Event log</h2>
+    {%- for e in vm.events[:100] %}
+    <div class="mono feed"><span class="t">{{ e.at | stamp_local }}</span><span class="{{ e.tone }}">{{ e.text }}</span></div>
+    {%- else %}
+    <div class="empty">No events for this market yet.</div>
+    {%- endfor %}
+  </section>
+</div>

@@ -1,0 +1,13 @@
+{%- if error %}
+<div class="note-box stack" style="gap: 8px" role="alert">
+  <span class="c-bad small">Could not load the rules from Gamma: {{ error }}</span>
+  <button class="btn" type="button" hx-get="/partials/review/{{ condition_id }}/rules" hx-target="closest div[hx-get]" hx-swap="innerHTML">Retry</button>
+</div>
+{%- else %}
+<p class="rules">{{ rules.description or 'Gamma has no description for this market.' }}</p>
+<div class="actions" style="gap: 8px">
+  <span class="badge t-n">Resolution source: {% if rules.resolution_source %}<span class="mono">{{ rules.resolution_source }}</span>{% else %}not given{% endif %}</span>
+  <span class="badge t-n">Ends {{ rules.end_date | stamp_local if rules.end_date else 'unknown' }}</span>
+</div>
+<span class="small muted">From Gamma, kept for 10 minutes.</span>
+{%- endif %}

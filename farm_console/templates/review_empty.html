@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Review queue{% endblock %}
+{% block content %}
+<header>
+  <h1>Review queue</h1>
+  <p class="sub">Undecided candidates, best ranked first.</p>
+</header>
+<div class="empty">No undecided candidates. <a href="/discover">Run a scan</a> to find more, or <a href="/discover?status=all">browse every market</a>.</div>
+{% endblock %}

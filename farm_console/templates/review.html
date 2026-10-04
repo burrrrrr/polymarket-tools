@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region, token_field, field_error %}
+{% block title %}Review · {{ (market.question or market.slug or '') | truncate(40, True) }}{% endblock %}
+{% block content %}
+{%- set cid = market.condition_id -%}
+{%- set ev_inputs = "[name='p_true'],[name='naked_budget']" -%}
+<nav class="actions" aria-label="Review queue">
+  <span class="lbl" style="margin-right: 6px">Queue</span>
+  {%- if queue.position %}
+  <span class="small muted">{{ queue.position }} of {{ queue.total }} undecided</span>
+  {%- else %}
+  <span class="small muted">{{ queue.total }} undecided · this market is {{ market.status }}</span>
+  {%- endif %}
+  {%- if queue.prev %}<a class="chip" href="/review/{{ queue.prev }}">Previous</a>{% endif %}
+  {%- if queue.next %}<a class="chip" href="/review/{{ queue.next }}">{{ 'Next' if queue.position else 'Top candidate' }}</a>{% endif %}
+  <a class="chip" href="/discover">All candidates</a>
+</nav>
+
+<header class="stack" style="gap: 10px">
+  <h1 class="question">{{ market.question or market.slug }}</h1>
+  <div class="actions" style="gap: 8px">
+    <span class="badge {{ 't-q' if market.status == 'approved' else ('t-r' if market.status in ('rejected', 'retired') else 't-n') }}">{{ market.status }}</span>
+    {%- if plan %}<span class="badge {{ 't-b' if plan.mode == 'budget' else 't-f' }}">{{ plan.mode | upper }}</span>{% endif %}
+    <span class="badge t-n">favorite {{ m.fav_outcome or '--' }} {{ market.metrics.get('book_mid') | cents }}</span>
+    <span class="badge t-n">{{ '%.0f' % cutoff_days if cutoff_days is not none else '--' }} days to cutoff</span>
+    <span class="badge t-n">pool ${{ '%.0f' % m.rate_per_day if m.rate_per_day is not none else '--' }}/day · band {{ m.v | cents }} · min {{ m.min_size | shares }}</span>
+    {%- if market.paused %}<span class="badge t-n">paused flag set</span>{% endif %}
+    {%- if market.naked_paused %}<span class="badge t-b">naked leg paused</span>{% endif %}
+    <span class="mono small muted">{{ market.slug or '' }}</span>
+  </div>
+  {%- if market.note %}<span class="small muted">Note: {{ market.note }}</span>{% endif %}
+</header>
+
+<div class="row">
+  <div class="grow stack" style="gap: 16px">
+    <section class="panel pad stack" style="gap: 18px">
+      <div class="page-head" style="align-items: baseline">
+        <h2>Reward band and planned quotes</h2>
+        {%- if strip %}<span class="mono small muted">favorite price, {{ strip.lo | cents }} to {{ strip.hi | cents }}</span>{% endif %}
+      </div>
+      {%- if strip %}
+      <div>
+        <div class="strip" role="img" aria-label="Reward band from {{ strip.lo | cents }} to {{ strip.hi | cents }}">
+          {%- for k in strip.marks %}
+          <div class="mk {{ k.kind }}" style="left: {{ k.left }}%" title="{{ k.label }}"></div>
+          {%- endfor %}
+        </div>
+        <div class="strip-axis mono"><span>{{ strip.lo | cents }}</span><span>{{ strip.hi | cents }}</span></div>
+      </div>
+      <div class="legend mono">
+        {%- for k in strip.marks %}<span class="mk-{{ k.kind }}"><i class="swatch box"></i>{{ k.label }}</span>{% endfor %}
+      </div>
+      {%- endif %}
+      <div class="scroll">
+        <table class="tbl tight">
+          <thead><tr><th>Slot</th><th>Order</th><th>Size</th><th>Score/share</th><th>Ties up</th><th>Why</th></tr></thead>
+          <tbody>
+            {%- for o in orders %}
+            <tr><td><span class="badge {{ o.tone }}">{{ o.slot }}</span></td><td class="mono">{{ o.order }}</td><td class="mono">{{ o.size | shares }}</td><td class="mono">{{ o.score | score }}</td><td class="mono">{{ o.cost | usd }}</td><td class="wrap c-mut" style="min-width: 240px">{{ o.why }}</td></tr>
+            {%- else %}
+            <tr><td colspan="6" class="muted">No plan stored for this market.</td></tr>
+            {%- endfor %}
+          </tbody>
+        </table>
+      </div>
+      <span class="small muted">Planned at the last scan against the book as it was then. The farmer re-plans every cycle against the live book.</span>
+    </section>
+
+    <section class="panel pad stats">
+      {%- for label, value in stats %}
+      <div class="stack" style="gap: 4px"><span class="lbl">{{ label }}</span><span class="mono" style="font-size: 18px">{{ value }}</span></div>
+      {%- endfor %}
+    </section>
+
+    <section class="panel pad stack">
+      <h2>Resolution rules</h2>
+      <div class="stack" hx-get="/partials/review/{{ cid }}/rules" hx-trigger="load" hx-swap="innerHTML">
+        <span class="small muted">Loading the market description from Gamma...</span>
+      </div>
+    </section>
+
+    <section class="panel pad stack triage" aria-disabled="true">
+      <div class="actions">
+        <span class="badge t-n">Claude triage</span>
+        <span class="small muted" style="flex: 1 1 280px">Planned: a verdict, a p_true estimate and resolution-risk notes for each candidate.</span>
+        <button class="btn" type="button" disabled>Claude triage (planned)</button>
+      </div>
+    </section>
+  </div>
+
+  <aside class="side">
+    <form class="panel pad stack decision" method="post" action="/review/{{ cid }}/approve" style="gap: 14px">
+      {{ token_field() }}
+      <h2>Decision</h2>
+      <label class="field">
+        <span class="lbl">Your p_true for the favorite</span>
+        <input class="inp mono" name="p_true" value="{{ values.p_true }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
+        {{ field_error(errors, 'p_true') }}
+      </label>
+      <div id="ev" aria-live="polite">{% include "partials/review_ev.html" %}</div>
+      <label class="field">
+        <span class="lbl">Naked budget ($)</span>
+        <input class="inp mono" name="naked_budget" value="{{ values.naked_budget }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.naked_budget }}>
+        {{ field_error(errors, 'naked_budget') }}
+      </label>
+      <label class="field">
+        <span class="lbl">Capital cap ($)</span>
+        <input class="inp mono" name="capital" value="{{ values.capital }}" inputmode="decimal" autocomplete="off" placeholder="farmer default, now {{ farmer_capital | usd }}" {{ 'aria-invalid="true"' | safe if errors.capital }}>
+        {{ field_error(errors, 'capital') }}
+        <span class="hint">Blank uses the farmer's capital setting.</span>
+      </label>
+      <div hx-get="/partials/review/{{ cid }}/holdings" hx-trigger="load" hx-swap="innerHTML">
+        <div class="note-box small muted">Reading the wallet's holdings in this market...</div>
+      </div>
+      <button class="btn btn-strong" type="submit">{{ {'approved': 'Save terms', 'retired': 'Re-approve and start quoting'}.get(market.status, 'Approve and start quoting') }}</button>
+      {%- if market.status == 'approved' %}
+      <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/retire" formnovalidate onclick="return confirm('Retire this market? The farmer cancels its orders and stops managing it.')">Retire</button>
+      {%- else %}
+      <label class="field">
+        <span class="lbl">Reject note (optional)</span>
+        <input class="inp" name="note" value="{{ values.note }}" placeholder="e.g. resolution risk" maxlength="500" {{ 'aria-invalid="true"' | safe if errors.note }}>
+        {{ field_error(errors, 'note') }}
+      </label>
+      <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/reject">Reject</button>
+      {%- endif %}
+    </form>
+  </aside>
+</div>
+{% endblock %}

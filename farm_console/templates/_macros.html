@@ -1,0 +1,20 @@
+{%- macro region(url, trigger="sse:cycle") -%}
+<div hx-get="{{ url }}" hx-trigger="{{ trigger }}" hx-swap="innerHTML">{{ caller() }}</div>
+{%- endmacro -%}
+{%- macro token_field() -%}
+<input type="hidden" name="{{ TOKEN_FIELD }}" value="{{ token }}">
+{%- endmacro -%}
+{%- macro field_error(errors, name) -%}
+{%- if errors.get(name) %}<span class="field-error" role="alert">{{ errors[name] }}</span>{% endif -%}
+{%- endmacro -%}
+{#- Pause, naked leg, edit and retire for an approved market; a link to Review otherwise. -#}
+{%- macro market_controls(cid, name, status, paused, naked_paused, long=False) -%}
+{%- if status == 'approved' %}
+<button class="btn {{ 'btn-on' if paused }}" type="button" hx-post="/markets/{{ cid }}/paused" hx-vals='{"value": "{{ 0 if paused else 1 }}"}' hx-swap="none">{{ 'Resume' if paused else 'Pause' }}{{ ' quoting' if long }}</button>
+<button class="btn {{ 'btn-on' if naked_paused }}" type="button" hx-post="/markets/{{ cid }}/naked-paused" hx-vals='{"value": "{{ 0 if naked_paused else 1 }}"}' hx-swap="none">{{ 'Resume' if naked_paused else 'Pause' }} naked leg</button>
+<a class="btn" href="/review/{{ cid }}">Edit p_true / budget</a>
+<button class="btn btn-danger" type="button" hx-post="/markets/{{ cid }}/retire" hx-swap="none" hx-confirm="Retire &quot;{{ name }}&quot;? The farmer cancels its orders and stops managing it.">Retire</button>
+{%- else %}
+<a class="btn" href="/review/{{ cid }}">{{ 'Re-approve' if status == 'retired' else 'Review' }}</a>
+{%- endif %}
+{%- endmacro -%}

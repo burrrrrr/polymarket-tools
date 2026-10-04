@@ -49,7 +49,9 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                moment the flag clears and goes through the checks above.
   RETIRED      rewards removed, market closed or not accepting orders, no
                longer approved, or the expiry buffer reached. Terminal, and
-               checked before the pause.
+               checked before the pause. A market a human approves again
+               after the farmer saw it unapproved starts over from QUOTING
+               with fresh runtime state, through the same checks.
 
 Every state but QUOTING wants no orders, so the same reconcile step that
 maintains quotes also cancels them. Separately, a longshot fill (longshot
@@ -779,22 +781,14 @@ def position_view(held, baseline, farm):
     }
 
 
-def resting_price(view):
-    """The price a slot rests at once this cycle's actions land, or None."""
-    if view["decision"] == "hold":
-        return view["order"]["price"]
-    if view["decision"] in ("place", "replace"):
-        return view["target"]["price"]
-    return None
-
-
 def mid_sample(state):
     """The farm_mids row of a market's farm_state snapshot."""
-    return farm_db.MidSample(
-        state.condition_id, state.updated_at, state.mid, state.book_mid,
-        resting_price(state.slots[Slot.FAV_BID.name]),
-        resting_price(state.slots[Slot.LONG_BID.name]),
-    )
+    def price(slot):
+        order = farm_db.resting_order(state.slots[slot.name])
+        return order and order[0]
+
+    return farm_db.MidSample(state.condition_id, state.updated_at, state.mid,
+                             state.book_mid, price(Slot.FAV_BID), price(Slot.LONG_BID))
 
 
 def naked_used(position, orders):
@@ -1141,8 +1135,11 @@ class Farmer:
 
     def reload(self, now):
         rows = farm_db.load_approved(self.db)
-        for cid, managed in self.markets.items():
-            managed.approved = cid in rows
+        for cid, managed in list(self.markets.items()):
+            was_approved, managed.approved = managed.approved, cid in rows
+            if managed.state.phase is Phase.RETIRED and managed.approved and not was_approved:
+                # Re-approved after retiring: start over as if newly approved.
+                del self.markets[cid]
         for cid, row in rows.items():
             managed = self.markets.get(cid)
             if managed is not None and managed.state.phase is Phase.RETIRED:

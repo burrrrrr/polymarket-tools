@@ -143,6 +143,24 @@ class SettingsTest(ScratchDb):
         self.assertEqual(set(errors), {"min_fav"})
 
 
+    def test_scan_rows_are_not_farmer_settings(self):
+        conn = self.open()
+        farm_db.put_scan_params(conn, {"min_fav": 0.92}, NOW)
+        funnel = farm_db.ScanFunnel(NOW, 60.0, 10, 5, 2, {"window too short": 5}, {})
+        farm_db.store_scan(conn, [], [], NOW, funnel)
+        self.assertEqual(farm_db.load_settings(conn), ({}, {}))
+        self.assertEqual(farm_db.load_scan_params(conn), {"min_fav": 0.92})
+        self.assertEqual(farm_db.load_scan_funnel(conn), funnel)
+
+    def test_put_settings_writes_all_or_nothing(self):
+        conn = self.open()
+        with self.assertRaises(ValueError):
+            farm_db.put_settings(conn, {"bid_offset": 0.02, "keep_ratio": 5}, NOW)
+        self.assertEqual(farm_db.load_settings(conn), ({}, {}))
+        farm_db.put_settings(conn, {"bid_offset": 0.02, "keep_ratio": 0.5}, NOW)
+        self.assertEqual(farm_db.load_settings(conn)[0], {"bid_offset": 0.02, "keep_ratio": 0.5})
+
+
 def seed(conn, *condition_ids):
     farm_db.store_scan(conn, [
         farm_db.ScanRow(cid, cid, "?", NOW.isoformat(), 1.0, "{}") for cid in condition_ids
@@ -165,6 +183,25 @@ class ControlsTest(ScratchDb):
         farm_db.approve_market(conn, "0xa", 0.98, 25.0)
         row = farm_db.find_market(conn, "0xa")
         self.assertEqual((row["p_true"], row["capital_usd"]), (0.98, 200.0))
+
+    def test_set_approval_sets_exact_terms_and_re_approves(self):
+        conn = self.open()
+        seed(conn, "0xa")
+        farm_db.approve_market(conn, "0xa", 0.97, 25.0, 200.0)
+        farm_db.retire_market(conn, "0xa", "done")
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None)
+        row = farm_db.find_market(conn, "0xa")
+        self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"],
+                          row["capital_usd"]), ("approved", 0.98, 10.0, None))
+
+    def test_cancel_all_counts_the_markets_it_paused(self):
+        conn = self.open()
+        seed(conn, "0xa", "0xb")
+        for cid in ("0xa", "0xb"):
+            farm_db.approve_market(conn, cid, 0.97, 25.0)
+        farm_db.set_paused(conn, "0xb", True)
+        self.assertEqual(farm_db.cancel_all(conn), 1)
+        self.assertEqual(farm_db.cancel_all(conn), 0)
 
     def test_rescan_leaves_the_controls_alone(self):
         conn = self.open()

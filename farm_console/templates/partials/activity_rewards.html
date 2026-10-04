@@ -1,0 +1,29 @@
+<section class="stack" style="gap: 16px">
+  <div class="tiles">
+    <div class="panel tile"><span class="lbl">Earned today</span><span class="mono value">{{ vm.today_usd | usd if vm.today_usd is not none else 'n/a' }}</span><span class="note">{{ 'from the earnings API, UTC day' if vm.today_usd is not none else ('in dry run' if vm.mode != 'LIVE' else 'not fetched yet') }}</span></div>
+    <div class="panel tile"><span class="lbl">Last 7 days</span><span class="mono value">{{ vm.week_usd | usd if vm.week_usd is not none else 'n/a' }}</span><span class="note">from the earnings API</span></div>
+    <div class="panel tile"><span class="lbl">Screener estimate</span><span class="mono value">{{ vm.est_daily_usd | usd }}/day</span><span class="note">{{ vm.quoting }} quoting market{{ '' if vm.quoting == 1 else 's' }}</span></div>
+    <div class="panel tile"><span class="lbl">Realised vs estimate</span><span class="mono value">{{ '%.0f%%' % (vm.realised_ratio * 100) if vm.realised_ratio is not none else 'n/a' }}</span><span class="note">7-day average per day over the estimate</span></div>
+  </div>
+  <div class="panel pad stack">
+    <h2>Daily rewards by market</h2>
+    {{ chart | safe }}
+    {%- if legend %}
+    <div class="legend">{% for color, name in legend %}<span><i class="swatch box" style="background: {{ color }}"></i>{{ name | truncate(40, True) }}</span>{% endfor %}</div>
+    {%- endif %}
+  </div>
+  <div class="panel pad-table">
+    <div class="scroll">
+      <table class="tbl">
+        <thead><tr><th>Market</th><th>Screener estimate $/day</th><th>Scoring share now</th><th>Earned today</th><th>Earned 7d</th></tr></thead>
+        <tbody>
+          {%- for r in vm.rows %}
+          <tr><td><a href="/markets/{{ r.condition_id }}">{{ r.name | truncate(48, True) }}</a></td><td class="mono">{{ r.est_daily_usd | usd }}</td><td class="mono">{{ '%.2f%%' % r.scoring_pct if r.scoring_pct is not none else 'n/a' }}</td><td class="mono">{{ r.today_usd | usd }}</td><td class="mono">{{ r.week_usd | usd }}</td></tr>
+          {%- else %}
+          <tr><td colspan="5" class="muted">No managed markets.</td></tr>
+          {%- endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>

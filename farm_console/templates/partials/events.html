@@ -1,0 +1,7 @@
+<div class="stack" style="gap: 4px">
+  {%- for e in vm.events %}
+  <div class="mono feed"><span class="t">{{ e.at | clock }}</span><span class="{{ e.tone }} line" title="{{ e.text }}">{{ e.text }}</span></div>
+  {%- else %}
+  <div class="empty">No events yet. They appear here as the farmer places, cancels, and changes phase.</div>
+  {%- endfor %}
+</div>

@@ -1,0 +1,3 @@
+{%- if not chrome.liveness.running -%}
+<div class="banner" role="status"><span class="badge t-r">Not running</span><span>{{ chrome.liveness.message }}</span></div>
+{%- endif -%}

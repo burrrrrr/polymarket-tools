@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% from "_macros.html" import token_field, field_error %}
+{% block title %}Discover{% endblock %}
+{% block content %}
+{%- set f = vm.filters -%}
+<header class="page-head">
+  <div>
+    <h1>Discover</h1>
+    <p class="sub">{% if funnel %}Last scan {{ funnel.at | stamp_local }}, {{ '{:,}'.format(funnel.listed) }} reward markets. {% endif %}Rescanning never touches your decisions.</p>
+  </div>
+</header>
+
+<form class="panel pad stack" method="post" action="/discover/scan" style="gap: 14px">
+  {{ token_field() }}
+  <div class="page-head">
+    <h2>Scan parameters</h2>
+    <button class="btn btn-strong" type="submit" {{ 'disabled' if job.phase.value == 'running' }}>{{ 'Scan in progress' if job.phase.value == 'running' else 'Run scan' }}</button>
+  </div>
+  <div class="form-grid">
+    {%- for name, field in fields.items() %}
+    <label class="field">
+      <span class="lbl">{{ field.label }}</span>
+      <input class="inp mono" name="{{ name }}" value="{{ values.get(name, '') }}" inputmode="decimal" {{ 'aria-invalid="true"' | safe if errors.get(name) }}>
+      {{ field_error(errors, name) }}
+      <span class="hint">{{ field.hint }}</span>
+    </label>
+    {%- endfor %}
+  </div>
+  {%- if refused %}<p class="field-error" role="alert" style="margin: 0">{{ refused }}</p>{% endif %}
+  {% include "partials/scan_status.html" %}
+</form>
+
+<section class="panel pad stack" style="gap: 14px">
+  <h2>Last scan funnel</h2>
+  {%- if funnel %}
+  <div class="funnel">
+    <div><span class="lbl">Reward markets listed</span><span class="mono value">{{ '{:,}'.format(funnel.listed) }}</span></div>
+    <div><span class="lbl">Passed prefilter</span><span class="mono value">{{ '{:,}'.format(funnel.prefiltered) }}</span></div>
+    <div><span class="lbl">Assessed on the book</span><span class="mono value">{{ '{:,}'.format(funnel.assessed) }}</span></div>
+  </div>
+  <div class="actions" style="gap: 6px">
+    <span class="small muted">Prefilter skipped</span>
+    {%- for reason, n in funnel.prefilter_skips.items() %}<span class="badge t-n mono">{{ reason }} {{ '{:,}'.format(n) }}</span>{% endfor %}
+  </div>
+  <div class="actions" style="gap: 6px">
+    <span class="small muted">Book skipped</span>
+    {%- for reason, n in funnel.assess_skips.items() %}<span class="badge t-n mono">{{ reason }} {{ '{:,}'.format(n) }}</span>{% else %}<span class="small muted">none</span>{% endfor %}
+  </div>
+  <span class="small muted">Took {{ funnel.duration_s | span }}.</span>
+  {%- else %}
+  <div class="empty">No scan recorded yet. Run one above, or with <span class="mono">python reward_screener.py scan</span>.</div>
+  {%- endif %}
+</section>
+
+<section class="panel pad-table">
+  <form class="filters" method="get" action="/discover" style="padding: 0 18px 14px">
+    <div class="seg" role="group" aria-label="Mode filter">
+      <a class="{{ 'on' if not f.mode }}" href="/discover{{ f.query(mode=None) }}">All</a>
+      {%- for m in modes %}
+      <a class="{{ 'on' if f.mode == m }}" href="/discover{{ f.query(mode=m) }}">{{ m | title }}</a>
+      {%- endfor %}
+    </div>
+    {%- if f.mode %}<input type="hidden" name="mode" value="{{ f.mode }}">{% endif %}
+    <label class="grow-field"><span class="sr">Search question or slug</span><input class="inp" name="q" value="{{ f.q }}" placeholder="Search question or slug"></label>
+    <label class="small muted">Status
+      <select class="inp" name="status">
+        {%- for s in statuses %}<option value="{{ s }}" {{ 'selected' if s == f.status }}>{{ s }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="small muted">Min days
+      <input class="inp mono" name="min_days" value="{{ f.min_days | number_text if f.min_days is not none else '' }}" inputmode="decimal" style="width: 80px">
+    </label>
+    <button class="btn" type="submit">Filter</button>
+  </form>
+  <div class="small muted" style="padding: 0 18px 10px">{{ '{:,}'.format(vm.total) }} market{{ '' if vm.total == 1 else 's' }} · ranked by yield × days to cutoff (90d cap) · page {{ f.page }} of {{ vm.pages }}</div>
+  <div class="scroll">
+    <table class="tbl">
+      <thead><tr><th>#</th><th>Mode</th><th>Favorite</th><th>Pool $/d</th><th>Band</th><th>Est $/d</th><th>Capital</th><th>APR</th><th>Days</th><th>Ahead</th><th>Vol 24h</th><th>Status</th><th>Market</th></tr></thead>
+      <tbody>
+        {%- for r in vm.rows %}
+        <tr>
+          <td class="mono muted">{{ r.rank }}</td>
+          <td><span class="badge {{ r.mode_tone }}">{{ r.mode or '--' }}</span></td>
+          <td class="mono">{{ r.fav }}</td>
+          <td class="mono">{{ '%.0f' % r.pool if r.pool is not none else '--' }}</td>
+          <td class="mono">{{ r.v | cents }}</td>
+          <td class="mono">{{ '%.2f' % r.est_daily_usd if r.est_daily_usd is not none else '--' }}</td>
+          <td class="mono">{{ '%.0f' % r.capital_usd if r.capital_usd is not none else '--' }}</td>
+          <td class="mono">{{ '{:,.0f}%'.format(r.apr * 100) if r.apr is not none else '--' }}</td>
+          <td class="mono">{{ '%.0f' % r.days if r.days is not none else '--' }}</td>
+          <td class="mono">{{ '%.1f' % r.ahead if r.ahead is not none else '--' }}</td>
+          <td class="mono">{{ r.volume }}</td>
+          <td><span class="badge {{ r.status_tone }}">{{ r.status }}</span></td>
+          <td class="wrap" style="min-width: 260px"><a href="/review/{{ r.condition_id }}">{{ r.name }}</a></td>
+        </tr>
+        {%- else %}
+        <tr><td colspan="13" class="muted">No markets match.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  <nav class="pager" aria-label="Pages">
+    {%- if f.page > 1 %}<a class="btn" href="/discover{{ f.query(page=f.page - 1) }}">Previous</a>{% endif %}
+    {%- if f.page < vm.pages %}<a class="btn" href="/discover{{ f.query(page=f.page + 1) }}">Next</a>{% endif %}
+  </nav>
+  <p class="small muted" style="margin: 4px 18px 12px">Days count to the farmer's cutoff (end date minus its expiry buffer). APR assumes the book stays as scanned and nobody reacts to your quotes. Treat it as a ranking, not a forecast.</p>
+</section>
+{% endblock %}

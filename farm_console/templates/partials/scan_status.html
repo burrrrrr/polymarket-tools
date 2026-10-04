@@ -1,0 +1,19 @@
+{%- set phase = job.phase.value -%}
+{%- if phase == 'running' %}
+<div id="scan-status" class="scan-status running" role="status" hx-get="/partials/discover/scan" hx-trigger="every 2s" hx-swap="outerHTML">
+  <span class="dot pulse"></span>
+  <span>Scanning: {{ job.stage }} · {{ ((now - job.started_at).total_seconds()) | span }} so far. A scan takes about a minute.</span>
+</div>
+{%- elif phase == 'done' %}
+<div id="scan-status" class="scan-status done" role="status">
+  <span class="badge t-q">Done</span>
+  <span>Scan from {{ job.started_at | clock }} finished in {{ ((job.finished_at - job.started_at).total_seconds()) | span }}: {{ '{:,}'.format(job.funnel.listed) }} listed, {{ '{:,}'.format(job.funnel.prefiltered) }} passed the prefilter, {{ '{:,}'.format(job.funnel.assessed) }} assessed and stored.</span>
+</div>
+{%- elif phase == 'failed' %}
+<div id="scan-status" class="scan-status failed" role="alert">
+  <span class="badge t-r">Failed</span>
+  <span>Scan from {{ job.started_at | clock }} failed after {{ ((job.finished_at - job.started_at).total_seconds()) | span }} while {{ job.stage or 'starting' }}: {{ job.error }}. Nothing was stored.</span>
+</div>
+{%- else %}
+<div id="scan-status"></div>
+{%- endif %}

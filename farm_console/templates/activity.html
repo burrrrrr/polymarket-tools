@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region %}
+{% block title %}Activity{% endblock %}
+{% block content %}
+<header>
+  <h1>Activity</h1>
+  <p class="sub">Rewards earned, fills, inventory, and every order action the farmer took.</p>
+</header>
+<nav class="tabs" aria-label="Activity">
+  {%- for key, label in (('rewards', 'Rewards'), ('fills', 'Fills'), ('inventory', 'Inventory'), ('log', 'Order log')) %}
+  <a href="/activity?tab={{ key }}" class="{{ 'on' if tab == key }}" {{ 'aria-current="page"' | safe if tab == key }}>{{ label }}</a>
+  {%- endfor %}
+</nav>
+{%- if tab == 'log' and before %}
+{# An older page of the log stays put; only the newest page follows the farmer. #}
+<div>{% include "partials/activity_log.html" %}</div>
+{%- else %}
+{%- set query = request.url.query %}
+{% call region("/partials/activity?" ~ query if query else "/partials/activity?tab=" ~ tab, "sse:farm-event" if tab in ('fills', 'log') else "sse:cycle") %}{% include "partials/activity_" ~ tab ~ ".html" %}{% endcall %}
+{%- endif %}
+{% endblock %}

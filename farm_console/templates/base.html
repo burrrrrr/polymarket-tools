@@ -1,0 +1,39 @@
+{% from "_macros.html" import region %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="console-token" content="{{ token }}">
+<title>Reward Farm · {% block title %}{% endblock %}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/htmx.min.js"></script>
+<script src="/static/sse.min.js"></script>
+</head>
+<body hx-ext="sse" sse-connect="/stream" hx-headers='{"{{ TOKEN_HEADER }}": "{{ token }}"}'>
+<div class="shell">
+  <nav class="nav">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#E6E3DD" stroke-width="1.6" aria-hidden="true"><path d="M3 20h18"/><path d="M6 20V10"/><path d="M12 20V4"/><path d="M18 20v-7"/></svg>
+      <span>Reward Farm</span>
+    </div>
+    <a href="/" class="{{ 'on' if page == 'overview' }}">Overview</a>
+    <a href="/discover" class="{{ 'on' if page == 'discover' }}">Discover</a>
+    <a href="/review" class="{{ 'on' if page == 'review' }}">Review queue <span class="badge t-n count">{{ chrome.candidates }}</span></a>
+    <a href="/markets" class="{{ 'on' if page == 'markets' }}">Live markets <span class="badge t-q count">{{ chrome.quoting }}</span></a>
+    <a href="/activity" class="{{ 'on' if page == 'activity' }}">Activity</a>
+    <a href="/settings" class="{{ 'on' if page == 'settings' }}">Settings</a>
+    <div class="status">
+      {% call region("/partials/chrome/status", "sse:cycle, sse:status, every 15s") %}{% include "partials/status.html" %}{% endcall %}
+    </div>
+  </nav>
+  <main>
+    {% call region("/partials/chrome/banner", "sse:cycle, sse:status, every 15s") %}{% include "partials/banner.html" %}{% endcall %}
+    {% block content %}{% endblock %}
+  </main>
+</div>
+</body>
+</html>

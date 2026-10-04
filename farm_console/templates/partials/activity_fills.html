@@ -1,0 +1,25 @@
+<section class="panel pad stack" style="gap: 12px">
+  {%- if vm %}
+  <div class="scroll">
+    <table class="tbl">
+      <thead><tr><th>Time</th><th>Market</th><th>Slot</th><th>Price (approx.)</th><th>Size</th><th>Edge vs p_true (approx.)</th><th>Effect</th></tr></thead>
+      <tbody>
+        {%- for f in vm %}
+        <tr>
+          <td class="mono">{{ f.at | stamp_local }}</td>
+          <td><a href="/markets/{{ f.condition_id }}">{{ f.name | truncate(40, True) }}</a></td>
+          <td><span class="badge {{ f.tone }}">{{ f.slot }}</span></td>
+          <td class="mono">{{ f.price | cents }}</td>
+          <td class="mono">{{ f.size | shares }}</td>
+          <td class="mono {{ 'c-good' if f.edge is not none and f.edge > 0 else ('c-bad' if f.edge is not none else '') }}">{{ f.edge | cents if f.edge is not none else '--' }}</td>
+          <td class="wrap muted">{{ f.effect }}</td>
+        </tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  <span class="small muted">Fill prices are approximate. The data API reports no fills, so the farmer infers them from position changes and prices each at the order that rested in its slot at the previous cycle. Edge is p_true minus that price, for favorite-bid fills only.</span>
+  {%- else %}
+  <div class="empty">No fills yet. Favorite-bid fills show their edge against your p_true. Longshot-bid fills are flagged and pause that market's naked leg.</div>
+  {%- endif %}
+</section>

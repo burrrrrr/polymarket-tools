@@ -1,0 +1,27 @@
+<section class="panel pad stack" style="gap: 6px">
+  <form class="filters" method="get" action="/activity">
+    <input type="hidden" name="tab" value="log">
+    <label class="small muted">Kind
+      <select class="inp" name="kind">
+        <option value="">all</option>
+        {%- for k in vm.kinds %}<option value="{{ k }}" {{ 'selected' if k == vm.kind }}>{{ k }}</option>{% endfor %}
+      </select>
+    </label>
+    <label class="small muted">Market
+      <select class="inp" name="condition_id">
+        <option value="">all</option>
+        {%- for cid, name in vm.markets %}<option value="{{ cid }}" {{ 'selected' if cid == vm.condition_id }}>{{ name | truncate(50, True) }}</option>{% endfor %}
+      </select>
+    </label>
+    <button class="btn" type="submit">Filter</button>
+    {%- if before %}<a class="small" href="/activity?tab=log{{ '&kind=' ~ vm.kind if vm.kind }}{{ '&condition_id=' ~ vm.condition_id if vm.condition_id }}">Newest</a>{% endif %}
+  </form>
+  {%- for e in vm.events %}
+  <div class="mono feed"><span class="t">#{{ e.id }} {{ e.at | stamp_local }}</span><span class="kind">{{ e.kind }}</span><span class="{{ e.tone }}">{{ e.detail }}</span></div>
+  {%- else %}
+  <div class="empty">No events match.</div>
+  {%- endfor %}
+  {%- if vm.older_than %}
+  <a class="small" style="margin-top: 8px" href="/activity?tab=log&before={{ vm.older_than }}{{ '&kind=' ~ vm.kind if vm.kind }}{{ '&condition_id=' ~ vm.condition_id if vm.condition_id }}">Older events</a>
+  {%- endif %}
+</section>

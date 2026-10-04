@@ -1,0 +1,40 @@
+<section class="panel pad stack" style="gap: 14px">
+  <div class="page-head" style="align-items: flex-start">
+    <div class="stack" style="gap: 4px">
+      <h2>Farmer process</h2>
+      {%- if status %}
+      <span class="mono small c-mut">{{ live.mode }} · {{ 'running' if live.running else 'not running' }} · pid {{ status.pid }} · {{ status.managed }} market{{ '' if status.managed == 1 else 's' }} managed</span>
+      {%- else %}
+      <span class="small muted">The farmer has never run against this database.</span>
+      {%- endif %}
+    </div>
+    <button class="btn" type="button" hx-post="/farmer/stop" hx-target="closest div[hx-get]" hx-swap="innerHTML" hx-confirm="Stop the farmer? A live farmer cancels the orders on its managed markets before it exits. Starting it again needs the terminal." {{ 'disabled' if not live.running }}>Stop farmer</button>
+  </div>
+  {%- if status %}
+  <dl class="facts">
+    <div><dt>Mode</dt><dd class="mono">{{ live.mode }}</dd></div>
+    <div><dt>Started</dt><dd class="mono">{{ status.started_at | stamp_local }}</dd></div>
+    <div><dt>Last cycle</dt><dd class="mono">{{ status.last_cycle_at | stamp_local }}</dd></div>
+    <div><dt>Interval</dt><dd class="mono">{{ status.interval_s | number_text }}s</dd></div>
+    <div><dt>Heartbeat</dt><dd class="mono">{{ 'on' if status.heartbeat else 'off' }}</dd></div>
+    {%- if status.stopped_at %}<div><dt>Stopped</dt><dd class="mono">{{ status.stopped_at | stamp_local }}</dd></div>{% endif %}
+  </dl>
+  {%- endif %}
+  {%- if stop %}
+  <div class="note-box small" role="status">
+    {%- if stop.consumed_at %}
+    Stop command {{ stop.id }} sent {{ stop.at | stamp_local }} was consumed at {{ stop.consumed_at | stamp_local }}: {{ stop.result }}.
+    {%- else %}
+    Stop command {{ stop.id }} sent {{ stop.at | stamp_local }} is waiting for the farmer's next cycle.
+    {%- endif %}
+  </div>
+  {%- endif %}
+  <div class="note-box hint">
+    <strong class="c-mut">Heartbeat dead-man switch ({{ 'on' if status and status.heartbeat else 'off' }}).</strong>
+    If the farmer stops sending heartbeats for 10s, Polymarket cancels every open order owned by these API credentials. That may include orders from your other tools. Test the scope before turning this on. It is set by <span class="mono">--heartbeat</span> when the farmer starts.
+  </div>
+  <div class="stack" style="gap: 6px">
+    <span class="hint">To go live, stop this farmer, then run this in a terminal. The farmer unlocks the private key from Bitwarden there; the console never handles keys.</span>
+    <code class="cmd">python reward_farmer.py --live --db {{ db_path }}</code>
+  </div>
+</section>

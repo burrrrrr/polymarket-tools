@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region, token_field, field_error %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<header>
+  <h1>Farmer control and settings</h1>
+  <p class="sub">Parameter changes apply on the farmer's next cycle. Going live needs the key unlocked in the farmer's terminal, so it never starts from here.</p>
+</header>
+{%- if notice %}<div class="notice" role="status">{{ notice }}</div>{% endif %}
+
+{% call region("/partials/settings/farmer", "sse:cycle, sse:status, every 5s") %}{% include "partials/settings_farmer.html" %}{% endcall %}
+
+{%- for group, rows in groups %}
+<form class="panel pad stack" method="post" action="/settings/group/{{ group }}" id="group-{{ group }}" style="gap: 14px">
+  {{ token_field() }}
+  <div class="page-head">
+    <h2>{{ group }}</h2>
+    <button class="btn btn-strong" type="submit">Save {{ group | lower }}</button>
+  </div>
+  <div class="form-grid wide">
+    {%- for r in rows %}
+    <div class="field">
+      <label class="lbl" for="s-{{ r.key }}">{{ r.label }}</label>
+      <div class="input-row">
+        <input class="inp mono" id="s-{{ r.key }}" name="{{ r.key }}" value="{{ r.text }}" inputmode="decimal" autocomplete="off" {{ 'aria-invalid="true"' | safe if r.error }}>
+        {%- if r.source == 'override' %}
+        <button class="btn small-btn" type="submit" formaction="/settings/reset/{{ r.key }}" title="Delete the override">Reset</button>
+        {%- endif %}
+      </div>
+      {{ field_error({r.key: r.error}, r.key) }}
+      <span class="hint"><span class="badge {{ 't-c' if r.source == 'override' else 't-n' }}">{{ {'override': 'override', 'farmer': "farmer's value", 'default': 'default'}[r.source] }}</span> <span class="mono">{{ r.key }}</span>. {{ r.hint }}</span>
+    </div>
+    {%- endfor %}
+  </div>
+</form>
+{%- endfor %}
+
+<form class="panel pad stack danger-zone" method="post" action="/farmer/cancel-all" style="gap: 12px">
+  {{ token_field() }}
+  <h2>Danger zone: cancel all managed orders</h2>
+  <span class="hint">Pauses every approved market. The farmer cancels all their orders on its next cycle and keeps them down until you resume each market. Orders on markets the farmer does not manage are left alone.</span>
+  <div class="actions">
+    <label class="grow-field"><span class="sr">Type CANCEL to confirm</span><input class="inp mono" name="confirm" placeholder="Type CANCEL to confirm" autocomplete="off" {{ 'aria-invalid="true"' | safe if cancel_error }}></label>
+    <button class="btn btn-danger" type="submit">Cancel all</button>
+  </div>
+  {%- if cancel_error %}<span class="field-error" role="alert">{{ cancel_error }}</span>{% endif %}
+</form>
+{% endblock %}
