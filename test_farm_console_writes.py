@@ -18,10 +18,15 @@ from reward_screener import Levels, RewardMarket, ScreenConfig
 from test_farm_console import A, B, C, ORIGIN, Console
 
 # Favorite mid 0.96, tick 0.001: the longshot bid must sit at 1.7c to score (BUDGET),
-# and the favorite bid rests at 95.0c.
-BUDGET_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
-# Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at 98.0c.
-FLOOR_BOOK = Levels(bids=[(0.985, 1000.0)], asks=[(0.995, 1000.0)], tick=0.001)
+# and the favorite bid rests at 94.9c. Each book's deepest bid sits outside the
+# band, so it scores nothing but keeps the midpoint above min_fav (not fragile).
+BUDGET_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0), (0.90, 1000.0)],
+                     asks=[(0.97, 1000.0)], tick=0.001)
+# Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at 97.9c.
+FLOOR_BOOK = Levels(bids=[(0.985, 1000.0), (0.95, 1000.0)], asks=[(0.995, 1000.0)],
+                    tick=0.001)
+# Its favorite fell since the scan: mid 0.885 is under min_fav, so the farmer would not quote.
+FALLEN_BOOK = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
 
 
 def assessed_row(cid, slug, book, now, rank, question=None, days=100):
@@ -86,7 +91,7 @@ class SecurityTest(Writes):
         for url, data in ((f"/markets/{A}/paused", {"value": "1"}),
                           ("/farmer/cancel-all", {"confirm": "CANCEL"}),
                           ("/farmer/stop", {}),
-                          ("/review/0xddd/approve", {"p_true": "0.97", "naked_budget": "25"})):
+                          ("/review/0xddd/approve", {"p_true": "97", "naked_budget": "25"})):
             with self.subTest(url=url):
                 self.assertEqual(self.client.post(url, data=data).status_code, 403)
         self.assertEqual(self.snapshot_markets(), before)
@@ -175,6 +180,14 @@ class FakeRemote:
         self.fail_rules = False
         self.position = reward_farmer.Position(12.0, 0.951, 0.0, 0.0)
         self.fail_position = False
+        self.book = BUDGET_BOOK
+        self.books = {}
+        self.book_calls = 0
+        self.fail_book = False
+        self.native_rates = {}
+        self.total_rates = {}
+        self.totals_gate = threading.Event()
+        self.totals_gate.set()
 
     def rules(self, condition_id):
         self.rule_calls += 1
@@ -188,6 +201,21 @@ class FakeRemote:
             raise ConnectionError("data api down")
         return self.position
 
+    def info(self, condition_id):
+        return reward_farmer.MarketInfo((f"tok-{condition_id}", "tok-long"),
+                                        self.native_rates.get(condition_id, 50.0), 0.035, 20.0,
+                                        0.001, False, True, False)
+
+    def totals(self):
+        self.totals_gate.wait(5)
+        return dict(self.total_rates)
+
+    def levels(self, token_id):
+        self.book_calls += 1
+        if self.fail_book:
+            raise ConnectionError("clob unreachable")
+        return self.books.get(token_id, self.book)
+
 
 class ReviewTest(Writes):
     def app_kwargs(self):
@@ -198,7 +226,8 @@ class ReviewTest(Writes):
         def clock():
             return self.clock[0] or utc_now()
         return {"fetch_rules": self.remote.rules, "fetch_position": self.remote.holdings,
-                "funder": "0xme", "clock": clock}
+                "fetch_info": self.remote.info, "fetch_book": self.remote.levels,
+                "fetch_total_rates": self.remote.totals, "funder": "0xme", "clock": clock}
 
     def test_review_opens_the_top_ranked_candidate(self):
         resp = self.client.get("/review", follow_redirects=False)
@@ -210,20 +239,185 @@ class ReviewTest(Writes):
         self.assertIn('href="/review/0xddd">Previous', page)
         self.assertIn('href="/review/0xfff">Next', page)
 
-    def test_page_shows_plan_strip_stats_and_decision(self):
+    def test_page_shows_live_region_stats_and_decision(self):
         page = self.client.get("/review/0xddd").text
-        for needle in ("BUDGET", "BUY No 95.0c", "BUY Yes 1.7c", "best bid 95.0c",
-                       "our bid 95.0c", "Claude triage (planned)", "Approve and start quoting",
-                       "Est $/day", "Reject"):
+        self.assertIn('name="naked_budget" value="10"', page)
+        self.assertIn('type="number" min="1" max="99" step="1"', page)
+        mid = json.loads(self.row("0xddd")["metrics"])["book_mid"]
+        self.assertIn(f'data-start="{round(mid * 100)}"', page)
+        for needle in ("BUDGET", "Claude triage (planned)", "Approve and start quoting",
+                       "Est $/day", "Reject", 'hx-get="/partials/review/0xddd/live"',
+                       "every 5s [document.visibilityState === 'visible']",
+                       'hx-include="#d-p_true, #d-naked_budget, #d-capital"'):
             self.assertIn(needle, page)
         self.assertIn('hx-trigger="input changed delay:300ms"', page)
 
+    def live(self, cid="0xddd", **terms):
+        terms = {"p_true": "97", "naked_budget": "25", "capital": "", **terms}
+        return self.client.get(f"/partials/review/{cid}/live", params=terms).text
+
+    def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
+        text = self.live()
+        for needle in ("Buy No 94.9c", "Buy Yes 1.7c", "bid at 94.9c", "ask at 98.3c",
+                       "our bid 94.9c", "best bid 95.5c", "best ask 97.0c",
+                       "longshot bid (mirror) 98.3c"):
+            self.assertIn(needle, text)
+        fm = reward_farmer.farm_market(
+            {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
+             "capital_usd": None}, self.remote.info("0xddd"),
+            reward_farmer.config_from(reward_farmer.build_parser().parse_args([])))
+        target = reward_farmer.target_orders(fm, BUDGET_BOOK, reward_farmer.Position(),
+                                             reward_farmer.config_from(
+                                                 reward_farmer.build_parser().parse_args([])),
+                                             True)
+        self.assertEqual([i.slot.name for i in target.intents], ["FAV_BID", "LONG_BID"])
+        for intent in target.intents:
+            self.assertIn(f"{intent.slot.name} {views.shares(intent.size)}</td>", text)
+
+    def test_live_plan_follows_the_terms_being_typed(self):
+        full = self.live()
+        capped = self.live(capital="100")
+        self.assertNotEqual(re.findall(r"FAV_BID ([\d,.]+)</td>", full),
+                            re.findall(r"FAV_BID ([\d,.]+)</td>", capped))
+        self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
+        self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
+        self.assertIn("Buy No 93.0c", self.live(p_true="95"))
+
+    def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
+        from farm_console.app import utc_now
+        start = utc_now()
+        self.clock[0] = start
+        self.live()
+        self.live(capital="100")
+        self.assertEqual(self.remote.book_calls, 1)
+        self.clock[0] = start + timedelta(seconds=3)
+        self.remote.fail_book = True
+        self.assertIn("Could not read the live book: ConnectionError: clob unreachable",
+                      self.live())
+        self.remote.fail_book = False
+        self.assertIn("Buy No 94.9c", self.live())
+
+    def test_live_region_of_a_managed_market_shows_the_book_without_a_plan(self):
+        text = self.live(A)
+        self.assertIn("The farmer manages this market", text)
+        self.assertNotIn("Buy No", text)
+        self.assertIn("midpoint", text)
+
     def test_approve_candidate_writes_terms_and_goes_to_the_next(self):
-        resp = self.post("/review/0xddd/approve", p_true="0.97", naked_budget="30", capital="")
+        resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="")
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/review/0xeee"))
         row = self.row("0xddd")
         self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"], row["capital_usd"]),
                          ("approved", 0.97, 30.0, None))
+
+    def test_approve_start_paused_pauses_and_goes_to_the_market(self):
+        self.assertIn('name="start_paused"', self.client.get("/review/0xddd").text)
+        resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                         start_paused="1")
+        self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/markets/0xddd"))
+        self.assertEqual((self.row("0xddd")["status"], self.row("0xddd")["paused"]), ("approved", 1))
+        self.assertEqual(self.row("0xeee")["paused"], 0)
+        self.assertNotIn('name="start_paused"', self.client.get("/review/0xddd").text)
+
+    def test_queue_filters_by_mode_and_keeps_the_mode_through_decisions(self):
+        resp = self.client.get("/review?mode=floor", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0xeee?mode=floor")
+        page = self.client.get("/review/0xeee?mode=floor").text
+        self.assertIn("1 of 2 undecided floor candidates", page)
+        self.assertIn('href="/review/0xfff?mode=floor">Next', page)
+        self.assertIn('<input type="hidden" name="queue_mode" value="floor">', page)
+        self.assertIn('hx-get="/partials/review/0xeee/live?mode=floor"', page)
+        self.assertIn("undecided floor candidates · this market is candidate, budget",
+                      self.client.get("/review/0xddd?mode=floor").text)
+        resp = self.post("/review/0xeee/reject", note="", queue_mode="floor")
+        self.assertEqual(resp.headers["location"], "/review/0xfff?mode=floor")
+        resp = self.post("/review/0xfff/reject", note="", queue_mode="floor")
+        self.assertEqual(resp.headers["location"], "/review?mode=floor")
+        self.assertEqual(self.client.get("/review?mode=bogus").status_code, 422)
+
+    def test_a_candidate_that_would_not_quote_now_offers_to_skip(self):
+        self.remote.books["tok-0xddd"] = FALLEN_BOOK
+        text = self.live(mode="budget")
+        self.assertIn("Wouldn't quote now", text)
+        self.assertIn("the midpoint 88.5c is under min_fav 90.0c", text)
+        self.assertIn('href="/review/0xddd/next-quotable?mode=budget">Skip to next quotable',
+                      text)
+        self.assertNotIn("Wouldn't quote now", self.live("0xeee"))
+
+    def test_skip_goes_to_the_next_candidate_the_farmer_would_quote(self):
+        from farm_console.app import utc_now
+        start = utc_now()
+        self.clock[0] = start
+        self.remote.books["tok-0xeee"] = FALLEN_BOOK
+        resp = self.client.get("/review/0xddd/next-quotable", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0xfff?skipped=1")
+        self.assertIn("Skipped 1 candidate that wouldn't quote now.",
+                      self.client.get("/review/0xfff?skipped=1").text)
+        self.remote.books["tok-0xfff"] = FALLEN_BOOK
+        self.clock[0] = start + timedelta(seconds=3)
+        resp = self.client.get("/review/0xddd/next-quotable", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review")
+
+    def rewards_end_for(self, *cids, sponsored=()):
+        """Native rates of 0 for cids, and a loaded total listing naming only sponsored."""
+        self.remote.native_rates.update({cid: 0.0 for cid in cids})
+        self.remote.total_rates = {"0xelsewhere": 1.0, **{cid: 5.0 for cid in sponsored}}
+        self.app.state.total_rates.refresh()
+
+    def discover_ids(self):
+        return re.findall(r'<a href="/review/(0x\w+)">', self.client.get("/discover").text)
+
+    def test_a_candidate_whose_rewards_ended_leaves_the_queue_and_discover(self):
+        self.assertIn("0xeee", self.discover_ids())
+        self.rewards_end_for("0xeee")
+        text = self.live("0xeee")
+        self.assertIn("Wouldn't quote now", text)
+        self.assertIn("The farmer would not quote: rewards removed. "
+                      "It has left the review queue.", text)
+        self.assertIn('href="/review/0xeee/next-quotable">Skip to next quotable', text)
+        self.assertEqual(self.row("0xeee")["rewards_active"], 0)
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xfff"])
+        self.assertNotIn("0xeee", self.discover_ids())
+        resp = self.client.get("/review/0xeee/next-quotable", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0xfff")
+
+    def test_sponsored_rewards_keep_a_candidate_and_returning_rewards_restore_one(self):
+        farm_db.set_rewards_active(self.db, "0xeee", False)
+        self.rewards_end_for("0xeee", sponsored=["0xeee"])
+        text = self.live("0xeee")
+        self.assertNotIn("rewards removed", text)
+        self.assertIn("Buy No", text)
+        self.assertEqual(self.row("0xeee")["rewards_active"], 1)
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xeee", "0xfff"])
+
+    def test_rewards_unknown_until_the_totals_land_writes_nothing(self):
+        farm_db.set_rewards_active(self.db, "0xfff", False)
+        self.remote.native_rates.update({"0xeee": 0.0, "0xfff": 0.0})
+        self.remote.total_rates = {"0xelsewhere": 1.0}
+        self.remote.totals_gate.clear()
+        self.addCleanup(self.remote.totals_gate.set)
+        self.assertIsNone(self.app.state.total_rates.get())
+        text = self.live("0xeee")
+        self.assertNotIn("rewards removed", text)
+        self.assertIn("Buy No", text)
+        self.live("0xfff")
+        self.assertEqual((self.row("0xeee")["rewards_active"], self.row("0xfff")["rewards_active"]),
+                         (1, 0))
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xeee"])
+
+    def test_skip_passes_over_a_candidate_whose_rewards_ended_and_records_it(self):
+        self.rewards_end_for("0xeee")
+        resp = self.client.get("/review/0xddd/next-quotable", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0xfff?skipped=1")
+        self.assertEqual(self.row("0xeee")["rewards_active"], 0)
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xfff"])
+
+    def test_the_console_never_writes_rewards_of_a_market_the_farmer_manages(self):
+        self.rewards_end_for(A, "0xeee")
+        self.live(A)
+        self.live("0xeee")
+        self.assertEqual((self.row(A)["rewards_active"], self.row("0xeee")["rewards_active"]),
+                         (1, 0))
 
     def test_last_candidate_decided_goes_to_the_previous_then_the_empty_queue(self):
         resp = self.post("/review/0xfff/reject", note="")
@@ -238,17 +432,18 @@ class ReviewTest(Writes):
         farm_db.set_approval(self.db, A, 0.99, 25.0, 200.0)
         page = self.client.get(f"/review/{A}").text
         self.assertIn('value="200"', page)
+        self.assertIn('name="p_true" value="99"', page)
         self.assertIn("Save terms", page)
-        resp = self.post(f"/review/{A}/approve", p_true="0.985", naked_budget="10", capital="")
+        resp = self.post(f"/review/{A}/approve", p_true="98", naked_budget="10", capital="")
         self.assertEqual(resp.headers["location"], f"/markets/{A}")
         row = self.row(A)
         self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"], row["capital_usd"]),
-                         ("approved", 0.985, 10.0, None))
+                         ("approved", 0.98, 10.0, None))
 
     def test_re_approving_a_retired_market_makes_it_approved(self):
         self.post(f"/markets/{A}/retire")
         self.assertIn("Re-approve and start quoting", self.client.get(f"/review/{A}").text)
-        self.post(f"/review/{A}/approve", p_true="0.99", naked_budget="25", capital="150")
+        self.post(f"/review/{A}/approve", p_true="99", naked_budget="25", capital="150")
         row = self.row(A)
         self.assertEqual((row["status"], row["capital_usd"]), ("approved", 150.0))
 
@@ -263,13 +458,15 @@ class ReviewTest(Writes):
     def test_invalid_decisions_show_inline_errors_and_write_nothing(self):
         before = self.snapshot_markets()
         for fields, message in (
-            ({"p_true": "1.2", "naked_budget": "25"}, "strictly between 0 and 1"),
-            ({"p_true": "0", "naked_budget": "25"}, "strictly between 0 and 1"),
-            ({"p_true": "abc", "naked_budget": "25"}, "strictly between 0 and 1"),
-            ({"p_true": "nan", "naked_budget": "25"}, "strictly between 0 and 1"),
-            ({"p_true": "0.97", "naked_budget": "-1"}, "0 or more"),
-            ({"p_true": "0.97", "naked_budget": ""}, "0 or more"),
-            ({"p_true": "0.97", "naked_budget": "25", "capital": "0"}, "positive amount"),
+            ({"p_true": "100", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "0", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "0.97", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "97.5", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "abc", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "nan", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "97", "naked_budget": "-1"}, "0 or more"),
+            ({"p_true": "97", "naked_budget": ""}, "0 or more"),
+            ({"p_true": "97", "naked_budget": "25", "capital": "0"}, "positive amount"),
         ):
             with self.subTest(fields=fields):
                 resp = self.post("/review/0xddd/approve", **fields)
@@ -287,26 +484,39 @@ class ReviewTest(Writes):
                                params={"p_true": p_true, "naked_budget": budget}).text
 
     def test_ev_check_uncapped_capped_and_out_of_band(self):
-        self.assertIn("Planned bid 95.0c is at or under your cap of 96.0c", self.ev("0xddd", "0.97"))
-        capped = self.ev("0xddd", "0.955")
-        self.assertIn("Planned bid 95.0c is above your cap of 94.5c (p_true minus 1.0c). "
-                      "The farmer bids 94.5c instead, which scores 0.327", capped)
+        self.assertIn("Planned bid 94.9c is at or under your cap of 95.0c", self.ev("0xddd", "97"))
+        capped = self.ev("0xddd", "96")
+        self.assertIn("Planned bid 94.9c is above your cap of 94.0c (p_true minus 2.0c). "
+                      "The farmer bids 94.0c instead, which scores 0.184", capped)
         self.assertIn('class="ev c-warn"', capped)
-        self.assertIn("outside the reward band", self.ev("0xddd", "0.93"))
-        self.assertIn("strictly between 0 and 1", self.ev("0xddd", "1.5"))
+        self.assertIn("outside the reward band", self.ev("0xddd", "93"))
+        self.assertIn("whole percent from 1 to 99", self.ev("0xddd", "150"))
 
     def test_ev_check_uses_the_effective_ev_margin(self):
         farm_db.put_setting(self.db, "ev_margin", 0.025, self.now)
-        self.assertIn("Planned bid 95.0c is above your cap of 94.5c (p_true minus 2.5c)",
-                      self.ev("0xddd", "0.97"))
+        self.assertIn("Planned bid 94.9c is above your cap of 94.5c (p_true minus 2.5c)",
+                      self.ev("0xddd", "97"))
+
+    def test_ev_check_scores_the_capped_bid_against_the_mid_it_creates(self):
+        # Book 93.4c / 99.0c with v 8.5c. The old plan's 97.0c bid created a 98.0c
+        # midpoint; the 95.0c cap creates (95.0 + 99.0) / 2 = 97.0c instead.
+        metrics = {"market": {"tick": 0.001, "v": 0.085}, "best_bid": 0.934, "best_ask": 0.99,
+                   "plan": {"fav_bid_price": 0.97, "mid": 0.98, "fav_bid_score": 0.779,
+                            "low_price": 0.001, "low_size": 100.0, "mode": "floor"}}
+        text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines)
+        self.assertIn("The farmer bids 95.0c instead, which scores 0.585 per share", text)
+        self.assertNotIn("0.419", text)
+        del metrics["best_bid"], metrics["best_ask"]
+        self.assertIn("which scores 0.419 per share",
+                      " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines))
 
     def test_ev_check_warns_when_budget_is_below_the_longshot_leg(self):
         plan = json.loads(self.row("0xddd")["metrics"])["plan"]
         cost = plan["low_price"] * plan["low_size"]
         self.assertIn(f"ties up ${cost:,.2f}, above your $25.00 naked budget",
-                      self.ev("0xddd", "0.97", "25"))
-        self.assertNotIn("BUDGET market", self.ev("0xddd", "0.97", str(cost + 1)))
-        self.assertNotIn("BUDGET market", self.ev("0xeee", "0.995", "0"))
+                      self.ev("0xddd", "97", "25"))
+        self.assertNotIn("BUDGET market", self.ev("0xddd", "97", str(cost + 1)))
+        self.assertNotIn("BUDGET market", self.ev("0xeee", "99", "0"))
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
         from farm_console.app import utc_now
@@ -417,7 +627,8 @@ class ScanTest(Writes):
         self.assertIsNone(self.row("0xnew"))
 
     def test_invalid_parameters_start_nothing_and_persist_nothing(self):
-        for name, value in (("min_fav", "2"), ("capital", "0"), ("bid_offset", "abc"),
+        for name, value in (("min_fav", "2"), ("capital", "0"), ("max_lead", "abc"),
+                            ("fav_target_score", "0"),
                             ("min_rate", "-1")):
             with self.subTest(name=name):
                 resp = self.post("/discover/scan", **scan_form(**{name: value}))
@@ -430,6 +641,16 @@ class ScanTest(Writes):
         self.assertIn('name="min_fav" value="0.9"', page)
         self.assertIn('name="horizon_cap_days" value="90"', page)
 
+    def test_stored_parameters_from_an_older_screener_still_load(self):
+        farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01},
+                                self.now)
+        resp = self.client.get("/discover")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('name="capital" value="300"', resp.text)
+        self.assertIn('name="fav_target_score" value="0.45"', resp.text)
+        self.assertIn('name="max_lead" value="0.005"', resp.text)
+        self.assertNotIn("bid_offset", resp.text)
+
 
 class DiscoverTest(Writes):
     def setUp(self):
@@ -440,10 +661,12 @@ class DiscoverTest(Writes):
             question = "Will 50% of x happen?" if i == 7 else f"Market number {i}?"
             rows.append(assessed_row(f"0x{i:04d}", f"m-{i}", book, self.now, 1000.0 - i,
                                      question, days=40 if i % 10 == 0 else 200))
-        farm_db.store_scan(self.db, rows, [r.condition_id for r in rows], self.now)
+        farm_db.store_scan(self.db, rows, [r.condition_id for r in rows]
+                           + [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
 
     def ids(self, query=""):
-        return re.findall(r'<a href="/review/(0x\w+)">', self.client.get("/discover" + query).text)
+        return re.findall(r'<a href="/review/(0x\w+)(?:\?mode=\w+)?">',
+                          self.client.get("/discover" + query).text)
 
     def test_candidates_by_rank_fifty_per_page(self):
         first, third = self.ids(), self.ids("?page=3")
@@ -459,6 +682,8 @@ class DiscoverTest(Writes):
         self.assertEqual(floor[0], "0x0076")
         self.assertIn('href="/discover?mode=floor&amp;status=candidate&amp;page=2">Next',
                       self.client.get("/discover?mode=floor").text)
+        self.assertIn('<a class="chip" href="/review/0x0000?mode=budget">Review</a>',
+                      self.client.get("/discover?mode=budget").text)
 
     def test_search_matches_question_or_slug_literally(self):
         self.assertEqual(self.ids("?q=50%25"), ["0x0007"])
@@ -484,10 +709,10 @@ class DiscoverTest(Writes):
 
 class SettingsTest(Writes):
     def test_each_field_shows_its_value_and_where_it_comes_from(self):
-        farm_db.put_setting(self.db, "bid_offset", 0.015, self.now)
+        farm_db.put_setting(self.db, "max_lead", 0.015, self.now)
         page = self.client.get("/settings").text
-        self.assertRegex(page, r'name="bid_offset" value="0.015"[^>]*>\s*<button[^>]*'
-                               r'formaction="/settings/reset/bid_offset"')
+        self.assertRegex(page, r'name="max_lead" value="0.015"[^>]*>\s*<button[^>]*'
+                               r'formaction="/settings/reset/max_lead"')
         self.assertRegex(page, r'(?s)name="min_fav" value="0.9".*?farmer&#39;s value')
         self.assertRegex(page, r'(?s)name="cooldown_s" value="600".*?>default<')
         self.assertNotIn("Global caps", page)
@@ -500,16 +725,16 @@ class SettingsTest(Writes):
                                                          **changes})
 
     def test_saving_writes_only_the_changed_fields(self):
-        resp = self.save("Quoting", bid_offset="0.02")
+        resp = self.save("Quoting", max_lead="0.02")
         self.assertEqual((resp.status_code, resp.headers["location"]),
                          (303, "/settings?saved=Quoting"))
-        self.assertEqual(farm_db.load_settings(self.db), ({"bid_offset": 0.02}, {}))
+        self.assertEqual(farm_db.load_settings(self.db), ({"max_lead": 0.02}, {}))
         self.assertIn("Saved Quoting", self.client.get("/settings?saved=Quoting").text)
 
     def test_invalid_values_show_inline_and_write_nothing(self):
-        resp = self.save("Quoting", bid_offset="0.9", keep_ratio="abc", capital="300")
+        resp = self.save("Quoting", max_lead="0.9", keep_ratio="abc", capital="300")
         self.assertEqual(resp.status_code, 422)
-        self.assertIn("bid_offset: 0.9 is out of range", resp.text)
+        self.assertIn("max_lead: 0.9 is out of range", resp.text)
         self.assertIn("keep_ratio: &#39;abc&#39; is not JSON", resp.text)
         self.assertIn('name="capital" value="300"', resp.text)
         self.assertEqual(farm_db.load_settings(self.db), ({}, {}))

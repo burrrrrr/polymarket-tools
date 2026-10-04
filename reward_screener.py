@@ -100,7 +100,10 @@ SCAN_HELP = {
     "min_window_days": "Minimum farmable days left",
     "horizon_cap_days": "Cap on days counted toward rank",
     "capital": "USD behind the favorite bid",
-    "bid_offset": "Favorite bid distance below the midpoint",
+    "fav_target_score": "Per-share score the favorite bid aims for. It sits at the deepest "
+                        "price that still reaches it",
+    "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
+                "0 joins it",
     "min_low_score": "Minimum per-share score of the longshot bid",
     "min_rate": "Minimum daily reward pool in USD",
 }
@@ -211,7 +214,8 @@ class ScreenConfig(NamedTuple):
     min_window_days: float = 30.0
     horizon_cap_days: float = 90.0
     capital: float = 500.0
-    bid_offset: float = 0.01
+    fav_target_score: float = 0.45
+    max_lead: float = 0.005
     min_low_score: float = 0.10
     min_rate: float = 0.0
 
@@ -228,6 +232,8 @@ class GammaInfo(NamedTuple):
     end_date: Optional[datetime]
     neg_risk: Optional[bool]
     slug: Optional[str]
+    event_closed: Optional[bool] = None
+    resolution_statuses: tuple = ()
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +291,15 @@ def adjusted_mid(bids, asks, min_size):
     return (bid + ask) / 2
 
 
+def fragile_mid(levels, min_size, min_fav):
+    """Whether pulling the best qualifying bid level drops the midpoint under
+    min_fav (or leaves no bid). In a thin book one maker's bid can hold the
+    favorite above the threshold; once it goes the farmer stops quoting."""
+    best = next(((p, s) for p, s in levels.bids if s >= min_size), None)
+    mid = adjusted_mid([lvl for lvl in levels.bids if lvl != best], levels.asks, min_size)
+    return mid is None or mid < min_fav
+
+
 def adjust_levels(levels, bids=(), asks=()):
     """Add (price, size) entries to a book's levels; a negative size removes.
 
@@ -306,26 +321,41 @@ def adjust_levels(levels, bids=(), asks=()):
     )
 
 
-def fav_bid_price(mid, levels, tick, bid_offset, min_size):
-    """Favorite bid about bid_offset under the midpoint it creates. Price or Skip.
+def created_mid(price, best_bid, best_ask):
+    """The reward midpoint once a bid of at least min_size rests at price.
 
-    The reward midpoint counts only levels of at least min_size. When
-    mid - offset lands at or below the best such bid, the bid does not move
-    the midpoint. Above it, the bid becomes the best bid and the midpoint
-    becomes (p + a) / 2 for best ask a, so the bid sits (a - p) / 2 from it;
-    p = a - 2 * offset puts it the intended distance from the midpoint it
-    creates rather than far below it.
+    best_bid and best_ask are the best levels of at least min_size. A bid at
+    or under the best bid leaves the midpoint where it was; above it, the bid
+    becomes the best bid.
     """
-    offset = max(bid_offset, tick)
-    price = floor_to_tick(mid - offset, tick)
+    return (max(price, best_bid) + best_ask) / 2
+
+
+def fav_bid_price(levels, v, tick, min_size, target_score, max_lead):
+    """Deepest favorite bid reaching target_score against the midpoint it creates. Price or Skip.
+
+    The bid may sit at most max_lead above the best bid of at least min_size,
+    and one tick under the lowest ask of any size, because it is post-only.
+    Its score never falls as its price rises: under the best bid the midpoint
+    is fixed, and above it the bid sits (best_ask - p) / 2 from the midpoint
+    it creates. So the scan walks down from that ceiling and stops at the
+    first miss. A ceiling that misses the target is still the answer, since
+    the target is a depth preference and a low score still earns a share.
+    """
     best_bid = next((p for p, s in levels.bids if s >= min_size), None)
     best_ask = next((p for p, s in levels.asks if s >= min_size), None)
-    if best_bid is not None and best_ask is not None and price > best_bid:
-        price = floor_to_tick(best_ask - 2 * offset, tick)
+    if best_bid is None or best_ask is None:
+        return Skip("one-sided book")
+    price = min(floor_to_tick(best_bid + max_lead, tick),
+                floor_to_tick(levels.asks[0][0] - tick, tick))
     if price < tick:
         return Skip("favorite bid below one tick")
-    if levels.asks and price >= levels.asks[0][0]:
-        return Skip("favorite bid would cross")
+    decimals = tick_decimals(tick)
+    while price - tick >= tick - 1e-9:
+        lower = round(price - tick, decimals)
+        if score(v, created_mid(lower, best_bid, best_ask) - lower) < target_score:
+            break
+        price = lower
     return price
 
 
@@ -368,19 +398,20 @@ def competing_score(levels, mid, v, min_size):
     return q_min(q_one, q_two, mid)
 
 
-def plan_quotes(market, levels, mid, config):
+def plan_quotes(market, levels, config):
     """Price and size our favorite bid and longshot bid. Returns QuotePlan or Skip.
 
     The longshot bid takes the lowest price that still scores at least
     min_low_score, then is sized so its score matches the favorite bid's:
     score beyond the smaller side earns nothing.
 
-    In a wide book the favorite bid becomes the new best bid and drags the
-    midpoint up toward itself, so both legs are scored against the midpoint
-    that includes it (QuotePlan.mid), not the one it was placed from.
+    A favorite bid above the best bid drags the midpoint up toward itself, so
+    both legs are scored against the midpoint that includes it (QuotePlan.mid),
+    not the book's own.
     """
     tick, v = market.tick, market.v
-    fav_price = fav_bid_price(mid, levels, tick, config.bid_offset, market.min_size)
+    fav_price = fav_bid_price(levels, v, tick, market.min_size, config.fav_target_score,
+                              config.max_lead)
     if isinstance(fav_price, Skip):
         return fav_price
     fav_size = max(market.min_size, round_size_down(config.capital / fav_price))
@@ -422,8 +453,10 @@ def assess(market, levels, config, now):
         return Skip("one-sided book")
     if book_mid < config.min_fav:
         return Skip("favorite too cheap")
+    if fragile_mid(levels, market.min_size, config.min_fav):
+        return Skip("fragile midpoint")
 
-    plan = plan_quotes(market, levels, book_mid, config)
+    plan = plan_quotes(market, levels, config)
     if isinstance(plan, Skip):
         return plan
     mid = plan.mid
@@ -555,16 +588,48 @@ def parse_levels(entry):
     )
 
 
+def _string_list(value):
+    """Gamma sends some list fields JSON-encoded as a string ("[]")."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return ()
+    return tuple(str(v) for v in value) if isinstance(value, list) else ()
+
+
 def parse_gamma(entry):
     holding = entry.get("holdingRewardsEnabled")
     neg_risk = entry.get("negRisk")
+    events = [e for e in entry.get("events") or [] if isinstance(e, dict)]
     return GammaInfo(
         volume24hr=_float(entry.get("volume24hr")),
         holding_rewards=holding if isinstance(holding, bool) else None,
         end_date=parse_time(entry.get("endDate")),
         neg_risk=neg_risk if isinstance(neg_risk, bool) else None,
         slug=entry.get("slug") or None,
+        event_closed=any(bool(e.get("closed")) for e in events) if events else None,
+        resolution_statuses=_string_list(entry.get("umaResolutionStatuses")),
     )
+
+
+def resolution_signal(info):
+    """Why a still-open market is already effectively decided, or None.
+
+    Polymarket closes a market only once its on-chain resolution settles, so
+    for a while a decided market stays active and accepting orders. Two
+    Gamma fields give it away earlier: the parent event is closed once the
+    outcome is known (an award announced, a game over), and a UMA status
+    appears once someone proposes a resolution. Farming either is quoting
+    into a known outcome.
+    """
+    if info is None:
+        return None
+    if info.event_closed:
+        return "event closed"
+    if info.resolution_statuses:
+        return "resolution proposed"
+    return None
 
 
 def apply_gamma(market, info):
@@ -718,6 +783,10 @@ def run_scan(config, now, on_stage=lambda stage: None):
             skipped["no book"] += 1
             continue
         info = gamma.get(market.condition_id)
+        stale = resolution_signal(info)
+        if stale:
+            skipped[stale] += 1
+            continue
         market = apply_gamma(market, info)
         if levels.tick:
             market = market._replace(tick=levels.tick)
@@ -799,7 +868,8 @@ def config_from(args):
         min_window_days=args.min_window_days,
         horizon_cap_days=args.horizon_cap_days,
         capital=args.capital,
-        bid_offset=args.bid_offset,
+        fav_target_score=args.fav_target_score,
+        max_lead=args.max_lead,
         min_low_score=args.min_low_score,
         min_rate=args.min_rate,
     )

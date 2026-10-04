@@ -11,10 +11,10 @@
       {%- if vm.fills %}
       <div class="scroll">
         <table class="tbl tight">
-          <thead><tr><th>Time</th><th>Slot</th><th>Price</th><th>Size</th><th>Edge vs p_true</th></tr></thead>
+          <thead><tr><th>Time</th><th>Slot</th><th>Price</th><th>Size</th><th>Edge vs p_true{{ tip('edge_vs_p_true') }}</th></tr></thead>
           <tbody>
             {%- for f in vm.fills %}
-            <tr><td class="mono">{{ f.at | stamp_local }}</td><td><span class="badge {{ f.tone }}">{{ f.slot }}</span></td><td class="mono">≈ {{ f.price | cents }}</td><td class="mono">{{ f.size | shares }}</td><td class="mono">{% if f.edge is not none %}≈ {{ f.edge | cents }}{% else %}--{% endif %}</td></tr>
+            <tr><td class="mono">{{ f.at | stamp_local }}</td><td><span class="badge {{ f.tone }}">{{ f.slot }}</span>{% if f.slot %}{{ tip(f.slot) }}{% endif %}</td><td class="mono">≈ {{ f.price | cents }}</td><td class="mono">{{ f.size | shares }}</td><td class="mono">{% if f.edge is not none %}≈ {{ f.edge | cents }}{% else %}--{% endif %}</td></tr>
             {%- endfor %}
           </tbody>
         </table>

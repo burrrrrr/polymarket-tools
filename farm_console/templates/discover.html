@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import token_field, field_error %}
+{% from "_macros.html" import token_field, field_error, polymarket_link %}
 {% block title %}Discover{% endblock %}
 {% block content %}
 {%- set f = vm.filters -%}
@@ -18,12 +18,11 @@
   </div>
   <div class="form-grid">
     {%- for name, field in fields.items() %}
-    <label class="field">
-      <span class="lbl">{{ field.label }}</span>
-      <input class="inp mono" name="{{ name }}" value="{{ values.get(name, '') }}" inputmode="decimal" {{ 'aria-invalid="true"' | safe if errors.get(name) }}>
+    <div class="field">
+      <div class="label-row"><label class="lbl" for="scan-{{ name }}">{{ field.label }}</label>{{ tip(name) }}</div>
+      <input class="inp mono" id="scan-{{ name }}" name="{{ name }}" value="{{ values.get(name, '') }}" inputmode="decimal" {{ 'aria-invalid="true"' | safe if errors.get(name) }}>
       {{ field_error(errors, name) }}
-      <span class="hint">{{ field.hint }}</span>
-    </label>
+    </div>
     {%- endfor %}
   </div>
   {%- if refused %}<p class="field-error" role="alert" style="margin: 0">{{ refused }}</p>{% endif %}
@@ -75,7 +74,7 @@
   <div class="small muted" style="padding: 0 18px 10px">{{ '{:,}'.format(vm.total) }} market{{ '' if vm.total == 1 else 's' }} · ranked by yield × days to cutoff (90d cap) · page {{ f.page }} of {{ vm.pages }}</div>
   <div class="scroll">
     <table class="tbl">
-      <thead><tr><th>#</th><th>Mode</th><th>Favorite</th><th>Pool $/d</th><th>Band</th><th>Est $/d</th><th>Capital</th><th>APR</th><th>Days</th><th>Ahead</th><th>Vol 24h</th><th>Status</th><th>Market</th></tr></thead>
+      <thead><tr><th>#</th><th>Mode{{ tip('mode') }}</th><th>Favorite{{ tip('favorite') }}</th><th>Pool $/d{{ tip('pool') }}</th><th>Band{{ tip('band') }}</th><th>Est $/d{{ tip('est_daily') }}</th><th>Capital{{ tip('planned_capital') }}</th><th>APR{{ tip('apr') }}</th><th>Days{{ tip('days') }}</th><th>Ahead{{ tip('ahead') }}</th><th>Vol 24h{{ tip('vol24h') }}</th><th>Status</th><th>Market</th><th></th></tr></thead>
       <tbody>
         {%- for r in vm.rows %}
         <tr>
@@ -91,10 +90,11 @@
           <td class="mono">{{ '%.1f' % r.ahead if r.ahead is not none else '--' }}</td>
           <td class="mono">{{ r.volume }}</td>
           <td><span class="badge {{ r.status_tone }}">{{ r.status }}</span></td>
-          <td class="wrap" style="min-width: 260px"><a href="/review/{{ r.condition_id }}">{{ r.name }}</a></td>
+          <td class="wrap" style="min-width: 260px"><a href="{{ review_url(r.condition_id, f.mode) }}">{{ r.name }}</a>{{ polymarket_link(r.slug, "ext", "↗") }}</td>
+          <td><a class="chip" href="{{ review_url(r.condition_id, f.mode) }}">Review</a></td>
         </tr>
         {%- else %}
-        <tr><td colspan="13" class="muted">No markets match.</td></tr>
+        <tr><td colspan="14" class="muted">No markets match.</td></tr>
         {%- endfor %}
       </tbody>
     </table>
@@ -103,6 +103,5 @@
     {%- if f.page > 1 %}<a class="btn" href="/discover{{ f.query(page=f.page - 1) }}">Previous</a>{% endif %}
     {%- if f.page < vm.pages %}<a class="btn" href="/discover{{ f.query(page=f.page + 1) }}">Next</a>{% endif %}
   </nav>
-  <p class="small muted" style="margin: 4px 18px 12px">Days count to the farmer's cutoff (end date minus its expiry buffer). APR assumes the book stays as scanned and nobody reacts to your quotes. Treat it as a ranking, not a forecast.</p>
 </section>
 {% endblock %}

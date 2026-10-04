@@ -1,11 +1,12 @@
+{% from "_macros.html" import polymarket_link %}
 <div class="scroll">
   <table class="tbl tight">
-    <thead><tr><th>Market</th><th>Phase</th><th>Mid</th><th>Fav bid</th><th>Longshot bid</th><th>Q1 / Q2</th><th>Naked</th></tr></thead>
+    <thead><tr><th>Market</th><th>Phase</th><th>Mid</th><th>Fav bid</th><th>Longshot bid</th><th>Q1 / Q2{{ tip('q1_q2') }}</th><th>Naked{{ tip('naked_at_risk') }}</th></tr></thead>
     <tbody>
       {%- for m in vm.markets %}
       <tr>
-        <td class="wrap" style="min-width: 150px"><a href="/markets/{{ m.condition_id }}">{{ m.name }}</a></td>
-        <td><span class="badge {{ m.phase_tone }}">{{ m.phase }}</span></td>
+        <td class="wrap" style="min-width: 150px"><a href="/markets/{{ m.condition_id }}">{{ m.name }}</a>{{ polymarket_link(m.slug, "ext", "↗") }}</td>
+        <td><span class="badge {{ m.phase_tone }}">{{ m.phase }}</span>{{ tip(m.phase) }}</td>
         <td class="mono">{{ m.mid | cents }}</td>
         <td class="mono c-fav">{% if m.fav_bid %}{{ m.fav_bid.price | cents }} × {{ m.fav_bid.size | shares }}{% else %}none{% endif %}</td>
         <td class="mono c-long">{% if m.long_bid %}{{ m.long_bid.price | cents }} × {{ m.long_bid.size | shares }}{% else %}none{% endif %}</td>

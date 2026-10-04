@@ -2,7 +2,7 @@
   <div class="panel pad-table">
     <div class="scroll">
       <table class="tbl">
-        <thead><tr><th>Market</th><th>Wallet fav / long</th><th>Baseline fav / long</th><th>Farm (tradable) fav / long</th><th>Avg cost fav / long</th><th>Exit orders</th></tr></thead>
+        <thead><tr><th>Market</th><th>Wallet fav / long</th><th>Baseline fav / long{{ tip('baseline') }}</th><th>Farm (tradable) fav / long{{ tip('farm_inventory') }}</th><th>Avg cost fav / long</th><th>Exit orders</th></tr></thead>
         <tbody>
           {%- for r in vm %}
           {%- set p = r.position %}

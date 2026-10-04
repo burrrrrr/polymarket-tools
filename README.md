@@ -494,8 +494,13 @@ Key `scan` options:
 - `--expiry-buffer-days` (7) stops farming this many days before the market
   ends. `--min-window-days` (30) is the fewest farmable days a market needs.
 - `--horizon-cap-days` (90) caps the days counted toward rank.
-- `--capital` (500) is the USD behind the favorite bid. `--bid-offset` (0.01)
-  is how far below the midpoint it sits.
+- `--capital` (500) is the USD behind the favorite bid.
+- `--fav-target-score` (0.45) is the per-share score the favorite bid aims
+  for. The bid sits at the deepest price that still reaches it. If no price
+  reaches it, the bid sits at its highest allowed price.
+- `--max-lead` (0.005) is the most the favorite bid may sit above the best bid
+  already in the book. 0 joins the best bid. The bid also stays one tick under
+  the lowest ask.
 - `--min-low-score` (0.10) is the lowest per-share score the longshot bid may
   have. The screener picks the lowest longshot price that reaches it.
 - `--mode` filters the table only. Every assessment is stored.
@@ -530,6 +535,26 @@ when the planned favorite bid is at or above `--p-true`, because a fill would
 lose money. It also warns when a `budget` market's longshot leg needs more
 than the budget.
 
+#### Decided markets
+
+Polymarket closes a market only after its on-chain resolution settles, so a
+market whose outcome is already known can stay active and accept orders for
+days. The scan skips a market when Gamma shows either signal:
+
+- `event closed`: the parent event is closed, for example the award was
+  announced or the game is over.
+- `resolution proposed`: a UMA resolution has been proposed, and possibly
+  disputed.
+
+Only candidates from the latest scan appear in the review queue and on
+Discover, so a market that stops qualifying leaves the queue at the next scan.
+A candidate also needs `rewards_active = 1`. Rewards can end between scans,
+so the console's Review page checks them live with the farmer's own rule and
+records what it finds. A candidate whose rewards ended leaves the queue at
+once, and it returns if they come back. Approved, rejected and retired markets
+always show. Some decided markets show neither signal until Polymarket updates
+them. Read the resolution rules before you approve.
+
 #### Approximations
 
 - The midpoint drops whole price levels smaller than the reward minimum size.
@@ -540,10 +565,10 @@ than the budget.
   conservative. Your own resting orders also count as competition.
 - The two outcome books are exact mirrors, so the screener reads only the
   favorite's book.
-- In a wide book the planned favorite bid becomes the best bid and pulls the
-  midpoint toward itself. The bid is then priced two offsets under the best
-  ask, which puts it one offset under the midpoint it creates. Both legs and
-  the competition are scored against that shifted midpoint.
+- A favorite bid above the best bid becomes the new best bid and pulls the
+  midpoint toward itself. Its score is measured against the midpoint it
+  creates, not the book's own. Both legs and the competition are scored
+  against that shifted midpoint.
 - `est$/d` assumes the book stays as it was at scan time, and that no other
   farmer reacts to your orders. Thin books show very high APRs that will not
   survive competition, so read them as a ranking, not a forecast.
@@ -628,8 +653,10 @@ Each market is in one of five states:
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
 - `RETIRED`: the market's rewards were removed, it closed or stopped
-  accepting orders, you no longer approve it, or it reached its end date
-  minus `--expiry-buffer-days`. All orders are cancelled. In live mode the
+  accepting orders, you no longer approve it, it reached its end date
+  minus `--expiry-buffer-days`, or Gamma shows it is already decided (its
+  event closed or a resolution was proposed; checked once a minute). All
+  orders are cancelled. In live mode the
   database row becomes `retired` with a note. A row you rejected keeps its
   `rejected` status. Retirement wins over a pause. If you approve a retired
   market again after the farmer has seen it unapproved, the farmer manages it
@@ -664,11 +691,11 @@ the same as setting it once, and a farmer that restarts reads the same level.
 The `settings` table overrides the farmer's command-line options. The
 command-line flags give the defaults, and each row replaces one of them
 while it exists. The keys are the option names with underscores, and the
-seconds options end in `_s`: `capital`, `bid_offset`, `ask_offset`,
-`min_capture`, `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`,
-`drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
-`expiry_buffer_days`. Each value is a JSON number. `farm_db.put_setting`
-refuses an unknown key or an out-of-range value. A bad row written another
+seconds options end in `_s`: `capital`, `fav_target_score`, `max_lead`,
+`ask_offset`, `min_capture`, `ev_margin`, `min_fav`, `min_low_score`,
+`keep_ratio`, `drop_threshold`, `drop_window_s`, `cooldown_s`,
+`naked_cooldown_s`, and `expiry_buffer_days`. Each value is a JSON number.
+`farm_db.put_setting` refuses an unknown key or an out-of-range value. A bad row written another
 way is ignored, with an `ALERT` event. When the effective config changes, the
 farmer logs a `SETTINGS` event with the old and new values. A changed setting
 moves the targets at once, but a resting order that still passes the keep
@@ -745,10 +772,11 @@ it does not manage.
 | `--once` | off | Run one cycle and exit |
 | `--interval` | 5 | Seconds between cycles |
 | `--capital` | 500 | USD per market behind the favorite bid, held favorite shares included at cost |
-| `--bid-offset` | 0.01 | Favorite bid distance below the midpoint |
+| `--fav-target-score` | 0.45 | Per-share score the favorite bid aims for. It sits at the deepest price that still reaches it |
+| `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask minimum above its average cost |
-| `--ev-margin` | 0.01 | The favorite bid stays at or below `p_true` minus this |
+| `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this |
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | Minimum per-share score of the longshot bid |
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target |
@@ -796,7 +824,7 @@ Each column has exactly one writer process:
 
 | Table | Writer | Purpose |
 | --- | --- | --- |
-| `markets` | Screener: scan columns. Console or CLI: `status`, `p_true`, `naked_budget_usd`, `note`, `paused`, `naked_paused`, `capital_usd`. Farmer, live only: `baseline_fav`, `baseline_long` | Candidate markets, your decisions, and the per-market controls |
+| `markets` | Screener: scan columns. Console: `rewards_active` of a candidate, from the Review page's live check. Console or CLI: `status`, `p_true`, `naked_budget_usd`, `note`, `paused`, `naked_paused`, `capital_usd`. Farmer, live only: `baseline_fav`, `baseline_long` | Candidate markets, your decisions, and the per-market controls |
 | `farm_state` | Farmer | One row per managed market, replaced every cycle: phase and reason, midpoints, Q1 and Q2, capital, naked USD in use, and JSON for the position, the four slots (resting order, target, live score, decision and reason), the favorite book inside the reward band with your orders marked, backoffs, and `scoring_pct` (live only) |
 | `farmer_status` | Farmer | One row: mode, pid, start time, last cycle, interval, heartbeat, managed count, effective config, and `stopped_at` once it exits |
 | `farm_events` | Farmer | Changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`, `ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, `SETTINGS`. Rows older than 30 days are deleted at startup |
@@ -861,7 +889,10 @@ rows and its funnel in one transaction and never changes your decisions.
 #### Decisions and controls
 
 - **Approve** sets `status` to `approved` with the p_true, naked budget, and
-  capital you entered. A blank capital means the farmer's `capital` setting.
+  capital you entered. You enter p_true as a whole percent from 1 to 99, with
+  the - and + buttons or the arrow keys stepping it by 1; the database stores
+  it as a probability. The naked budget starts at $10 for a new market. A
+  blank capital means the farmer's `capital` setting.
   On a market that is already approved, the same form edits those terms.
   After a decision on a candidate, the console opens the next undecided
   candidate. After an edit, it opens the market's page.
@@ -869,7 +900,8 @@ rows and its funnel in one transaction and never changes your decisions.
   will do with it. The farmer never bids above p_true minus `ev_margin`,
   rounded down to the tick. When the planned bid is above that cap, the
   check shows the price the farmer bids instead and its lower score, or that
-  the cap is outside the band. On a BUDGET market it also warns when your
+  the cap is outside the band. That score is measured against the midpoint
+  the capped bid creates. On a BUDGET market it also warns when your
   naked budget is below the planned longshot leg. It uses the effective
   `ev_margin`: your override, else the farmer's last value, else the default.
 - **Pause and naked leg** set `paused` or `naked_paused` to the level the
@@ -908,7 +940,10 @@ reachable from your own machine, and only by its own pages:
   forge a request.
 - A request other than GET or HEAD whose `Origin` header names another origin
   gets 403, even with the token.
-- Every change is a POST. No GET request writes anything.
+- Every decision and control is a POST. Two GET requests write, the Review
+  page's live check and its skip to the next quotable candidate, and they
+  only record a candidate's `rewards_active` as Polymarket reports it. No
+  request can choose that value.
 
 `farm_console/security.py` holds all of these checks, as a middleware in
 front of every route.
@@ -937,7 +972,11 @@ return the same data the pages show, as JSON.
 The midpoint chart reads `farm_mids`, which the farmer fills with one sample
 per market per minute. A market's chart is empty until the farmer has run for
 a minute. The resolution rules come from Gamma when you open a Review page
-and are kept for 10 minutes. If Gamma or the data API is unreachable, that
+and are kept for 10 minutes. The live check needs the total reward listing,
+which includes sponsored pools and takes most of a minute to read. The console
+reads it in a background thread when a Review page first asks, then at most
+every 5 minutes. Until it lands, a candidate with no native reward rate keeps
+its place in the queue. If Gamma or the data API is unreachable, that
 panel says so and offers a retry; the rest of the page still works.
 
 htmx 2.0.11 and htmx-ext-sse 2.2.4 are vendored in `farm_console/static/`, so
@@ -945,6 +984,20 @@ the console works offline except for the IBM Plex fonts, which fall back to
 system fonts, and the Review page's rules and holdings. To upgrade, download
 `dist/htmx.min.js` from the `htmx.org` package and `dist/sse.min.js` from the
 `htmx-ext-sse` package, and update the versions here.
+
+#### What the terms mean
+
+Each term on the console that is not self-explanatory, such as naked budget,
+Q1 / Q2, a phase or a slot name, has an info button after it. Hover over it or
+Tab to it to see what the term means. Escape closes the explanation.
+
+`farm_console/glossary.py` holds every explanation, so edit them there. The
+Settings and scan parameters take their explanations from it too. A template
+shows a term's button with `{{ tip('naked_budget') }}`, and an unknown key fails
+the page instead of rendering an empty tip. `farm_console/static/tips.js`, with
+no dependencies, shows one tooltip on the page body, so a scrolling table never
+clips it. `test_farm_console_tips.py` fails when a template uses a key the
+glossary lacks, or when the glossary has an entry no page uses.
 
 ## Important Notes
 

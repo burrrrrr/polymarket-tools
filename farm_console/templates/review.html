@@ -1,74 +1,61 @@
 {% extends "base.html" %}
-{% from "_macros.html" import region, token_field, field_error %}
+{% from "_macros.html" import region, token_field, field_error, polymarket_link %}
 {% block title %}Review · {{ (market.question or market.slug or '') | truncate(40, True) }}{% endblock %}
 {% block content %}
 {%- set cid = market.condition_id -%}
 {%- set ev_inputs = "[name='p_true'],[name='naked_budget']" -%}
 <nav class="actions" aria-label="Review queue">
   <span class="lbl" style="margin-right: 6px">Queue</span>
+  <div class="seg" role="group" aria-label="Queue mode filter">
+    {%- for m in [none] + MODES | list %}
+    <a class="{{ 'on' if queue_mode == m }}" href="/review{{ '?mode=' ~ m if m }}">{{ (m or 'all') | title }}</a>
+    {%- endfor %}
+  </div>
+  {%- set kind = (queue_mode ~ ' ') if queue_mode else '' %}
   {%- if queue.position %}
-  <span class="small muted">{{ queue.position }} of {{ queue.total }} undecided</span>
+  <span class="small muted">{{ queue.position }} of {{ queue.total }} undecided {{ kind }}candidates</span>
   {%- else %}
-  <span class="small muted">{{ queue.total }} undecided · this market is {{ market.status }}</span>
+  <span class="small muted">{{ queue.total }} undecided {{ kind }}candidates · this market is {{ market.status }}{% if market.status == 'candidate' and plan %}, {{ plan.mode }}{% endif %}</span>
   {%- endif %}
-  {%- if queue.prev %}<a class="chip" href="/review/{{ queue.prev }}">Previous</a>{% endif %}
-  {%- if queue.next %}<a class="chip" href="/review/{{ queue.next }}">{{ 'Next' if queue.position else 'Top candidate' }}</a>{% endif %}
-  <a class="chip" href="/discover">All candidates</a>
+  {%- if queue.prev %}<a class="chip" href="{{ review_url(queue.prev, queue_mode) }}">Previous</a>{% endif %}
+  {%- if queue.next %}<a class="chip" href="{{ review_url(queue.next, queue_mode) }}">{{ 'Next' if queue.position else 'Top candidate' }}</a>{% endif %}
+  <a class="chip" href="/discover{{ '?mode=' ~ queue_mode if queue_mode }}">All candidates</a>
+  {%- if skipped %}
+  <span class="small c-warn">Skipped {{ skipped }} candidate{{ 's' if skipped != 1 }} that wouldn't quote now.</span>
+  {%- endif %}
 </nav>
 
 <header class="stack" style="gap: 10px">
   <h1 class="question">{{ market.question or market.slug }}</h1>
   <div class="actions" style="gap: 8px">
     <span class="badge {{ 't-q' if market.status == 'approved' else ('t-r' if market.status in ('rejected', 'retired') else 't-n') }}">{{ market.status }}</span>
-    {%- if plan %}<span class="badge {{ 't-b' if plan.mode == 'budget' else 't-f' }}">{{ plan.mode | upper }}</span>{% endif %}
-    <span class="badge t-n">favorite {{ m.fav_outcome or '--' }} {{ market.metrics.get('book_mid') | cents }}</span>
-    <span class="badge t-n">{{ '%.0f' % cutoff_days if cutoff_days is not none else '--' }} days to cutoff</span>
-    <span class="badge t-n">pool ${{ '%.0f' % m.rate_per_day if m.rate_per_day is not none else '--' }}/day · band {{ m.v | cents }} · min {{ m.min_size | shares }}</span>
+    {%- if plan %}<span class="badge {{ 't-b' if plan.mode == 'budget' else 't-f' }}">{{ plan.mode | upper }}{{ tip(plan.mode | lower) }}</span>{% endif %}
+    <span class="badge t-n">favorite {{ m.fav_outcome or '--' }} {{ market.metrics.get('book_mid') | cents }}{{ tip('favorite') }}</span>
+    <span class="badge t-n">{{ '%.0f' % cutoff_days if cutoff_days is not none else '--' }} days to cutoff{{ tip('days') }}</span>
+    <span class="badge t-n">pool ${{ '%.0f' % m.rate_per_day if m.rate_per_day is not none else '--' }}/day{{ tip('pool') }} · band {{ m.v | cents }}{{ tip('band') }} · min {{ m.min_size | shares }}{{ tip('min_size') }}</span>
     {%- if market.paused %}<span class="badge t-n">paused flag set</span>{% endif %}
-    {%- if market.naked_paused %}<span class="badge t-b">naked leg paused</span>{% endif %}
+    {%- if market.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
     <span class="mono small muted">{{ market.slug or '' }}</span>
+    {{ polymarket_link(market.slug) }}
   </div>
   {%- if market.note %}<span class="small muted">Note: {{ market.note }}</span>{% endif %}
 </header>
 
 <div class="row">
   <div class="grow stack" style="gap: 16px">
-    <section class="panel pad stack" style="gap: 18px">
+    <section class="panel pad stack" style="gap: 14px">
       <div class="page-head" style="align-items: baseline">
-        <h2>Reward band and planned quotes</h2>
-        {%- if strip %}<span class="mono small muted">favorite price, {{ strip.lo | cents }} to {{ strip.hi | cents }}</span>{% endif %}
+        <h2>Live orders and book{{ tip('band_strip') }}</h2>
+        <span class="streaming"><span class="dot" style="width: 6px; height: 6px; background: #63D3A6"></span>live, every {{ LIVE_POLL_S }}s</span>
       </div>
-      {%- if strip %}
-      <div>
-        <div class="strip" role="img" aria-label="Reward band from {{ strip.lo | cents }} to {{ strip.hi | cents }}">
-          {%- for k in strip.marks %}
-          <div class="mk {{ k.kind }}" style="left: {{ k.left }}%" title="{{ k.label }}"></div>
-          {%- endfor %}
-        </div>
-        <div class="strip-axis mono"><span>{{ strip.lo | cents }}</span><span>{{ strip.hi | cents }}</span></div>
+      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-naked_budget, #d-capital" hx-swap="innerHTML">
+        <span class="small muted">Reading the live book...</span>
       </div>
-      <div class="legend mono">
-        {%- for k in strip.marks %}<span class="mk-{{ k.kind }}"><i class="swatch box"></i>{{ k.label }}</span>{% endfor %}
-      </div>
-      {%- endif %}
-      <div class="scroll">
-        <table class="tbl tight">
-          <thead><tr><th>Slot</th><th>Order</th><th>Size</th><th>Score/share</th><th>Ties up</th><th>Why</th></tr></thead>
-          <tbody>
-            {%- for o in orders %}
-            <tr><td><span class="badge {{ o.tone }}">{{ o.slot }}</span></td><td class="mono">{{ o.order }}</td><td class="mono">{{ o.size | shares }}</td><td class="mono">{{ o.score | score }}</td><td class="mono">{{ o.cost | usd }}</td><td class="wrap c-mut" style="min-width: 240px">{{ o.why }}</td></tr>
-            {%- else %}
-            <tr><td colspan="6" class="muted">No plan stored for this market.</td></tr>
-            {%- endfor %}
-          </tbody>
-        </table>
-      </div>
-      <span class="small muted">Planned at the last scan against the book as it was then. The farmer re-plans every cycle against the live book.</span>
     </section>
 
     <section class="panel pad stats">
-      {%- for label, value in stats %}
-      <div class="stack" style="gap: 4px"><span class="lbl">{{ label }}</span><span class="mono" style="font-size: 18px">{{ value }}</span></div>
+      {%- for label, value, key in stats %}
+      <div class="stack" style="gap: 4px"><span class="lbl">{{ label }}{{ tip(key) }}</span><span class="mono" style="font-size: 18px">{{ value }}</span></div>
       {%- endfor %}
     </section>
 
@@ -91,27 +78,37 @@
   <aside class="side">
     <form class="panel pad stack decision" method="post" action="/review/{{ cid }}/approve" style="gap: 14px">
       {{ token_field() }}
+      <input type="hidden" name="queue_mode" value="{{ queue_mode or '' }}">
       <h2>Decision</h2>
-      <label class="field">
-        <span class="lbl">Your p_true for the favorite</span>
-        <input class="inp mono" name="p_true" value="{{ values.p_true }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
+      <div class="field">
+        <div class="label-row"><label class="lbl" for="d-p_true">Your p_true for the favorite (%)</label>{{ tip('p_true') }}</div>
+        <div class="stepper">
+          <button class="btn" type="button" data-step="down" aria-controls="d-p_true" aria-label="Lower p_true by 1%">&minus;</button>
+          <input class="inp mono" id="d-p_true" name="p_true" value="{{ values.p_true }}" type="number" min="1" max="99" step="1"{% if p_true_start %} data-start="{{ p_true_start }}"{% endif %} autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
+          <button class="btn" type="button" data-step="up" aria-controls="d-p_true" aria-label="Raise p_true by 1%">+</button>
+        </div>
         {{ field_error(errors, 'p_true') }}
-      </label>
-      <div id="ev" aria-live="polite">{% include "partials/review_ev.html" %}</div>
-      <label class="field">
-        <span class="lbl">Naked budget ($)</span>
-        <input class="inp mono" name="naked_budget" value="{{ values.naked_budget }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.naked_budget }}>
+      </div>
+      <div class="field">
+        <div class="label-row"><span class="lbl">EV check</span>{{ tip('ev_check') }}</div>
+        <div id="ev" aria-live="polite">{% include "partials/review_ev.html" %}</div>
+      </div>
+      <div class="field">
+        <div class="label-row"><label class="lbl" for="d-naked_budget">Naked budget ($)</label>{{ tip('naked_budget') }}</div>
+        <input class="inp mono" id="d-naked_budget" name="naked_budget" value="{{ values.naked_budget }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.naked_budget }}>
         {{ field_error(errors, 'naked_budget') }}
-      </label>
-      <label class="field">
-        <span class="lbl">Capital cap ($)</span>
-        <input class="inp mono" name="capital" value="{{ values.capital }}" inputmode="decimal" autocomplete="off" placeholder="farmer default, now {{ farmer_capital | usd }}" {{ 'aria-invalid="true"' | safe if errors.capital }}>
+      </div>
+      <div class="field">
+        <div class="label-row"><label class="lbl" for="d-capital">Capital cap ($)</label>{{ tip('capital_cap') }}</div>
+        <input class="inp mono" id="d-capital" name="capital" value="{{ values.capital }}" inputmode="decimal" autocomplete="off" placeholder="farmer default, now {{ farmer_capital | usd }}" {{ 'aria-invalid="true"' | safe if errors.capital }}>
         {{ field_error(errors, 'capital') }}
-        <span class="hint">Blank uses the farmer's capital setting.</span>
-      </label>
+      </div>
       <div hx-get="/partials/review/{{ cid }}/holdings" hx-trigger="load" hx-swap="innerHTML">
         <div class="note-box small muted">Reading the wallet's holdings in this market...</div>
       </div>
+      {%- if market.status != 'approved' %}
+      <label class="check"><input type="checkbox" name="start_paused" value="1"{{ ' checked' if values.start_paused }}> Start paused{{ tip('start_paused') }}</label>
+      {%- endif %}
       <button class="btn btn-strong" type="submit">{{ {'approved': 'Save terms', 'retired': 'Re-approve and start quoting'}.get(market.status, 'Approve and start quoting') }}</button>
       {%- if market.status == 'approved' %}
       <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/retire" formnovalidate onclick="return confirm('Retire this market? The farmer cancels its orders and stops managing it.')">Retire</button>
@@ -121,7 +118,7 @@
         <input class="inp" name="note" value="{{ values.note }}" placeholder="e.g. resolution risk" maxlength="500" {{ 'aria-invalid="true"' | safe if errors.note }}>
         {{ field_error(errors, 'note') }}
       </label>
-      <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/reject">Reject</button>
+      <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/reject" formnovalidate>Reject</button>
       {%- endif %}
     </form>
   </aside>

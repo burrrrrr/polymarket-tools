@@ -110,19 +110,21 @@ class SettingsTest(ScratchDb):
         self.assertEqual(set(farm_db.SETTINGS), set(FarmConfig._fields))
 
     def test_parse_accepts_numbers_in_range(self):
-        self.assertEqual(farm_db.parse_setting("bid_offset", "0.015"), 0.015)
+        self.assertEqual(farm_db.parse_setting("max_lead", "0.015"), 0.015)
         self.assertEqual(farm_db.parse_setting("cooldown_s", "0"), 0.0)
         self.assertEqual(farm_db.parse_setting("capital", "250"), 250.0)
 
     def test_parse_rejects_bad_values(self):
         for key, text in (
-            ("bid_offset", "abc"),
-            ("bid_offset", '"0.01"'),
-            ("bid_offset", "true"),
-            ("bid_offset", "null"),
-            ("bid_offset", "NaN"),
-            ("bid_offset", "-0.01"),
-            ("bid_offset", "0.6"),
+            ("max_lead", "abc"),
+            ("max_lead", '"0.01"'),
+            ("max_lead", "true"),
+            ("max_lead", "null"),
+            ("max_lead", "NaN"),
+            ("max_lead", "-0.01"),
+            ("max_lead", "0.6"),
+            ("fav_target_score", "0"),
+            ("fav_target_score", "1.5"),
             ("capital", "0"),
             ("min_fav", "1.5"),
             ("drop_window_s", "0"),
@@ -155,16 +157,75 @@ class SettingsTest(ScratchDb):
     def test_put_settings_writes_all_or_nothing(self):
         conn = self.open()
         with self.assertRaises(ValueError):
-            farm_db.put_settings(conn, {"bid_offset": 0.02, "keep_ratio": 5}, NOW)
+            farm_db.put_settings(conn, {"max_lead": 0.02, "keep_ratio": 5}, NOW)
         self.assertEqual(farm_db.load_settings(conn), ({}, {}))
-        farm_db.put_settings(conn, {"bid_offset": 0.02, "keep_ratio": 0.5}, NOW)
-        self.assertEqual(farm_db.load_settings(conn)[0], {"bid_offset": 0.02, "keep_ratio": 0.5})
+        farm_db.put_settings(conn, {"max_lead": 0.02, "keep_ratio": 0.5}, NOW)
+        self.assertEqual(farm_db.load_settings(conn)[0], {"max_lead": 0.02, "keep_ratio": 0.5})
 
 
 def seed(conn, *condition_ids):
     farm_db.store_scan(conn, [
         farm_db.ScanRow(cid, cid, "?", NOW.isoformat(), 1.0, "{}") for cid in condition_ids
     ], condition_ids, NOW)
+
+
+class StaleCandidateTest(ScratchDb):
+    """A candidate the latest scan dropped must leave the review queue."""
+
+    def scan(self, conn, at, *condition_ids):
+        farm_db.store_scan(conn, [
+            farm_db.ScanRow(cid, cid, "?", at.isoformat(), 1.0, "{}") for cid in condition_ids
+        ], condition_ids, at)
+
+    def setUp(self):
+        super().setUp()
+        self.conn = self.open()
+        self.scan(self.conn, NOW, "0xstale", "0xkept", "0xapproved")
+        farm_db.approve_market(self.conn, "0xapproved", 0.97, 25.0)
+        self.scan(self.conn, NOW + timedelta(hours=1), "0xkept")
+
+    def test_queue_holds_only_candidates_from_the_latest_scan(self):
+        self.assertEqual(farm_db.candidate_queue(self.conn), ["0xkept"])
+
+    def test_search_drops_stale_candidates_but_keeps_decided_markets(self):
+        rows, total = farm_db.search_markets(
+            self.conn, statuses=None, mode=None, text=None, min_days=None,
+            buffer_days=7, now=NOW, limit=50, offset=0)
+        self.assertEqual(({r.condition_id for r in rows}, total),
+                         ({"0xkept", "0xapproved"}, 2))
+
+
+class RewardsActiveTest(ScratchDb):
+    """A candidate whose rewards ended leaves the queue; decided markets stay."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn = self.open()
+        farm_db.store_scan(self.conn, [
+            farm_db.ScanRow(cid, cid, "?", NOW.isoformat(), rank, "{}")
+            for cid, rank in (("0xa", 4.0), ("0xb", 3.0), ("0xc", 3.0), ("0xd", 1.0),
+                              ("0xapproved", 2.0))
+        ], ["0xa", "0xb", "0xc", "0xd", "0xapproved"], NOW)
+        farm_db.approve_market(self.conn, "0xapproved", 0.97, 25.0)
+
+    def search(self):
+        rows, _ = farm_db.search_markets(
+            self.conn, statuses=None, mode=None, text=None, min_days=None,
+            buffer_days=7, now=NOW, limit=50, offset=0)
+        return {r.condition_id for r in rows}
+
+    def test_ended_rewards_drop_a_candidate_and_returning_ones_restore_it(self):
+        farm_db.set_rewards_active(self.conn, "0xb", False)
+        farm_db.set_rewards_active(self.conn, "0xapproved", False)
+        self.assertEqual(farm_db.candidate_queue(self.conn), ["0xa", "0xc", "0xd"])
+        self.assertEqual(self.search(), {"0xa", "0xc", "0xd", "0xapproved"})
+        farm_db.set_rewards_active(self.conn, "0xb", True)
+        self.assertEqual(farm_db.candidate_queue(self.conn), ["0xa", "0xc", "0xb", "0xd"])
+
+    def test_queue_after_a_market_keeps_its_place_once_it_has_left(self):
+        self.assertEqual(farm_db.candidate_queue(self.conn, after="0xc"), ["0xb", "0xd"])
+        farm_db.set_rewards_active(self.conn, "0xc", False)
+        self.assertEqual(farm_db.candidate_queue(self.conn, after="0xc"), ["0xb", "0xd"])
 
 
 class ControlsTest(ScratchDb):
@@ -193,6 +254,24 @@ class ControlsTest(ScratchDb):
         row = farm_db.find_market(conn, "0xa")
         self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"],
                           row["capital_usd"]), ("approved", 0.98, 10.0, None))
+
+    def test_candidate_queue_filters_by_planned_mode(self):
+        conn = self.open()
+        farm_db.store_scan(conn, [
+            farm_db.ScanRow(cid, cid, cid, None, rank, json.dumps({"plan": {"mode": mode}}))
+            for cid, rank, mode in (("0xa", 3.0, "floor"), ("0xb", 2.0, "budget"),
+                                    ("0xc", 1.0, "floor"))], ["0xa", "0xb", "0xc"], NOW)
+        self.assertEqual(farm_db.candidate_queue(conn), ["0xa", "0xb", "0xc"])
+        self.assertEqual(farm_db.candidate_queue(conn, "floor"), ["0xa", "0xc"])
+        self.assertEqual(farm_db.candidate_queue(conn, "budget"), ["0xb"])
+
+    def test_set_approval_paused_sets_the_flag_and_otherwise_keeps_it(self):
+        conn = self.open()
+        seed(conn, "0xa", "0xb")
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, paused=True)
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None)
+        farm_db.set_approval(conn, "0xb", 0.98, 10.0, None)
+        self.assertEqual([farm_db.find_market(conn, c)["paused"] for c in ("0xa", "0xb")], [1, 0])
 
     def test_cancel_all_counts_the_markets_it_paused(self):
         conn = self.open()

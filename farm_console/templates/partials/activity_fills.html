@@ -2,13 +2,13 @@
   {%- if vm %}
   <div class="scroll">
     <table class="tbl">
-      <thead><tr><th>Time</th><th>Market</th><th>Slot</th><th>Price (approx.)</th><th>Size</th><th>Edge vs p_true (approx.)</th><th>Effect</th></tr></thead>
+      <thead><tr><th>Time</th><th>Market</th><th>Slot</th><th>Price (approx.)</th><th>Size</th><th>Edge vs p_true (approx.){{ tip('edge_vs_p_true') }}</th><th>Effect</th></tr></thead>
       <tbody>
         {%- for f in vm %}
         <tr>
           <td class="mono">{{ f.at | stamp_local }}</td>
           <td><a href="/markets/{{ f.condition_id }}">{{ f.name | truncate(40, True) }}</a></td>
-          <td><span class="badge {{ f.tone }}">{{ f.slot }}</span></td>
+          <td><span class="badge {{ f.tone }}">{{ f.slot }}</span>{% if f.slot %}{{ tip(f.slot) }}{% endif %}</td>
           <td class="mono">{{ f.price | cents }}</td>
           <td class="mono">{{ f.size | shares }}</td>
           <td class="mono {{ 'c-good' if f.edge is not none and f.edge > 0 else ('c-bad' if f.edge is not none else '') }}">{{ f.edge | cents if f.edge is not none else '--' }}</td>

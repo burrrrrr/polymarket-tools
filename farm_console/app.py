@@ -1,7 +1,9 @@
 """Routes of the farm console. Reads go through farm_db, derivation through views."""
 
 import asyncio
+import json
 import mimetypes
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,7 +21,7 @@ import reward_farmer
 import reward_screener
 from farm_db import CommandKind, EventKind
 
-from . import charts, forms, remote, security, views
+from . import charts, forms, glossary, remote, security, views
 from .scan import ScanPhase, ScanRunner
 
 HERE = Path(__file__).parent
@@ -29,6 +31,14 @@ DEFAULT_PORT = 8787
 FARMER_DEFAULTS = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))._asdict()
 # htmx refreshes the regions listening for this event after a market control.
 CONTROLS_EVENT = "controls"
+# How often an open Review page re-reads the live book and re-plans the orders.
+LIVE_POLL_S = 5
+# The naked budget a new review starts with, and what the quotable check assumes.
+DEFAULT_NAKED_BUDGET = 10.0
+# Skipping to the next quotable candidate reads at most QUOTABLE_SCAN books,
+# QUOTABLE_BATCH at a time.
+QUOTABLE_SCAN = 40
+QUOTABLE_BATCH = 8
 
 OVERVIEW_REGIONS = {"kpis": "partials/kpis.html", "alerts": "partials/alerts.html",
                     "tracked": "partials/tracked.html", "events": "partials/events.html"}
@@ -50,13 +60,15 @@ def utc_now():
 
 def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc_now,
                scan=reward_screener.run_scan, fetch_rules=remote.fetch_rules,
-               fetch_position=remote.fetch_position, funder=None):
+               fetch_position=remote.fetch_position, fetch_info=remote.fetch_info,
+               fetch_book=remote.fetch_book, fetch_total_rates=remote.fetch_total_rates,
+               funder=None):
     """The console over db_path, served on 127.0.0.1:port.
 
     max_polls ends /stream after that many polls, so a test can read it to the
-    end; None streams until the client leaves. scan, fetch_rules and
-    fetch_position reach the network; funder is the wallet address whose
-    holdings the Review page shows.
+    end; None streams until the client leaves. scan and the fetch_ functions
+    reach the network; funder is the wallet address whose holdings the Review
+    page shows.
     """
     app = FastAPI(title="Farm console", docs_url=None, redoc_url=None)
     app.state.token = token = security.new_token()
@@ -69,9 +81,16 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     templates.env.globals.update(PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE,
                                  token=token, TOKEN_FIELD=security.TOKEN_FIELD,
                                  TOKEN_HEADER=security.TOKEN_HEADER,
-                                 CONTROLS_EVENT=CONTROLS_EVENT)
+                                 CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
+                                 polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
+                                 review_url=views.review_url, MODES=views.MODES,
+                                 glossary=glossary.GLOSSARY)
     runner = ScanRunner(db_path, clock, scan)
     rules = remote.TtlCache(fetch_rules, remote.RULES_TTL, clock)
+    infos = remote.TtlCache(fetch_info, remote.INFO_TTL, clock)
+    books = remote.TtlCache(fetch_book, remote.BOOK_TTL, clock)
+    app.state.total_rates = total_rates = remote.TotalRates(
+        fetch_total_rates, remote.TOTAL_RATES_TTL, clock)
 
     def connect():
         return farm_db.open_db(db_path)
@@ -282,6 +301,14 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         status = farm_db.read_farmer_status(conn)
         return views.setting_value(key, status, overrides, FARMER_DEFAULTS)[0]
 
+    def farmer_config(conn):
+        """The FarmConfig the farmer runs with now, as effective() reads each field."""
+        overrides, _ = farm_db.load_settings(conn)
+        status = farm_db.read_farmer_status(conn)
+        return reward_farmer.FarmConfig(**{
+            key: views.setting_value(key, status, overrides, FARMER_DEFAULTS)[0]
+            for key in reward_farmer.FarmConfig._fields})
+
     async def form_of(request):
         return security.form_fields(await request.body())
 
@@ -325,13 +352,14 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
 
     # -- review ------------------------------------------------------------
 
-    def review_context(conn, market, now, values=None, errors=None):
+    def review_context(conn, market, now, values=None, errors=None, mode=None, skipped=0):
         status = farm_db.read_farmer_status(conn)
         ev_margin = effective(conn, "ev_margin")
         values = values or {
-            "p_true": views.number_text(market.p_true) if market.p_true is not None else "",
-            "naked_budget": views.number_text(market.naked_budget_usd)
-            if market.naked_budget_usd is not None else "25",
+            "p_true": views.number_text(market.p_true * 100) if market.p_true is not None else "",
+            "naked_budget": views.number_text(market.naked_budget_usd
+                                              if market.naked_budget_usd is not None
+                                              else DEFAULT_NAKED_BUDGET),
             "capital": views.number_text(market.capital_usd)
             if market.capital_usd is not None else "",
             "note": "",
@@ -340,13 +368,13 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         return {
             "market": market, "m": market.metrics.get("market", {}),
             "plan": market.metrics.get("plan"),
-            "queue": views.queue(farm_db.candidate_queue(conn), market.condition_id),
-            "strip": views.review_strip(market.metrics),
-            "orders": views.planned_orders(market.metrics),
+            "queue": views.queue(farm_db.candidate_queue(conn, mode), market.condition_id),
+            "queue_mode": mode, "skipped": skipped,
             "stats": views.review_stats(market.metrics),
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
-            "ev": views.ev_check(market.metrics, values["p_true"], values["naked_budget"],
-                                 ev_margin),
+            "ev": views.ev_check(market.metrics, forms.parse_p_true(values["p_true"]),
+                                 values["naked_budget"], ev_margin),
+            "p_true_start": views.p_true_start(market.metrics),
             "ev_margin": ev_margin, "farmer_capital": effective(conn, "capital"),
             "values": values, "errors": errors or {},
         }
@@ -358,29 +386,123 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "chrome": views.chrome(snapshot(conn, now), now), "now": now, "page": "review",
             **review_context(conn, market, now, **kw)}, status_code=status_code)
 
+    def parse_mode(mode):
+        if mode and mode not in views.MODES:
+            raise HTTPException(422, f"no mode {mode!r}")
+        return mode or None
+
+    def queue_url(mode):
+        return "/review" + (f"?mode={mode}" if mode else "")
+
     @app.get("/review")
-    def review_first(request: Request):
+    def review_first(request: Request, mode: Optional[str] = None):
         now = clock()
+        mode = parse_mode(mode)
         with closing(connect()) as conn:
-            ids = farm_db.candidate_queue(conn)
+            ids = farm_db.candidate_queue(conn, mode)
             if ids:
-                return see_other(f"/review/{ids[0]}")
+                return see_other(views.review_url(ids[0], mode))
             return render(request, "review_empty.html", now, snapshot(conn, now),
-                          page="review")
+                          page="review", queue_mode=mode)
 
     @app.get("/review/{condition_id}", response_class=HTMLResponse)
-    def review(request: Request, condition_id: str):
+    def review(request: Request, condition_id: str, mode: Optional[str] = None,
+               skipped: int = 0):
+        mode = parse_mode(mode)
         with closing(connect()) as conn:
-            return review_page(request, conn, condition_id)
+            return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
+
+    def plan_now(row, cfg, p_true=None, budget=DEFAULT_NAKED_BUDGET, capital=None):
+        """(views.live_review of a market row with these terms against the live
+        book, its views.rewards_state); p_true None plans without the EV cap."""
+        terms = {"p_true": 1.0 if p_true is None else p_true, "naked_budget_usd": budget,
+                 "capital_usd": capital, "paused": 0, "naked_paused": 0}
+        cid = row["condition_id"]
+        info, rates = infos.get(cid), total_rates.get()
+        fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
+        live = views.live_review({**dict(row), **terms}, info, books.get(fav_token), rates, cfg,
+                                 clock(), row["status"] == "approved")
+        return live, views.rewards_state(info, cid, rates)
+
+    def quotable(row, cfg):
+        """(whether the farmer would quote this candidate now, its rewards state).
+        A market whose book cannot be read counts, so its page can show why."""
+        try:
+            live, active = plan_now(row, cfg)
+        except Exception:
+            return True, None
+        return bool(live.orders), active
+
+    def record_rewards(checked):
+        """Store the rewards state read for each (row, state) in checked, so a
+        candidate whose rewards ended leaves the queue and one whose rewards came
+        back returns. None is unknown. The farmer owns the markets it manages."""
+        changed = [(row["condition_id"], active) for row, active in checked
+                   if row["status"] == "candidate" and active is not None
+                   and active != bool(row["rewards_active"])]
+        if changed:
+            with closing(connect()) as conn:
+                for cid, active in changed:
+                    farm_db.set_rewards_active(conn, cid, active)
+
+    @app.get("/review/{condition_id}/next-quotable")
+    def next_quotable(condition_id: str, mode: Optional[str] = None):
+        mode = parse_mode(mode)
+        with closing(connect()) as conn:
+            ids = farm_db.candidate_queue(conn, mode, after=condition_id)
+            cfg = farmer_config(conn)
+            rows = [farm_db.find_market(conn, cid) for cid in ids[:QUOTABLE_SCAN]]
+        skipped, checked, found = 0, [], None
+        with ThreadPoolExecutor(QUOTABLE_BATCH) as pool:
+            for i in range(0, len(rows), QUOTABLE_BATCH):
+                batch = rows[i:i + QUOTABLE_BATCH]
+                for row, (ok, active) in zip(batch, pool.map(lambda r: quotable(r, cfg), batch)):
+                    checked.append((row, active))
+                    if ok:
+                        found = row
+                        break
+                    skipped += 1
+                if found is not None:
+                    break
+        record_rewards(checked)
+        if found is not None:
+            return see_other(views.review_url(found["condition_id"], mode, skipped))
+        rest = ids[len(rows):]
+        return see_other(views.review_url(rest[0], mode, skipped) if rest else queue_url(mode))
 
     @app.get("/partials/review/{condition_id}/ev", response_class=HTMLResponse)
     def review_ev(request: Request, condition_id: str, p_true: str = "",
                   naked_budget: str = ""):
         with closing(connect()) as conn:
             market = find(conn, condition_id)
-            ev = views.ev_check(market.metrics, p_true, naked_budget,
+            ev = views.ev_check(market.metrics, forms.parse_p_true(p_true), naked_budget,
                                 effective(conn, "ev_margin"))
         return templates.TemplateResponse(request, "partials/review_ev.html", {"ev": ev})
+
+    @app.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
+    def review_live(request: Request, condition_id: str, p_true: str = "",
+                    naked_budget: str = "", capital: str = "", mode: Optional[str] = None):
+        mode = parse_mode(mode)
+        p, budget, cap = forms.preview_terms(
+            {"p_true": p_true, "naked_budget": naked_budget, "capital": capital})
+        with closing(connect()) as conn:
+            row = farm_db.find_market(conn, condition_id)
+            if row is None:
+                raise HTTPException(404, f"no market {condition_id!r}")
+            cfg = farmer_config(conn)
+        try:
+            (live, active), error = plan_now(row, cfg, p, 0.0 if budget is None else budget,
+                                             cap), None
+        except Exception as e:
+            live, active, error = None, None, f"{type(e).__name__}: {e}"
+        record_rewards([(row, active)])
+        candidate = row["status"] == "candidate"
+        return templates.TemplateResponse(request, "partials/review_live.html", {
+            "live": live, "error": error, "p_true_missing": p is None,
+            "budget_missing": budget is None, "candidate": candidate,
+            "left_queue": candidate and active is False,
+            "skip_url": f"/review/{condition_id}/next-quotable"
+                        + (f"?mode={mode}" if mode else "")})
 
     @app.get("/partials/review/{condition_id}/rules", response_class=HTMLResponse)
     def review_rules(request: Request, condition_id: str):
@@ -406,31 +528,33 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "long_outcome": views.OTHER_OUTCOME.get(m.get("fav_outcome"), "longshot"),
             "error": error})
 
-    def next_review(ids, condition_id):
+    def next_review(ids, condition_id, mode):
         following = views.after_decision(ids, condition_id)
-        return f"/review/{following}" if following else "/review"
+        return views.review_url(following, mode) if following else queue_url(mode)
 
     @app.post("/review/{condition_id}/approve")
     async def approve(request: Request, condition_id: str):
         form = await form_of(request)
         decision, errors = forms.parse_decision(form)
+        mode = parse_mode(form.get("queue_mode"))
         with closing(connect()) as conn:
             market = find(conn, condition_id)
             if errors:
                 return review_page(request, conn, condition_id, 422,
                                    values={**form, "note": form.get("note", "")},
-                                   errors=errors)
-            ids = farm_db.candidate_queue(conn)
+                                   errors=errors, mode=mode)
+            ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
-                                 decision.capital)
-        if market.status == "candidate":
-            return see_other(next_review(ids, condition_id))
+                                 decision.capital, decision.start_paused)
+        if market.status == "candidate" and not decision.start_paused:
+            return see_other(next_review(ids, condition_id, mode))
         return see_other(f"/markets/{condition_id}")
 
     @app.post("/review/{condition_id}/reject")
     async def reject(request: Request, condition_id: str):
         form = await form_of(request)
         note, errors = forms.parse_note(form)
+        mode = parse_mode(form.get("queue_mode"))
         with closing(connect()) as conn:
             find(conn, condition_id)
             if errors:
@@ -438,10 +562,10 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                    values={**form, "p_true": form.get("p_true", ""),
                                            "naked_budget": form.get("naked_budget", ""),
                                            "capital": form.get("capital", "")},
-                                   errors=errors)
-            ids = farm_db.candidate_queue(conn)
+                                   errors=errors, mode=mode)
+            ids = farm_db.candidate_queue(conn, mode)
             farm_db.reject_market(conn, condition_id, note)
-        return see_other(next_review(ids, condition_id))
+        return see_other(next_review(ids, condition_id, mode))
 
     @app.post("/review/{condition_id}/retire")
     async def retire_reviewed(request: Request, condition_id: str):

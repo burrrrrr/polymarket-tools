@@ -4,11 +4,11 @@
 {%- endif %}
 <section class="tiles">
   <div class="panel tile"><span class="lbl">Markets</span><span class="mono value">{{ t.quoting }} / {{ t.approved }}</span><span class="note">quoting / approved</span></div>
-  <div class="panel tile"><span class="lbl">Capital in bids</span><span class="mono value">{{ t.fav_bid_usd | usd }}</span><span class="note">favorite bids resting</span></div>
-  <div class="panel tile"><span class="lbl">Naked at risk</span><span class="mono value">{{ t.naked_usd | usd }}</span><span class="note">of {{ t.naked_budget_usd | usd }} budget (quoting markets)</span></div>
-  <div class="panel tile"><span class="lbl">Farm inventory</span><span class="mono value">{{ t.inventory_usd | usd }}</span><span class="note">shares above baseline, at avg cost</span></div>
-  <div class="panel tile"><span class="lbl">Est. rewards</span><span class="mono value">{{ t.est_daily_usd | usd }}/day</span><span class="note">screener estimate, static book</span></div>
-  <div class="panel tile"><span class="lbl">Earned today</span>
+  <div class="panel tile"><span class="lbl">Capital in bids{{ tip('capital_in_bids') }}</span><span class="mono value">{{ t.fav_bid_usd | usd }}</span><span class="note">favorite bids resting</span></div>
+  <div class="panel tile"><span class="lbl">Naked at risk{{ tip('naked_at_risk') }}</span><span class="mono value">{{ t.naked_usd | usd }}</span><span class="note">of {{ t.naked_budget_usd | usd }} budget (quoting markets)</span></div>
+  <div class="panel tile"><span class="lbl">Farm inventory{{ tip('farm_inventory') }}</span><span class="mono value">{{ t.inventory_usd | usd }}</span><span class="note">shares above baseline, at avg cost</span></div>
+  <div class="panel tile"><span class="lbl">Est. rewards{{ tip('est_daily') }}</span><span class="mono value">{{ t.est_daily_usd | usd }}/day</span><span class="note">screener estimate, static book</span></div>
+  <div class="panel tile"><span class="lbl">Earned today{{ tip('earned_today') }}</span>
     {%- if t.earned_today_usd is none %}
     <span class="mono value">n/a</span><span class="note">{{ 'in dry run' if vm.mode != 'LIVE' else 'not fetched yet' }}</span>
     {%- else %}

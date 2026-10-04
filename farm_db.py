@@ -17,6 +17,10 @@ a busy timeout, and every column has exactly one writer process:
                   One exception: the live farmer retires a market by moving
                   status and note from 'approved' to 'retired' in a single
                   conditional UPDATE, so it never overwrites a human decision.
+                  Another: the console's live check of a candidate on the
+                  Review page sets its rewards_active when the rewards it
+                  reads differ, so ended rewards drop it from the queue
+                  before the next scan.
   farm_state      farmer. One row per managed market, replaced every cycle.
   farmer_status   farmer. A single row about the running process.
   farm_events     farmer. Changes only (places, cancels, fills, phase
@@ -284,14 +288,26 @@ def load_scan_params(conn):
     return _get_json(conn, SCAN_PARAMS_KEY) or {}
 
 
+# A candidate counts only if the latest scan assessed it and its rewards are
+# still on. One that stopped qualifying (resolved, too close to expiry, priced
+# out) keeps its row from an older scan, and without this it would sit in the
+# review queue forever. Rewards can end between scans; the console's live check
+# records that in rewards_active. Decided rows (approved, rejected, retired)
+# always show.
+CURRENT = ("(status <> 'candidate' "
+           "OR (rewards_active = 1 "
+           "AND last_scanned = (SELECT MAX(last_scanned) FROM markets)))")
+
+
 def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, limit,
                    offset):
     """(markets, total) by rank, filtered; each filter applies only when given.
 
     mode is the planned mode ('floor' or 'budget'). min_days counts from now to
-    the end date less buffer_days, the farmer's cutoff.
+    the end date less buffer_days, the farmer's cutoff. Stale candidates are
+    always left out (see CURRENT).
     """
-    where, params = [], []
+    where, params = [CURRENT], []
     if statuses:
         where.append(f"status IN ({', '.join('?' * len(statuses))})")
         params.extend(statuses)
@@ -312,11 +328,22 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
     return [_market(r) for r in rows], total
 
 
-def candidate_queue(conn):
-    """Condition ids of the undecided candidates, best rank first."""
+def candidate_queue(conn, mode=None, after=None):
+    """Condition ids of the undecided candidates, best rank first; mode ('floor'
+    or 'budget') keeps only that planned mode. after (a condition id) keeps only
+    those the queue orders after that market, which holds its place even when
+    it has left the queue."""
+    where, params = "", []
+    if mode:
+        where += " AND json_extract(metrics, '$.plan.mode') = ?"
+        params.append(mode)
+    if after:
+        where += (" AND (rank_score, condition_id) < "
+                  "(SELECT rank_score, condition_id FROM markets WHERE condition_id = ?)")
+        params.append(after)
     return [r[0] for r in conn.execute(
-        "SELECT condition_id FROM markets WHERE status = 'candidate' "
-        "ORDER BY rank_score DESC")]
+        f"SELECT condition_id FROM markets WHERE status = 'candidate' AND {CURRENT}{where} "
+        "ORDER BY rank_score DESC, condition_id DESC", params)]
 
 
 def list_markets(conn, status, limit):
@@ -342,16 +369,18 @@ def approve_market(conn, condition_id, p_true, budget, capital_usd=None):
         )
 
 
-def set_approval(conn, condition_id, p_true, budget, capital_usd):
+def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False):
     """Approve with exactly these terms; capital_usd None means the farmer's capital.
 
+    paused sets the pause flag in the same write, so the farmer previews the
+    orders instead of placing them; False leaves the flag as it was.
     Re-approving a retired market makes the farmer manage it afresh.
     """
     with conn:
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
-            "capital_usd = ? WHERE condition_id = ?",
-            (p_true, budget, capital_usd, condition_id),
+            "capital_usd = ?, paused = paused OR ? WHERE condition_id = ?",
+            (p_true, budget, capital_usd, paused, condition_id),
         )
 
 
@@ -377,6 +406,12 @@ def set_paused(conn, condition_id, paused):
     with conn:
         conn.execute("UPDATE markets SET paused = ? WHERE condition_id = ?",
                      (int(paused), condition_id))
+
+
+def set_rewards_active(conn, condition_id, active):
+    with conn:
+        conn.execute("UPDATE markets SET rewards_active = ? WHERE condition_id = ?",
+                     (int(active), condition_id))
 
 
 def set_naked_paused(conn, condition_id, paused):
@@ -423,7 +458,8 @@ class Bound(NamedTuple):
 # Keys are FarmConfig field names.
 SETTINGS = {
     "capital": Bound(0, low_open=True),
-    "bid_offset": Bound(0, 0.5),
+    "fav_target_score": Bound(0, 1, low_open=True),
+    "max_lead": Bound(0, 0.5),
     "ask_offset": Bound(0, 0.5),
     "min_capture": Bound(0, 0.5),
     "ev_margin": Bound(0, 0.5),

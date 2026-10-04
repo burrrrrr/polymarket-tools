@@ -12,6 +12,9 @@
 <link rel="stylesheet" href="/static/app.css">
 <script src="/static/htmx.min.js"></script>
 <script src="/static/sse.min.js"></script>
+<script src="/static/stream.js"></script>
+<script src="/static/tips.js" defer></script>
+<script src="/static/stepper.js" defer></script>
 </head>
 <body hx-ext="sse" sse-connect="/stream" hx-headers='{"{{ TOKEN_HEADER }}": "{{ token }}"}'>
 <div class="shell">

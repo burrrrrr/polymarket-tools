@@ -10,5 +10,7 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# Reward screener database
+# Reward screener database, and SQLite's WAL sidecar files
 farm.db
+farm.db-wal
+farm.db-shm

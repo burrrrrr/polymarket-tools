@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import farm_db
-from farm_console import charts, views
+from farm_console import charts, remote, views
 from farm_console.app import create_app
 from farm_db import Event, EventKind, FarmerStatus, FarmState, MarketRecord, MidSample
 
@@ -300,6 +300,61 @@ class ChartsTest(unittest.TestCase):
         self.assertNotIn("$99.00", svg)
 
 
+class TotalRatesTest(unittest.TestCase):
+    """The holder runs each refresh through spawn; the test runs it when it chooses."""
+
+    def setUp(self):
+        self.now = NOW
+        self.answers = []
+        self.calls = 0
+        self.spawned = []
+        self.rates = remote.TotalRates(self.fetch, timedelta(minutes=5), lambda: self.now,
+                                       self.spawned.append)
+
+    def fetch(self):
+        self.calls += 1
+        answer = self.answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    def land(self):
+        while self.spawned:
+            self.spawned.pop(0)()
+
+    def test_none_until_the_first_fetch_lands_then_the_map(self):
+        self.answers = [{"0xa": 1.0}]
+        self.assertIsNone(self.rates.get())
+        self.now = NOW + timedelta(minutes=6)
+        self.assertIsNone(self.rates.get())
+        self.assertEqual(len(self.spawned), 1)
+        self.land()
+        self.assertEqual(self.rates.get(), {"0xa": 1.0})
+
+    def test_no_refetch_within_ttl(self):
+        self.answers = [{"0xa": 1.0}, {"0xb": 2.0}]
+        self.rates.get()
+        self.land()
+        self.now = NOW + timedelta(minutes=4)
+        self.rates.get()
+        self.land()
+        self.assertEqual((self.calls, self.rates.get()), (1, {"0xa": 1.0}))
+        self.now = NOW + timedelta(minutes=5)
+        self.rates.get()
+        self.land()
+        self.assertEqual((self.calls, self.rates.get()), (2, {"0xb": 2.0}))
+
+    def test_a_failed_or_empty_refresh_keeps_the_old_map(self):
+        self.answers = [{"0xa": 1.0}, ConnectionError("clob down"), {}]
+        self.rates.refresh()
+        for minutes in (5, 10):
+            self.now = NOW + timedelta(minutes=minutes)
+            self.rates.get()
+            self.land()
+            self.assertEqual(self.rates.get(), {"0xa": 1.0})
+        self.assertEqual(self.calls, 3)
+
+
 class Console(unittest.TestCase):
     """The app against a scratch farm.db seeded through farm_db."""
 
@@ -404,7 +459,7 @@ class RoutesTest(Console):
         self.publish(states=[state(A, "PAUSED", "paused by operator", slots={})
                              ._replace(updated_at=self.now)])
         self.assertIn("paused by operator", self.client.get("/partials/overview/alerts").text)
-        self.assertIn('<span class="badge t-n">PAUSED</span>',
+        self.assertIn('<span class="badge t-n">PAUSED<button type="button" class="tip"',
                       self.client.get("/partials/markets").text)
 
 

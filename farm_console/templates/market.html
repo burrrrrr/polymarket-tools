@@ -1,12 +1,13 @@
 {% extends "base.html" %}
-{% from "_macros.html" import region %}
+{% from "_macros.html" import region, polymarket_link %}
 {% block title %}{{ vm.card.name | truncate(40, True) }}{% endblock %}
 {% block content %}
 {%- set base = "/partials/markets/" ~ vm.card.condition_id -%}
 <a href="/markets" style="font-size: 13px">Live markets</a>
 <div class="stack" style="gap: 6px">
   <h1 class="question">{{ vm.card.name }}</h1>
-  <span class="mono small muted">{{ vm.slug or '' }} · {{ vm.card.condition_id }}</span>
+  <span class="mono small muted">{{ vm.card.slug or '' }} · {{ vm.card.condition_id }}</span>
+  {{ polymarket_link(vm.card.slug) }}
 </div>
 {% call region(base ~ "/summary", "sse:cycle, " ~ CONTROLS_EVENT ~ " from:body") %}{% include "partials/market_summary.html" %}{% endcall %}
 <section class="panel pad stack">

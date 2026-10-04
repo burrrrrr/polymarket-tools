@@ -20,7 +20,7 @@
   <div class="form-grid wide">
     {%- for r in rows %}
     <div class="field">
-      <label class="lbl" for="s-{{ r.key }}">{{ r.label }}</label>
+      <div class="label-row"><label class="lbl" for="s-{{ r.key }}">{{ r.label }}</label>{{ tip(r.key) }}</div>
       <div class="input-row">
         <input class="inp mono" id="s-{{ r.key }}" name="{{ r.key }}" value="{{ r.text }}" inputmode="decimal" autocomplete="off" {{ 'aria-invalid="true"' | safe if r.error }}>
         {%- if r.source == 'override' %}
@@ -28,7 +28,7 @@
         {%- endif %}
       </div>
       {{ field_error({r.key: r.error}, r.key) }}
-      <span class="hint"><span class="badge {{ 't-c' if r.source == 'override' else 't-n' }}">{{ {'override': 'override', 'farmer': "farmer's value", 'default': 'default'}[r.source] }}</span> <span class="mono">{{ r.key }}</span>. {{ r.hint }}</span>
+      <span class="hint"><span class="badge {{ 't-c' if r.source == 'override' else 't-n' }}">{{ {'override': 'override', 'farmer': "farmer's value", 'default': 'default'}[r.source] }}</span> <span class="mono">{{ r.key }}</span></span>
     </div>
     {%- endfor %}
   </div>
@@ -37,8 +37,8 @@
 
 <form class="panel pad stack danger-zone" method="post" action="/farmer/cancel-all" style="gap: 12px">
   {{ token_field() }}
-  <h2>Danger zone: cancel all managed orders</h2>
-  <span class="hint">Pauses every approved market. The farmer cancels all their orders on its next cycle and keeps them down until you resume each market. Orders on markets the farmer does not manage are left alone.</span>
+  <h2>Danger zone: cancel all managed orders{{ tip('cancel_all') }}</h2>
+  <span class="hint">The farmer cancels the orders on its next cycle and keeps them down until you resume each market.</span>
   <div class="actions">
     <label class="grow-field"><span class="sr">Type CANCEL to confirm</span><input class="inp mono" name="confirm" placeholder="Type CANCEL to confirm" autocomplete="off" {{ 'aria-invalid="true"' | safe if cancel_error }}></label>
     <button class="btn btn-danger" type="submit">Cancel all</button>

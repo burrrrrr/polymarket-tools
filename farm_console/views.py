@@ -4,14 +4,18 @@ page shows. Every derived number, alert, and class name is decided here, so
 the templates only lay values out and the JSON API serves the same objects.
 """
 
+import json
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import Callable, Iterable, NamedTuple, Optional
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
+import reward_farmer
 from farm_db import EventKind, FarmerStatus, resting_order
-from reward_screener import floor_to_tick
+from reward_screener import Skip, adjusted_mid, created_mid, floor_to_tick
 from reward_screener import score as share_score
+
+from .forms import P_TRUE_ERROR
 
 SLOTS = ("FAV_BID", "LONG_BID", "FAV_ASK", "LONG_ASK")
 PHASES = ("QUOTING", "COOLDOWN", "BELOW_RANGE", "PAUSED", "RETIRED")
@@ -101,6 +105,17 @@ def market_name(market, condition_id=""):
     if market is None:
         return condition_id[:12]
     return market.question or market.slug or market.condition_id[:12]
+
+
+def review_url(condition_id, mode=None, skipped=0):
+    """A market's Review page, keeping the queue's mode filter."""
+    query = urlencode({k: v for k, v in (("mode", mode), ("skipped", skipped)) if v})
+    return f"/review/{condition_id}" + (f"?{query}" if query else "")
+
+
+def polymarket_url(slug):
+    """polymarket.com redirects /market/<slug> to the market inside its event."""
+    return f"https://polymarket.com/market/{quote(slug)}" if slug else None
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +299,7 @@ def slot_rows(state):
 class Card:
     condition_id: str
     name: str
+    slug: Optional[str]
     mode: Optional[str]
     fav_outcome: Optional[str]
     p_true: Optional[float]
@@ -320,7 +336,7 @@ def card(market, state, status, now):
     budget = market.naked_budget_usd or 0.0
     if state is None:
         return Card(
-            condition_id=market.condition_id, name=market_name(market),
+            condition_id=market.condition_id, name=market_name(market), slug=market.slug,
             mode=metrics.get("plan", {}).get("mode"), fav_outcome=m.get("fav_outcome"),
             p_true=market.p_true, budget_usd=budget, capital_usd=market.capital_usd,
             cutoff=cutoff, cutoff_in_s=cutoff and (cutoff - now).total_seconds(),
@@ -334,7 +350,7 @@ def card(market, state, status, now):
     mid = state.mid if state.mid is not None else state.book_mid
     high = max(state.q1, state.q2)
     return Card(
-        condition_id=market.condition_id, name=market_name(market),
+        condition_id=market.condition_id, name=market_name(market), slug=market.slug,
         mode=metrics.get("plan", {}).get("mode"), fav_outcome=m.get("fav_outcome"),
         p_true=market.p_true, budget_usd=budget, capital_usd=state.capital_usd,
         cutoff=cutoff, cutoff_in_s=cutoff and (cutoff - now).total_seconds(),
@@ -631,7 +647,6 @@ class Marker:
 @dataclass(frozen=True)
 class MarketDetail:
     card: Card
-    slug: Optional[str]
     status: str
     v: Optional[float]
     min_size: Optional[float]
@@ -654,7 +669,7 @@ def market_detail(market, state, status, events, mids, now):
     phase_since = next((e.at for e in own if e.kind is EventKind.PHASE), None)
     markets = {market.condition_id: market}
     return MarketDetail(
-        card=c, slug=market.slug, status=market.status, v=m.get("v"),
+        card=c, status=market.status, v=m.get("v"),
         min_size=m.get("min_size"), tick=m.get("tick"), phase_since=phase_since,
         fav_bid_cap_usd=c.capital_usd,
         book=book_rows(state.book, c.mid if c.mid is not None else c.book_mid, m.get("v"))
@@ -769,7 +784,6 @@ def fills_tab(snap, fill_events):
 class SettingRow:
     key: str
     label: str
-    hint: str
     value: float
     source: str
     text: str
@@ -798,7 +812,7 @@ def setting_rows(fields, group, status, overrides, bad_rows, defaults, submitted
             continue
         value, source = setting_value(key, status, overrides, defaults)
         stored_error = f"Stored row ignored: {bad_rows[key]}" if key in bad_rows else None
-        rows.append(SettingRow(key, field.label, field.hint, value, source,
+        rows.append(SettingRow(key, field.label, value, source,
                                submitted.get(key, number_text(value)),
                                errors.get(key) or stored_error))
     return rows
@@ -903,17 +917,6 @@ OTHER_OUTCOME = {"Yes": "No", "No": "Yes"}
 
 
 @dataclass(frozen=True)
-class PlannedOrder:
-    slot: str
-    tone: str
-    order: str
-    size: float
-    score: float
-    cost: float
-    why: str
-
-
-@dataclass(frozen=True)
 class Queue:
     position: Optional[int]
     total: int
@@ -936,69 +939,168 @@ def after_decision(ids, condition_id):
     return q.next or q.prev
 
 
-def planned_orders(metrics):
-    plan, m = metrics.get("plan"), metrics.get("market", {})
-    if not plan:
-        return []
-    fav = m.get("fav_outcome") or "favorite"
+# ---------------------------------------------------------------------------
+# Review: the farmer's orders against the live book
+# ---------------------------------------------------------------------------
+
+LADDER_LEVELS = 12
+
+
+@dataclass(frozen=True)
+class PreviewOrder:
+    """One order the farmer would place. price is in its own outcome's terms;
+    book_price is where it rests in the favorite book (a longshot bid shows
+    there as an ask at its mirror)."""
+
+    slot: str
+    tone: str
+    outcome: str
+    price: float
+    size: float
+    score: float
+    cost: float
+    book_price: float
+
+
+@dataclass(frozen=True)
+class LadderRow:
+    price: float
+    size: float
+    total: float
+    depth_pct: float
+    score: Optional[float]
+    ours: Optional[PreviewOrder]
+
+
+@dataclass(frozen=True)
+class LiveReview:
+    """The favorite book now, and what the farmer would place against it.
+
+    asks run highest price first and bids best first, so the two meet at the
+    midpoint. total is the size resting from the inside out to that level, and
+    outside the shares on each side beyond the levels shown.
+    """
+
+    read_at: datetime
+    fav_outcome: str
+    long_outcome: str
+    book_mid: Optional[float]
+    mid: Optional[float]
+    note: str
+    orders: list
+    strip: Optional[BandStrip]
+    asks: list
+    bids: list
+    outside_asks: float
+    outside_bids: float
+
+
+def rewards_state(info, condition_id, total_rates):
+    """reward_farmer.rewards_active, or None while the answer waits on
+    total_rates, which is None until the slow listing is first read."""
+    active = reward_farmer.rewards_active(info, condition_id, total_rates)
+    # Before the listing is read the rule assumes active. That answer is real
+    # only when an empty listing would give the same one.
+    if total_rates is None and active != reward_farmer.rewards_active(info, condition_id, {}):
+        return None
+    return active
+
+
+def live_review(row, info, levels, total_rates, cfg, now, managed):
+    """row: the market's farm.db row carrying the terms to preview; levels: the
+    favorite token's live book; total_rates: as reward_farmer.rewards_active
+    takes it. Planning is the farmer's own, from a zero farm position, since a
+    new market's holdings become its baseline. A market the farmer already
+    manages gets the book without a plan."""
+    fav = json.loads(row["metrics"])["market"].get("fav_outcome") or "favorite"
     long = OTHER_OUTCOME.get(fav, "longshot")
-    book_mid = metrics.get("book_mid", plan["mid"])
-    if abs(plan["mid"] - book_mid) > 1e-9:
-        fav_why = ("Becomes the best bid, priced two offsets under the best ask so it "
-                   "sits one offset from the midpoint it creates.")
+    book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
+    target, note = reward_farmer.Target(book_mid, []), ""
+    fm = reward_farmer.farm_market(row, info, cfg)
+    if managed:
+        note = "The farmer manages this market. Its live orders are on the market page."
+    elif isinstance(fm, Skip):
+        note = f"The farmer cannot manage this market: {fm.reason}."
     else:
-        fav_why = f"One offset under the {cents(book_mid)} midpoint."
-    long_cost = plan["low_price"] * plan["low_size"]
-    if plan.get("mode") == "floor":
-        long_why = (f"Floor bid: the cheapest tick that still scores, sized so its score "
-                    f"matches the favorite bid's. It ties up {usd(long_cost)}.")
-    else:
-        long_why = (f"The lowest longshot price that still scores, sized so its score "
-                    f"matches the favorite bid's. Its {usd(long_cost)} is naked risk, "
-                    f"capped by the naked budget.")
-    return [
-        PlannedOrder("FAV_BID", SLOT_TONE["FAV_BID"],
-                     f"BUY {fav} {cents(plan['fav_bid_price'])}", plan["fav_bid_size"],
-                     plan["fav_bid_score"], plan["fav_bid_price"] * plan["fav_bid_size"],
-                     fav_why),
-        PlannedOrder("LONG_BID", SLOT_TONE["LONG_BID"], f"BUY {long} {cents(plan['low_price'])}",
-                     plan["low_size"], plan["low_score"], long_cost, long_why),
-    ]
+        fm = fm._replace(tick=levels.tick or fm.tick)
+        obs = reward_farmer.Observation(
+            mid=book_mid, recent_mids=(),
+            rewards_active=reward_farmer.rewards_active(info, fm.condition_id, total_rates),
+            accepting_orders=info.accepting_orders, closed=info.closed, approved=True,
+            expires_at=fm.expires_at)
+        state = reward_farmer.step_state(reward_farmer.State(reward_farmer.Phase.QUOTING),
+                                         obs, now, cfg)
+        if state.phase is reward_farmer.Phase.QUOTING:
+            target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True)
+            if not target.intents:
+                note = "The farmer would place nothing: no bid scores against this book."
+        else:
+            why = state.reason or (f"the midpoint {cents(book_mid)} is under min_fav "
+                                   f"{cents(cfg.min_fav)}")
+            note = f"The farmer would not quote: {why}."
 
+    orders = []
+    for i in target.intents:
+        is_fav = i.slot.role is reward_farmer.Role.FAV
+        orders.append(PreviewOrder(
+            i.slot.name, SLOT_TONE[i.slot.name], fav if is_fav else long, i.price, i.size,
+            i.score, i.price * i.size, i.price if is_fav else round(1 - i.price, 6)))
 
-def review_strip(metrics):
-    """The band around the planned midpoint with the scanned book's best bid and
-    ask and our planned bids."""
-    plan, m = metrics.get("plan"), metrics.get("market", {})
-    if not plan:
-        return None
+    mid = target.mid if target.mid is not None else book_mid
+    ours = {(o.book_price, o.slot == "FAV_BID"): o for o in orders}
+
+    def side(entries, is_bid):
+        sizes = dict(entries)
+        prices = sorted(set(sizes) | {p for p, bid in ours if bid == is_bid}, reverse=is_bid)
+        rows, total = [], 0.0
+        for n, price in enumerate(prices):
+            total += sizes.get(price, 0.0)
+            mine = ours.get((price, is_bid))
+            if n < LADDER_LEVELS or mine:
+                in_band = mid is not None and abs(price - mid) < info.v
+                rows.append((price, sizes.get(price, 0.0), total,
+                             share_score(info.v, abs(price - mid)) if in_band else None, mine))
+        return rows, total - sum(r[1] for r in rows)
+
+    ask_rows, outside_asks = side(levels.asks, False)
+    bid_rows, outside_bids = side(levels.bids, True)
+    deepest = max([r[2] for r in ask_rows + bid_rows] or [0.0]) or 1.0
+
+    def ladder(rows):
+        return [LadderRow(price, size, total, round(total / deepest * 100, 1), score, mine)
+                for price, size, total, score, mine in rows]
+
+    by_slot = {o.slot: o.price for o in orders}
     book = [("book", price, f"{label} {cents(price)}")
-            for price, label in ((metrics.get("best_bid"), "best bid"),
-                                 (metrics.get("best_ask"), "best ask"))
+            for price, label in ((levels.bids[0][0] if levels.bids else None, "best bid"),
+                                 (levels.asks[0][0] if levels.asks else None, "best ask"))
             if price is not None]
-    strip = band_strip(plan["mid"], m.get("v"), plan["fav_bid_price"], plan["low_price"], book)
-    if strip is None:
-        return None
-    names = {"fav_bid": "our bid", "mid": "mid", "long_bid": "longshot bid (mirror)"}
-    return BandStrip(strip.lo, strip.hi, sorted(
-        (k if k.label else replace(k, label=f"{names[k.kind]} {cents(k.price)}")
-         for k in strip.marks), key=lambda k: k.price))
+    strip = band_strip(mid, info.v, by_slot.get("FAV_BID"), by_slot.get("LONG_BID"), book)
+    if strip is not None:
+        names = {"fav_bid": "our bid", "mid": "mid", "long_bid": "longshot bid (mirror)"}
+        strip = BandStrip(strip.lo, strip.hi, sorted(
+            (k if k.label else replace(k, label=f"{names[k.kind]} {cents(k.price)}")
+             for k in strip.marks), key=lambda k: k.price))
+    return LiveReview(now, fav, long, book_mid, mid, note, orders, strip,
+                      list(reversed(ladder(ask_rows))), ladder(bid_rows),
+                      outside_asks, outside_bids)
 
 
 def review_stats(metrics):
+    """(label, value, glossary key) of each yield figure."""
     def pct(value):
         return "--" if value is None else f"{value * 100:,.0f}%"
 
     ahead = metrics.get("depth_ahead_ratio")
     return [
-        ("Est share", pct(metrics.get("share"))),
-        ("Est $/day", usd(metrics.get("est_daily_usd"))),
-        ("Capital", usd(metrics.get("capital_usd"))),
-        ("APR", pct(metrics.get("apr"))),
-        ("Depth ahead", "--" if ahead is None else f"{ahead:.1f}x"),
+        ("Est share", pct(metrics.get("share")), "est_share"),
+        ("Est $/day", usd(metrics.get("est_daily_usd")), "est_daily"),
+        ("Capital", usd(metrics.get("capital_usd")), "planned_capital"),
+        ("APR", pct(metrics.get("apr")), "apr"),
+        ("Depth ahead", "--" if ahead is None else f"{ahead:.1f}x", "ahead"),
         ("Holding rewards", {True: "yes", False: "no"}.get(metrics.get("holding_rewards"),
-                                                           "unknown")),
-        ("Vol 24h", human_volume(metrics.get("volume24hr"))),
+                                                           "unknown"), "holding_rewards"),
+        ("Vol 24h", human_volume(metrics.get("volume24hr")), "vol24h"),
     ]
 
 
@@ -1015,13 +1117,20 @@ def _float(text):
         return None
 
 
-def ev_check(metrics, p_true_text, budget_text, ev_margin):
-    """What the farmer will do with this p_true and budget, by its own rule: the
-    favorite bid never prices above floor_to_tick(p_true - ev_margin)."""
+def p_true_start(metrics):
+    """The whole percent an empty p_true steps to first: the scanned favorite
+    mid, rounded, or None without one."""
+    mid = metrics.get("book_mid")
+    return None if mid is None else min(max(round(mid * 100), 1), 99)
+
+
+def ev_check(metrics, p_true, budget_text, ev_margin):
+    """What the farmer will do with this p_true (a probability, None while the
+    typed percent is invalid) and budget, by its own rule: the favorite bid
+    never prices above floor_to_tick(p_true - ev_margin)."""
     plan, m = metrics.get("plan"), metrics.get("market", {})
-    p_true = _float(p_true_text)
-    if p_true is None or not 0 < p_true < 1 or not plan:
-        return EvCheck("c-warn", ["Enter a probability strictly between 0 and 1."])
+    if p_true is None or not plan:
+        return EvCheck("c-warn", [P_TRUE_ERROR])
     tick = m.get("tick") or 0.001
     bid, cap = plan["fav_bid_price"], floor_to_tick(p_true - ev_margin, tick)
     margin = f"p_true minus {cents(ev_margin)}"
@@ -1029,7 +1138,12 @@ def ev_check(metrics, p_true_text, budget_text, ev_margin):
         tone, lines = "c-good", [f"Planned bid {cents(bid)} is at or under your cap of "
                                  f"{cents(cap)} ({margin}). A fill is +EV by your estimate."]
     else:
-        capped = share_score(m.get("v") or 0.0, plan["mid"] - cap) if cap >= tick else 0.0
+        best_bid, best_ask = metrics.get("best_bid"), metrics.get("best_ask")
+        # A scan row from before the book's best levels were stored has only the
+        # midpoint the planned bid created.
+        mid = (plan["mid"] if best_bid is None or best_ask is None
+               else created_mid(cap, best_bid, best_ask))
+        capped = share_score(m.get("v") or 0.0, mid - cap) if cap >= tick else 0.0
         then = (f"The farmer bids {cents(cap)} instead, which scores {capped:.3f} per share "
                 f"instead of {plan['fav_bid_score']:.3f}." if capped > 0 else
                 f"{cents(cap)} is outside the reward band, so the farmer places no favorite "

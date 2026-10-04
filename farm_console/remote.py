@@ -1,15 +1,23 @@
 """What the Review page fetches on demand: a market's resolution rules from
-Gamma, and the funder's holdings in it, read the way the farmer reads them."""
+Gamma, the funder's holdings in it, its CLOB record and live book, and the
+total reward rates, all read the way the farmer reads them."""
 
+import threading
 from datetime import datetime, timedelta
 from typing import NamedTuple, Optional
 
 import httpx
 
 import reward_farmer
-from reward_screener import GAMMA_HOST, parse_time
+import reward_screener
+from reward_screener import CLOB_HOST, GAMMA_HOST, parse_levels, parse_time
 
 RULES_TTL = timedelta(minutes=10)
+# The CLOB record holds the reward terms and tick, which rarely change; the
+# book is cached just long enough that several open tabs share one fetch.
+INFO_TTL = timedelta(minutes=5)
+BOOK_TTL = timedelta(seconds=2)
+TOTAL_RATES_TTL = timedelta(seconds=reward_farmer.TOTAL_RATES_S)
 TIMEOUT_S = 15
 
 
@@ -45,6 +53,79 @@ def fetch_position(user, condition_id, fav_token_id):
     fav = holdings.get(fav_token_id, (0.0, 0.0))
     long = holdings.get(longs[0], (0.0, 0.0)) if len(longs) == 1 else (0.0, 0.0)
     return reward_farmer.Position(fav[0], fav[1], long[0], long[1])
+
+
+def fetch_info(condition_id):
+    """The market's reward_farmer.MarketInfo from the CLOB."""
+    with httpx.Client() as http:
+        return reward_farmer.fetch_market_info(http, condition_id, timeout=TIMEOUT_S)
+
+
+def fetch_book(token_id):
+    """The token's live book as reward_screener.Levels."""
+    with httpx.Client() as http:
+        resp = http.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=TIMEOUT_S)
+        resp.raise_for_status()
+        return parse_levels(resp.json())
+
+
+def fetch_total_rates():
+    """{condition_id: total daily rate} of every reward market, sponsored pools
+    included."""
+    with httpx.Client() as http:
+        return reward_screener.fetch_total_rates(http)
+
+
+def in_background(work):
+    threading.Thread(target=work, daemon=True, name="console-total-rates").start()
+
+
+class TotalRates:
+    """The fetch_total_rates map, which pages for most of a minute.
+
+    get() never waits on it. It returns the last map, None until the first
+    fetch lands, and starts a refresh through spawn when there is no map yet or
+    the last refresh started ttl ago. A failed or empty fetch keeps the old
+    map, as in the farmer.
+    """
+
+    def __init__(self, fetch, ttl, clock, spawn=in_background):
+        self.fetch = fetch
+        self.ttl = ttl
+        self.clock = clock
+        self.spawn = spawn
+        self.rates = None
+        self._started = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def get(self):
+        if self._claim():
+            self.spawn(self._fetch)
+        return self.rates
+
+    def refresh(self):
+        """Fetch the map in this thread, unless it is fresh or already being fetched."""
+        if self._claim():
+            self._fetch()
+
+    def _claim(self):
+        with self._lock:
+            due = not self._running and (self._started is None
+                                         or self.clock() - self._started >= self.ttl)
+            if due:
+                self._running, self._started = True, self.clock()
+            return due
+
+    def _fetch(self):
+        try:
+            rates = self.fetch()
+            if rates:
+                self.rates = rates
+        except Exception:
+            pass
+        finally:
+            self._running = False
 
 
 class TtlCache:

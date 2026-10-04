@@ -3,14 +3,14 @@
 <div class="stack" style="gap: 18px">
   <header class="page-head" style="align-items: flex-start">
     <div class="actions">
-      <span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{% if vm.phase_since %} since {{ vm.phase_since | clock }}{% endif %}</span>
+      <span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{% if vm.phase_since %} since {{ vm.phase_since | clock }}{% endif %}{{ tip(c.phase) }}</span>
       {%- if c.phase_reason %}<span class="badge t-n">{{ c.phase_reason }}{% if c.phase_until %} until {{ c.phase_until | clock }}{% endif %}</span>{% endif %}
-      {%- if c.mode %}<span class="badge {{ 't-b' if c.mode == 'BUDGET' else 't-f' }}">{{ c.mode }}</span>{% endif %}
-      <span class="badge t-n">favorite {{ c.fav_outcome or '--' }} · p_true {{ '%.3f' % c.p_true if c.p_true is not none else '--' }}</span>
-      <span class="badge t-n">band {{ vm.v | cents }} · min {{ vm.min_size | shares }} · tick {{ '%g' % vm.tick if vm.tick else '--' }}</span>
-      <span class="badge t-n">budget {{ c.budget_usd | usd }} · capital {{ c.capital_usd | usd if c.capital_usd is not none else 'farmer default' }}</span>
+      {%- if c.mode %}<span class="badge {{ 't-b' if c.mode | lower == 'budget' else 't-f' }}">{{ c.mode | upper }}{{ tip(c.mode | lower) }}</span>{% endif %}
+      <span class="badge t-n">favorite {{ c.fav_outcome or '--' }} · p_true {{ '%.3f' % c.p_true if c.p_true is not none else '--' }}{{ tip('p_true') }}</span>
+      <span class="badge t-n">band {{ vm.v | cents }}{{ tip('band') }} · min {{ vm.min_size | shares }}{{ tip('min_size') }} · tick {{ '%g' % vm.tick if vm.tick else '--' }}</span>
+      <span class="badge t-n">budget {{ c.budget_usd | usd }}{{ tip('naked_budget') }} · capital {{ c.capital_usd | usd if c.capital_usd is not none else 'farmer default' }}{{ tip('capital_cap') }}</span>
       {%- if c.paused %}<span class="badge t-n">paused flag set</span>{% endif %}
-      {%- if c.naked_paused %}<span class="badge t-b">naked leg paused</span>{% endif %}
+      {%- if c.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
       {%- if vm.status != 'approved' %}<span class="badge t-r">{{ vm.status }}</span>{% endif %}
     </div>
     <div class="actions">
@@ -22,12 +22,12 @@
   <div class="empty">Approved, waiting for the farmer. Nothing is quoting yet: the farmer has no farm_state row for this market.</div>
   {%- else %}
   <section class="tiles">
-    <div class="panel tile"><span class="lbl">Mid (effective)</span><span class="mono value" style="font-size: 20px">{{ c.mid | cents }}</span><span class="note">book mid before our quotes {{ c.book_mid | cents }}</span></div>
-    <div class="panel tile"><span class="lbl">Q1 / Q2</span><span class="mono value" style="font-size: 20px">{{ '%.1f' % c.q1 }} / {{ '%.1f' % c.q2 }}</span><span class="note">balance {{ c.q_balance_pct }}%</span></div>
-    <div class="panel tile"><span class="lbl">Capital in bid</span><span class="mono value" style="font-size: 20px">{{ (c.fav_bid.notional if c.fav_bid else 0) | usd }}</span><span class="note">cap {{ c.capital_usd | usd }}</span></div>
-    <div class="panel tile"><span class="lbl">Naked at risk</span><span class="mono value" style="font-size: 20px">{{ c.naked_used_usd | usd }}</span><span class="note">budget {{ c.budget_usd | usd }}</span></div>
-    <div class="panel tile"><span class="lbl">Farm inventory</span><span class="mono value" style="font-size: 20px">{% if c.position %}{{ c.position.farm.fav | shares }} / {{ c.position.farm.long | shares }}{% else %}--{% endif %}</span><span class="note">fav / longshot above baseline</span></div>
-    <div class="panel tile"><span class="lbl">Expiry cutoff</span><span class="mono value" style="font-size: 20px">{% if c.cutoff_in_s is none %}--{% elif c.cutoff_in_s > 0 %}{{ c.cutoff_in_s | span }}{% else %}passed{% endif %}</span><span class="note">GTD {{ c.cutoff | stamp_local }}</span></div>
+    <div class="panel tile"><span class="lbl">Mid (effective){{ tip('mid_effective') }}</span><span class="mono value" style="font-size: 20px">{{ c.mid | cents }}</span><span class="note">book mid before our quotes {{ c.book_mid | cents }}{{ tip('book_mid') }}</span></div>
+    <div class="panel tile"><span class="lbl">Q1 / Q2{{ tip('q1_q2') }}</span><span class="mono value" style="font-size: 20px">{{ '%.1f' % c.q1 }} / {{ '%.1f' % c.q2 }}</span><span class="note">balance {{ c.q_balance_pct }}%</span></div>
+    <div class="panel tile"><span class="lbl">Capital in bid{{ tip('capital_in_bids') }}</span><span class="mono value" style="font-size: 20px">{{ (c.fav_bid.notional if c.fav_bid else 0) | usd }}</span><span class="note">cap {{ c.capital_usd | usd }}</span></div>
+    <div class="panel tile"><span class="lbl">Naked at risk{{ tip('naked_at_risk') }}</span><span class="mono value" style="font-size: 20px">{{ c.naked_used_usd | usd }}</span><span class="note">budget {{ c.budget_usd | usd }}</span></div>
+    <div class="panel tile"><span class="lbl">Farm inventory{{ tip('farm_inventory') }}</span><span class="mono value" style="font-size: 20px">{% if c.position %}{{ c.position.farm.fav | shares }} / {{ c.position.farm.long | shares }}{% else %}--{% endif %}</span><span class="note">fav / longshot above baseline</span></div>
+    <div class="panel tile"><span class="lbl">Expiry cutoff{{ tip('expiry_cutoff') }}</span><span class="mono value" style="font-size: 20px">{% if c.cutoff_in_s is none %}--{% elif c.cutoff_in_s > 0 %}{{ c.cutoff_in_s | span }}{% else %}passed{% endif %}</span><span class="note">GTD {{ c.cutoff | stamp_local }}</span></div>
   </section>
 
   {%- endif %}

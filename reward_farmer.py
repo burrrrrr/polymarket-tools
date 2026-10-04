@@ -47,6 +47,8 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                apply; it resumes a little above the threshold.
   PAUSED       a human paused the market (markets.paused). It leaves the
                moment the flag clears and goes through the checks above.
+               When resuming would quote, the orders it would place are
+               published to farm_state as a preview and never sent.
   RETIRED      rewards removed, market closed or not accepting orders, no
                longer approved, or the expiry buffer reached. Terminal, and
                checked before the pause. A market a human approves again
@@ -131,11 +133,13 @@ from reward_screener import (
     adjust_levels,
     adjusted_mid,
     fav_bid_price,
+    fetch_gamma,
     fetch_levels,
     fetch_total_rates,
     floor_to_tick,
     lowest_scoring_bid,
     parse_time,
+    resolution_signal,
     round_size_down,
     round_size_up,
     score,
@@ -156,6 +160,7 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 POSITIONS_S = 60
 MARKET_INFO_S = 300
 MARKET_INFO_RETRY_S = 60
+RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
 MID_SAMPLE_S = 60
@@ -343,6 +348,7 @@ class Observation(NamedTuple):
     paused: bool = False
     naked_paused: bool = False
     naked_cooldown_until: Optional[datetime] = None
+    resolution: Optional[str] = None
 
 
 class MarketInfo(NamedTuple):
@@ -360,7 +366,8 @@ class MarketInfo(NamedTuple):
 
 class FarmConfig(NamedTuple):
     capital: float
-    bid_offset: float
+    fav_target_score: float
+    max_lead: float
     ask_offset: float
     min_capture: float
     ev_margin: float
@@ -413,9 +420,14 @@ def mirror(price, tick):
     return round(1 - price, tick_decimals(tick))
 
 
-def plan_fav_bid(fm, levels, book_mid, position, cfg):
+def uncapped_fav_bid(fm, levels, cfg):
+    return fav_bid_price(levels, fm.v, fm.tick, fm.min_size, cfg.fav_target_score,
+                         cfg.max_lead)
+
+
+def plan_fav_bid(fm, levels, position, cfg):
     """(price, size) of the favorite bid before balancing, or None."""
-    price = fav_bid_price(book_mid, levels, fm.tick, cfg.bid_offset, fm.min_size)
+    price = uncapped_fav_bid(fm, levels, cfg)
     if isinstance(price, Skip):
         return None
     price = min(price, ev_cap(fm, cfg))
@@ -425,13 +437,14 @@ def plan_fav_bid(fm, levels, book_mid, position, cfg):
     return price, round_size_down(max(0.0, room) / price)
 
 
-def plan_long_ask_price(fm, levels, book_mid, fav_bid, cfg):
-    """Longshot ask at the mirror of the favorite bid, or of where it would sit."""
+def plan_long_ask_price(fm, levels, fav_bid, cfg):
+    """Longshot ask at the mirror of the favorite bid, or of where it would sit; None
+    when the book leaves no favorite bid to mirror."""
     if fav_bid is not None:
         return mirror(fav_bid, fm.tick)
-    fav_equivalent = floor_to_tick(book_mid - max(cfg.bid_offset, fm.tick), fm.tick)
-    if levels.asks:
-        fav_equivalent = min(fav_equivalent, floor_to_tick(levels.asks[0][0] - fm.tick, fm.tick))
+    fav_equivalent = uncapped_fav_bid(fm, levels, cfg)
+    if isinstance(fav_equivalent, Skip):
+        return None
     return mirror(fav_equivalent, fm.tick)
 
 
@@ -466,12 +479,10 @@ def target_orders(fm, levels, position, cfg, naked_allowed):
         return Target(None, [])
     tick, v = fm.tick, fm.v
 
-    fav_bid = plan_fav_bid(fm, levels, book_mid, position, cfg)
+    fav_bid = plan_fav_bid(fm, levels, position, cfg)
     long_ask = fav_ask = None
     if position.long_shares >= fm.min_size:
-        long_ask = plan_long_ask_price(
-            fm, levels, book_mid, fav_bid and fav_bid[0], cfg
-        )
+        long_ask = plan_long_ask_price(fm, levels, fav_bid and fav_bid[0], cfg)
     if position.fav_shares >= fm.min_size:
         fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg)
 
@@ -588,6 +599,8 @@ RETIRE_CHECKS = (
     ("not accepting orders", lambda obs, now: not obs.accepting_orders),
     ("no longer approved", lambda obs, now: not obs.approved),
     ("expiry buffer reached", lambda obs, now: now >= obs.expires_at),
+    ("event closed", lambda obs, now: obs.resolution == "event closed"),
+    ("resolution proposed", lambda obs, now: obs.resolution == "resolution proposed"),
 )
 
 
@@ -712,9 +725,14 @@ def q_totals(intents):
     return q[QSide.ONE], q[QSide.TWO]
 
 
-def slot_views(state, orders, target, actions, backoffs, fm, position, cfg):
-    """Per slot: the resting order, the target, and what this cycle decided."""
+def slot_views(state, orders, target, preview, actions, backoffs, fm, position, cfg):
+    """Per slot: the resting order, the target, and what this cycle decided.
+
+    preview is what a paused market would place on resume; its intents show
+    as the target with decision "preview" and are never acted on.
+    """
     intents = {i.slot: i for i in target.intents}
+    previews = {i.slot: i for i in preview.intents} if preview else {}
     cancelled = {i for a in actions if isinstance(a, Cancel) for i in a.order_ids}
     placing = {a.intent.slot for a in actions if isinstance(a, Place)}
     views = {}
@@ -723,7 +741,9 @@ def slot_views(state, orders, target, actions, backoffs, fm, position, cfg):
         kept = next((o for o in resting if o.id not in cancelled), None)
         shown = kept or (resting[0] if resting else None)
         intent = intents.get(slot)
-        if intent is None:
+        if intent is None and slot in previews and not resting:
+            decision, reason = "preview", "would place on resume"
+        elif intent is None:
             why = "no target" if state.phase is Phase.QUOTING else str(state)
             decision, reason = ("cancel" if resting else "none"), why
         elif kept is not None:
@@ -736,11 +756,12 @@ def slot_views(state, orders, target, actions, backoffs, fm, position, cfg):
         else:
             decision = "backoff"
             reason = f"rejected; retry after {stamp(backoffs[slot].until)}"
+        shown_intent = intent or previews.get(slot)
         views[slot.name] = {
             "order": shown and {"id": shown.id, "price": shown.price,
                                 "size": shown.size_remaining},
-            "target": intent and {"price": intent.price, "size": intent.size,
-                                  "score": intent.score},
+            "target": shown_intent and {"price": shown_intent.price, "size": shown_intent.size,
+                                        "score": shown_intent.score},
             "live_score": (order_score(slot, shown.price, target.mid, fm.v)
                            if shown and target.mid is not None else None),
             "decision": decision,
@@ -1023,7 +1044,8 @@ class Farmer:
         self.events = []
         self.mids = []
         self.scoring = {}
-        self.positions_at = self.rewards_at = 0.0
+        self.positions_at = self.rewards_at = self.resolutions_at = 0.0
+        self.resolutions = {}
         self.started_at = self.last_cycle_at = datetime.now(timezone.utc)
         self.sim_ids = 0
         self.stop = threading.Event()
@@ -1231,6 +1253,23 @@ class Farmer:
         except Exception as e:
             log(f"Warning: earnings for {date} unavailable ({e})")
 
+    def refresh_resolutions(self):
+        """Gamma's view of whether each managed market is already decided.
+
+        One batched read a minute. A failed read keeps the last answer, so a
+        Gamma outage neither retires markets nor forgets a known signal.
+        """
+        ids = [m.fm.condition_id for m in self.active()]
+        if not ids:
+            return
+        info = fetch_gamma(self.http, ids)
+        if not info:
+            log("Warning: Gamma resolution check returned nothing; keeping the last answer")
+            return
+        for cid in ids:
+            if cid in info:
+                self.resolutions[cid] = resolution_signal(info[cid])
+
     def open_orders(self, managed):
         if not self.live:
             return list(managed.sim_orders)
@@ -1249,6 +1288,9 @@ class Farmer:
         if unpositioned or time.monotonic() >= self.positions_at:
             self.refresh_positions(now)
             self.positions_at = time.monotonic() + POSITIONS_S
+        if time.monotonic() >= self.resolutions_at:
+            self.refresh_resolutions()
+            self.resolutions_at = time.monotonic() + RESOLUTION_S
         if self.live and time.monotonic() >= self.rewards_at:
             self.refresh_rewards(now)
             self.rewards_at = time.monotonic() + REWARDS_S
@@ -1288,6 +1330,7 @@ class Farmer:
             paused=fm.paused,
             naked_paused=fm.naked_paused,
             naked_cooldown_until=managed.naked_paused_until,
+            resolution=self.resolutions.get(fm.condition_id),
         )
         previous, managed.state = managed.state, step_state(managed.state, obs, now, self.cfg)
         if book_mid is not None:
@@ -1302,9 +1345,15 @@ class Farmer:
                       data={"from": previous.phase.value, "to": state.phase.value,
                             "reason": state.reason, "until": stamp(state.until)})
 
-        target = Target(book_mid, [])
+        target, preview = Target(book_mid, []), None
         if managed.state.phase is Phase.QUOTING:
             target = target_orders(
+                fm, book, managed.position, self.cfg, naked_allowed(obs, now)
+            )
+        elif (managed.state.phase is Phase.PAUSED
+              and step_state(managed.state, obs._replace(paused=False), now,
+                             self.cfg).phase is Phase.QUOTING):
+            preview = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now)
             )
         actions = without_backed_off(
@@ -1322,7 +1371,7 @@ class Farmer:
                       f"  {slot.name} on {fm.label}: backing off {backoff.delay_s:g}s",
                       fm.condition_id, slot,
                       data={"until": stamp(backoff.until), "attempts": backoff.attempts})
-        managed.snapshot = self.market_state(managed, levels, book_mid, target, orders,
+        managed.snapshot = self.market_state(managed, levels, book_mid, target, preview, orders,
                                              actions, now)
         if (managed.mid_sampled_at is None
                 or (now - managed.mid_sampled_at).total_seconds() >= MID_SAMPLE_S):
@@ -1331,7 +1380,7 @@ class Farmer:
         if managed.state.phase is Phase.RETIRED:
             self.retire(managed)
 
-    def market_state(self, managed, levels, book_mid, target, orders, actions, now):
+    def market_state(self, managed, levels, book_mid, target, preview, orders, actions, now):
         fm, state = managed.fm, managed.state
         q1, q2 = q_totals(target.intents)
         return farm_db.FarmState(
@@ -1347,7 +1396,7 @@ class Farmer:
             capital_usd=fm.capital,
             naked_used_usd=naked_used(managed.position, orders),
             position=position_view(managed.held, managed.baseline, managed.position),
-            slots=slot_views(state, orders, target, actions, managed.backoffs, fm,
+            slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
                              managed.position, self.cfg),
             book=book_view(levels, orders, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
@@ -1555,7 +1604,8 @@ def run(args):
 def config_from(args):
     return FarmConfig(
         capital=args.capital,
-        bid_offset=args.bid_offset,
+        fav_target_score=args.fav_target_score,
+        max_lead=args.max_lead,
         ask_offset=args.ask_offset,
         min_capture=args.min_capture,
         ev_margin=args.ev_margin,
@@ -1602,10 +1652,14 @@ Examples:
         ("--interval", float, 5.0, "Seconds between cycles"),
         ("--capital", float, 500.0, "USD per market behind the favorite bid, "
                                     "favorite inventory at cost included"),
-        ("--bid-offset", float, 0.01, "Favorite bid distance below the midpoint"),
+        ("--fav-target-score", float, 0.45, "Per-share score the favorite bid aims for. "
+                                            "It sits at the deepest price that still "
+                                            "reaches it"),
+        ("--max-lead", float, 0.005, "Most the favorite bid may sit above the best bid "
+                                     "already in the book. 0 joins it"),
         ("--ask-offset", float, 0.01, "Favorite ask distance above the midpoint"),
         ("--min-capture", float, 0.005, "Favorite ask minimum above average cost"),
-        ("--ev-margin", float, 0.01, "Favorite bid maximum is p_true minus this"),
+        ("--ev-margin", float, 0.02, "Favorite bid maximum is p_true minus this"),
         ("--min-fav", float, 0.90, "Stop quoting below this favorite midpoint"),
         ("--min-low-score", float, 0.10, "Minimum per-share score of the longshot bid"),
         ("--keep-ratio", float, 0.8, "Keep an order scoring at least this share "

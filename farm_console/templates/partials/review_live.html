@@ -1,0 +1,58 @@
+{%- if error %}
+<div class="note-box small"><span class="c-bad">Could not read the live book: {{ error }}</span> Trying again in a few seconds.</div>
+{%- else %}
+{%- set l = live %}
+<span class="mono small muted">Read {{ l.read_at | clock }} · book mid {{ l.book_mid | cents }}{% if l.mid is not none and l.mid != l.book_mid %} · mid with our bids {{ l.mid | cents }}{% endif %}</span>
+{%- if l.note and candidate and not l.orders and not budget_missing %}
+<div class="banner" role="status"><span class="badge t-r">Wouldn't quote now</span><span style="flex: 1 1 240px">{{ l.note }}{% if left_queue %} It has left the review queue.{% endif %}</span><a class="btn" href="{{ skip_url }}">Skip to next quotable</a></div>
+{%- elif l.note %}
+<div class="note-box small">{{ l.note }}</div>
+{%- endif %}
+{%- if l.orders and p_true_missing %}
+<div class="note-box small">Enter your p_true to apply the EV cap. Until then the favorite bid is planned without it.</div>
+{%- endif %}
+{%- if budget_missing %}
+<div class="note-box small">Enter a naked budget. Until then the longshot bid is planned with $0, which also stops the favorite bid.</div>
+{%- endif %}
+{%- if l.orders %}
+<div class="scroll">
+  <table class="tbl tight">
+    <thead><tr><th>Slot</th><th>Order</th><th>Size</th><th>Score/share{{ tip('score_per_share') }}</th><th>Ties up{{ tip('ties_up') }}</th><th>In the {{ l.fav_outcome }} book</th></tr></thead>
+    <tbody>
+      {%- for o in l.orders %}
+      <tr><td><span class="badge {{ o.tone }}">{{ o.slot }}</span>{{ tip(o.slot) }}</td><td class="mono">Buy {{ o.outcome }} {{ o.price | cents }}</td><td class="mono">{{ o.size | shares }}</td><td class="mono">{{ o.score | score }}</td><td class="mono">{{ o.cost | usd }}</td><td class="mono c-mut">{{ 'bid' if o.slot == 'FAV_BID' else 'ask' }} at {{ o.book_price | cents }}</td></tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+</div>
+<span class="small muted">{{ l.orders | sum(attribute='cost') | usd }} tied up in total. The farmer plans the same way on its first cycle after approval.</span>
+{%- endif %}
+{%- if l.strip %}
+<div>
+  <div class="strip" role="img" aria-label="Reward band from {{ l.strip.lo | cents }} to {{ l.strip.hi | cents }}">
+    {%- for k in l.strip.marks %}
+    <div class="mk {{ k.kind }}" style="left: {{ k.left }}%" title="{{ k.label }}"></div>
+    {%- endfor %}
+  </div>
+  <div class="strip-axis mono"><span>{{ l.strip.lo | cents }}</span><span>{{ l.strip.hi | cents }}</span></div>
+</div>
+<div class="legend mono">
+  {%- for k in l.strip.marks %}<span class="mk-{{ k.kind }}"><i class="swatch box"></i>{{ k.label }}</span>{% endfor %}
+</div>
+{%- endif %}
+<div class="scroll">
+  <table class="tbl tight ladder">
+    <thead><tr><th>{{ l.fav_outcome }}</th><th>{{ l.long_outcome }}</th><th>Size</th><th>Depth</th><th>Score{{ tip('score_per_share') }}</th><th>Ours</th></tr></thead>
+    <tbody>
+      {%- for r in l.asks %}
+      <tr class="{{ 'ours' if r.ours }}"><td class="mono">{{ r.price | cents }}</td><td class="mono c-mut">{{ (1 - r.price) | cents }}</td><td class="mono">{{ r.size | shares }}</td><td><div class="depth"><div class="bar"><div class="ask" style="width: {{ r.depth_pct }}%"></div></div><span class="mono">{{ r.total | shares }}</span></div></td><td class="mono">{{ r.score | score if r.score is not none else '' }}</td><td class="mono c-long">{% if r.ours %}{{ r.ours.slot }} {{ r.ours.size | shares }}{% endif %}</td></tr>
+      {%- endfor %}
+      <tr class="midrow"><td class="mono">{{ l.mid | cents }}</td><td class="mono">{{ (1 - l.mid) | cents if l.mid is not none else '' }}</td><td colspan="4">midpoint{% if l.mid is not none and l.mid != l.book_mid %} with our bids{% endif %}</td></tr>
+      {%- for r in l.bids %}
+      <tr class="{{ 'ours' if r.ours }}"><td class="mono c-fav">{{ r.price | cents }}</td><td class="mono c-mut">{{ (1 - r.price) | cents }}</td><td class="mono">{{ r.size | shares }}</td><td><div class="depth"><div class="bar"><div class="bid" style="width: {{ r.depth_pct }}%"></div></div><span class="mono">{{ r.total | shares }}</span></div></td><td class="mono">{{ r.score | score if r.score is not none else '' }}</td><td class="mono c-fav">{% if r.ours %}{{ r.ours.slot }} {{ r.ours.size | shares }}{% endif %}</td></tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+</div>
+<span class="small muted">The {{ l.fav_outcome }} book; the {{ l.long_outcome }} book is its mirror, so a {{ l.long_outcome }} bid rests here as an ask at 1 minus its price. Depth is the size from the midpoint out. Score is per share, inside the band only.{% if l.outside_asks or l.outside_bids %} {{ l.outside_asks | shares }} more shares ask and {{ l.outside_bids | shares }} bid beyond the levels shown.{% endif %}</span>
+{%- endif %}

@@ -16,7 +16,7 @@
     <div><dt>Started</dt><dd class="mono">{{ status.started_at | stamp_local }}</dd></div>
     <div><dt>Last cycle</dt><dd class="mono">{{ status.last_cycle_at | stamp_local }}</dd></div>
     <div><dt>Interval</dt><dd class="mono">{{ status.interval_s | number_text }}s</dd></div>
-    <div><dt>Heartbeat</dt><dd class="mono">{{ 'on' if status.heartbeat else 'off' }}</dd></div>
+    <div><dt>Heartbeat{{ tip('heartbeat') }}</dt><dd class="mono">{{ 'on' if status.heartbeat else 'off' }}</dd></div>
     {%- if status.stopped_at %}<div><dt>Stopped</dt><dd class="mono">{{ status.stopped_at | stamp_local }}</dd></div>{% endif %}
   </dl>
   {%- endif %}
@@ -31,7 +31,7 @@
   {%- endif %}
   <div class="note-box hint">
     <strong class="c-mut">Heartbeat dead-man switch ({{ 'on' if status and status.heartbeat else 'off' }}).</strong>
-    If the farmer stops sending heartbeats for 10s, Polymarket cancels every open order owned by these API credentials. That may include orders from your other tools. Test the scope before turning this on. It is set by <span class="mono">--heartbeat</span> when the farmer starts.
+    {{ glossary.heartbeat.text }} Test the scope before turning this on. It is set by <span class="mono">--heartbeat</span> when the farmer starts.
   </div>
   <div class="stack" style="gap: 6px">
     <span class="hint">To go live, stop this farmer, then run this in a terminal. The farmer unlocks the private key from Bitwarden there; the console never handles keys.</span>
