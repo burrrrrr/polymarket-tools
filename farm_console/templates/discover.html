@@ -74,7 +74,7 @@
   <div class="small muted" style="padding: 0 18px 10px">{{ '{:,}'.format(vm.total) }} market{{ '' if vm.total == 1 else 's' }} · ranked by yield × days to cutoff (90d cap) · page {{ f.page }} of {{ vm.pages }}</div>
   <div class="scroll">
     <table class="tbl">
-      <thead><tr><th>#</th><th>Mode{{ tip('mode') }}</th><th>Favorite{{ tip('favorite') }}</th><th>Pool $/d{{ tip('pool') }}</th><th>Band{{ tip('band') }}</th><th>Est $/d{{ tip('est_daily') }}</th><th>Capital{{ tip('planned_capital') }}</th><th>APR{{ tip('apr') }}</th><th>Days{{ tip('days') }}</th><th>Ahead{{ tip('ahead') }}</th><th>Vol 24h{{ tip('vol24h') }}</th><th>Status</th><th>Market</th><th></th></tr></thead>
+      <thead><tr><th>#</th><th>Mode{{ tip('mode') }}</th><th>Favorite{{ tip('favorite') }}</th><th>Pool $/d{{ tip('pool') }}</th><th>Band{{ tip('band') }}</th><th>Est $/d{{ tip('est_daily') }}</th><th>Capital{{ tip('planned_capital') }}</th><th>Net APR{{ tip('net_apr') }}</th><th>Days{{ tip('days') }}</th><th>Ahead{{ tip('ahead') }}</th><th>Vol 24h{{ tip('vol24h') }}</th><th>Status</th><th>Market</th><th></th></tr></thead>
       <tbody>
         {%- for r in vm.rows %}
         <tr>
@@ -85,7 +85,7 @@
           <td class="mono">{{ r.v | cents }}</td>
           <td class="mono">{{ '%.2f' % r.est_daily_usd if r.est_daily_usd is not none else '--' }}</td>
           <td class="mono">{{ '%.0f' % r.capital_usd if r.capital_usd is not none else '--' }}</td>
-          <td class="mono">{{ '{:,.0f}%'.format(r.apr * 100) if r.apr is not none else '--' }}</td>
+          <td class="mono">{{ '{:,.0f}%'.format(r.net_apr * 100) if r.net_apr is not none else '--' }}</td>
           <td class="mono">{{ '%.0f' % r.days if r.days is not none else '--' }}</td>
           <td class="mono">{{ '%.1f' % r.ahead if r.ahead is not none else '--' }}</td>
           <td class="mono">{{ r.volume }}</td>

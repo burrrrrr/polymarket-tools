@@ -15,9 +15,13 @@ S(v, s) = ((v - s) / v)^2 at distance s from the midpoint inside the max
 spread v. Score is sampled once a minute and the pool is paid daily. So the
 farmer rests on both sides, in four slots per market:
 
-  FAV_BID   favorite BUY, Q_one, uses cash. Fills are wanted: below our own
-            probability p_true a fill is +EV, and the bid never prices above
-            p_true minus a margin.
+  FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until the
+            market resolves, so it costs the price less p_true discounted at
+            the hurdle rate. The bid rests at the price in the band whose
+            rewards net of expected fills (from the market's taker tape) are
+            highest, never above p_true minus a margin, and only when that
+            net beats the orders without it. With no tape read yet it does
+            not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same.
@@ -87,7 +91,8 @@ minutes, and resets on the next accepted place.
 
 Reconciling keeps an existing order when it is still close enough to target
 (same price grid, most of the target score, size within -20%/+25%) instead of
-replacing it on every wiggle of the midpoint. Replacing an order loses its
+replacing it on every wiggle of the midpoint. A favorite bid is held to most
+of the best price's net instead of the score. Replacing an order loses its
 queue position and costs two API calls, so this hysteresis matters.
 
 Planning, reconciling, and the lifecycle are pure functions; the daemon around
@@ -110,12 +115,14 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import NamedTuple, Optional
 
 import httpx
 from dotenv import load_dotenv
 
 import farm_db
+import fill_cost
 from farm_db import EventKind, stamp
 from py_clob_client_v2.clob_types import (
     AssetType,
@@ -130,6 +137,10 @@ from py_clob_client_v2.clob_types import (
 
 from reward_screener import (
     CLOB_HOST,
+    DATA_API_HOST,
+    RATE_LIMIT_RETRIES,
+    Outlook,
+    QuoteValue,
     Skip,
     _chunks,
     _float,
@@ -137,20 +148,24 @@ from reward_screener import (
     adjust_levels,
     adjusted_mid,
     best_price,
-    fav_bid_price,
+    fav_bid_candidates,
+    fav_ceiling,
     fetch_gamma,
     fetch_levels,
+    fetch_tape,
     fetch_total_rates,
+    fill_params,
     floor_to_tick,
+    get_with_retry,
     longshot_bid,
     parse_time,
+    q_min,
     resolution_signal,
     round_size_down,
     score,
     tick_decimals,
+    value_quote,
 )
-
-DATA_API_HOST = os.getenv("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com")
 
 BUY, SELL = "BUY", "SELL"
 
@@ -161,9 +176,15 @@ RESUME_MARGIN = 0.005
 # An order whose size left this band around the target gets replaced.
 KEEP_SIZE_RANGE = (0.8, 1.25)
 
+# A resting favorite bid stays while its net trails the best price's by no
+# more than this, in $/day, or (1 - keep_ratio) of the best net if larger.
+NET_KEEP_SLACK_USD = 0.02
+
 POSITIONS_S = 60
 MARKET_INFO_S = 300
 MARKET_INFO_RETRY_S = 60
+TAPE_S = 600
+TAPE_RETRY_S = 60
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
@@ -178,10 +199,6 @@ BACKOFF_MAX_S = 900
 # Most orders the CLOB accepts in one batch POST.
 POST_BATCH_LIMIT = 15
 POSITIONS_PAGE = 500
-# The data API answers about one read in thirty with a 429 and Retry-After: 1,
-# even at one read every two seconds.
-RATE_LIMIT_RETRIES = 3
-RATE_LIMIT_WAIT_MAX_S = 5.0
 
 
 def log(message):
@@ -191,6 +208,10 @@ def log(message):
 
 def cents(price, tick):
     return f"{price * 100:.{max(1, tick_decimals(tick) - 2)}f}c"
+
+
+def signed_usd(value):
+    return f"-${-value:.2f}" if value < 0 else f"${value:.2f}"
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +308,21 @@ class LiveOrder(NamedTuple):
     size_remaining: float
 
 
+EMPTY_CURVE = MappingProxyType({})
+
+
+class FavChoice(NamedTuple):
+    """How the favorite bid was priced. best is the QuoteValue of the bid
+    chosen, or None with the reason there is none. curve maps every
+    candidate price whose plan kept a favorite bid to its QuoteValue;
+    baseline_per_day is what the plan with no favorite bid earns."""
+
+    best: Optional[QuoteValue] = None
+    curve: MappingProxyType = EMPTY_CURVE
+    baseline_per_day: float = 0.0
+    reason: str = ""
+
+
 class Target(NamedTuple):
     """The orders wanted, and the midpoint they were scored against.
 
@@ -296,6 +332,7 @@ class Target(NamedTuple):
 
     mid: Optional[float]
     intents: list
+    fav: FavChoice = FavChoice()
 
 
 class Cancel(NamedTuple):
@@ -377,7 +414,6 @@ class MarketInfo(NamedTuple):
 
 class FarmConfig(NamedTuple):
     capital: float
-    fav_target_score: float
     max_lead: float
     ask_offset: float
     min_capture: float
@@ -390,6 +426,10 @@ class FarmConfig(NamedTuple):
     cooldown_s: float
     naked_cooldown_s: float
     expiry_buffer_days: float
+    hurdle_rate: float
+    depth_haircut: float
+    fill_lookback_days: float
+    sweep_prior_weight: float
 
 
 # ---------------------------------------------------------------------------
@@ -431,32 +471,13 @@ def mirror(price, tick):
     return round(1 - price, tick_decimals(tick))
 
 
-def uncapped_fav_bid(fm, levels, cfg):
-    return fav_bid_price(levels, fm.v, fm.tick, fm.min_size, cfg.fav_target_score,
-                         cfg.max_lead)
-
-
-def plan_fav_bid(fm, levels, position, cfg):
-    """(price, size) of the favorite bid before balancing, or None."""
-    price = uncapped_fav_bid(fm, levels, cfg)
-    if isinstance(price, Skip):
-        return None
-    price = min(price, ev_cap(fm, cfg))
-    if price < fm.tick:
-        return None
-    room = fm.capital - position.fav_shares * position.fav_avg
-    return price, round_size_down(max(0.0, room) / price)
-
-
-def plan_long_ask_price(fm, levels, fav_bid, cfg):
-    """Longshot ask at the mirror of the favorite bid, or of where it would sit; None
-    when the book leaves no favorite bid to mirror."""
-    if fav_bid is not None:
-        return mirror(fav_bid, fm.tick)
-    fav_equivalent = uncapped_fav_bid(fm, levels, cfg)
-    if isinstance(fav_equivalent, Skip):
-        return None
-    return mirror(fav_equivalent, fm.tick)
+def plan_long_ask_price(fm, levels, fav_price, cfg):
+    """Longshot ask at the mirror of the favorite bid, or of the highest one allowed
+    when there is none; None when the book leaves no favorite bid to mirror. With no
+    favorite bid the exit takes the most fill-prone price: its fills are wanted."""
+    if fav_price is None:
+        fav_price = fav_ceiling(levels, fm.tick, fm.min_size, cfg.max_lead)
+    return None if fav_price is None else mirror(fav_price, fm.tick)
 
 
 def plan_fav_ask_price(fm, levels, book_mid, position, cfg):
@@ -475,10 +496,12 @@ def plan_fav_ask_price(fm, levels, book_mid, position, cfg):
     return price
 
 
-def target_orders(fm, levels, position, cfg, naked_allowed):
-    """The orders this market should rest, scored against the mid they create.
+def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price):
+    """The orders this market would rest with its favorite bid at fav_price, or
+    with no favorite bid when fav_price is None, scored against the mid they create.
 
-    `levels` is the favorite book without our own resting orders. Sizes are
+    `levels` is the favorite book without our own resting orders. The bid is
+    sized from the capital left after favorite inventory at cost. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
     LONG_BID at the cheapest price that covers the rest within the budget, no
     higher than the min_low_score price (longshot_bid), then the favorite bid
@@ -493,10 +516,13 @@ def target_orders(fm, levels, position, cfg, naked_allowed):
         return Target(None, [])
     tick, v = fm.tick, fm.v
 
-    fav_bid = plan_fav_bid(fm, levels, position, cfg)
+    fav_bid = None
+    if fav_price is not None:
+        room = fm.capital - position.fav_shares * position.fav_avg
+        fav_bid = fav_price, round_size_down(max(0.0, room) / fav_price)
     long_ask = fav_ask = None
     if position.long_shares >= fm.min_size:
-        long_ask = plan_long_ask_price(fm, levels, fav_bid and fav_bid[0], cfg)
+        long_ask = plan_long_ask_price(fm, levels, fav_price, cfg)
     if position.fav_shares >= fm.min_size:
         fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg)
 
@@ -551,14 +577,93 @@ def target_orders(fm, levels, position, cfg, naked_allowed):
     return Target(mid, [intents[slot] for slot in Slot if slot in intents])
 
 
-def keep_failure(order, intent, mid, fm, position, cfg):
-    """Why a resting order is not close enough to its target to leave alone, or None."""
+def live_rate(fm, total_rates):
+    """The market's daily pool: the live total, sponsored rewards included, else
+    the rate of the scan it was approved from."""
+    rate = total_rates.get(fm.condition_id) if total_rates else None
+    return fm.rate_per_day if rate is None else rate
+
+
+def market_outlook(fm, total_rates, tape, cfg, now):
+    """The Outlook a favorite bid on this market is valued with; no tape is
+    the prior alone."""
+    return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
+                   tape or fill_cost.Tape.unobserved(cfg.fill_lookback_days), fill_params(cfg))
+
+
+def value_of(target, fm, levels, outlook):
+    """value_quote of a planned set of orders, its favorite bid included."""
+    by = {i.slot: i for i in target.intents}
+    bid = by.get(Slot.FAV_BID)
+    capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
+    return value_quote(levels, target.mid, fm.v, fm.min_size,
+                       q_min(*q_totals(target.intents), target.mid),
+                       bid and (bid.price, bid.size), capital, fm.p_true, outlook)
+
+
+def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_tape=False):
+    """The orders this market should rest, with the favorite bid at the price
+    that earns the most net of what its fills cost.
+
+    Every price from fav_bid_candidates, capped at ev_cap, is planned with
+    quotes_at and valued with value_quote on the plan as balanced. The
+    baseline is the plan with no favorite bid: nothing, or the exits alone.
+    The best price is quoted only when its net beats the baseline's reward,
+    and a tie goes to the lower price. A tape that was never read quotes the
+    baseline, so real money is never bid on the prior alone, unless
+    bid_without_tape (a preview of a market the farmer has not read yet).
+    """
+    base = quotes_at(fm, levels, position, cfg, naked_allowed, None)
+    if base.mid is None:
+        return base._replace(fav=FavChoice(reason="one-sided book"))
+    baseline = value_of(base, fm, levels, outlook).net_per_day
+    if not outlook.tape.observed and not bid_without_tape:
+        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline, "no fill tape yet"))
+
+    plans, curve = {}, {}
+    for price in fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
+                                    ev_cap(fm, cfg)):
+        plan = quotes_at(fm, levels, position, cfg, naked_allowed, price)
+        if any(i.slot is Slot.FAV_BID for i in plan.intents):
+            plans[price], curve[price] = plan, value_of(plan, fm, levels, outlook)
+    if not curve:
+        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline,
+                                           "no scoring favorite bid"))
+    best = None
+    for value in curve.values():
+        if best is None or value.net_per_day >= best.net_per_day - 1e-12:
+            best = value
+    curve = MappingProxyType(curve)
+    if best.net_per_day <= baseline:
+        return base._replace(fav=FavChoice(None, curve, baseline, (
+            f"no favorite bid pays: best net {signed_usd(best.net_per_day)}/day at "
+            f"{cents(best.price, fm.tick)}")))
+    return plans[best.price]._replace(fav=FavChoice(best, curve, baseline))
+
+
+def keep_failure(order, intent, target, fm, position, cfg):
+    """Why a resting order is not close enough to its target to leave alone, or None.
+
+    A favorite bid is judged by its net on target.fav.curve rather than its
+    score: the net-best price moves a tick with every wiggle of the midpoint,
+    while the net at the resting price barely changes.
+    """
     low, high = KEEP_SIZE_RANGE
     if (order.token_id, order.side) != (intent.token_id, intent.side):
         return "wrong token or side"
     if not on_tick(order.price, fm.tick):
         return "off the tick grid"
-    if order_score(order.slot, order.price, mid, fm.v) < cfg.keep_ratio * intent.score - 1e-12:
+    if order.slot is Slot.FAV_BID:
+        fav = target.fav
+        value = fav.curve.get(round(order.price, tick_decimals(fm.tick)))
+        if value is None:
+            return "outside the bid candidates"
+        slack = max((1 - cfg.keep_ratio) * abs(fav.best.net_per_day), NET_KEEP_SLACK_USD)
+        if (value.net_per_day < fav.best.net_per_day - slack
+                or value.net_per_day <= fav.baseline_per_day):
+            return "net below keep ratio"
+    elif order_score(order.slot, order.price, target.mid, fm.v) < (
+            cfg.keep_ratio * intent.score - 1e-12):
         return "score below keep ratio"
     if not low * intent.size - 1e-9 <= order.size_remaining <= high * intent.size + 1e-9:
         return "size out of range"
@@ -571,7 +676,7 @@ def keep_failure(order, intent, mid, fm, position, cfg):
     return None
 
 
-def reconcile(intents, live_orders, mid, fm, position, cfg):
+def reconcile(target, live_orders, fm, position, cfg):
     """Cancels and places that turn the resting orders into the targets.
 
     Per slot, one resting order with no keep_failure survives; every other
@@ -579,7 +684,7 @@ def reconcile(intents, live_orders, mid, fm, position, cfg):
     survived.
     All cancels come first, so freed balance is available to the places.
     """
-    targets = {intent.slot: intent for intent in intents}
+    targets = {intent.slot: intent for intent in target.intents}
     cancels, places = [], []
     for slot in Slot:
         orders = [o for o in live_orders if o.slot is slot]
@@ -588,7 +693,7 @@ def reconcile(intents, live_orders, mid, fm, position, cfg):
         if intent is not None:
             kept = next(
                 (o for o in orders
-                 if keep_failure(o, intent, mid, fm, position, cfg) is None),
+                 if keep_failure(o, intent, target, fm, position, cfg) is None),
                 None,
             )
             if kept is None:
@@ -738,11 +843,22 @@ def q_totals(intents):
     return q[QSide.ONE], q[QSide.TWO]
 
 
-def slot_views(state, orders, target, preview, actions, backoffs, fm, position, cfg):
+def economics_view(fav):
+    """The chosen favorite bid's economics per day, or None without one."""
+    if fav.best is None:
+        return None
+    return {**fav.best._asdict(), "fill_cost_per_day": fav.best.fill_cost_per_day,
+            "net_per_day": fav.best.net_per_day, "net_apr": fav.best.net_apr,
+            "baseline_per_day": fav.baseline_per_day}
+
+
+def slot_views(state, orders, target, preview, actions, backoffs, fm, position, cfg, tape):
     """Per slot: the resting order, the target, and what this cycle decided.
 
     preview is what a paused market would place on resume; its intents show
-    as the target with decision "preview" and are never acted on.
+    as the target with decision "preview" and are never acted on. FAV_BID
+    also carries the economics of the bid chosen (or previewed) and a summary
+    of the taker tape behind them.
     """
     intents = {i.slot: i for i in target.intents}
     previews = {i.slot: i for i in preview.intents} if preview else {}
@@ -758,12 +874,14 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
             decision, reason = "preview", "would place on resume"
         elif intent is None:
             why = "no target" if state.phase is Phase.QUOTING else str(state)
+            if slot is Slot.FAV_BID and state.phase is Phase.QUOTING and target.fav.reason:
+                why = target.fav.reason
             decision, reason = ("cancel" if resting else "none"), why
         elif kept is not None:
             decision, reason = "hold", ""
         elif slot in placing and resting:
             decision = "replace"
-            reason = keep_failure(resting[0], intent, target.mid, fm, position, cfg)
+            reason = keep_failure(resting[0], intent, target, fm, position, cfg)
         elif slot in placing:
             decision, reason = "place", ""
         else:
@@ -780,6 +898,10 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
             "decision": decision,
             "reason": reason,
         }
+    fav = (preview or target).fav
+    views[Slot.FAV_BID.name].update(
+        economics=economics_view(fav), fav_reason=fav.reason,
+        tape=fill_cost.tape_summary(tape) if tape else None)
     return views
 
 
@@ -939,19 +1061,11 @@ def fetch_holdings(http, user, timeout=30):
     """{token_id: (shares, avg_price)} for every position the user holds."""
     holdings, offset = {}, 0
     while True:
-        for attempt in range(RATE_LIMIT_RETRIES + 1):
-            resp = http.get(
-                f"{DATA_API_HOST}/positions",
-                params={"user": user, "limit": POSITIONS_PAGE, "offset": offset,
-                        "sizeThreshold": 0},
-                timeout=timeout,
-            )
-            if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
-                break
-            time.sleep(min(_float(resp.headers.get("retry-after")) or 1.0,
-                           RATE_LIMIT_WAIT_MAX_S))
-        resp.raise_for_status()
-        page = resp.json() or []
+        page = get_with_retry(
+            http, f"{DATA_API_HOST}/positions",
+            {"user": user, "limit": POSITIONS_PAGE, "offset": offset, "sizeThreshold": 0},
+            timeout,
+        ).json() or []
         for p in page:
             size, avg = _float(p.get("size")), _float(p.get("avgPrice"))
             if p.get("asset") and size is not None:
@@ -1045,6 +1159,8 @@ class Managed:
         self.sim_orders = []
         self.snapshot = None
         self.mid_sampled_at = None
+        self.tape = None
+        self.tape_due = None
 
 
 class Farmer:
@@ -1172,6 +1288,20 @@ class Farmer:
                 due = now + timedelta(seconds=MARKET_INFO_RETRY_S)
             self.infos[condition_id] = (info, due)
         return info
+
+    def refresh_tape(self, managed, now):
+        """Re-read the market's taker tape every TAPE_S. A failed read keeps the
+        last tape and retries after TAPE_RETRY_S; until one lands, there is none."""
+        if managed.tape_due is not None and now < managed.tape_due:
+            return
+        fm = managed.fm
+        try:
+            managed.tape = fetch_tape(self.http, fm.condition_id, fm.fav_token_id, now,
+                                      self.cfg.fill_lookback_days)
+            managed.tape_due = now + timedelta(seconds=TAPE_S)
+        except Exception as e:
+            log(f"Warning: trades of {fm.label} failed ({e})")
+            managed.tape_due = now + timedelta(seconds=TAPE_RETRY_S)
 
     def reload(self, now):
         rows = farm_db.load_approved(self.db)
@@ -1366,18 +1496,21 @@ class Farmer:
                             "reason": state.reason, "until": stamp(state.until)})
 
         target, preview = Target(book_mid, []), None
-        if managed.state.phase is Phase.QUOTING:
-            target = target_orders(
-                fm, book, managed.position, self.cfg, naked_allowed(obs, now)
+        previewing = (managed.state.phase is Phase.PAUSED
+                      and step_state(managed.state, obs._replace(paused=False), now,
+                                     self.cfg).phase is Phase.QUOTING)
+        if managed.state.phase is Phase.QUOTING or previewing:
+            self.refresh_tape(managed, now)
+            planned = target_orders(
+                fm, book, managed.position, self.cfg, naked_allowed(obs, now),
+                market_outlook(fm, self.total_rates.rates, managed.tape, self.cfg, now),
             )
-        elif (managed.state.phase is Phase.PAUSED
-              and step_state(managed.state, obs._replace(paused=False), now,
-                             self.cfg).phase is Phase.QUOTING):
-            preview = target_orders(
-                fm, book, managed.position, self.cfg, naked_allowed(obs, now)
-            )
+            if previewing:
+                preview = planned
+            else:
+                target = planned
         actions = without_backed_off(
-            reconcile(target.intents, orders, target.mid, fm, managed.position, self.cfg),
+            reconcile(target, orders, fm, managed.position, self.cfg),
             managed.backoffs,
             now,
         )
@@ -1417,7 +1550,7 @@ class Farmer:
             naked_used_usd=naked_used(managed.position, orders),
             position=position_view(managed.held, managed.baseline, managed.position),
             slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
-                             managed.position, self.cfg),
+                             managed.position, self.cfg, managed.tape),
             book=book_view(levels, orders, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
             backoff={slot.name: {"until": stamp(b.until), "attempts": b.attempts}
@@ -1432,8 +1565,12 @@ class Farmer:
         placed = sum(isinstance(a, Place) for a in actions)
         held = len(orders) - len(cancelled)
         mid = cents(target.mid, fm.tick) if target.mid is not None else "--"
+        best = target.fav.best
+        fav = (f"bid {cents(best.price, fm.tick)} net {signed_usd(best.net_per_day)}/day"
+               if best else target.fav.reason or "no bid")
         log(f"{fm.label}: {managed.state.phase.value} mid {mid} "
-            f"Q1 {q1:.1f} Q2 {q2:.1f} | hold {held} cancel {len(cancelled)} place {placed}")
+            f"Q1 {q1:.1f} Q2 {q2:.1f} | {fav} | hold {held} cancel {len(cancelled)} "
+            f"place {placed}")
         slot_order = list(Slot)
         for o in sorted(orders, key=lambda o: slot_order.index(o.slot)):
             if o.id not in cancelled:
@@ -1624,7 +1761,6 @@ def run(args):
 def config_from(args):
     return FarmConfig(
         capital=args.capital,
-        fav_target_score=args.fav_target_score,
         max_lead=args.max_lead,
         ask_offset=args.ask_offset,
         min_capture=args.min_capture,
@@ -1637,6 +1773,10 @@ def config_from(args):
         cooldown_s=args.cooldown,
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
+        hurdle_rate=args.hurdle_rate,
+        depth_haircut=args.depth_haircut,
+        fill_lookback_days=args.fill_lookback_days,
+        sweep_prior_weight=args.sweep_prior_weight,
     )
 
 
@@ -1672,9 +1812,6 @@ Examples:
         ("--interval", float, 5.0, "Seconds between cycles"),
         ("--capital", float, 500.0, "USD per market behind the favorite bid, "
                                     "favorite inventory at cost included"),
-        ("--fav-target-score", float, 0.45, "Per-share score the favorite bid aims for. "
-                                            "It sits at the deepest price that still "
-                                            "reaches it"),
         ("--max-lead", float, 0.005, "Most the favorite bid may sit above the best bid "
                                      "already in the book. 0 joins it"),
         ("--ask-offset", float, 0.01, "Favorite ask distance above the midpoint"),
@@ -1683,8 +1820,9 @@ Examples:
         ("--min-fav", float, 0.90, "Stop quoting below this favorite midpoint"),
         ("--min-low-score", float, 0.10, "The longshot bid never sits above the cheapest "
                                          "price scoring this per share"),
-        ("--keep-ratio", float, 0.8, "Keep an order scoring at least this share "
-                                     "of its target"),
+        ("--keep-ratio", float, 0.8, "Keep an order scoring at least this share of its "
+                                     "target, a favorite bid earning this share of the "
+                                     "best net"),
         ("--drop-threshold", float, 0.03, "Fall in the favorite's best ask that triggers "
                                           "a cooldown"),
         ("--drop-window", float, 60.0, "Seconds over which the ask's fall is measured"),
@@ -1692,6 +1830,14 @@ Examples:
         ("--naked-cooldown", float, 3600.0, "Seconds without a longshot bid after "
                                             "a longshot fill"),
         ("--expiry-buffer-days", float, 7.0, "Retire this many days before the end date"),
+        ("--hurdle-rate", float, 0.40, "Yearly return capital must beat; a filled share "
+                                       "costs its price minus p_true discounted at this "
+                                       "rate to the end date"),
+        ("--depth-haircut", float, 0.5, "Share of the bids ahead of the favorite bid a sell "
+                                        "sweep must get through before it reaches ours"),
+        ("--fill-lookback-days", float, 30.0, "Days of taker trades the fill estimate reads"),
+        ("--sweep-prior-weight", float, 0.25, "Assumed sweeps per lookback that clear the "
+                                             "whole book, on top of the ones seen"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

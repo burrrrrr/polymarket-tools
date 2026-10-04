@@ -461,8 +461,9 @@ approve or reject. It is read-only. It places, cancels, and signs nothing, and
 it needs no credentials.
 
 The strategy targets markets whose favorite outcome trades at 90c or more. You
-rest a favorite bid just under the midpoint, and a fill there is wanted when
-your own probability beats the price. You also rest a longshot bid far below
+rest a favorite bid just under the midpoint, priced where its rewards minus
+the cost of its fills are highest (see [The fill-cost model](#the-fill-cost-model)).
+You also rest a longshot bid far below
 the longshot midpoint. Above a 0.90 midpoint Polymarket only pays for
 two-sided liquidity, so the longshot bid exists to make the favorite bid
 score. Each market lands in one of two modes:
@@ -489,6 +490,15 @@ A scan takes about a minute. Most of that is `/rewards/markets/current`, which
 pages slowly. It prints one line per stage with the counts it kept and the
 reasons it skipped the rest, then a table sorted by rank.
 
+A scan assesses a market at most twice. The first pass costs fills from the
+prior alone (see [The fill-cost model](#the-fill-cost-model)), which overrates
+a market whenever its fills cost money. The top `--tape-markets` of that
+ranking then read their taker trades from the data API and are assessed
+again. A market whose fills then cost more than its rewards is dropped as
+`fills cost more than the rewards`. This cut is a heuristic: a market below it
+keeps its optimistic prior-only figures, marked `p` in the table and
+`(prior)` in the console.
+
 Key `scan` options:
 
 - `--min-fav` (default 0.90) is the lowest favorite midpoint to consider.
@@ -496,9 +506,11 @@ Key `scan` options:
   ends. `--min-window-days` (30) is the fewest farmable days a market needs.
 - `--horizon-cap-days` (90) caps the days counted toward rank.
 - `--capital` (500) is the USD behind the favorite bid.
-- `--fav-target-score` (0.45) is the per-share score the favorite bid aims
-  for. The bid sits at the deepest price that still reaches it. If no price
-  reaches it, the bid sits at its highest allowed price.
+- `--hurdle-rate` (0.40), `--depth-haircut` (0.5), `--fill-lookback-days`
+  (30) and `--sweep-prior-weight` (0.25) set the fill-cost model, the same
+  settings the farmer has. The scan has no p_true, so it costs a fill against
+  the book midpoint.
+- `--tape-markets` (100) is how many of the top markets read their taker tape.
 - `--max-lead` (0.005) is the most the favorite bid may sit above the best bid
   already in the book. 0 joins the best bid. The bid also stays one tick under
   the lowest ask.
@@ -530,16 +542,20 @@ The table columns:
 | `v` | Max spread from the midpoint that still scores, in cents |
 | `min` | Minimum order size that scores, in shares |
 | `est$/d` | Your estimated daily reward: pool times your share of the score |
+| `fill/d` | Favorite shares a day expected to fill your bid; `t` from the market's tape, `p` from the prior alone |
+| `net$/d` | `est$/d` less `fill/d` times the loss per filled share |
 | `cap$` | Capital both bids tie up |
-| `APR%` | `est$/d` divided by `cap$`, times 365 |
+| `APR%` | `est$/d` divided by `cap$`, times 365, before fill costs |
+| `net%` | `net$/d` divided by `cap$`, times 365 |
 | `days` | Days left to farm, after the expiry buffer |
 | `ahead` | Shares of longshot bids priced above yours, divided by your longshot size. A seller has to fill all of them before reaching your bid, so a low value means more fill risk on the leg you do not want filled |
 | `vol24h` | 24-hour volume from Gamma |
 | `H` | `H` when Gamma reports holding rewards enabled, `-` when not, `?` when unknown |
 
-Rank is daily yield times the days left, capped at `--horizon-cap-days`. That
-is the reward return you can expect over the farm horizon, so long-dated
-markets rank higher than short ones with the same yield.
+Rank is the net daily yield (`net$/d` over `cap$`) times the days left,
+capped at `--horizon-cap-days`. That is the return you can expect over the
+farm horizon, so long-dated markets rank higher than short ones with the same
+yield.
 
 `approve` takes your probability that the favorite wins (`--p-true`) and the
 longshot risk budget (`--budget`, default $25). `--capital` sets the USD
@@ -588,6 +604,35 @@ them. Read the resolution rules before you approve.
   farmer reacts to your orders. Thin books show very high APRs that will not
   survive competition, so read them as a ranking, not a forecast.
 
+#### The fill-cost model
+
+A favorite share bought by a fill is held until the market resolves, and the
+capital it ties up could earn the hurdle rate r (`--hurdle-rate`) elsewhere.
+A fill at price b of a share worth p_true at resolution, t years out, loses
+
+    L(b) = b - p_true / (1 + r) ** t
+
+today. On a short-dated market L is negative and fills are welcome. For each
+favorite bid price b on the tick grid inside the reward band, with the size
+Q it rests at once the quotes are balanced,
+
+    net(b) = reward/day(b, Q) - fills/day(b, Q) * L(b)
+
+`fills/day` comes from the market's taker tape: the trades that sold the
+favorite or bought the longshot, which both fill favorite bids. Trades less
+than a minute apart chain into one sweep, for at most 10 minutes. A sweep of
+X shares fills min(Q, X - alpha * A) of a bid that waits behind A shares (every
+bid above b and those already at b), where alpha is `--depth-haircut`, since
+some of that depth is cancelled before a sweep arrives. The sum over the
+sweeps of the last `--fill-lookback-days` is divided by the days the tape
+covers. The data API serves only about 1,800 trades, so a busy market's tape
+covers less than the lookback. On top, `--sweep-prior-weight` sweeps per
+lookback are assumed to clear the whole book, so a quiet market never reads as
+never filling.
+
+The model leaves out fills of the longshot bid, the sweep's price, and the
+farmer's own fill history.
+
 The `markets` table in `farm.db` is the interface to the farmer (see
 [The farm.db contract](#the-farmdb-contract)). A scan updates the metrics,
 rank, end date, and `rewards_active` flag. It never touches your decisions:
@@ -623,14 +668,22 @@ python reward_farmer.py --live --heartbeat    # real orders with the dead-man sw
 Each cycle prints one summary line per market, then one line per action:
 
 ```text
-[16:36:06] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | hold 0 cancel 0 place 2
+[16:36:06] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | bid 94.9c net $3.12/day | hold 0 cancel 0 place 2
 [16:36:06]   PLACE  FAV_BID    94.9c x    526.87  score 0.585  some-market
 [16:36:06]   PLACE  LONG_BID    0.1c x    735.88  score 0.419  some-market
-[16:36:11] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | hold 2 cancel 0 place 0
+[16:36:11] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | bid 94.9c net $3.12/day | hold 2 cancel 0 place 0
 ```
 
 `score` is the per-share reward score at the current midpoint. `Q1` and `Q2`
-are the planned score on each side. Polymarket pays on the smaller one.
+are the planned score on each side. Polymarket pays on the smaller one. The
+`bid ... net` part is the favorite bid chosen and its net per day, or why
+there is none, such as `no fill tape yet` or `no favorite bid pays: best net
+-$0.12/day at 93.8c`.
+
+The farmer reads each market's taker tape every 10 minutes while the market
+is about to quote, and retries a failed read after a minute, keeping the last
+tape. Until a market's first tape lands it places no favorite bid, and only
+the exits rest.
 
 #### The four slots
 
@@ -641,7 +694,7 @@ four slots per market:
 
 | Slot | Order | Side | Purpose |
 | --- | --- | --- | --- |
-| `FAV_BID` | Buy the favorite | Q_one | The main quote. A fill is wanted, because the bid never prices above your `p_true` minus `--ev-margin`. Uses cash. |
+| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price with the best net of its fill cost (see [The fill-cost model](#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, and only when that net beats what the orders earn without it. Uses cash. |
 | `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
 | `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price whose size, enough to balance Q_one, keeps its cost plus any longshot shares held within the market's approved budget, and never above the cheapest price scoring `--min-low-score`. On a `floor` market that is 0.1c to 0.2c, where it almost never fills. On a `budget` market it rests higher. |
@@ -713,10 +766,12 @@ the same as setting it once, and a farmer that restarts reads the same level.
 The `settings` table overrides the farmer's command-line options. The
 command-line flags give the defaults, and each row replaces one of them
 while it exists. The keys are the option names with underscores, and the
-seconds options end in `_s`: `capital`, `fav_target_score`, `max_lead`,
-`ask_offset`, `min_capture`, `ev_margin`, `min_fav`, `min_low_score`,
-`keep_ratio`, `drop_threshold`, `drop_window_s`, `cooldown_s`,
-`naked_cooldown_s`, and `expiry_buffer_days`. Each value is a JSON number.
+seconds options end in `_s`: `capital`, `max_lead`, `ask_offset`,
+`min_capture`, `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`,
+`hurdle_rate`, `depth_haircut`, `fill_lookback_days`, `sweep_prior_weight`,
+`drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
+`expiry_buffer_days`. Each value is a JSON number. Opening the database deletes
+a `fav_target_score` row left from before fill-cost pricing.
 `farm_db.put_setting` refuses an unknown key or an out-of-range value. A bad row written another
 way is ignored, with an `ALERT` event. When the effective config changes, the
 farmer logs a `SETTINGS` event with the old and new values. A changed setting
@@ -744,7 +799,10 @@ next farmer starts, so it does not stop that farmer.
 - An order that is still close to its target stays in place. It must sit on
   the current tick, score at least `--keep-ratio` of the target, keep a size
   within -20% and +25% of the target, and stay within the price cap or
-  budget. Otherwise it is replaced. This keeps queue position and avoids
+  budget. Otherwise it is replaced. A favorite bid is judged by its net
+  instead of its score. It stays while its price is still a candidate, its
+  net trails the best price's by no more than `1 - --keep-ratio` of it (or
+  $0.02/day, if more), and it beats the orders without it. This keeps queue position and avoids
   churning orders on every small move of the midpoint.
 - An order the CLOB rejects, such as a post-only cross or an unfunded bid,
   backs off that market's slot for 30 seconds. Each further rejection doubles
@@ -794,14 +852,17 @@ it does not manage.
 | `--once` | off | Run one cycle and exit |
 | `--interval` | 5 | Seconds between cycles |
 | `--capital` | 500 | USD per market behind the favorite bid, held favorite shares included at cost |
-| `--fav-target-score` | 0.45 | Per-share score the favorite bid aims for. It sits at the deepest price that still reaches it |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask minimum above its average cost |
 | `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this |
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
-| `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target |
+| `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets at least this share of the best price's |
+| `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus p_true discounted at this rate to the end date |
+| `--depth-haircut` | 0.5 | Share of the bids ahead of the favorite bid a sell sweep must get through before it reaches ours |
+| `--fill-lookback-days` | 30 | Days of taker trades the fill estimate reads |
+| `--sweep-prior-weight` | 0.25 | Assumed sweeps per lookback that clear the whole book, on top of the ones seen |
 | `--drop-threshold` | 0.03 | Fall in the favorite's best ask that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |
@@ -892,7 +953,7 @@ Pages:
 | --- | --- | --- |
 | Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids against the budgets, farm inventory, the screener's $/day estimate, today's earnings), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
 | Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode, text in the question or slug, status, and minimum days to the farmer's cutoff | Run a scan |
-| Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures, the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, and capital; reject with a note; retire an approved market; re-approve a retired one |
+| Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures (gross, fills/day, fill cost and net APR), the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, and capital; reject with a note; retire an approved market; re-approve a retired one |
 | Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, edit p_true and budget, retire |
 | Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
 | Activity (`/activity?tab=`) | `rewards`: earnings per day and market against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
@@ -921,8 +982,12 @@ rows and its funnel in one transaction and never changes your decisions.
 - **EV check.** While you type p_true, the Review page shows what the farmer
   will do with it. The farmer never bids above p_true minus `ev_margin`,
   rounded down to the tick. When the planned bid is above that cap, the
-  check shows the price the farmer bids instead and its lower score, or that
-  the cap is outside the band. That score is measured against the midpoint
+  check shows the cap the farmer bids no higher than and its lower score, or
+  that the cap is outside the band. The live preview below it shows the price
+  the farmer would pick under that cap and its net per day. Until you type a
+  p_true, it values the market at the book midpoint, as the scan does. Its
+  fills come from the tape the scan stored, or from the prior alone, which
+  the preview says. That score is measured against the midpoint
   the capped bid creates. It also warns when your naked budget is below the
   planned longshot leg, which the scan priced within its own naked budget.
   It uses the effective

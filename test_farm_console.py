@@ -236,6 +236,42 @@ class CardsTest(unittest.TestCase):
         self.assertEqual((c.fav_bid.price, c.long_bid.price), (0.98, 0.001))
 
 
+    def test_card_shows_the_favorite_bid_economics_the_farmer_wrote(self):
+        slots = quoting_slots()
+        slots["FAV_BID"].update(economics={"net_per_day": 4.2, "reward_per_day": 5.0,
+                                           "fills_per_day": 8.0, "loss_per_share": 0.1},
+                                fav_reason="", tape={"sweeps": 3, "span_days": 30.0})
+        c = views.card(market(A, "a"), state(A, slots=slots), status(), NOW)
+        self.assertEqual((c.economics["net_per_day"], c.tape["sweeps"]), (4.2, 3))
+
+    def test_a_state_from_before_fill_costs_has_no_economics(self):
+        c = views.card(market(A, "a"), state(A), status(), NOW)
+        self.assertEqual((c.economics, c.fav_reason, c.tape), (None, "", None))
+
+
+class FillCostFiguresTest(unittest.TestCase):
+    def test_review_stats_show_dashes_without_fill_figures(self):
+        stats = {label: value for label, value, _ in views.review_stats({})}
+        self.assertEqual([stats[k] for k in ("Fills/day", "Fill cost/day", "Net APR")],
+                         ["--"] * 3)
+
+    def test_fills_estimated_from_the_prior_alone_say_so(self):
+        stats = {label: value for label, value, _ in views.review_stats(
+            {"fills_per_day": 16.94, "fill_source": "prior", "fill_cost_usd": 1.2,
+             "net_apr": 0.25})}
+        self.assertEqual((stats["Fills/day"], stats["Fill cost/day"], stats["Net APR"]),
+                         ("16.9 (prior)", "$1.20", "25%"))
+        taped = dict((label, value) for label, value, _ in views.review_stats(
+            {"fills_per_day": 3.0, "fill_source": "tape"}))
+        self.assertEqual(taped["Fills/day"], "3")
+
+    def test_discover_ranks_by_net_apr_and_old_rows_show_their_gross_apr(self):
+        new = market(A, "a")._replace(metrics={**metrics("a"), "apr": 0.9, "net_apr": 0.4})
+        old = market(B, "b")._replace(metrics={**metrics("b"), "apr": 0.9})
+        self.assertEqual(views.discover_row(1, new, status(), NOW).net_apr, 0.4)
+        self.assertEqual(views.discover_row(2, old, status(), NOW).net_apr, 0.9)
+
+
 class DetailTest(unittest.TestCase):
     def test_book_rows_order_and_scores(self):
         rows = views.book_rows(state(A).book, 0.99, 0.035)

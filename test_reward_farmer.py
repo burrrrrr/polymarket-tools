@@ -28,8 +28,11 @@ from reward_farmer import (
     config_from,
     farm_position,
     fill_events,
+    keep_failure,
+    market_outlook,
     naked_allowed,
     next_backoff,
+    quotes_at,
     ratchet_baseline,
     reconcile,
     rewards_active,
@@ -38,6 +41,7 @@ from reward_farmer import (
     target_orders,
     without_backed_off,
 )
+from fill_cost import Sweep, Tape
 from reward_screener import Levels
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
@@ -46,7 +50,6 @@ FAV, LONG = "fav-token", "long-token"
 
 CFG = FarmConfig(
     capital=500.0,
-    fav_target_score=0.45,
     max_lead=0.005,
     ask_offset=0.01,
     min_capture=0.005,
@@ -59,6 +62,10 @@ CFG = FarmConfig(
     cooldown_s=600.0,
     naked_cooldown_s=3600.0,
     expiry_buffer_days=7.0,
+    hurdle_rate=0.40,
+    depth_haircut=0.5,
+    fill_lookback_days=30.0,
+    sweep_prior_weight=1.0,
 )
 
 
@@ -115,9 +122,26 @@ def q_sums(target):
     return q_one, q_two
 
 
-class TargetOrdersTest(unittest.TestCase):
+# A tape read with no sweeps on it: fills come from the prior alone.
+QUIET = Tape((), 30.0, fetched_at=NOW)
+
+
+def sweeps(*sizes):
+    return Tape(tuple(Sweep(NOW.timestamp() - n, x) for n, x in enumerate(sizes)), 30.0,
+                fetched_at=NOW)
+
+
+def plan(fm, book, position=Position(), cfg=CFG, naked=True, tape=QUIET):
+    """target_orders against a book, valued at the scan's rate with this tape."""
+    return target_orders(fm, book, position, cfg, naked,
+                         market_outlook(fm, None, tape, cfg, NOW))
+
+
+class BalancingTest(unittest.TestCase):
+    """The orders around a favorite bid at a given price."""
+
     def test_flat_floor_market_balances_fav_bid_with_floor_long_bid(self):
-        target = target_orders(market(), FLOOR_BOOK, Position(), CFG, naked_allowed=True)
+        target = quotes_at(market(), FLOOR_BOOK, Position(), CFG, True, 0.979)
         intents = by_slot(target)
         self.assertEqual(set(intents), {Slot.FAV_BID, Slot.LONG_BID})
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
@@ -133,9 +157,9 @@ class TargetOrdersTest(unittest.TestCase):
         self.assertLess(q_two - q_one, low.score * 0.01 + 1e-9)
 
     def test_fav_inventory_covers_q_two_and_shrinks_long_bid(self):
-        flat = by_slot(target_orders(market(), FLOOR_BOOK, Position(), CFG, True))
+        flat = by_slot(quotes_at(market(), FLOOR_BOOK, Position(), CFG, True, 0.979))
         held = Position(fav_shares=100.0, fav_avg=0.97)
-        target = target_orders(market(), FLOOR_BOOK, held, CFG, True)
+        target = quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979)
         intents = by_slot(target)
         ask = intents[Slot.FAV_ASK]
         self.assertEqual((ask.token_id, ask.side, ask.price, ask.size), (FAV, "SELL", 0.999, 100.0))
@@ -150,14 +174,14 @@ class TargetOrdersTest(unittest.TestCase):
 
     def test_fav_inventory_covering_all_of_q_one_needs_no_long_bid(self):
         held = Position(fav_shares=300.0, fav_avg=0.97)
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, held, CFG, True))
+        intents = by_slot(quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979))
         self.assertIn(Slot.FAV_ASK, intents)
         self.assertIn(Slot.FAV_BID, intents)
         self.assertNotIn(Slot.LONG_BID, intents)
 
     def test_binding_budget_caps_long_bid_and_trims_fav_bid(self):
         fm = market(p_true=0.98, naked_budget_usd=25.0)
-        target = target_orders(fm, BUDGET_BOOK, Position(), CFG, True)
+        target = quotes_at(fm, BUDGET_BOOK, Position(), CFG, True, 0.949)
         intents = by_slot(target)
         low, fav = intents[Slot.LONG_BID], intents[Slot.FAV_BID]
         self.assertEqual(low.price, 0.017)
@@ -178,14 +202,14 @@ class TargetOrdersTest(unittest.TestCase):
         for budget in (5.0, 10.0, 15.0, 25.0, 35.0):
             with self.subTest(budget=budget):
                 fm = market(p_true=0.98, naked_budget_usd=budget)
-                intents = by_slot(target_orders(fm, BUDGET_BOOK, Position(), CFG, True))
+                intents = by_slot(quotes_at(fm, BUDGET_BOOK, Position(), CFG, True, 0.949))
                 self.assertEqual(intents[Slot.LONG_BID].price, 0.017)
                 self.assertLess(intents[Slot.FAV_BID].size, 526.87)
 
     def test_budget_counts_longshot_shares_already_held(self):
         fm = market(p_true=0.98, naked_budget_usd=25.0)
         held = Position(long_shares=10.0, long_avg=1.0)
-        low = by_slot(target_orders(fm, BUDGET_BOOK, held, CFG, True))[Slot.LONG_BID]
+        low = by_slot(quotes_at(fm, BUDGET_BOOK, held, CFG, True, 0.949))[Slot.LONG_BID]
         self.assertLessEqual(low.price * low.size + 10.0, 25.0)
         self.assertEqual(low.size, 882.35)
 
@@ -193,7 +217,7 @@ class TargetOrdersTest(unittest.TestCase):
         # Mistral's favorite bid 0.855 x 584.79 scores 0.0271, 15.86 of Q_one. At 0.1c
         # the longshot bid scores 0.0199 and covers it with 795.97 shares for $0.80.
         # The cheapest price scoring 0.10 is 1.6c, first in line for a No buyer.
-        target = target_orders(MISTRAL, MISTRAL_BOOK_BID_GONE, Position(), MISTRAL_CFG, True)
+        target = quotes_at(MISTRAL, MISTRAL_BOOK_BID_GONE, Position(), MISTRAL_CFG, True, 0.855)
         intents = by_slot(target)
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
         self.assertEqual((fav.price, fav.size), (0.855, 584.79))
@@ -203,51 +227,119 @@ class TargetOrdersTest(unittest.TestCase):
         self.assertGreaterEqual(q_two, q_one)
 
     def test_floor_bid_scoring_over_min_low_score_stays_at_the_floor(self):
-        target = target_orders(MISTRAL, MISTRAL_BOOK, Position(), MISTRAL_CFG, True)
+        target = quotes_at(MISTRAL, MISTRAL_BOOK, Position(), MISTRAL_CFG, True, 0.935)
         low = by_slot(target)[Slot.LONG_BID]
         self.assertEqual(low.price, 0.001)
         self.assertGreaterEqual(low.score, MISTRAL_CFG.min_low_score)
 
-    def test_p_true_caps_fav_bid_price(self):
-        fm = market(p_true=0.985)
-        fav = by_slot(target_orders(fm, FLOOR_BOOK, Position(), CFG, True))[Slot.FAV_BID]
-        self.assertEqual(fav.price, 0.975)
-        self.assertAlmostEqual(fav.score, (0.020 / 0.035) ** 2)
-
-    def test_p_true_cap_outside_band_drops_fav_bid(self):
-        fm = market(p_true=0.96)
-        target = target_orders(fm, FLOOR_BOOK, Position(), CFG, True)
-        self.assertEqual(target.intents, [])
-
-    def test_naked_cooldown_gives_no_long_bid_and_no_unmatched_fav_bid(self):
-        target = target_orders(market(), FLOOR_BOOK, Position(), CFG, naked_allowed=False)
-        self.assertEqual(target.intents, [])
-
-    def test_naked_cooldown_keeps_covered_q_two(self):
-        held = Position(fav_shares=100.0, fav_avg=0.97)
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, held, CFG, False))
-        self.assertNotIn(Slot.LONG_BID, intents)
-        self.assertIn(Slot.FAV_ASK, intents)
-        fav, ask = intents[Slot.FAV_BID], intents[Slot.FAV_ASK]
-        self.assertLessEqual(fav.score * fav.size, ask.score * ask.size + 1e-9)
-
     def test_longshot_inventory_produces_long_ask_at_fav_bid_mirror(self):
         held = Position(long_shares=200.0, long_avg=0.005)
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, held, CFG, True))
+        intents = by_slot(quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979))
         ask = intents[Slot.LONG_ASK]
         self.assertEqual((ask.token_id, ask.side, ask.price, ask.size), (LONG, "SELL", 0.021, 200.0))
         self.assertAlmostEqual(ask.score, intents[Slot.FAV_BID].score)
 
     def test_inventory_below_min_size_gets_no_exit(self):
         held = Position(fav_shares=20.0, fav_avg=0.97, long_shares=20.0, long_avg=0.01)
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, held, CFG, True))
+        intents = by_slot(quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979))
         self.assertNotIn(Slot.FAV_ASK, intents)
         self.assertNotIn(Slot.LONG_ASK, intents)
 
+
+class TargetOrdersTest(unittest.TestCase):
+    def test_p_true_caps_fav_bid_price(self):
+        fm = market(p_true=0.985)
+        fav = by_slot(plan(fm, FLOOR_BOOK))[Slot.FAV_BID]
+        self.assertEqual(fav.price, 0.975)
+        self.assertAlmostEqual(fav.score, (0.020 / 0.035) ** 2)
+
+    def test_p_true_cap_outside_band_drops_fav_bid(self):
+        target = plan(market(p_true=0.96), FLOOR_BOOK)
+        self.assertEqual((target.intents, target.fav.reason), ([], "no scoring favorite bid"))
+
+    def test_naked_cooldown_gives_no_long_bid_and_no_unmatched_fav_bid(self):
+        self.assertEqual(plan(market(), FLOOR_BOOK, naked=False).intents, [])
+
+    def test_naked_cooldown_keeps_covered_q_two(self):
+        held = Position(fav_shares=100.0, fav_avg=0.97)
+        intents = by_slot(plan(market(), FLOOR_BOOK, held, naked=False))
+        self.assertNotIn(Slot.LONG_BID, intents)
+        self.assertIn(Slot.FAV_ASK, intents)
+        fav, ask = intents[Slot.FAV_BID], intents[Slot.FAV_ASK]
+        self.assertLessEqual(fav.score * fav.size, ask.score * ask.size + 1e-9)
+
     def test_one_sided_book_plans_nothing(self):
         book = Levels(bids=[(0.985, 1000.0)], asks=[], tick=0.001)
-        target = target_orders(market(), book, Position(), CFG, True)
+        target = plan(market(), book)
         self.assertEqual((target.mid, target.intents), (None, []))
+
+
+# FLOOR_BOOK with 2,000 more shares bid at 98.0c: a bid there or under waits
+# behind 3,000 shares, at 98.1c or over behind 1,000.
+STACKED_BOOK = Levels(bids=[(0.985, 1000.0), (0.980, 2000.0)], asks=[(0.995, 1000.0)],
+                      tick=0.001)
+
+
+class NetPricingTest(unittest.TestCase):
+    def test_no_tape_places_no_favorite_bid_but_keeps_the_exits(self):
+        held = Position(long_shares=200.0, long_avg=0.005)
+        target = plan(market(), FLOOR_BOOK, held, tape=None)
+        intents = by_slot(target)
+        self.assertNotIn(Slot.FAV_BID, intents)
+        self.assertEqual(target.fav.reason, "no fill tape yet")
+        # With no favorite bid the exit mirrors the highest bid allowed, 99.0c.
+        self.assertEqual(intents[Slot.LONG_ASK].price, 0.010)
+
+    def test_a_preview_without_a_tape_prices_on_the_prior(self):
+        fm = market()
+        target = target_orders(fm, FLOOR_BOOK, Position(), CFG, True,
+                               market_outlook(fm, None, None, CFG, NOW), bid_without_tape=True)
+        self.assertIn(Slot.FAV_BID, by_slot(target))
+
+    def test_a_quiet_tape_bids_the_highest_price_allowed(self):
+        # p_true 0.995 less the 1c margin caps the 99.0c ceiling at 98.5c.
+        target = plan(market(), FLOOR_BOOK)
+        self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.985)
+        self.assertEqual(target.fav.best.price, 0.985)
+
+    def test_sweeps_through_the_top_of_the_book_push_the_bid_behind_the_deep_level(self):
+        # 1,400-share sweeps, 60 a month, get 900 past the 1,000 ahead of 98.1c
+        # (haircut to 500) and nothing past the 3,000 ahead of 98.0c.
+        fm = market()
+        target = plan(fm, STACKED_BOOK, tape=sweeps(*[1400.0] * 60))
+        fav = by_slot(target)[Slot.FAV_BID]
+        self.assertLessEqual(fav.price, 0.980)
+        self.assertEqual(by_slot(plan(fm, STACKED_BOOK))[Slot.FAV_BID].price, 0.985)
+        balanced = by_slot(quotes_at(fm, STACKED_BOOK, Position(), CFG, True, fav.price))
+        self.assertEqual(fav.size, balanced[Slot.FAV_BID].size)
+        self.assertAlmostEqual(target.fav.best.fills_per_day, fav.size / 30)
+
+    def test_fills_costing_more_than_the_bid_earns_place_none_but_keep_the_exit(self):
+        # 30 full clears a month at a 1,000% hurdle: each fill loses most of its price.
+        costly = CFG._replace(hurdle_rate=10.0, sweep_prior_weight=30.0)
+        held = Position(fav_shares=100.0, fav_avg=0.97)
+        target = plan(market(), FLOOR_BOOK, held, cfg=costly)
+        intents = by_slot(target)
+        self.assertNotIn(Slot.FAV_BID, intents)
+        self.assertIn(Slot.FAV_ASK, intents)
+        self.assertRegex(target.fav.reason,
+                         r"^no favorite bid pays: best net -\$\d+\.\d\d/day at \d+\.\dc$")
+
+    def test_a_short_dated_market_welcomes_fills_up_to_the_ev_cap(self):
+        # Two days out a 98.5c fill of a 99.5c share gains 0.8c: sweeps only add.
+        fm = market(end_date=NOW + timedelta(days=2))
+        target = plan(fm, FLOOR_BOOK, tape=sweeps(*[1e5] * 30))
+        self.assertLess(target.fav.best.loss_per_share, 0)
+        self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.985)
+
+    def test_the_outlook_takes_the_live_rate_and_the_end_date(self):
+        fm = market(rate_per_day=100.0, end_date=NOW + timedelta(days=365.25))
+        outlook = market_outlook(fm, {"0xc0nd": 40.0}, QUIET, CFG, NOW)
+        self.assertEqual((outlook.rate_per_day, outlook.years_left), (40.0, 1.0))
+        self.assertEqual(market_outlook(fm, {"0xother": 40.0}, QUIET, CFG, NOW).rate_per_day,
+                         100.0)
+        self.assertEqual(market_outlook(fm, None, None, CFG, NOW).tape,
+                         Tape.unobserved(CFG.fill_lookback_days))
 
 
 def live(order_id, slot, price, size):
@@ -256,20 +348,47 @@ def live(order_id, slot, price, size):
 
 
 class ReconcileTest(unittest.TestCase):
+    """On FLOOR_BOOK with a quiet tape: FAV_BID 98.5c x 507.61, LONG_BID 0.1c x 675.82."""
+
     def setUp(self):
         self.fm = market()
-        self.target = target_orders(self.fm, FLOOR_BOOK, Position(), CFG, True)
+        self.target = plan(self.fm, FLOOR_BOOK)
         self.intents = by_slot(self.target)
 
     def run_reconcile(self, orders):
-        return reconcile(self.target.intents, orders, self.target.mid, self.fm, Position(), CFG)
+        return reconcile(self.target, orders, self.fm, Position(), CFG)
+
+    def keep(self, price, target=None):
+        target = target or self.target
+        order = live("a", Slot.FAV_BID, price, self.intents[Slot.FAV_BID].size)
+        return keep_failure(order, self.intents[Slot.FAV_BID], target, self.fm, Position(), CFG)
 
     def test_keeps_orders_within_hysteresis(self):
         orders = [
-            live("a", Slot.FAV_BID, 0.978, 450.0),
-            live("b", Slot.LONG_BID, 0.001, 500.0),
+            live("a", Slot.FAV_BID, 0.984, 450.0),
+            live("b", Slot.LONG_BID, 0.001, 600.0),
         ]
         self.assertEqual(self.run_reconcile(orders), [])
+
+    def test_a_deeper_bid_earning_most_of_the_best_net_stays(self):
+        # 98.1c scores (2.6 / 3.5)^2 = 0.55, under 0.8 of the target's 0.73,
+        # but nets within a fifth of the best price's.
+        self.assertLess(0.552, CFG.keep_ratio * self.intents[Slot.FAV_BID].score)
+        self.assertIsNone(self.keep(0.981))
+
+    def test_a_bid_trailing_the_best_net_by_more_than_the_keep_ratio_is_replaced(self):
+        curve = self.target.fav.curve
+        self.assertLess(curve[0.979].net_per_day, 0.8 * curve[0.985].net_per_day)
+        self.assertEqual(self.keep(0.979), "net below keep ratio")
+
+    def test_a_bid_netting_no_more_than_the_plan_without_it_is_replaced(self):
+        no_better = self.target.fav._replace(
+            baseline_per_day=self.target.fav.curve[0.981].net_per_day)
+        self.assertEqual(self.keep(0.981, self.target._replace(fav=no_better)),
+                         "net below keep ratio")
+
+    def test_a_bid_above_the_candidates_is_replaced(self):
+        self.assertEqual(self.keep(0.99), "outside the bid candidates")
 
     def test_places_every_target_when_nothing_rests(self):
         actions = self.run_reconcile([])
@@ -277,40 +396,40 @@ class ReconcileTest(unittest.TestCase):
 
     def test_replaces_order_out_of_band(self):
         orders = [
-            live("a", Slot.FAV_BID, 0.95, 510.72),
-            live("b", Slot.LONG_BID, 0.001, 435.17),
+            live("a", Slot.FAV_BID, 0.95, 507.61),
+            live("b", Slot.LONG_BID, 0.001, 675.82),
         ]
         actions = self.run_reconcile(orders)
         self.assertEqual(actions, [Cancel(("a",)), Place(self.intents[Slot.FAV_BID])])
 
     def test_replaces_order_whose_size_left_the_band(self):
         orders = [
-            live("a", Slot.FAV_BID, 0.979, 300.0),
-            live("b", Slot.LONG_BID, 0.001, 435.17),
+            live("a", Slot.FAV_BID, 0.985, 300.0),
+            live("b", Slot.LONG_BID, 0.001, 675.82),
         ]
         actions = self.run_reconcile(orders)
         self.assertEqual(actions, [Cancel(("a",)), Place(self.intents[Slot.FAV_BID])])
 
     def test_replaces_fav_bid_above_ev_cap(self):
         fm = market(p_true=0.985)
-        target = target_orders(fm, FLOOR_BOOK, Position(), CFG, True)
+        target = plan(fm, FLOOR_BOOK)
         orders = [live("a", Slot.FAV_BID, 0.98, 510.2)]
-        actions = reconcile(target.intents, orders, target.mid, fm, Position(), CFG)
+        actions = reconcile(target, orders, fm, Position(), CFG)
         self.assertEqual(actions[0], Cancel(("a",)))
 
     def test_cancels_extras_and_slots_without_intent(self):
         orders = [
-            live("a", Slot.FAV_BID, 0.979, 510.72),
-            live("b", Slot.FAV_BID, 0.979, 510.72),
-            live("c", Slot.LONG_BID, 0.001, 435.17),
+            live("a", Slot.FAV_BID, 0.985, 507.61),
+            live("b", Slot.FAV_BID, 0.985, 507.61),
+            live("c", Slot.LONG_BID, 0.001, 675.82),
             live("d", Slot.FAV_ASK, 0.999, 100.0),
         ]
         self.assertEqual(self.run_reconcile(orders), [Cancel(("b", "d"))])
 
     def test_cancels_come_before_places(self):
         orders = [
-            live("a", Slot.FAV_BID, 0.95, 510.72),
-            live("b", Slot.LONG_BID, 0.050, 435.17),
+            live("a", Slot.FAV_BID, 0.95, 507.61),
+            live("b", Slot.LONG_BID, 0.050, 675.82),
         ]
         actions = self.run_reconcile(orders)
         self.assertEqual(actions[0], Cancel(("a", "b")))
@@ -320,8 +439,8 @@ class ReconcileTest(unittest.TestCase):
         )
 
     def test_no_intents_cancels_everything(self):
-        orders = [live("a", Slot.FAV_BID, 0.979, 510.72), live("b", Slot.LONG_BID, 0.001, 435.17)]
-        actions = reconcile([], orders, self.target.mid, self.fm, Position(), CFG)
+        orders = [live("a", Slot.FAV_BID, 0.985, 507.61), live("b", Slot.LONG_BID, 0.001, 675.82)]
+        actions = reconcile(self.target._replace(intents=[]), orders, self.fm, Position(), CFG)
         self.assertEqual(actions, [Cancel(("a", "b"))])
 
 
@@ -433,7 +552,7 @@ class StepStateTest(unittest.TestCase):
         held = Position(fav_shares=100.0, fav_avg=0.97)
         obs = observe(naked_paused=True)
         self.assertFalse(naked_allowed(obs, NOW))
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, held, CFG, naked_allowed(obs, NOW)))
+        intents = by_slot(plan(market(), FLOOR_BOOK, held, naked=naked_allowed(obs, NOW)))
         self.assertNotIn(Slot.LONG_BID, intents)
         self.assertIn(Slot.FAV_BID, intents)
 
@@ -448,15 +567,15 @@ class BaselineTest(unittest.TestCase):
     def test_preexisting_fav_shares_without_farm_fills_get_no_fav_ask(self):
         held = Position(fav_shares=300.0, fav_avg=0.97)
         farm = farm_position(held, ratchet_baseline(None, held))
-        intents = by_slot(target_orders(market(), FLOOR_BOOK, farm, CFG, True))
+        intents = by_slot(plan(market(), FLOOR_BOOK, farm))
         self.assertNotIn(Slot.FAV_ASK, intents)
-        self.assertEqual(intents[Slot.FAV_BID].size, 510.72)
+        self.assertEqual(intents[Slot.FAV_BID].size, 507.61)
 
     def test_only_shares_above_the_baseline_are_sold(self):
         baseline = ratchet_baseline(None, Position(fav_shares=300.0, fav_avg=0.97))
         held = Position(fav_shares=400.0, fav_avg=0.972)
         farm = farm_position(held, ratchet_baseline(baseline, held))
-        ask = by_slot(target_orders(market(), FLOOR_BOOK, farm, CFG, True))[Slot.FAV_ASK]
+        ask = by_slot(plan(market(), FLOOR_BOOK, farm))[Slot.FAV_ASK]
         self.assertEqual(ask.size, 100.0)
 
     def test_manual_sale_lowers_the_baseline(self):
@@ -479,7 +598,7 @@ class BackoffTest(unittest.TestCase):
         self.assertEqual(backoff.until, NOW + timedelta(seconds=900))
 
     def test_waiting_slot_drops_only_its_places(self):
-        target = target_orders(market(), FLOOR_BOOK, Position(), CFG, True)
+        target = plan(market(), FLOOR_BOOK)
         intents = by_slot(target)
         actions = [Cancel(("a",)), Place(intents[Slot.FAV_BID]), Place(intents[Slot.LONG_BID])]
         backoffs = {Slot.LONG_BID: next_backoff(None, NOW)}
@@ -500,7 +619,7 @@ WORKED_BOOK = Levels(
 
 class WideBookTest(unittest.TestCase):
     def test_fav_bid_stops_max_lead_over_the_best_bid_and_scores_against_its_mid(self):
-        target = target_orders(market(min_size=20.0), WIDE_BOOK, Position(), CFG, True)
+        target = plan(market(min_size=20.0), WIDE_BOOK)
         fav = by_slot(target)[Slot.FAV_BID]
         self.assertEqual(fav.price, 0.955)
         self.assertAlmostEqual(target.mid, 0.97)
@@ -508,7 +627,7 @@ class WideBookTest(unittest.TestCase):
 
     def test_ev_cap_above_the_best_bid_scores_against_the_mid_it_creates(self):
         fm = market(min_size=20.0, p_true=0.963)
-        target = target_orders(fm, WIDE_BOOK, Position(), CFG, True)
+        target = plan(fm, WIDE_BOOK)
         fav = by_slot(target)[Slot.FAV_BID]
         # The 0.953 cap moves the midpoint to (0.953 + 0.985) / 2 = 0.969.
         self.assertEqual(fav.price, 0.953)
@@ -518,12 +637,13 @@ class WideBookTest(unittest.TestCase):
     def test_worked_example_at_the_default_config(self):
         defaults = config_from(build_parser().parse_args([]))
         fm = market(v=0.085, min_size=20.0, p_true=0.96)
-        target = target_orders(fm, WORKED_BOOK, Position(), defaults, True)
+        target = plan(fm, WORKED_BOOK, cfg=defaults)
         fav = by_slot(target)[Slot.FAV_BID]
-        # The 0.940 EV cap does not bind.
-        self.assertEqual(fav.price, 0.935)
-        self.assertAlmostEqual(target.mid, 0.9625)
-        self.assertAlmostEqual(fav.score, ((0.085 - 0.0275) / 0.085) ** 2)
+        # A quiet tape bids the 93.9c ceiling, 0.5c over the best bid; the 0.940
+        # EV cap does not bind.
+        self.assertEqual(fav.price, 0.939)
+        self.assertAlmostEqual(target.mid, 0.9645)
+        self.assertAlmostEqual(fav.score, ((0.085 - 0.0255) / 0.085) ** 2)
 
 
 class BoundaryTest(unittest.TestCase):
@@ -610,9 +730,11 @@ class FarmerCycleTest(unittest.TestCase):
         self.book_fetches = 0
         self.on_book_fetch = lambda count: None
         self.info = mock.Mock(return_value=INFO)
+        self.tape = mock.Mock(return_value=QUIET)
         self.book = FLOOR_BOOK
         for name, fake in (
             ("fetch_market_info", self.info),
+            ("fetch_tape", self.tape),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
@@ -728,15 +850,15 @@ class FarmerCycleTest(unittest.TestCase):
         farmer.cycle()
         before = self.last_event_id()
 
-        farm_db.put_setting(self.ui, "fav_target_score", 0.25, NOW)
+        farm_db.put_setting(self.ui, "ev_margin", 0.022, NOW)
         farmer.cycle()
         settings = [e for e in self.events(before) if e["kind"] == "SETTINGS"]
         self.assertEqual(len(settings), 1)
-        self.assertEqual(json.loads(settings[0]["data"]), {"fav_target_score": [0.45, 0.25]})
+        self.assertEqual(json.loads(settings[0]["data"]), {"ev_margin": [0.02, 0.022]})
         _, slots = self.farm_state()
         self.assertEqual(slots["FAV_BID"]["target"]["price"], 0.973)
         status = self.query("SELECT config FROM farmer_status")[0]
-        self.assertEqual(json.loads(status["config"])["fav_target_score"], 0.25)
+        self.assertEqual(json.loads(status["config"])["ev_margin"], 0.022)
 
         farmer.cycle()
         self.assertEqual(len([e for e in self.events(before) if e["kind"] == "SETTINGS"]), 1)
@@ -893,6 +1015,50 @@ class FarmerCycleTest(unittest.TestCase):
                          [farm_db.stamp(NOW + timedelta(seconds=s)) for s in (0, 60, 125)])
         self.assertEqual([(r["fav_bid"], r["long_bid"]) for r in rows], [(0.975, 0.001)] * 3)
         self.assertEqual((rows[0]["mid"], rows[0]["book_mid"]), (0.99, 0.99))
+
+    def cycle_at(self, *seconds):
+        """Cycle one farmer at each NOW + seconds. Returns, per cycle, the tape
+        reads so far and the FAV_BID slot's (decision, reason)."""
+        clock, seen = [NOW], []
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        with mock.patch.object(reward_farmer, "datetime", Clock):
+            farmer = self.started_farmer()
+            for s in seconds:
+                clock[0] = NOW + timedelta(seconds=s)
+                farmer.cycle()
+                fav = self.farm_state()[1]["FAV_BID"]
+                seen.append((self.tape.call_count, fav["decision"], fav["reason"]))
+        return seen
+
+    def test_the_tape_is_read_once_per_ten_minutes(self):
+        reads = [n for n, _, _ in self.cycle_at(0, 5, 300, 599, 600)]
+        self.assertEqual(reads, [1, 1, 1, 1, 2])
+
+    def test_until_a_tape_lands_there_is_no_favorite_bid_and_the_read_retries_in_a_minute(self):
+        self.tape.side_effect = [httpx.ConnectError("data API down"), QUIET]
+        self.assertEqual(self.cycle_at(0, 30, 60), [
+            (1, "none", "no fill tape yet"), (1, "none", "no fill tape yet"), (2, "place", "")])
+
+    def test_a_failed_reread_keeps_bidding_on_the_last_tape(self):
+        self.tape.side_effect = [QUIET, httpx.ConnectError("data API down"), QUIET]
+        self.assertEqual(self.cycle_at(0, 600, 630, 660), [
+            (1, "place", ""), (2, "hold", ""), (2, "hold", ""), (3, "hold", "")])
+
+    def test_the_favorite_bid_slot_shows_its_economics_and_tape(self):
+        self.tape.return_value = sweeps(100.0, 50.0)
+        self.started_farmer().cycle()
+        _, slots = self.farm_state()
+        economics = slots["FAV_BID"]["economics"]
+        self.assertEqual(economics["price"], slots["FAV_BID"]["target"]["price"])
+        self.assertAlmostEqual(economics["net_per_day"], economics["reward_per_day"]
+                               - economics["fills_per_day"] * economics["loss_per_share"])
+        self.assertEqual((slots["FAV_BID"]["tape"]["sweeps"], slots["FAV_BID"]["tape"]["shares"]),
+                         (2, 150.0))
 
     def test_paused_market_samples_no_resting_bids(self):
         farm_db.set_paused(self.ui, CID, True)

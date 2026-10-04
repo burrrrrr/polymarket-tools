@@ -49,7 +49,23 @@ GLOSSARY = {
                                    "markets; it is optimistic."),
     "planned_capital": Term("Capital", "USD the planned quotes would tie up: the favorite bid "
                                        "plus the longshot bid."),
-    "apr": Term("APR", "Estimated $/day ÷ capital × 365. A ranking figure, not a forecast."),
+    "apr": Term("APR", "Estimated $/day ÷ capital × 365, before fill costs. A ranking figure, "
+                       "not a forecast."),
+    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: the "
+                                       "taker sells seen on the market's tape that would get "
+                                       "past the bids ahead of ours, plus the assumed sweeps "
+                                       "that clear the book (Sweep prior weight per "
+                                       "lookback). (prior) means no tape "
+                                       "was read, only that assumption, so the figure is "
+                                       "optimistic."),
+    "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
+                                       "minus p_true discounted at the hurdle rate to the end "
+                                       "date. The scan has no p_true and uses the midpoint."),
+    "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
+                               "this."),
+    "net_daily": Term("Net/day", "The favorite bid's share of the pool less what its fills "
+                                 "cost a day, at the price the farmer chose for the best net. "
+                                 "With no favorite bid, why none pays."),
     "days": Term("Days", "Days until the farmer stops: the market's end date minus the "
                          "expiry buffer."),
     "ahead": Term("Depth ahead", "Longshot shares bid above our longshot bid, as a multiple "
@@ -80,8 +96,8 @@ GLOSSARY = {
                                        "side: resting favorite bids plus favorite shares held, "
                                        "at cost. Leave blank to use the farmer's default."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
-                                 "the EV margin. Above that cap, the farmer bids the cap "
-                                 "instead, which earns less."),
+                                 "the EV margin. The farmer never bids above that cap, and "
+                                 "below it picks the price with the best net of fill costs."),
 
     # live state
     "mid_effective": Term("Mid (effective)", "The reward midpoint including our own favorite "
@@ -118,8 +134,9 @@ GLOSSARY = {
                                    "earn nothing above 90c."),
 
     # order slots and their decisions
-    "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint. A fill is wanted when "
-                               "the price is under p_true."),
+    "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price earning "
+                               "the most rewards net of what its fills cost: a filled share "
+                               "ties up capital until the market resolves."),
     "LONG_BID": Term("LONG_BID", "Buys the longshot far below its midpoint. It exists only to "
                                  "make the favorite bid earn rewards; this is the naked leg."),
     "FAV_ASK": Term("FAV_ASK", "Sells favorite shares the farmer bought, above the midpoint "
@@ -157,12 +174,6 @@ GLOSSARY = {
                                           "favorite side: its resting bid plus farm inventory "
                                           "at cost. The screener sizes the planned favorite "
                                           "bid with it."),
-    "fav_target_score": Term("Favorite target score", "The per-share score the favorite bid "
-                                                      "aims for, scored against the midpoint "
-                                                      "it creates. It sits at the deepest "
-                                                      "price that still reaches it. If none "
-                                                      "does, it sits at its highest allowed "
-                                                      "price."),
     "max_lead": Term("Max lead", "The most the favorite bid may sit above the best bid "
                                  "already in the book, in price: 0.005 is 0.5c. 0 joins "
                                  "the best bid."),
@@ -183,7 +194,9 @@ GLOSSARY = {
                                                 "price, sized to the budget, and the favorite "
                                                 "bid shrinks to match."),
     "keep_ratio": Term("Keep ratio", "Keep a resting order while it scores at least this "
-                                     "fraction of its target."),
+                                     "fraction of its target. A favorite bid stays while it "
+                                     "earns at least this fraction of the best price's net "
+                                     "$/day."),
     "drop_threshold": Term("Ask drop threshold", "A fall this large in the favorite's best "
                                                  "ask within the drop window starts a "
                                                  "cooldown. Only the ask counts, because a "
@@ -208,6 +221,28 @@ GLOSSARY = {
                                              "much if their best bid left. Our favorite bid "
                                              "would follow the next bid down and its score "
                                              "would collapse."),
+    "hurdle_rate": Term("Hurdle rate", "The yearly return capital must beat, 0.40 is 40%. A "
+                                       "filled favorite share is held until the market "
+                                       "resolves, so it costs its price minus p_true "
+                                       "discounted at this rate to the end date. On a "
+                                       "short-dated market that cost is negative and fills "
+                                       "are welcome."),
+    "depth_haircut": Term("Depth haircut", "The share of the bids ahead of ours a sell sweep "
+                                           "must get through before it reaches our favorite "
+                                           "bid. Below 1 because some of that depth is "
+                                           "cancelled before a sweep arrives."),
+    "fill_lookback_days": Term("Fill lookback", "Days of taker trades the fill estimate "
+                                                "reads. The data API serves only the last "
+                                                "1,800 or so, so a busy market's estimate "
+                                                "covers less."),
+    "sweep_prior_weight": Term("Sweep prior weight", "Sweeps per lookback assumed to clear "
+                                                     "the whole book, on top of the ones "
+                                                     "seen, so a quiet market never reads as "
+                                                     "never filling."),
+    "tape_markets": Term("Markets with a tape", "How many of the top markets read their "
+                                                "taker trades to estimate fills. The rest "
+                                                "rank on the prior alone, which is "
+                                                "optimistic."),
     "heartbeat": Term("Heartbeat", "If the farmer stops sending heartbeats for 10s, "
                                    "Polymarket cancels every order owned by these API "
                                    "credentials, possibly including your other tools' "

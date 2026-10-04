@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import Callable, Iterable, NamedTuple, Optional
 from urllib.parse import quote, urlencode
 
+import fill_cost
 import reward_farmer
 from farm_db import EventKind, FarmerStatus, resting_order
 from reward_screener import Skip, adjusted_mid, best_price, created_mid, floor_to_tick
@@ -326,6 +327,12 @@ class Card:
     paused: bool
     naked_paused: bool
     status: str
+    # The farmer's favorite bid economics from its FAV_BID slot, the reason it
+    # has none, and the tape behind them; absent from farm_state rows that
+    # predate fill-cost pricing.
+    economics: Optional[dict] = None
+    fav_reason: str = ""
+    tape: Optional[dict] = None
 
 
 def card(market, state, status, now):
@@ -347,6 +354,7 @@ def card(market, state, status, now):
             paused=market.paused, naked_paused=market.naked_paused, status=market.status,
         )
     fav_bid, long_bid = resting(state, "FAV_BID"), resting(state, "LONG_BID")
+    fav_view = state.slots.get("FAV_BID") or {}
     mid = state.mid if state.mid is not None else state.book_mid
     high = max(state.q1, state.q2)
     return Card(
@@ -365,7 +373,8 @@ def card(market, state, status, now):
         naked_used_usd=state.naked_used_usd,
         naked_pct=round(min(100.0, state.naked_used_usd / budget * 100), 1) if budget else 0.0,
         position=state.position, paused=market.paused, naked_paused=market.naked_paused,
-        status=market.status,
+        status=market.status, economics=fav_view.get("economics"),
+        fav_reason=fav_view.get("fav_reason") or "", tape=fav_view.get("tape"),
     )
 
 
@@ -857,7 +866,7 @@ class DiscoverRow:
     v: Optional[float]
     est_daily_usd: Optional[float]
     capital_usd: Optional[float]
-    apr: Optional[float]
+    net_apr: Optional[float]
     days: Optional[float]
     ahead: Optional[float]
     volume: str
@@ -887,7 +896,9 @@ def discover_row(rank, market, status, now):
         slug=market.slug, mode=plan.get("mode"), mode_tone=mode_tone(plan.get("mode")),
         fav=f"{info.get('fav_outcome', '?')} {cents(m.get('book_mid', m.get('mid')))}",
         pool=info.get("rate_per_day"), v=info.get("v"), est_daily_usd=m.get("est_daily_usd"),
-        capital_usd=m.get("capital_usd"), apr=m.get("apr"),
+        capital_usd=m.get("capital_usd"),
+        # A row scanned before fill-cost pricing has only the gross APR.
+        net_apr=m.get("net_apr", m.get("apr")),
         days=(cutoff - now).total_seconds() / 86400 if cutoff else None,
         ahead=m.get("depth_ahead_ratio"), volume=human_volume(m.get("volume24hr")),
         status=market.status, status_tone=STATUS_TONE.get(market.status, "t-n"),
@@ -993,6 +1004,10 @@ class LiveReview:
     bids: list
     outside_asks: float
     outside_bids: float
+    # The favorite bid's economics, and whether its fills came from the scan's
+    # stored tape or the prior alone.
+    value: Optional[reward_farmer.QuoteValue] = None
+    fill_source: str = "prior"
 
 
 def rewards_state(info, condition_id, total_rates):
@@ -1011,11 +1026,20 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
     favorite token's live book; total_rates: as reward_farmer.rewards_active
     takes it. Planning is the farmer's own, from a zero farm position, since a
     new market's holdings become its baseline. A market the farmer already
-    manages gets the book without a plan."""
-    fav = json.loads(row["metrics"])["market"].get("fav_outcome") or "favorite"
+    manages gets the book without a plan.
+
+    A row with no p_true is valued at the book midpoint, as the scan values
+    it. Fills come from the tape the scan stored, or the prior alone without
+    one; the console never reads a tape itself, and the farmer would not bid
+    until it has read one."""
+    metrics = json.loads(row["metrics"])
+    fav = metrics["market"].get("fav_outcome") or "favorite"
     long = OTHER_OUTCOME.get(fav, "longshot")
     book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
     target, note = reward_farmer.Target(book_mid, []), ""
+    tape = fill_cost.tape_from_json(metrics.get("tape"))
+    if row["p_true"] is None:
+        row = {**dict(row), "p_true": book_mid}
     fm = reward_farmer.farm_market(row, info, cfg)
     if managed:
         note = "The farmer manages this market. Its live orders are on the market page."
@@ -1031,9 +1055,11 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
         state = reward_farmer.step_state(reward_farmer.State(reward_farmer.Phase.QUOTING),
                                          obs, now, cfg)
         if state.phase is reward_farmer.Phase.QUOTING:
-            target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True)
+            outlook = reward_farmer.market_outlook(fm, total_rates, tape, cfg, now)
+            target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True,
+                                                 outlook, bid_without_tape=True)
             if not target.intents:
-                note = "The farmer would place nothing: no bid scores against this book."
+                note = f"The farmer would place nothing: {target.fav.reason}."
         else:
             why = state.reason or (f"the midpoint {cents(book_mid)} is under min_fav "
                                    f"{cents(cfg.min_fav)}")
@@ -1083,7 +1109,8 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
              for k in strip.marks), key=lambda k: k.price))
     return LiveReview(now, fav, long, book_mid, mid, note, orders, strip,
                       list(reversed(ladder(ask_rows))), ladder(bid_rows),
-                      outside_asks, outside_bids)
+                      outside_asks, outside_bids, target.fav.best,
+                      "tape" if tape is not None else "prior")
 
 
 def review_stats(metrics):
@@ -1092,11 +1119,17 @@ def review_stats(metrics):
         return "--" if value is None else f"{value * 100:,.0f}%"
 
     ahead = metrics.get("depth_ahead_ratio")
+    fills = metrics.get("fills_per_day")
+    prior = " (prior)" if metrics.get("fill_source") == "prior" else ""
     return [
         ("Est share", pct(metrics.get("share")), "est_share"),
         ("Est $/day", usd(metrics.get("est_daily_usd")), "est_daily"),
         ("Capital", usd(metrics.get("capital_usd")), "planned_capital"),
         ("APR", pct(metrics.get("apr")), "apr"),
+        ("Fills/day", "--" if fills is None else f"{shares(round(fills, 1))}{prior}",
+         "fills_per_day"),
+        ("Fill cost/day", usd(metrics.get("fill_cost_usd")), "fill_cost"),
+        ("Net APR", pct(metrics.get("net_apr")), "net_apr"),
         ("Depth ahead", "--" if ahead is None else f"{ahead:.1f}x", "ahead"),
         ("Holding rewards", {True: "yes", False: "no"}.get(metrics.get("holding_rewards"),
                                                            "unknown"), "holding_rewards"),
@@ -1144,8 +1177,8 @@ def ev_check(metrics, p_true, budget_text, ev_margin):
         mid = (plan["mid"] if best_bid is None or best_ask is None
                else created_mid(cap, best_bid, best_ask))
         capped = share_score(m.get("v") or 0.0, mid - cap) if cap >= tick else 0.0
-        then = (f"The farmer bids {cents(cap)} instead, which scores {capped:.3f} per share "
-                f"instead of {plan['fav_bid_score']:.3f}." if capped > 0 else
+        then = (f"The farmer bids no higher than {cents(cap)}, which scores {capped:.3f} per "
+                f"share instead of {plan['fav_bid_score']:.3f}." if capped > 0 else
                 f"{cents(cap)} is outside the reward band, so the farmer places no favorite "
                 f"bid and the market earns nothing.")
         tone, lines = "c-warn", [f"Planned bid {cents(bid)} is above your cap of "

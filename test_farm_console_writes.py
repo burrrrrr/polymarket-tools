@@ -8,6 +8,7 @@ from datetime import timedelta
 from fastapi.testclient import TestClient
 
 import farm_db
+import fill_cost
 import reward_farmer
 import reward_screener
 from farm_console import forms, views
@@ -18,13 +19,14 @@ from reward_screener import Levels, RewardMarket, ScreenConfig
 from test_farm_console import A, B, C, ORIGIN, Console
 
 # Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
-# sits at 1.7c, the cheapest price scoring 0.10 (BUDGET), sized to the budget, and the
-# favorite bid rests at 94.9c. Each book's deepest bid sits outside the
+# sits at the cheapest price covering the favorite bid within the budget (BUDGET), and
+# the favorite bid rests at the 95.5c ceiling. Each book's deepest bid sits outside the
 # band, so it scores nothing, but if the best bid left it would keep the midpoint
 # above min_fav and less than 3c down (not fragile).
 BUDGET_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0), (0.90, 1000.0)],
                      asks=[(0.97, 1000.0)], tick=0.001)
-# Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at 97.9c.
+# Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at the
+# 99.0c ceiling.
 FLOOR_BOOK = Levels(bids=[(0.985, 1000.0), (0.95, 1000.0)], asks=[(0.995, 1000.0)],
                     tick=0.001)
 # Its favorite fell since the scan: mid 0.885 is under min_fav, so the farmer would not quote.
@@ -260,18 +262,17 @@ class ReviewTest(Writes):
 
     def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
         text = self.live()
-        for needle in ("Buy No 94.9c", "Buy Yes 1.7c", "bid at 94.9c", "ask at 98.3c",
-                       "our bid 94.9c", "best bid 95.5c", "best ask 97.0c",
+        for needle in ("Buy No 95.0c", "Buy Yes 1.7c", "bid at 95.0c", "ask at 98.3c",
+                       "our bid 95.0c", "best bid 95.5c", "best ask 97.0c",
                        "longshot bid (mirror) 98.3c"):
             self.assertIn(needle, text)
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
         fm = reward_farmer.farm_market(
             {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
-             "capital_usd": None}, self.remote.info("0xddd"),
-            reward_farmer.config_from(reward_farmer.build_parser().parse_args([])))
-        target = reward_farmer.target_orders(fm, BUDGET_BOOK, reward_farmer.Position(),
-                                             reward_farmer.config_from(
-                                                 reward_farmer.build_parser().parse_args([])),
-                                             True)
+             "capital_usd": None}, self.remote.info("0xddd"), cfg)
+        target = reward_farmer.target_orders(
+            fm, BUDGET_BOOK, reward_farmer.Position(), cfg, True,
+            reward_farmer.market_outlook(fm, None, None, cfg, self.now), bid_without_tape=True)
         self.assertEqual([i.slot.name for i in target.intents], ["FAV_BID", "LONG_BID"])
         for intent in target.intents:
             self.assertIn(f"{intent.slot.name} {views.shares(intent.size)}</td>", text)
@@ -283,7 +284,12 @@ class ReviewTest(Writes):
                             re.findall(r"FAV_BID ([\d,.]+)</td>", capped))
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
         self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
-        self.assertIn("Buy No 93.0c", self.live(p_true="95"))
+        self.assertIn("Buy No 94.0c", self.live(p_true="96"))
+        # Capped at 93.0c the bid scores 0.02, and with one assumed book-clearing
+        # sweep a month its fills cost more than that earns.
+        farm_db.put_settings(self.db, {"sweep_prior_weight": 1.0}, self.now)
+        self.assertIn("The farmer would place nothing: no favorite bid pays: best net "
+                      "-$0.09/day at 93.0c.", self.live(p_true="95"))
 
     def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
         from farm_console.app import utc_now
@@ -297,7 +303,37 @@ class ReviewTest(Writes):
         self.assertIn("Could not read the live book: ConnectionError: clob unreachable",
                       self.live())
         self.remote.fail_book = False
-        self.assertIn("Buy No 94.9c", self.live())
+        self.assertIn("Buy No 95.0c", self.live())
+
+    def test_live_plan_without_p_true_values_the_market_at_the_book_midpoint(self):
+        # p_true 96.0c, the book midpoint, less the 2c margin caps the bid at 94.0c.
+        text = self.live(p_true="")
+        self.assertIn("Buy No 94.0c", text)
+        self.assertIn("valued at the book midpoint", text)
+
+    def preview(self, metrics_tape=None):
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
+        row = dict(self.row("0xddd"))
+        metrics = json.loads(row["metrics"])
+        row.update(p_true=0.97, naked_budget_usd=25.0, capital_usd=None,
+                   metrics=json.dumps({**metrics, "tape": metrics_tape}))
+        live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
+                                 self.now, False)
+        fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg)
+        outlook = reward_farmer.market_outlook(fm, None, fill_cost.tape_from_json(metrics_tape),
+                                               cfg, self.now)
+        return live, reward_farmer.target_orders(fm, BUDGET_BOOK, reward_farmer.Position(),
+                                                 cfg, True, outlook, bid_without_tape=True)
+
+    def test_live_plan_prices_fills_from_the_tape_the_scan_stored(self):
+        tape = fill_cost.Tape((fill_cost.Sweep(self.now.timestamp() - 60, 5000.0),), 30.0,
+                              fetched_at=self.now)
+        live, target = self.preview(fill_cost.tape_to_json(tape))
+        self.assertEqual(live.fill_source, "tape")
+        self.assertEqual(live.value, target.fav.best)
+        prior, _ = self.preview()
+        self.assertEqual(prior.fill_source, "prior")
+        self.assertGreater(live.value.fills_per_day, prior.value.fills_per_day)
 
     def test_live_region_of_a_managed_market_shows_the_book_without_a_plan(self):
         text = self.live(A)
@@ -486,17 +522,17 @@ class ReviewTest(Writes):
                                params={"p_true": p_true, "naked_budget": budget}).text
 
     def test_ev_check_uncapped_capped_and_out_of_band(self):
-        self.assertIn("Planned bid 94.9c is at or under your cap of 95.0c", self.ev("0xddd", "97"))
+        self.assertIn("Planned bid 95.5c is at or under your cap of 96.0c", self.ev("0xddd", "98"))
         capped = self.ev("0xddd", "96")
-        self.assertIn("Planned bid 94.9c is above your cap of 94.0c (p_true minus 2.0c). "
-                      "The farmer bids 94.0c instead, which scores 0.184", capped)
+        self.assertIn("Planned bid 95.5c is above your cap of 94.0c (p_true minus 2.0c). "
+                      "The farmer bids no higher than 94.0c, which scores 0.184", capped)
         self.assertIn('class="ev c-warn"', capped)
         self.assertIn("outside the reward band", self.ev("0xddd", "93"))
         self.assertIn("whole percent from 1 to 99", self.ev("0xddd", "150"))
 
     def test_ev_check_uses_the_effective_ev_margin(self):
         farm_db.put_setting(self.db, "ev_margin", 0.025, self.now)
-        self.assertIn("Planned bid 94.9c is above your cap of 94.5c (p_true minus 2.5c)",
+        self.assertIn("Planned bid 95.5c is above your cap of 94.5c (p_true minus 2.5c)",
                       self.ev("0xddd", "97"))
 
     def test_ev_check_scores_the_capped_bid_against_the_mid_it_creates(self):
@@ -506,7 +542,7 @@ class ReviewTest(Writes):
                    "plan": {"fav_bid_price": 0.97, "mid": 0.98, "fav_bid_score": 0.779,
                             "low_price": 0.001, "low_size": 100.0, "mode": "floor"}}
         text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines)
-        self.assertIn("The farmer bids 95.0c instead, which scores 0.585 per share", text)
+        self.assertIn("The farmer bids no higher than 95.0c, which scores 0.585 per share", text)
         self.assertNotIn("0.419", text)
         del metrics["best_bid"], metrics["best_ask"]
         self.assertIn("which scores 0.419 per share",
@@ -630,7 +666,7 @@ class ScanTest(Writes):
 
     def test_invalid_parameters_start_nothing_and_persist_nothing(self):
         for name, value in (("min_fav", "2"), ("capital", "0"), ("max_lead", "abc"),
-                            ("fav_target_score", "0"),
+                            ("hurdle_rate", "-0.1"), ("tape_markets", "5000"),
                             ("min_rate", "-1"), ("fragile_drop", "-0.01")):
             with self.subTest(name=name):
                 resp = self.post("/discover/scan", **scan_form(**{name: value}))
@@ -646,16 +682,17 @@ class ScanTest(Writes):
         self.assertIn('name="naked_budget" value="10"', page)
 
     def test_stored_parameters_from_an_older_screener_still_load(self):
-        farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01},
-                                self.now)
+        farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01,
+                                          "fav_target_score": 0.45}, self.now)
         resp = self.client.get("/discover")
         self.assertEqual(resp.status_code, 200)
         self.assertIn('name="capital" value="300"', resp.text)
-        self.assertIn('name="fav_target_score" value="0.45"', resp.text)
+        self.assertIn('name="hurdle_rate" value="0.4"', resp.text)
         self.assertIn('name="max_lead" value="0.005"', resp.text)
         self.assertIn('name="fragile_drop" value="0.03"', resp.text)
         self.assertIn('name="naked_budget" value="10"', resp.text)
         self.assertNotIn("bid_offset", resp.text)
+        self.assertNotIn("fav_target_score", resp.text)
 
 
 class DiscoverTest(Writes):

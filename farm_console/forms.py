@@ -30,12 +30,16 @@ SCAN_FIELDS = {
     "min_window_days": Field("Min window (days)", bound=Bound(0)),
     "horizon_cap_days": Field("Horizon cap (days)", bound=Bound(0, low_open=True)),
     "capital": Field("Capital per market ($)", bound=Bound(0, low_open=True)),
-    "fav_target_score": Field("Favorite target score", bound=Bound(0, 1, low_open=True)),
     "max_lead": Field("Max lead", bound=Bound(0, 0.5)),
     "min_low_score": Field("Min longshot score", bound=Bound(0, 1, low_open=True)),
     "naked_budget": Field("Naked budget ($)", bound=Bound(0)),
     "min_rate": Field("Min pool ($/day)", bound=Bound(0)),
     "fragile_drop": Field("Fragile mid drop", bound=Bound(0, 1)),
+    "hurdle_rate": Field("Hurdle rate", bound=Bound(0, 10)),
+    "depth_haircut": Field("Depth haircut", bound=Bound(0, 1)),
+    "fill_lookback_days": Field("Fill lookback (days)", bound=Bound(1, 365)),
+    "sweep_prior_weight": Field("Sweep prior weight", bound=Bound(0, 100)),
+    "tape_markets": Field("Markets with a tape", bound=Bound(0, 2000)),
 }
 
 QUOTING, SAFETY = "Quoting", "Safety"
@@ -43,13 +47,16 @@ SETTING_GROUPS = (QUOTING, SAFETY)
 
 SETTING_FIELDS = {
     "capital": Field("Capital per market ($)", QUOTING),
-    "fav_target_score": Field("Favorite target score", QUOTING),
     "max_lead": Field("Max lead", QUOTING),
     "ask_offset": Field("Ask offset", QUOTING),
     "min_capture": Field("Min capture", QUOTING),
     "ev_margin": Field("EV margin", QUOTING),
     "min_low_score": Field("Min longshot score", QUOTING),
     "keep_ratio": Field("Keep ratio", QUOTING),
+    "hurdle_rate": Field("Hurdle rate", QUOTING),
+    "depth_haircut": Field("Depth haircut", QUOTING),
+    "fill_lookback_days": Field("Fill lookback (days)", QUOTING),
+    "sweep_prior_weight": Field("Sweep prior weight", QUOTING),
     "drop_threshold": Field("Ask drop threshold", SAFETY),
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),

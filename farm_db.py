@@ -171,6 +171,9 @@ ADDED_MARKET_COLUMNS = (
     ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
     ("capital_usd", "REAL"),
 )
+# Settings the farmer no longer has. A row left behind would be reported as
+# an unknown setting on every start.
+RETIRED_SETTINGS = ("fav_target_score",)
 
 
 def stamp(dt):
@@ -189,6 +192,8 @@ def open_db(path):
         for name, kind in ADDED_MARKET_COLUMNS:
             if name not in present:
                 conn.execute(f"ALTER TABLE markets ADD COLUMN {name} {kind}")
+        conn.executemany("DELETE FROM settings WHERE key = ?",
+                         [(key,) for key in RETIRED_SETTINGS])
     return conn
 
 
@@ -458,7 +463,6 @@ class Bound(NamedTuple):
 # Keys are FarmConfig field names.
 SETTINGS = {
     "capital": Bound(0, low_open=True),
-    "fav_target_score": Bound(0, 1, low_open=True),
     "max_lead": Bound(0, 0.5),
     "ask_offset": Bound(0, 0.5),
     "min_capture": Bound(0, 0.5),
@@ -471,6 +475,10 @@ SETTINGS = {
     "cooldown_s": Bound(0),
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
+    "hurdle_rate": Bound(0, 10),
+    "depth_haircut": Bound(0, 1),
+    "fill_lookback_days": Bound(1, 365),
+    "sweep_prior_weight": Bound(0, 100),
 }
 
 

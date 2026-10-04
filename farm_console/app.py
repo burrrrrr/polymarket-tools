@@ -413,8 +413,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     def plan_now(row, cfg, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
                  capital=None):
         """(views.live_review of a market row with these terms against the live
-        book, its views.rewards_state); p_true None plans without the EV cap."""
-        terms = {"p_true": 1.0 if p_true is None else p_true, "naked_budget_usd": budget,
+        book, its views.rewards_state); p_true None values it at the book midpoint."""
+        terms = {"p_true": p_true, "naked_budget_usd": budget,
                  "capital_usd": capital, "paused": 0, "naked_paused": 0}
         cid = row["condition_id"]
         info, rates = infos.get(cid), total_rates.get()
@@ -589,7 +589,10 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
 
     def scan_values(conn):
         """The scan form's values: the last ones run, else the screener's defaults."""
-        return {**reward_screener.ScreenConfig()._asdict(), **farm_db.load_scan_params(conn)}
+        stored = farm_db.load_scan_params(conn)
+        # Parameters a scan no longer takes stay in old rows; drop them.
+        return {**reward_screener.ScreenConfig()._asdict(),
+                **{k: v for k, v in stored.items() if k in reward_screener.ScreenConfig._fields}}
 
     def discover_response(request, conn, filters, status_code=200, values=None, errors=None,
                           refused=None):

@@ -109,6 +109,16 @@ class SettingsTest(ScratchDb):
     def test_settings_cover_exactly_the_farm_config(self):
         self.assertEqual(set(farm_db.SETTINGS), set(FarmConfig._fields))
 
+    def test_opening_deletes_a_retired_setting_and_nothing_else(self):
+        conn = self.open()
+        farm_db.put_setting(conn, "keep_ratio", 0.5, NOW)
+        with conn:
+            conn.execute("INSERT INTO settings VALUES ('fav_target_score', '0.45', ?)",
+                         (NOW.isoformat(),))
+        for _ in range(2):
+            reopened = self.open()
+            self.assertEqual(farm_db.load_settings(reopened), ({"keep_ratio": 0.5}, {}))
+
     def test_parse_accepts_numbers_in_range(self):
         self.assertEqual(farm_db.parse_setting("max_lead", "0.015"), 0.015)
         self.assertEqual(farm_db.parse_setting("cooldown_s", "0"), 0.0)
@@ -123,11 +133,14 @@ class SettingsTest(ScratchDb):
             ("max_lead", "NaN"),
             ("max_lead", "-0.01"),
             ("max_lead", "0.6"),
-            ("fav_target_score", "0"),
-            ("fav_target_score", "1.5"),
+            ("min_low_score", "0"),
+            ("min_low_score", "1.5"),
             ("capital", "0"),
             ("min_fav", "1.5"),
             ("drop_window_s", "0"),
+            ("hurdle_rate", "-0.1"),
+            ("depth_haircut", "1.5"),
+            ("fill_lookback_days", "0.5"),
             ("no_such_key", "1"),
         ):
             with self.subTest(key=key, text=text), self.assertRaises(ValueError):

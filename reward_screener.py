@@ -9,9 +9,11 @@ table that a separate farmer daemon reads; the human approval in between is
 the point, because the farmer will hold real inventory on whatever it is told.
 
 The strategy being screened for: on a market whose favorite outcome trades at
-90c or more, rest a favorite BID just under the midpoint (a fill there is
-wanted - it is +EV whenever our own probability beats the price) and a
-longshot BID far below the longshot midpoint (a fill there is not wanted).
+90c or more, rest a favorite BID just under the midpoint and a longshot BID
+far below the longshot midpoint (a fill there is not wanted). A favorite fill
+is not free either: the share ties up capital until the market resolves, so
+the favorite bid sits at the price where its rewards net of what its fills
+cost are highest (fill_cost.py has the model).
 Polymarket only scores the two-sided minimum once the midpoint is above 0.90,
 so the longshot bid exists purely to make the favorite bid count. On a 0.001
 tick a longshot bid at 0.1c-0.2c almost never fills and costs nearly nothing,
@@ -40,10 +42,13 @@ A scan is three stages:
   2. Fetch the favorite token's order book for each survivor (the two outcome
      books of a market mirror each other exactly, so one is enough) and the
      Gamma market record for volume, holding rewards, and a precise end date.
-  3. Plan our two quotes against each book, estimate the score already
-     resting there, and turn our share of the pool into a yield on the
-     capital the quotes tie up. Markets rank by expected reward return over
-     the farm horizon, capped so a two-year market does not dwarf everything.
+  3. Plan our two quotes against each book at every favorite bid price in
+     the band, estimate the score already resting there, and value each plan
+     as our share of the pool less the cost of its expected fills, with the
+     book midpoint standing in for p_true. Fills come from a prior first;
+     the top markets then read their taker tape and are valued again.
+     Markets rank by expected net return over the farm horizon, capped so a
+     two-year market does not dwarf everything.
 
 Scoring and planning are pure functions of (market, book, config) so the
 farmer can reuse them verbatim against its own live books.
@@ -71,9 +76,11 @@ from typing import NamedTuple, Optional
 import httpx
 
 import farm_db
+import fill_cost
 
 CLOB_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
 GAMMA_HOST = os.getenv("POLYMARKET_GAMMA_HOST", "https://gamma-api.polymarket.com")
+DATA_API_HOST = os.getenv("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com")
 
 # Cursor values the CLOB uses to start and end a paginated listing.
 FIRST_CURSOR = "MA=="
@@ -83,6 +90,14 @@ LAST_CURSOR = "LTE="
 BOOKS_REQUEST_LIMIT = 500
 # Most condition ids Gamma /markets resolves in one request.
 GAMMA_REQUEST_LIMIT = 100
+# The data API answers about one read in thirty with a 429 and Retry-After: 1,
+# even at one read every two seconds.
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_WAIT_MAX_S = 5.0
+# /trades pages; past about 1,800 rows of a market it returns nothing.
+TAPE_PAGE = 1000
+TAPE_PAGES = 2
+TAPE_THREADS = 4
 
 # A longshot bid at or below this price is the FLOOR mode.
 FLOOR_PRICE = 0.002
@@ -105,8 +120,6 @@ SCAN_HELP = {
     "min_window_days": "Minimum farmable days left",
     "horizon_cap_days": "Cap on days counted toward rank",
     "capital": "USD behind the favorite bid",
-    "fav_target_score": "Per-share score the favorite bid aims for. It sits at the deepest "
-                        "price that still reaches it",
     "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
                 "0 joins it",
     "min_low_score": "The longshot bid never sits above the cheapest price scoring this per "
@@ -117,6 +130,15 @@ SCAN_HELP = {
     "min_rate": "Minimum daily reward pool in USD",
     "fragile_drop": "Skip a market whose midpoint falls this much once its best bid "
                       "leaves",
+    "hurdle_rate": "Yearly return capital must beat; a filled share costs its price "
+                   "minus the midpoint discounted at this rate to the end date",
+    "depth_haircut": "Share of the bids ahead of the favorite bid a sweep must get "
+                     "through before it reaches ours",
+    "fill_lookback_days": "Days of taker trades the fill estimate reads",
+    "sweep_prior_weight": "Assumed sweeps per lookback that clear the whole book, on top "
+                          "of the ones seen",
+    "tape_markets": "How many of the top markets read their taker tape; the rest are "
+                    "ranked on the prior alone",
 }
 
 
@@ -217,6 +239,54 @@ class Assessment(NamedTuple):
     holding_rewards: Optional[bool] = None
     best_bid: Optional[float] = None
     best_ask: Optional[float] = None
+    # The fill cost of the favorite bid. est_daily_usd, daily_yield and apr
+    # stay the gross reward; rank_score is the net yield. fill_source is
+    # "tape" when fills came from the market's taker tape, "prior" when only
+    # from the prior; tape is the tape as fill_cost.tape_to_json stores it.
+    fills_per_day: Optional[float] = None
+    fill_cost_usd: Optional[float] = None
+    net_daily_usd: Optional[float] = None
+    net_apr: Optional[float] = None
+    loss_per_share: Optional[float] = None
+    fav_ahead: Optional[float] = None
+    fill_source: Optional[str] = None
+    tape: Optional[dict] = None
+
+
+class Outlook(NamedTuple):
+    """What valuing a quote needs beyond the book, worked out by the caller:
+    the daily pool, the years to resolution, the taker tape, and the model."""
+
+    rate_per_day: float
+    years_left: float
+    tape: fill_cost.Tape
+    fill: fill_cost.FillParams
+
+
+class QuoteValue(NamedTuple):
+    """One configuration of our quotes, valued per day. price is the favorite
+    bid's, or None for a configuration without one: no fills, and the reward
+    the other legs earn alone."""
+
+    price: Optional[float]
+    size: float
+    ahead: float
+    capital_usd: float
+    reward_per_day: float
+    fills_per_day: float
+    loss_per_share: float
+
+    @property
+    def fill_cost_per_day(self):
+        return self.fills_per_day * self.loss_per_share
+
+    @property
+    def net_per_day(self):
+        return self.reward_per_day - self.fill_cost_per_day
+
+    @property
+    def net_apr(self):
+        return self.net_per_day * 365 / self.capital_usd if self.capital_usd > 0 else None
 
 
 class Skip(NamedTuple):
@@ -231,12 +301,16 @@ class ScreenConfig(NamedTuple):
     min_window_days: float = 30.0
     horizon_cap_days: float = 90.0
     capital: float = 500.0
-    fav_target_score: float = 0.45
     max_lead: float = 0.005
     min_low_score: float = 0.10
     naked_budget: float = DEFAULT_NAKED_BUDGET
     min_rate: float = 0.0
     fragile_drop: float = 0.03
+    hurdle_rate: float = 0.40
+    depth_haircut: float = 0.5
+    fill_lookback_days: float = 30.0
+    sweep_prior_weight: float = 0.25
+    tape_markets: float = 100.0
 
 
 class ScanResult(NamedTuple):
@@ -359,34 +433,6 @@ def created_mid(price, best_bid, best_ask):
     return (max(price, best_bid) + best_ask) / 2
 
 
-def fav_bid_price(levels, v, tick, min_size, target_score, max_lead):
-    """Deepest favorite bid reaching target_score against the midpoint it creates. Price or Skip.
-
-    The bid may sit at most max_lead above the best bid of at least min_size,
-    and one tick under the lowest ask of any size, because it is post-only.
-    Its score never falls as its price rises: under the best bid the midpoint
-    is fixed, and above it the bid sits (best_ask - p) / 2 from the midpoint
-    it creates. So the scan walks down from that ceiling and stops at the
-    first miss. A ceiling that misses the target is still the answer, since
-    the target is a depth preference and a low score still earns a share.
-    """
-    best_bid = best_price(levels.bids, min_size)
-    best_ask = best_price(levels.asks, min_size)
-    if best_bid is None or best_ask is None:
-        return Skip("one-sided book")
-    price = min(floor_to_tick(best_bid + max_lead, tick),
-                floor_to_tick(levels.asks[0][0] - tick, tick))
-    if price < tick:
-        return Skip("favorite bid below one tick")
-    decimals = tick_decimals(tick)
-    while price - tick >= tick - 1e-9:
-        lower = round(price - tick, decimals)
-        if score(v, created_mid(lower, best_bid, best_ask) - lower) < target_score:
-            break
-        price = lower
-    return price
-
-
 def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
     """The naked longshot bid adding `need` to Q_two for at most `room` USD.
     LongshotBid, or None when need is not positive or nothing fits.
@@ -452,8 +498,79 @@ def competing_score(levels, mid, v, min_size):
     return q_min(q_one, q_two, mid)
 
 
-def plan_quotes(market, levels, config):
-    """Price and size our favorite bid and longshot bid. Returns QuotePlan or Skip.
+def fav_ceiling(levels, tick, min_size, max_lead):
+    """The highest favorite bid allowed, or None: at most max_lead above the
+    best bid of at least min_size, and a tick under the lowest ask of any
+    size, because it is post-only. None on a one-sided book or under a tick."""
+    best_bid = best_price(levels.bids, min_size)
+    if best_bid is None or best_price(levels.asks, min_size) is None:
+        return None
+    price = min(floor_to_tick(best_bid + max_lead, tick),
+                floor_to_tick(levels.asks[0][0] - tick, tick))
+    return price if price >= tick - 1e-9 else None
+
+
+def fav_bid_candidates(levels, v, tick, min_size, max_lead, cap=None):
+    """Favorite bid prices worth valuing, highest first.
+
+    From fav_ceiling, or cap when lower, down the tick grid while the bid
+    still scores against the midpoint it creates. Its score never falls as
+    its price rises: under the best bid the midpoint is fixed, and above it
+    the bid sits (best_ask - p) / 2 from the midpoint it creates. So the walk
+    ends at the first price that scores nothing.
+    """
+    price = fav_ceiling(levels, tick, min_size, max_lead)
+    if price is None:
+        return []
+    if cap is not None:
+        price = min(price, cap)
+    best_bid, best_ask = best_price(levels.bids, min_size), best_price(levels.asks, min_size)
+    decimals = tick_decimals(tick)
+    prices = []
+    # The band edge itself scores a float-noise 1e-30, not a real share.
+    while (price >= tick - 1e-9
+           and score(v, created_mid(price, best_bid, best_ask) - price) > 1e-9):
+        prices.append(price)
+        price = round(price - tick, decimals)
+    return prices
+
+
+def fill_params(config):
+    """The fill model's parameters from a ScreenConfig or a FarmConfig."""
+    return fill_cost.FillParams(config.hurdle_rate, config.depth_haircut,
+                                config.fill_lookback_days, config.sweep_prior_weight)
+
+
+def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook):
+    """What a configuration of our quotes earns per day, net of what its fills cost.
+
+    levels is the favorite book without our orders, mid the midpoint once our
+    quotes join it, my_q our Q_min there, and bid the favorite bid's (price,
+    size), or None. The reward is our share of the pool against
+    competing_score. A fill of the favorite bid loses
+    fill_cost.loss_per_share against p_true, and the bid fills as the tape's
+    sweeps reach it behind every bid at or above its price.
+    """
+    comp_q = competing_score(levels, mid, v, min_size)
+    reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
+    if bid is None:
+        return QuoteValue(None, 0.0, 0.0, capital_usd, reward, 0.0, 0.0)
+    price, size = bid
+    ahead = fill_cost.depth_ahead(levels.bids, price)
+    return QuoteValue(
+        price=price,
+        size=size,
+        ahead=ahead,
+        capital_usd=capital_usd,
+        reward_per_day=reward,
+        fills_per_day=fill_cost.fills_per_day(outlook.tape, size, ahead, outlook.fill),
+        loss_per_share=fill_cost.loss_per_share(price, p_true, outlook.years_left,
+                                                outlook.fill.hurdle_rate),
+    )
+
+
+def plan_at(market, levels, config, fav_price):
+    """Size our favorite bid at fav_price and price our longshot bid. QuotePlan or Skip.
 
     The longshot bid is longshot_bid within config.naked_budget, covering the
     favorite bid's score, as the farmer prices it. When the budget leaves it
@@ -465,10 +582,6 @@ def plan_quotes(market, levels, config):
     not the book's own.
     """
     tick, v = market.tick, market.v
-    fav_price = fav_bid_price(levels, v, tick, market.min_size, config.fav_target_score,
-                              config.max_lead)
-    if isinstance(fav_price, Skip):
-        return fav_price
     fav_size = max(market.min_size, round_size_down(config.capital / fav_price))
     quoted = adjust_levels(levels, bids=[(fav_price, fav_size)])
     mid = adjusted_mid(quoted.bids, quoted.asks, market.min_size)
@@ -494,12 +607,45 @@ def plan_quotes(market, levels, config):
     )
 
 
+def plan_quotes(market, levels, config, outlook, p_true):
+    """The plan whose favorite bid earns the most net of its fill cost.
+    (QuotePlan, QuoteValue) or Skip.
+
+    Every price from fav_bid_candidates is planned with plan_at and valued
+    with value_quote on the plan as balanced, so a bid the budget trims is
+    valued at the size it rests at. A tie goes to the lower price.
+    """
+    best, reason = None, "favorite bid outside band"
+    for price in fav_bid_candidates(levels, market.v, market.tick, market.min_size,
+                                    config.max_lead):
+        plan = plan_at(market, levels, config, price)
+        if isinstance(plan, Skip):
+            reason = plan.reason
+            continue
+        my_q = q_min(plan.fav_bid_score * plan.fav_bid_size, plan.low_score * plan.low_size,
+                     plan.mid)
+        capital = plan.fav_bid_size * plan.fav_bid_price + plan.low_size * plan.low_price
+        value = value_quote(levels, plan.mid, market.v, market.min_size, my_q,
+                            (price, plan.fav_bid_size), capital, p_true, outlook)
+        if best is None or value.net_per_day >= best[1].net_per_day - 1e-12:
+            best = plan, value
+    if best is None:
+        return Skip(reason)
+    if best[1].net_per_day <= 0:
+        return Skip("fills cost more than the rewards")
+    return best
+
+
 def days_until(end_date, buffer_days, now):
     return (end_date - timedelta(days=buffer_days) - now).total_seconds() / 86400
 
 
-def assess(market, levels, config, now):
-    """Plan quotes on one market's favorite book and value them. Returns Assessment or Skip."""
+def assess(market, levels, config, now, tape=None):
+    """Plan quotes on one market's favorite book and value them. Returns Assessment or Skip.
+
+    With no tape the fills come from the prior alone. There is no p_true at
+    scan time, so a fill is costed against the book midpoint.
+    """
     days_left = days_until(market.end_date, config.expiry_buffer_days, now)
     if days_left < config.min_window_days:
         return Skip("window too short")
@@ -511,21 +657,21 @@ def assess(market, levels, config, now):
     if fragile_mid(levels, market.min_size, config.min_fav, config.fragile_drop):
         return Skip("fragile midpoint")
 
-    plan = plan_quotes(market, levels, config)
-    if isinstance(plan, Skip):
-        return plan
+    outlook = Outlook(market.rate_per_day, fill_cost.years_until(market.end_date, now),
+                      tape or fill_cost.Tape.unobserved(config.fill_lookback_days),
+                      fill_params(config))
+    planned = plan_quotes(market, levels, config, outlook, book_mid)
+    if isinstance(planned, Skip):
+        return planned
+    plan, value = planned
     mid = plan.mid
 
     q_one = plan.fav_bid_score * plan.fav_bid_size
     q_two = plan.low_score * plan.low_size
     my_q = q_min(q_one, q_two, mid)
     comp_q = competing_score(levels, mid, market.v, market.min_size)
-    share = my_q / (my_q + comp_q)
-    est_daily_usd = market.rate_per_day * share
-    capital_usd = (
-        plan.fav_bid_size * plan.fav_bid_price + plan.low_size * plan.low_price
-    )
-    daily_yield = est_daily_usd / capital_usd
+    capital_usd = value.capital_usd
+    daily_yield = value.reward_per_day / capital_usd
 
     # Longshot bids priced above ours fill first; they are the favorite asks
     # below the mirror of our price.
@@ -538,19 +684,27 @@ def assess(market, levels, config, now):
         plan=plan,
         comp_q=comp_q,
         my_q=my_q,
-        share=share,
-        est_daily_usd=est_daily_usd,
+        share=my_q / (my_q + comp_q),
+        est_daily_usd=value.reward_per_day,
         capital_usd=capital_usd,
         daily_yield=daily_yield,
         apr=daily_yield * 365,
         days_left=days_left,
-        rank_score=daily_yield * min(days_left, config.horizon_cap_days),
+        rank_score=value.net_per_day / capital_usd * min(days_left, config.horizon_cap_days),
         depth_ahead=depth_ahead,
         depth_ahead_ratio=depth_ahead / plan.low_size,
         floor_score=score(market.v, (1 - mid) - market.tick),
         single_sided_ok=mid <= TWO_SIDED_ABOVE,
         best_bid=best_price(levels.bids, market.min_size),
         best_ask=best_price(levels.asks, market.min_size),
+        fills_per_day=value.fills_per_day,
+        fill_cost_usd=value.fill_cost_per_day,
+        net_daily_usd=value.net_per_day,
+        net_apr=value.net_apr,
+        loss_per_share=value.loss_per_share,
+        fav_ahead=value.ahead,
+        fill_source="tape" if outlook.tape.observed else "prior",
+        tape=fill_cost.tape_to_json(tape) if tape else None,
     )
 
 
@@ -784,12 +938,97 @@ def fetch_gamma(http, condition_ids, timeout=20):
     return info
 
 
+def get_with_retry(http, url, params, timeout):
+    """GET, waiting out a 429 up to RATE_LIMIT_RETRIES times; raises on a failed read."""
+    for attempt in range(RATE_LIMIT_RETRIES + 1):
+        resp = http.get(url, params=params, timeout=timeout)
+        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+            break
+        time.sleep(min(_float(resp.headers.get("retry-after")) or 1.0, RATE_LIMIT_WAIT_MAX_S))
+    resp.raise_for_status()
+    return resp
+
+
+def parse_hits(rows, fav_token_id):
+    """(hits on favorite bids, unix time of the oldest row) from /trades rows.
+
+    Rows are taker trades. A taker selling the favorite hits favorite bids,
+    and so does a taker buying the other outcome, matched against favorite
+    bids at 1 - price by minting a pair. A row that is neither, or malformed,
+    is no hit but still marks how far back the fetched history reaches.
+    """
+    hits, oldest = [], None
+    for row in rows:
+        at = _float(row.get("timestamp"))
+        if at is None:
+            continue
+        oldest = at if oldest is None else min(oldest, at)
+        side, asset = str(row.get("side") or "").upper(), str(row.get("asset") or "")
+        size = _float(row.get("size"))
+        if not asset or size is None or size <= 0:
+            continue
+        if (side == "SELL" and asset == fav_token_id) or (side == "BUY" and asset != fav_token_id):
+            hits.append(fill_cost.Hit(at, size))
+    return hits, oldest
+
+
+def fetch_tape(http, condition_id, fav_token_id, now, lookback_days, timeout=20):
+    """The market's taker tape over the lookback as a fill_cost.Tape; raises on a failed read.
+
+    Pages stop at a short page, at one reaching past the lookback, or at
+    TAPE_PAGES, the most the API serves anyway.
+    """
+    cutoff = now.timestamp() - lookback_days * fill_cost.DAY_S
+    hits, oldest, full_page_seen = [], None, False
+    for page in range(TAPE_PAGES):
+        rows = get_with_retry(
+            http, f"{DATA_API_HOST}/trades",
+            {"market": condition_id, "takerOnly": "true", "limit": TAPE_PAGE,
+             "offset": page * TAPE_PAGE},
+            timeout,
+        ).json() or []
+        page_hits, page_oldest = parse_hits(rows, fav_token_id)
+        hits.extend(page_hits)
+        if page_oldest is not None:
+            oldest = page_oldest if oldest is None else min(oldest, page_oldest)
+        if len(rows) < TAPE_PAGE:
+            break
+        full_page_seen = True
+        if oldest is not None and oldest < cutoff:
+            break
+    return fill_cost.make_tape(hits, oldest, now, lookback_days, full_page_seen)
+
+
+def fetch_tapes(http, markets, now, lookback_days):
+    """{condition_id: Tape} over TAPE_THREADS threads; a failed market is left out."""
+    def fetch(market):
+        try:
+            return market.condition_id, fetch_tape(http, market.condition_id,
+                                                   market.fav_token_id, now, lookback_days)
+        except Exception as e:
+            print(f"  Warning: trades of {market.slug or market.condition_id} failed ({e})")
+            return market.condition_id, None
+
+    if not markets:
+        return {}
+    with ThreadPoolExecutor(min(len(markets), TAPE_THREADS)) as pool:
+        return {cid: tape for cid, tape in pool.map(fetch, markets) if tape is not None}
+
+
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
 
 def run_scan(config, now, on_stage=lambda stage: None):
-    """Fetch, screen, and assess, naming each stage to on_stage as it starts."""
+    """Fetch, screen, and assess, naming each stage to on_stage as it starts.
+
+    Every market is first assessed with fills from the prior alone, which
+    overrates it whenever a fill costs money (L > 0, nearly every bid at scan
+    time). Only the top tape_markets of that ranking then read their taker
+    tape and are assessed again; one whose fills then cost more than its
+    rewards is dropped. This is a heuristic cut, not an exhaustive search: a
+    market below the cut keeps its prior-only, optimistic figures.
+    """
     scan_started = time.monotonic()
     with httpx.Client() as http:
         on_stage("listing reward markets")
@@ -855,6 +1094,29 @@ def run_scan(config, now, on_stage=lambda stage: None):
             )
         assessments.append(result)
     assessments.sort(key=lambda a: a.rank_score, reverse=True)
+
+    top = assessments[:int(config.tape_markets)]
+    on_stage(f"reading fill tapes for {len(top):,} markets")
+    started = time.monotonic()
+    with httpx.Client() as http:
+        tapes = fetch_tapes(http, [a.market for a in top], now, config.fill_lookback_days)
+    taped = {}
+    for a in top:
+        tape = tapes.get(a.market.condition_id)
+        if tape is not None:
+            taped[a.market.condition_id] = assess(a.market, books[a.market.fav_token_id],
+                                                  config, now, tape)
+    kept = []
+    for a in assessments:
+        result = taped.get(a.market.condition_id, a)
+        if isinstance(result, Skip):
+            skipped[result.reason] += 1
+        else:
+            kept.append(result._replace(volume24hr=a.volume24hr,
+                                        holding_rewards=a.holding_rewards))
+    assessments = sorted(kept, key=lambda a: a.rank_score, reverse=True)
+    print(f"Tapes: {len(tapes):,} of {len(top):,} read "
+          f"({time.monotonic() - started:.1f}s)")
     print(f"Assessed: {len(assessments):,} kept; skipped {tally(skipped)}")
     funnel = farm_db.ScanFunnel(
         at=now, duration_s=round(time.monotonic() - scan_started, 1), listed=len(listing),
@@ -894,7 +1156,8 @@ def store(conn, result, now):
 def print_table(assessments):
     header = (
         f"{'#':>3} {'mode':6} {'fav':>14} {'pool$':>6} {'v':>4} {'min':>4} "
-        f"{'est$/d':>7} {'cap$':>6} {'APR%':>6} {'days':>5} {'ahead':>6} "
+        f"{'est$/d':>7} {'fill/d':>6} {'net$/d':>7} {'cap$':>6} {'APR%':>6} {'net%':>6} "
+        f"{'days':>5} {'ahead':>6} "
         f"{'vol24h':>7} {'H':1} {'question':40} slug"
     )
     print(header)
@@ -906,7 +1169,9 @@ def print_table(assessments):
         print(
             f"{rank:>3} {a.plan.mode.value:6} {fav:>14} {m.rate_per_day:>6.0f} "
             f"{m.v * 100:>4.1f} {m.min_size:>4.0f} {a.est_daily_usd:>7.2f} "
-            f"{a.capital_usd:>6.0f} {a.apr * 100:>6.0f} {a.days_left:>5.0f} "
+            f"{a.fills_per_day:>5.0f}{'p' if a.fill_source == 'prior' else 't'} "
+            f"{a.net_daily_usd:>7.2f} {a.capital_usd:>6.0f} {a.apr * 100:>6.0f} "
+            f"{a.net_apr * 100:>6.0f} {a.days_left:>5.0f} "
             f"{a.depth_ahead_ratio:>6.1f} {human_volume(a.volume24hr):>7} "
             f"{holding:1} {m.question[:40]:40} {m.slug}"
         )
@@ -923,12 +1188,16 @@ def config_from(args):
         min_window_days=args.min_window_days,
         horizon_cap_days=args.horizon_cap_days,
         capital=args.capital,
-        fav_target_score=args.fav_target_score,
         max_lead=args.max_lead,
         min_low_score=args.min_low_score,
         naked_budget=args.naked_budget,
         min_rate=args.min_rate,
         fragile_drop=args.fragile_drop,
+        hurdle_rate=args.hurdle_rate,
+        depth_haircut=args.depth_haircut,
+        fill_lookback_days=args.fill_lookback_days,
+        sweep_prior_weight=args.sweep_prior_weight,
+        tape_markets=args.tape_markets,
     )
 
 
