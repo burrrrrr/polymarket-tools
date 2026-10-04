@@ -453,6 +453,103 @@ Without it the watcher logs a warning and runs poll-only.
 - A `--price` that is already legal at `--from-tick` is rejected up front: no
   tick change is needed to place it.
 
+### Reward Screener
+
+`reward_screener.py` ranks the markets that pay Polymarket liquidity rewards
+for one farming strategy, and stores them in `farm.db` (SQLite) for you to
+approve or reject. It is read-only. It places, cancels, and signs nothing, and
+it needs no credentials.
+
+The strategy targets markets whose favorite outcome trades at 90c or more. You
+rest a favorite bid just under the midpoint, and a fill there is wanted when
+your own probability beats the price. You also rest a longshot bid far below
+the longshot midpoint. Above a 0.90 midpoint Polymarket only pays for
+two-sided liquidity, so the longshot bid exists to make the favorite bid
+score. Each market lands in one of two modes:
+
+- `floor`: the longshot bid scores at 0.2c or less, so its cost and fill risk
+  are negligible.
+- `budget`: the longshot bid must sit higher to score. Its capital is naked
+  risk, which you cap per market when you approve it.
+
+A future farmer daemon reads the approved rows. The screener never changes
+your decisions, so rescanning is always safe.
+
+```bash
+python reward_screener.py                     # same as 'scan' with defaults
+python reward_screener.py scan --mode floor --top 20 --json scan.json
+python reward_screener.py list --status approved
+python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --budget 25
+python reward_screener.py reject <slug-or-condition-id> --note "resolution risk"
+```
+
+A scan takes about a minute. Most of that is `/rewards/markets/current`, which
+pages slowly. It prints one line per stage with the counts it kept and the
+reasons it skipped the rest, then a table sorted by rank.
+
+Key `scan` options:
+
+- `--min-fav` (default 0.90) is the lowest favorite midpoint to consider.
+- `--expiry-buffer-days` (7) stops farming this many days before the market
+  ends. `--min-window-days` (30) is the fewest farmable days a market needs.
+- `--horizon-cap-days` (90) caps the days counted toward rank.
+- `--capital` (500) is the USD behind the favorite bid. `--bid-offset` (0.01)
+  is how far below the midpoint it sits.
+- `--min-low-score` (0.10) is the lowest per-share score the longshot bid may
+  have. The screener picks the lowest longshot price that reaches it.
+- `--mode` filters the table only. Every assessment is stored.
+
+The table columns:
+
+| Column | Meaning |
+| --- | --- |
+| `mode` | `floor` or `budget`, as above |
+| `fav` | Favorite outcome and its size-adjusted midpoint in cents |
+| `pool$` | The market's whole daily reward pool in USD, sponsored rewards included |
+| `v` | Max spread from the midpoint that still scores, in cents |
+| `min` | Minimum order size that scores, in shares |
+| `est$/d` | Your estimated daily reward: pool times your share of the score |
+| `cap$` | Capital both bids tie up |
+| `APR%` | `est$/d` divided by `cap$`, times 365 |
+| `days` | Days left to farm, after the expiry buffer |
+| `ahead` | Shares of longshot bids priced above yours, divided by your longshot size. A seller has to fill all of them before reaching your bid, so a low value means more fill risk on the leg you do not want filled |
+| `vol24h` | 24-hour volume from Gamma |
+| `H` | `H` when Gamma reports holding rewards enabled, `-` when not, `?` when unknown |
+
+Rank is daily yield times the days left, capped at `--horizon-cap-days`. That
+is the reward return you can expect over the farm horizon, so long-dated
+markets rank higher than short ones with the same yield.
+
+`approve` takes your probability that the favorite wins (`--p-true`) and the
+longshot risk budget (`--budget`, default $25). It warns, but still approves,
+when the planned favorite bid is at or above `--p-true`, because a fill would
+lose money. It also warns when a `budget` market's longshot leg needs more
+than the budget.
+
+#### Approximations
+
+- The midpoint drops whole price levels smaller than the reward minimum size.
+  Polymarket's adjusted midpoint applies the cutoff per order, so a level of
+  many small orders counts here but not there.
+- Competing score treats every resting order in the book as one maker. Above a
+  0.90 midpoint that overstates the competition, so your estimated share is
+  conservative. Your own resting orders also count as competition.
+- The two outcome books are exact mirrors, so the screener reads only the
+  favorite's book.
+- In a wide book the planned favorite bid becomes the best bid and pulls the
+  midpoint toward itself. Both legs and the competition are scored against
+  that shifted midpoint, so a bid placed 1c under the book's midpoint can sit
+  further than 1c from the midpoint that counts.
+- `est$/d` assumes the book stays as it was at scan time, and that no other
+  farmer reacts to your orders. Thin books show very high APRs that will not
+  survive competition, so read them as a ranking, not a forecast.
+
+The `markets` table in `farm.db` is the interface to the farmer. A scan
+updates the metrics, rank, end date, and `rewards_active` flag. It never
+touches `status`, `p_true`, `naked_budget_usd`, or `note`. A market that
+leaves the reward set gets `rewards_active = 0` and keeps its status.
+Retiring markets is the farmer's job.
+
 ## Important Notes
 
 ### Token Allowances

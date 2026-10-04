@@ -9,3 +9,6 @@ __pycache__/
 
 # Virtual environment
 .venv/
+
+# Reward screener database
+farm.db
