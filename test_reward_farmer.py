@@ -65,6 +65,7 @@ CFG = FarmConfig(
     naked_cooldown_s=3600.0,
     expiry_buffer_days=7.0,
     hurdle_rate=0.40,
+    stuck_share=0.25,
 )
 
 
@@ -123,8 +124,8 @@ def q_sums(target):
 
 def curve(*rates):
     """Fills drawn from the market's history: these rates from the first of
-    DISTANCES, the last one held to the end."""
-    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True)
+    DISTANCES, the last one held to the end. A filled share never exits."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0)
 
 
 # A quiet market: a sweep reaches a bid at the midpoint about once a month,
@@ -134,7 +135,7 @@ QUIET = curve(0.033, 0.03, 0.027, 0.024, 0.021, 0.018, 0.015, 0.011)
 SWEPT = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
 # A scan's fill prior, and a market history with no sweeps in 60 days.
 PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=NOW)
-NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90)
+NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90, 0, 0.0)
 
 
 def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET):
@@ -350,8 +351,9 @@ class NetPricingTest(unittest.TestCase):
     def test_the_outlook_takes_the_live_rate_the_end_date_and_the_fill_curve(self):
         fm = market(rate_per_day=100.0, end_date=NOW + timedelta(days=365.25))
         outlook = market_outlook(fm, {"0xc0nd": 40.0}, NO_SWEEPS, PRIOR, CFG, NOW)
-        self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate),
-                         (40.0, 1.0, CFG.hurdle_rate))
+        self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate,
+                          outlook.stuck_share),
+                         (40.0, 1.0, CFG.hurdle_rate, CFG.stuck_share))
         self.assertEqual(outlook.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, CFG.min_fav))
         self.assertTrue(outlook.fills.from_history)
         unread = market_outlook(fm, {"0xother": 40.0}, None, PRIOR, CFG, NOW)
@@ -1339,7 +1341,7 @@ class FarmerCycleTest(FarmerHarness):
         self.assertNotIn("PLACE FAV_BID", [f"{e['kind']} {e['slot']}" for e in self.events()])
 
     def test_the_favorite_bid_slot_shows_its_economics_and_history_on_the_stored_prior(self):
-        history = History((4, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90)
+        history = History((4, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90, 2, 10.0)
         self.history.return_value = history
         self.started_farmer().cycle()
         row, slots = self.farm_state()

@@ -137,17 +137,17 @@ SCAN_NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=SCAN_NOW)
 
 
-def curve(*rates):
+def curve(*rates, exit_per_day=0.0):
     """A FillCurve with these rates from the first of DISTANCES, the last one
-    held to the end."""
-    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True)
+    held to the end. By default a filled share never exits."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, exit_per_day)
 
 
 NO_FILLS = curve(0.0)
 
 
-def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40):
-    return Outlook(rate, years, fills, hurdle_rate)
+def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40, stuck_share=0.25):
+    return Outlook(rate, years, fills, hurdle_rate, stuck_share)
 
 
 class FavBidCandidatesTest(unittest.TestCase):
@@ -193,6 +193,19 @@ class ValueQuoteTest(unittest.TestCase):
                                             (0.9475, 100.0), 95.0, 0.98, outlook(fills))
         self.assertAlmostEqual(moved.fills_per_day, 100 * 0.15)
 
+    def test_a_fill_that_sells_back_fast_costs_less_than_one_held_to_resolution(self):
+        # A year at 40%: held, 0.98 / 1.4 = 0.70 today. Selling back at once,
+        # all but the stuck quarter are worth 0.98.
+        rates = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0, 0.98)
+        held = reward_screener.value_quote(*quote, outlook(curve(*rates), years=1.0))
+        fast = reward_screener.value_quote(
+            *quote, outlook(curve(*rates, exit_per_day=1e6), years=1.0))
+        self.assertEqual(fast.fills_per_day, held.fills_per_day)
+        self.assertAlmostEqual(held.loss_per_share, 0.94 - 0.98 / 1.4)
+        self.assertAlmostEqual(fast.loss_per_share, 0.94 - 0.98 * (0.75 + 0.25 / 1.4), places=6)
+        self.assertGreater(fast.net_per_day, held.net_per_day)
+
     def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
                                             5.0, 0.98, outlook(curve(1e6)))
@@ -235,8 +248,15 @@ class AssessTest(unittest.TestCase):
         default = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, fill_cost.DEFAULT_PRIOR)
         self.assertEqual(default.fill_source, "default")
 
+    def test_the_stuck_share_setting_prices_the_fills(self):
+        stuck = assess(MARKET, DEEP_BOOK, CONFIG._replace(stuck_share=1.0), SCAN_NOW, PRIOR)
+        exiting = assess(MARKET, DEEP_BOOK, CONFIG._replace(stuck_share=0.0), SCAN_NOW, PRIOR)
+        self.assertGreater(stuck.fills_per_day, 0)
+        self.assertLess(stuck.net_daily_usd, exiting.net_daily_usd)
+
     def test_a_history_prices_the_fills_and_is_stored(self):
-        history = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90)
+        history = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90,
+                          8, 40.0)
         a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR, history)
         self.assertEqual(a.fill_source, "history")
         self.assertEqual(fill_cost.history_from_json(a.history), history)
@@ -310,10 +330,11 @@ class RunScanTest(unittest.TestCase):
                                               SCAN_NOW, prior)
         return result, asked
 
-    # A sweep through every bid each hour for 60 days, held two years at 40%.
-    HEAVY = History((1440,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90)
-    BUSY = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90)
-    QUIET = History((0,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90)
+    # A sweep through every bid each hour for 60 days, none of them recovered,
+    # held two years at 40%.
+    HEAVY = History((1440,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90, 0, 43200.0)
+    BUSY = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90, 8, 40.0)
+    QUIET = History((0,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90, 0, 0.0)
 
     def test_only_the_top_markets_read_a_history_and_one_whose_fills_cost_too_much_drops(self):
         result, asked = self.scan({"0x1": self.HEAVY})
@@ -344,7 +365,7 @@ class RunScanTest(unittest.TestCase):
 
     def test_the_sample_draws_markets_the_stored_prior_dropped_but_not_unpriced_ones(self):
         steep = fill_cost.Prior((50.0,) * len(DISTANCES), (1000.0,) * len(DISTANCES), 1,
-                                SCAN_NOW, 0.90)
+                                SCAN_NOW, 0.90, 0.0, 1000.0)
         cheap = Levels(bids=[(0.80, 1000.0)], asks=[(0.82, 1000.0)], tick=0.001)
         with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
             result, asked = self.scan({c: self.QUIET for c in self.RATES}, steep,

@@ -59,9 +59,11 @@ GLOSSARY = {
                                        "it is that pooled rate alone, and the farmer does not "
                                        "bid."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
-                                       "minus p_true discounted at the hurdle rate to the end "
-                                       "date. Without a p_true it uses the midpoint. A sweep "
-                                       "that reaches the bid fills all of it."),
+                                       "minus p_true discounted at the hurdle rate over its "
+                                       "expected hold, days until the market's measured exit "
+                                       "for most fills, the end date for the stuck share. "
+                                       "Without a p_true it uses the midpoint. A sweep that "
+                                       "reaches the bid fills all of it."),
     "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
                                "this."),
     "net_daily": Term("Net/day", "The favorite bid's share of the pool less what its fills "
@@ -137,7 +139,8 @@ GLOSSARY = {
     # order slots and their decisions
     "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price earning "
                                "the most rewards net of what its fills cost: a filled share "
-                               "ties up capital until the market resolves."),
+                               "ties up capital until FAV_ASK sells it, or until the market "
+                               "resolves if it never does."),
     "LONG_BID": Term("LONG_BID", "Buys the longshot far below its midpoint. It exists only to "
                                  "make the favorite bid earn rewards; this is the naked leg."),
     "FAV_ASK": Term("FAV_ASK", "Sells favorite shares the farmer bought, above the midpoint "
@@ -230,11 +233,18 @@ GLOSSARY = {
                                              "would follow the next bid down and its score "
                                              "would collapse."),
     "hurdle_rate": Term("Hurdle rate", "The yearly return capital must beat, 0.40 is 40%. A "
-                                       "filled favorite share is held until the market "
-                                       "resolves, so it costs its price minus p_true "
-                                       "discounted at this rate to the end date. On a "
-                                       "short-dated market that cost is negative and fills "
-                                       "are welcome."),
+                                       "filled favorite share costs its price minus p_true "
+                                       "discounted at this rate over its expected hold: "
+                                       "until the farmer sells it back, mostly within days, "
+                                       "or to the end date for the stuck share. On a "
+                                       "short-dated market, or one whose fills sell back "
+                                       "fast, that cost is negative and fills are welcome."),
+    "stuck_share": Term("Stuck share", "The share of fills never sold back, 0.25 is 25%: the "
+                                       "midpoint falls under the min favorite mid, which "
+                                       "pulls the ask, or the market collapses. Those are "
+                                       "held to the end date. The rest sell back after a "
+                                       "hold set by how fast the market's midpoint "
+                                       "recovered after past sweeps."),
     "tape_markets": Term("Markets read for fills", "How many of the top markets read their "
                                                    "fill history: 60 days of trades and "
                                                    "midpoints. Up to 60 more drawn at random "

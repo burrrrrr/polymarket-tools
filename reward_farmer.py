@@ -15,14 +15,15 @@ S(v, s) = ((v - s) / v)^2 at distance s from the midpoint inside the max
 spread v. Score is sampled once a minute and the pool is paid daily. So the
 farmer rests on both sides, in four slots per market:
 
-  FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until the
-            market resolves, so it costs the price less p_true discounted at
-            the hurdle rate. The bid rests at the price in the band whose
-            rewards net of expected fills (from the market's fill history,
-            shrunk toward the last scan's cross-market prior) are highest,
-            never above p_true minus a margin, and only when that net beats
-            the orders without it. Until the market's history is read it
-            does not rest at all.
+  FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until
+            FAV_ASK sells it, or to resolution for the --stuck-share that
+            never sells, so it costs the price less p_true discounted at the
+            hurdle rate over that hold. The bid rests at the price in the
+            band whose rewards net of expected fills (from the market's fill
+            history, shrunk toward the last scan's cross-market prior) are
+            highest, never above p_true minus a margin, and only when that
+            net beats the orders without it. Until the market's history is
+            read it does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same.
@@ -447,6 +448,7 @@ class FarmConfig(NamedTuple):
     naked_cooldown_s: float
     expiry_buffer_days: float
     hurdle_rate: float
+    stuck_share: float
 
 
 # ---------------------------------------------------------------------------
@@ -605,7 +607,8 @@ def market_outlook(fm, total_rates, history, prior, cfg, now):
     """The Outlook a favorite bid on this market is valued with: fills from its
     history shrunk toward prior, or prior alone without a history."""
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate)
+                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate,
+                   cfg.stuck_share)
 
 
 def value_of(target, fm, levels, outlook):
@@ -2064,6 +2067,7 @@ def config_from(args):
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
+        stuck_share=args.stuck_share,
     )
 
 
@@ -2130,7 +2134,10 @@ Examples:
         ("--expiry-buffer-days", float, 7.0, "Retire this many days before the end date"),
         ("--hurdle-rate", float, 0.40, "Yearly return capital must beat; a filled share "
                                        "costs its price minus p_true discounted at this "
-                                       "rate to the end date"),
+                                       "rate over its expected hold"),
+        ("--stuck-share", float, 0.25, "Share of fills never sold back, held to the end "
+                                       "date; the rest exit at the market's measured "
+                                       "exit rate"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

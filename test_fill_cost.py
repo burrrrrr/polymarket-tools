@@ -6,7 +6,9 @@ from datetime import datetime, timedelta, timezone
 from fill_cost import (
     DEFAULT_PRIOR,
     DISTANCES,
+    EXIT_DISTANCE,
     FLOOR_RATE,
+    PRE_SWEEP_S,
     STRENGTHS,
     History,
     Hit,
@@ -16,6 +18,7 @@ from fill_cost import (
     fit_prior,
     history_from_json,
     history_to_json,
+    hold_discount,
     loss_per_share,
     make_history,
     prior_from_json,
@@ -28,13 +31,40 @@ T = NOW.timestamp()
 DAY = 86400.0
 
 
+def summed_discount(exit_per_day, years, hurdle_rate, stuck_share, steps=200000):
+    """hold_discount by summing the exit density over a grid instead of its
+    closed form."""
+    lam, delta = exit_per_day * 365.25, math.log(1 + hurdle_rate)
+    dt = years / steps
+    exiting = sum(lam * math.exp(-(lam + delta) * (i + 0.5) * dt) * dt for i in range(steps))
+    exiting += math.exp(-(lam + delta) * years)
+    return (1 - stuck_share) * exiting + stuck_share * math.exp(-delta * years)
+
+
 class LossTest(unittest.TestCase):
-    def test_a_long_dated_fill_costs_more_than_its_discount_to_p_true(self):
+    def test_a_share_that_never_exits_is_discounted_to_resolution(self):
         # A year out at 40%: 0.97 / 1.4 = 0.692857 today.
-        self.assertAlmostEqual(loss_per_share(0.95, 0.97, 1.0, 0.40), 0.95 - 0.97 / 1.4)
+        self.assertAlmostEqual(hold_discount(0.0, 1.0, 0.40, 0.25), 1 / 1.4)
+        self.assertAlmostEqual(hold_discount(0.5, 1.0, 0.40, 1.0), 1 / 1.4)
+        self.assertAlmostEqual(loss_per_share(0.95, 0.97, hold_discount(0.0, 1.0, 0.40, 0.25)),
+                               0.95 - 0.97 / 1.4)
+
+    def test_a_fast_exit_with_nothing_stuck_is_barely_discounted(self):
+        self.assertAlmostEqual(hold_discount(1e6, 1.0, 0.40, 0.0), 1.0, places=6)
+        self.assertAlmostEqual(hold_discount(1e6, 1.0, 0.40, 0.25), 0.75 + 0.25 / 1.4, places=6)
+
+    def test_a_week_long_hold_matches_the_exit_density_summed(self):
+        self.assertAlmostEqual(hold_discount(1 / 7, 1.0, 0.40, 0.25),
+                               summed_discount(1 / 7, 1.0, 0.40, 0.25), places=7)
+        self.assertAlmostEqual(hold_discount(1 / 7, 0.02, 0.40, 0.0),
+                               summed_discount(1 / 7, 0.02, 0.40, 0.0), places=7)
+
+    def test_without_a_hurdle_nothing_is_discounted(self):
+        self.assertEqual(hold_discount(0.0, 1.0, 0.0, 0.25), 1.0)
+        self.assertAlmostEqual(hold_discount(0.2, 1.0, 0.0, 0.25), 1.0)
 
     def test_a_short_dated_fill_below_the_discounted_value_is_welcome(self):
-        self.assertLess(loss_per_share(0.95, 0.99, 2 / 365.25, 0.40), 0)
+        self.assertLess(loss_per_share(0.95, 0.99, hold_discount(0.0, 2 / 365.25, 0.40, 1.0)), 0)
 
     def test_years_run_to_the_end_date_and_never_go_negative(self):
         self.assertAlmostEqual(years_until(NOW + timedelta(days=365.25), NOW), 1.0)
@@ -126,14 +156,50 @@ class MakeHistoryTest(unittest.TestCase):
         self.assertEqual(history.events[0], 0)
 
 
+class ExitTest(unittest.TestCase):
+    def test_a_hold_ends_when_the_mid_is_back_where_the_sweep_found_it(self):
+        mids = [(B - 3600, 0.95), (B + 30, 0.93), (B + DAY, 0.949), (B + 3 * DAY, 0.95)]
+        history = history_of((0, 0.93), mids=mids)
+        self.assertEqual(history.exits, 1)
+        self.assertAlmostEqual(history.held_days, 3.0)
+
+    def test_a_hold_still_running_counts_up_to_the_read(self):
+        # The mid recovers only after the read, ten days after the sweep.
+        mids = [(B - 3600, 0.95), (B + 30, 0.93), (T + DAY, 0.95)]
+        history = history_of((0, 0.93), mids=mids)
+        self.assertEqual(history.exits, 0)
+        self.assertAlmostEqual(history.held_days, 10.0)
+
+    def test_the_minute_the_sweep_began_in_is_no_recovery(self):
+        early = history_of((0, 0.93), mids=[(B - 3600, 0.95), (B + 59, 0.95), (B + DAY, 0.95)])
+        self.assertAlmostEqual(early.held_days, 1.0)
+        on_time = history_of((0, 0.93), mids=[(B - 3600, 0.95), (B + PRE_SWEEP_S, 0.95)])
+        self.assertAlmostEqual(on_time.held_days, PRE_SWEEP_S / DAY)
+
+    def test_a_sweep_reaching_no_farther_than_the_exit_distance_starts_no_hold(self):
+        mids = [(B - 3600, 0.95), (B + DAY, 0.95)]
+        history = history_of((0, 0.95 - EXIT_DISTANCE), (7200, 0.942), mids=mids)
+        self.assertEqual(at(history.events, 0.0075), 2)
+        self.assertEqual((history.exits, history.held_days), (0, 0.0))
+
+    def test_a_burst_of_sweeps_starts_one_hold(self):
+        mids = [(B - 3600, 0.95), (B + 2 * DAY, 0.95)]
+        history = history_of((0, 0.93), (1800, 0.93), mids=mids)
+        self.assertEqual((at(history.events, EXIT_DISTANCE), history.exits), (1, 1))
+        self.assertAlmostEqual(history.held_days, 2.0)
+
+
 PRIOR = Prior(
     rates=(0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.05, 0.04, 0.03, 0.02, 0.01, 0.005),
     strengths=(20.0,) * len(DISTANCES),
     markets=50,
     at=NOW,
     floor=0.90,
+    exit_rate=0.2,
+    exit_strength=10.0,
 )
-HISTORY = History(events=(20, 16, 12, 10, 8, 6, 4, 2, 2, 1, 0, 0), days=20.0, read_at=NOW, floor=0.90)
+HISTORY = History(events=(20, 16, 12, 10, 8, 6, 4, 2, 2, 1, 0, 0), days=20.0, read_at=NOW,
+                  floor=0.90, exits=7, held_days=30.0)
 
 
 class CurveTest(unittest.TestCase):
@@ -143,6 +209,12 @@ class CurveTest(unittest.TestCase):
         self.assertAlmostEqual(curve.per_day(0.0), (20 + 20 * 0.6) / (20 + 20))
         self.assertAlmostEqual(curve.per_day(0.01), (8 + 20 * 0.2) / (20 + 20))
         self.assertAlmostEqual(curve.per_day(0.10), (0 + 20 * 0.005) / (20 + 20))
+
+    def test_the_exit_rate_shrinks_toward_the_prior_by_its_strength(self):
+        self.assertAlmostEqual(fill_curve(HISTORY, PRIOR, 0.90).exit_per_day,
+                               (7 + 10.0 * 0.2) / (30.0 + 10.0))
+        self.assertEqual(fill_curve(None, PRIOR, 0.90).exit_per_day, 0.2)
+        self.assertEqual(fill_curve(HISTORY._replace(floor=0.92), PRIOR, 0.90).exit_per_day, 0.2)
 
     def test_between_grid_points_the_rate_is_linear(self):
         curve = fill_curve(HISTORY, PRIOR, 0.90)
@@ -193,8 +265,11 @@ class CurveTest(unittest.TestCase):
         self.assertEqual(fill_source(None, PRIOR._replace(floor=0.92), 0.90), "default")
 
 
-def histories(counts, days=60.0, floor=0.90):
-    return [History((k,) * len(DISTANCES), days, NOW, floor) for k in counts]
+def histories(counts, days=60.0, floor=0.90, exits=None, held=None):
+    exits = exits or [0] * len(counts)
+    held = held or [0.0] * len(counts)
+    return [History((k,) * len(DISTANCES), days, NOW, floor, e, h)
+            for k, e, h in zip(counts, exits, held)]
 
 
 def poisson(rng, mean):
@@ -218,9 +293,25 @@ class FitPriorTest(unittest.TestCase):
         self.assertAlmostEqual(prior.rates[0], 0.1)
         self.assertEqual(prior.strengths[0], STRENGTHS[-1])
 
+    def test_exits_pool_over_the_held_days(self):
+        prior = fit_prior(histories([5] * 30, exits=[1, 4] * 15, held=[10.0] * 30), NOW, 0.90)
+        self.assertAlmostEqual(prior.exit_rate, 75 / 300.0)
+        self.assertEqual(prior.exit_strength, STRENGTHS[-1])
+
+    def test_markets_whose_exit_rates_differ_pool_at_a_weaker_strength(self):
+        prior = fit_prior(histories([50] * 30, exits=[0, 40] * 15, held=[40.0, 4.0] * 15),
+                          NOW, 0.90)
+        self.assertAlmostEqual(prior.exit_rate, 600 / 660.0)
+        self.assertLess(prior.exit_strength, 10.0)
+
+    def test_without_any_held_days_the_exit_rate_is_the_defaults(self):
+        prior = fit_prior(histories([3] * 30), NOW, 0.90)
+        self.assertEqual((prior.exit_rate, prior.exit_strength),
+                         (DEFAULT_PRIOR.exit_rate, DEFAULT_PRIOR.exit_strength))
+
     def test_a_distance_without_events_pools_to_zero(self):
         events = (5,) * (len(DISTANCES) - 1) + (0,)
-        prior = fit_prior([History(events, 30.0, NOW, 0.90)] * 25, NOW, 0.90)
+        prior = fit_prior([History(events, 30.0, NOW, 0.90, 0, 0.0)] * 25, NOW, 0.90)
         self.assertEqual((prior.rates[-1], prior.strengths[-1]), (0.0, STRENGTHS[-1]))
 
     def test_too_few_markets_leave_the_prior_unfit(self):
@@ -246,10 +337,19 @@ class StoredHistoryTest(unittest.TestCase):
         stored = history_to_json(HISTORY)
         regrid = {**stored, "distances": stored["distances"][:-1], "events": stored["events"][:-1]}
         self.assertIsNone(history_from_json(regrid))
-        self.assertIsNone(history_from_json({**stored, "v": 2}))
+        self.assertIsNone(history_from_json({**stored, "v": 3}))
         prior = prior_to_json(PRIOR)
         self.assertIsNone(prior_from_json({**prior, "distances": [d * 2 for d in DISTANCES]}))
-        self.assertIsNone(prior_from_json({**prior, "v": 2}))
+        self.assertIsNone(prior_from_json({**prior, "v": 3}))
+
+    def test_a_row_stored_before_exit_times_reads_as_none(self):
+        stored, prior = history_to_json(HISTORY), prior_to_json(PRIOR)
+        v1 = {k: v for k, v in stored.items() if k not in ("exits", "held_days")}
+        self.assertIsNone(history_from_json({**v1, "v": 1}))
+        self.assertIsNone(history_from_json({**stored, "v": 1}))
+        v1 = {k: v for k, v in prior.items() if k not in ("exit_rate", "exit_strength")}
+        self.assertIsNone(prior_from_json({**v1, "v": 1}))
+        self.assertIsNone(prior_from_json({**prior, "v": 1}))
 
     def test_malformed_values_read_as_none(self):
         stored = history_to_json(HISTORY)
@@ -261,7 +361,13 @@ class StoredHistoryTest(unittest.TestCase):
                     {**stored, "days": 61.0},
                     {**stored, "days": float("nan")},
                     {**stored, "read_at": "yesterday"},
-                    {**stored, "floor": "high"}):
+                    {**stored, "floor": "high"},
+                    {**stored, "exits": 9},
+                    {**stored, "exits": -1},
+                    {**stored, "exits": 1.0},
+                    {**stored, "held_days": -0.5},
+                    {**stored, "held_days": float("inf")},
+                    {**stored, "held_days": "x"}):
             self.assertIsNone(history_from_json(bad), bad)
         prior = prior_to_json(PRIOR)
         n = len(DISTANCES)
@@ -273,7 +379,11 @@ class StoredHistoryTest(unittest.TestCase):
                     {**prior, "strengths": [1.0] * (n - 1)},
                     {**prior, "markets": "3"},
                     {**prior, "at": 5},
-                    {**prior, "floor": 1.5}):
+                    {**prior, "floor": 1.5},
+                    {**prior, "exit_rate": -0.1},
+                    {**prior, "exit_rate": float("nan")},
+                    {**prior, "exit_strength": 0.0},
+                    {**prior, "exit_strength": float("inf")}):
             self.assertIsNone(prior_from_json(bad), bad)
 
 

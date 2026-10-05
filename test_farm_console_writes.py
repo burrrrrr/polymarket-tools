@@ -375,9 +375,12 @@ class ReviewTest(Writes):
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
         self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
-        # Capped at 93.0c the bid scores 0.02, and at a 300% hurdle its fills
-        # cost more than that earns.
+        # Capped at 93.0c the bid scores 0.02. At a 300% hurdle its fills
+        # still pay while most sell back within days, but held to resolution
+        # they cost more than that earns.
         farm_db.put_settings(self.db, {"hurdle_rate": 3.0}, self.now)
+        self.assertIn("Buy No 93.0c", self.live(p_true="95"))
+        farm_db.put_settings(self.db, {"stuck_share": 1.0}, self.now)
         self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
                                                  r"bid pays: best net -\$\d+\.\d\d/day at 9\d\.\dc\.")
 
@@ -420,7 +423,8 @@ class ReviewTest(Writes):
                                                  cfg, True, outlook, bid_without_history=True)
 
     def test_live_plan_prices_fills_from_the_history_the_scan_stored(self):
-        busy = fill_cost.History((40, 30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0), 60.0, self.now, 0.90)
+        busy = fill_cost.History((40, 30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0), 60.0, self.now, 0.90,
+                                 12, 60.0)
         live, target = self.preview(history=fill_cost.history_to_json(busy))
         self.assertEqual(live.fill_source, "history")
         self.assertEqual(live.value, target.fav.best)

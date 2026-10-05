@@ -490,6 +490,7 @@ SETTINGS = {
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
+    "stuck_share": Bound(0, 1),
 }
 
 

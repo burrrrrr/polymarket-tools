@@ -517,9 +517,9 @@ Key `scan` options:
   ends. `--min-window-days` (30) is the fewest farmable days a market needs.
 - `--horizon-cap-days` (90) caps the days counted toward rank.
 - `--capital` (500) is the USD behind the favorite bid.
-- `--hurdle-rate` (0.40) sets what a filled share costs, the same setting the
-  farmer has. The scan has no p_true, so it costs a fill against the book
-  midpoint.
+- `--hurdle-rate` (0.40) and `--stuck-share` (0.25) set what a filled share
+  costs, the same settings the farmer has. The scan has no p_true, so it
+  costs a fill against the book midpoint.
 - `--tape-markets` (100) is how many of the top markets read their fill
   history. The fill prior is fit from the 60 randomly drawn markets' histories
   instead, and needs at least 20 of them.
@@ -624,15 +624,26 @@ them. Read the resolution rules before you approve.
 
 #### The fill-cost model
 
-A favorite share bought by a fill is held until the market resolves, and the
-capital it ties up could earn the hurdle rate r (`--hurdle-rate`) elsewhere.
-A fill at price b of a share worth p_true at resolution, t years out, loses
+A favorite share bought by a fill ties up capital that could earn the hurdle
+rate r (`--hurdle-rate`) elsewhere, until it leaves. The farmer offers it back
+through `FAV_ASK`, and the midpoint mostly recovers to where the sweep found
+it within days, so most fills exit after a hold T, taken as exponential with
+the market's exit rate λ a year and cut short at resolution, Y years out.
+Some fills never exit: the midpoint falls under `--min-fav`, which pulls the
+ask, or the market collapses. The share q of them (`--stuck-share`) is held
+to resolution. With δ = ln(1 + r) and k = λ + δ, a dollar of p_true is worth
 
-    L(b) = b - p_true / (1 + r) ** t
+    D = (1 - q) * (λ/k * (1 - e^(-kY)) + e^(-kY)) + q * e^(-δY)
 
-today. On a short-dated market L is negative and fills are welcome. For each
-favorite bid price b on the tick grid inside the reward band, with the size
-Q it rests at once the quotes are balanced,
+today, and a fill at price b of a share worth p_true loses
+
+    L(b) = b - p_true * D
+
+today. With q = 1, or no exits, D is (1 + r) ** -Y, every share held to
+resolution. On a short-dated market, or one whose fills exit fast, L is
+negative and fills are welcome. For each favorite bid price b on the tick
+grid inside the reward band, with the size Q it rests at once the quotes are
+balanced,
 
     net(b) = reward/day(b, Q) - Q * rate(m - b) * L(b)
 
@@ -667,6 +678,16 @@ and s the prior's strength. A nearer bid never gets a lower rate than a
 farther one. A scan needs at least 20 sampled histories to fit a prior; with
 fewer, the stored prior stays. Until a scan stores one, a built-in prior fit from
 256 markets in October 2026 stands in.
+
+λ comes from the same history. Each event counted 1c below the midpoint
+starts a clock, which stops at the first minute midpoint, a minute or more
+after the sweep began, back at or above the midpoint the sweep found. A clock
+still running when the history was read counts its time so far. The market's
+exits a day are its stopped clocks over its days on the clock, shrunk toward
+the prior's pooled exit rate the same way, with a strength in days on the
+clock. The built-in exit rate, about one exit in 4.7 days, comes from the 74
+markets approved on 2026-10-05. Those lean toward markets that recovered,
+which `--stuck-share` covers.
 
 The model leaves out fills of the longshot bid, and the farmer's own record of
 its fills.
@@ -818,8 +839,9 @@ command-line flags give the defaults, and each row replaces one of them
 while it exists. The keys are the option names with underscores, and the
 seconds options end in `_s`: `capital`, `max_lead`, `ask_offset`,
 `min_capture`, `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`,
-`hurdle_rate`, `drop_threshold`, `drop_window_s`, `cooldown_s`,
-`naked_cooldown_s`, and `expiry_buffer_days`. Each value is a JSON number.
+`hurdle_rate`, `stuck_share`, `drop_threshold`, `drop_window_s`,
+`cooldown_s`, `naked_cooldown_s`, and `expiry_buffer_days`. Each value is a
+JSON number.
 Opening the database deletes rows of retired settings: `fav_target_score`,
 from before fill-cost pricing, and `depth_haircut`, `fill_lookback_days` and
 `sweep_prior_weight`, from before fill histories.
@@ -910,7 +932,8 @@ it does not manage.
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets at least this share of the best price's |
-| `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus p_true discounted at this rate to the end date |
+| `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus p_true discounted at this rate over its expected hold |
+| `--stuck-share` | 0.25 | Share of fills never sold back, held to the end date; the rest exit at the market's measured exit rate |
 | `--drop-threshold` | 0.03 | Fall in the favorite's best ask that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |

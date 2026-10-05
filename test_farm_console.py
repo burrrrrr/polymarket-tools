@@ -19,7 +19,7 @@ NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 ORIGIN = "http://127.0.0.1:8787"
 A, B, C = "0xaaa", "0xbbb", "0xccc"
 CONFIG = {"expiry_buffer_days": 7.0, "min_fav": 0.9}
-HISTORY = fill_cost.History((9, 7, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90)
+HISTORY = fill_cost.History((9, 7, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90, 2, 10.0)
 ECONOMICS = {"net_per_day": 4.2, "reward_per_day": 5.0, "fills_per_day": 8.0,
              "loss_per_share": 0.1}
 
