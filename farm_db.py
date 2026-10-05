@@ -173,7 +173,8 @@ ADDED_MARKET_COLUMNS = (
 )
 # Settings the farmer no longer has. A row left behind would be reported as
 # an unknown setting on every start.
-RETIRED_SETTINGS = ("fav_target_score",)
+RETIRED_SETTINGS = ("fav_target_score", "depth_haircut", "fill_lookback_days",
+                    "sweep_prior_weight")
 
 
 def stamp(dt):
@@ -224,19 +225,24 @@ class ScanFunnel(NamedTuple):
 
 SCAN_PARAMS_KEY = "scan.params"
 SCAN_LAST_KEY = "scan.last"
+SCAN_FILL_PRIOR_KEY = "scan.fill_prior"
 
 
-def store_scan(conn, rows, reward_ids, now, funnel=None):
+def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None):
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
     naked_paused, capital_usd) are never touched, so rescanning is always
-    safe. Retiring is the farmer's call. A funnel is kept as the last scan's.
+    safe. Retiring is the farmer's call. A funnel is kept as the last scan's,
+    and a prior (the JSON-safe dict of a fill prior) as the fill prior every
+    reader values fills with.
     """
     at = stamp(now)
     with conn:
         if funnel is not None:
             _put_json(conn, SCAN_LAST_KEY, {**funnel._asdict(), "at": stamp(funnel.at)}, now)
+        if prior is not None:
+            _put_json(conn, SCAN_FILL_PRIOR_KEY, prior, now)
         conn.executemany(
             """
             INSERT INTO markets (condition_id, slug, question, end_date,
@@ -291,6 +297,14 @@ def put_scan_params(conn, params, now):
 
 def load_scan_params(conn):
     return _get_json(conn, SCAN_PARAMS_KEY) or {}
+
+
+def load_scan_json(conn, key):
+    """A scan.-prefixed settings row's value, or None when it is absent or not JSON."""
+    try:
+        return _get_json(conn, key)
+    except ValueError:
+        return None
 
 
 # A candidate counts only if the latest scan assessed it and its rewards are
@@ -476,9 +490,6 @@ SETTINGS = {
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
-    "depth_haircut": Bound(0, 1),
-    "fill_lookback_days": Bound(1, 365),
-    "sweep_prior_weight": Bound(0, 100),
 }
 
 

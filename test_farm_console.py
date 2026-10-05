@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 import farm_db
+import fill_cost
 from farm_console import charts, remote, views
 from farm_console.app import create_app
 from farm_db import Event, EventKind, FarmerStatus, FarmState, MarketRecord, MidSample
@@ -18,6 +19,9 @@ NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 ORIGIN = "http://127.0.0.1:8787"
 A, B, C = "0xaaa", "0xbbb", "0xccc"
 CONFIG = {"expiry_buffer_days": 7.0, "min_fav": 0.9}
+HISTORY = fill_cost.History((9, 7, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90)
+ECONOMICS = {"net_per_day": 4.2, "reward_per_day": 5.0, "fills_per_day": 8.0,
+             "loss_per_share": 0.1}
 
 
 def metrics(slug, est=10.0, v=0.035, mode="FLOOR"):
@@ -238,15 +242,21 @@ class CardsTest(unittest.TestCase):
 
     def test_card_shows_the_favorite_bid_economics_the_farmer_wrote(self):
         slots = quoting_slots()
-        slots["FAV_BID"].update(economics={"net_per_day": 4.2, "reward_per_day": 5.0,
-                                           "fills_per_day": 8.0, "loss_per_share": 0.1},
-                                fav_reason="", tape={"sweeps": 3, "span_days": 30.0})
+        slots["FAV_BID"].update(economics=ECONOMICS, fav_reason="",
+                                history=fill_cost.history_to_json(HISTORY))
         c = views.card(market(A, "a"), state(A, slots=slots), status(), NOW)
-        self.assertEqual((c.economics["net_per_day"], c.tape["sweeps"]), (4.2, 3))
+        self.assertEqual((c.economics["net_per_day"], c.history), (4.2, HISTORY))
 
     def test_a_state_from_before_fill_costs_has_no_economics(self):
         c = views.card(market(A, "a"), state(A), status(), NOW)
-        self.assertEqual((c.economics, c.fav_reason, c.tape), (None, "", None))
+        self.assertEqual((c.economics, c.fav_reason, c.history), (None, "", None))
+
+    def test_a_state_from_before_fill_histories_shows_no_history(self):
+        slots = quoting_slots()
+        slots["FAV_BID"].update(economics=ECONOMICS, fav_reason="",
+                                tape={"sweeps": 3, "span_days": 30.0, "capped": True})
+        c = views.card(market(A, "a"), state(A, slots=slots), status(), NOW)
+        self.assertEqual((c.economics["net_per_day"], c.history), (4.2, None))
 
 
 class FillCostFiguresTest(unittest.TestCase):
@@ -451,6 +461,22 @@ class RoutesTest(Console):
                 self.assertEqual(resp.status_code, 200)
                 for needle in needles:
                     self.assertIn(needle, resp.text)
+
+    def test_the_summary_shows_the_fill_history_and_passes_over_an_old_tape(self):
+        for behind, shown in (({"history": fill_cost.history_to_json(HISTORY)},
+                               "· history 9 sweeps below mid over 60.0d"),
+                              ({"tape": {"sweeps": 3, "shares": 150.0}}, None)):
+            with self.subTest(behind=list(behind)):
+                slots = quoting_slots()
+                slots["FAV_BID"].update(economics=ECONOMICS, fav_reason="", **behind)
+                self.publish(states=[state(A, slots=slots)._replace(updated_at=self.now)])
+                resp = self.client.get(f"/partials/markets/{A}/summary")
+                self.assertEqual(resp.status_code, 200)
+                self.assertIn("8.0 fills/day", resp.text)
+                if shown:
+                    self.assertIn(shown, resp.text)
+                else:
+                    self.assertNotIn("sweeps", resp.text)
 
     def test_an_unrewarded_market_lists_under_its_own_phase(self):
         self.publish(states=[state(A, "UNREWARDED", "rewards removed")._replace(

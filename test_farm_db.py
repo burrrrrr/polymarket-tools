@@ -113,8 +113,10 @@ class SettingsTest(ScratchDb):
         conn = self.open()
         farm_db.put_setting(conn, "keep_ratio", 0.5, NOW)
         with conn:
-            conn.execute("INSERT INTO settings VALUES ('fav_target_score', '0.45', ?)",
-                         (NOW.isoformat(),))
+            for key in ("fav_target_score", "depth_haircut", "fill_lookback_days",
+                        "sweep_prior_weight"):
+                conn.execute("INSERT INTO settings VALUES (?, '0.45', ?)",
+                             (key, NOW.isoformat()))
         for _ in range(2):
             reopened = self.open()
             self.assertEqual(farm_db.load_settings(reopened), ({"keep_ratio": 0.5}, {}))
@@ -139,8 +141,8 @@ class SettingsTest(ScratchDb):
             ("min_fav", "1.5"),
             ("drop_window_s", "0"),
             ("hurdle_rate", "-0.1"),
-            ("depth_haircut", "1.5"),
-            ("fill_lookback_days", "0.5"),
+            ("hurdle_rate", "10.5"),
+            ("depth_haircut", "0.5"),
             ("no_such_key", "1"),
         ):
             with self.subTest(key=key, text=text), self.assertRaises(ValueError):
@@ -162,10 +164,19 @@ class SettingsTest(ScratchDb):
         conn = self.open()
         farm_db.put_scan_params(conn, {"min_fav": 0.92}, NOW)
         funnel = farm_db.ScanFunnel(NOW, 60.0, 10, 5, 2, {"window too short": 5}, {})
-        farm_db.store_scan(conn, [], [], NOW, funnel)
+        prior = {"v": 1, "rates": [0.1], "markets": 30}
+        farm_db.store_scan(conn, [], [], NOW, funnel, prior=prior)
         self.assertEqual(farm_db.load_settings(conn), ({}, {}))
         self.assertEqual(farm_db.load_scan_params(conn), {"min_fav": 0.92})
         self.assertEqual(farm_db.load_scan_funnel(conn), funnel)
+        self.assertEqual(farm_db.load_scan_json(conn, farm_db.SCAN_FILL_PRIOR_KEY), prior)
+
+    def test_a_scan_without_a_prior_keeps_the_stored_one(self):
+        conn = self.open()
+        farm_db.store_scan(conn, [], [], NOW, prior={"markets": 30})
+        farm_db.store_scan(conn, [], [], NOW)
+        self.assertEqual(farm_db.load_scan_json(conn, farm_db.SCAN_FILL_PRIOR_KEY),
+                         {"markets": 30})
 
     def test_put_settings_writes_all_or_nothing(self):
         conn = self.open()

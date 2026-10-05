@@ -487,18 +487,28 @@ python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --capital
 python reward_screener.py reject <slug-or-condition-id> --note "resolution risk"
 ```
 
-A scan takes about a minute. Most of that is `/rewards/markets/current`, which
-pages slowly. It prints one line per stage with the counts it kept and the
-reasons it skipped the rest, then a table sorted by rank.
+A scan takes two to three minutes. About a minute of that is
+`/rewards/markets/current`, which pages slowly, and most of the rest is
+reading the fill histories. It prints one line per stage with the counts it
+kept and the reasons it skipped the rest, then a table sorted by rank.
 
-A scan assesses a market at most twice. The first pass costs fills from the
-prior alone (see [The fill-cost model](#the-fill-cost-model)), which overrates
-a market whenever its fills cost money. The top `--tape-markets` of that
-ranking then read their taker trades from the data API and are assessed
-again. A market whose fills then cost more than its rewards is dropped as
-`fills cost more than the rewards`. This cut is a heuristic: a market below it
-keeps its optimistic prior-only figures, marked `p` in the table and
-`(prior)` in the console.
+A scan assesses every market twice. The first pass costs fills from the fill
+prior the last scan stored (see [The fill-cost model](#the-fill-cost-model)),
+only to rank the markets. The top `--tape-markets` of that ranking then read
+their fill history: trades from the data API and minute midpoints from the
+CLOB, up to nine requests a market. So do 60 markets drawn at random from
+every market whose fills the first pass valued, kept or dropped as `fills
+cost more than the rewards`. That costs up to 60 more histories, fewer when
+the draw lands in the top, about 50 more seconds. A new fill prior is fit
+from the random sample's histories alone and stored with the scan. The top
+markets are the busiest, while most of the markets the prior values trade
+little, so a prior fit from the top would cost every quiet market's fills
+too high. The draw includes the markets the first pass dropped, so a stored
+prior that ran high cannot narrow the sample to the busy markets it spared.
+The second pass values every market on that prior, each market that read its
+history on its own history too. A market whose fills cost more than its
+rewards is dropped as `fills cost more than the rewards`. A market that read
+no history is valued on the prior alone, marked `p` in the table.
 
 Key `scan` options:
 
@@ -507,11 +517,12 @@ Key `scan` options:
   ends. `--min-window-days` (30) is the fewest farmable days a market needs.
 - `--horizon-cap-days` (90) caps the days counted toward rank.
 - `--capital` (500) is the USD behind the favorite bid.
-- `--hurdle-rate` (0.40), `--depth-haircut` (0.5), `--fill-lookback-days`
-  (30) and `--sweep-prior-weight` (0.25) set the fill-cost model, the same
-  settings the farmer has. The scan has no p_true, so it costs a fill against
-  the book midpoint.
-- `--tape-markets` (100) is how many of the top markets read their taker tape.
+- `--hurdle-rate` (0.40) sets what a filled share costs, the same setting the
+  farmer has. The scan has no p_true, so it costs a fill against the book
+  midpoint.
+- `--tape-markets` (100) is how many of the top markets read their fill
+  history. The fill prior is fit from the 60 randomly drawn markets' histories
+  instead, and needs at least 20 of them.
 - `--max-lead` (0.005) is the most the favorite bid may sit above the best bid
   already in the book. 0 joins the best bid. The bid also stays one tick under
   the lowest ask.
@@ -549,7 +560,7 @@ The table columns:
 | `v` | Max spread from the midpoint that still scores, in cents |
 | `min` | Minimum order size that scores, in shares |
 | `est$/d` | Your estimated daily reward: pool times your share of the score |
-| `fill/d` | Favorite shares a day expected to fill your bid; `t` from the market's tape, `p` from the prior alone |
+| `fill/d` | Favorite shares a day expected to fill your bid; `h` from the market's history, `p` from a scan's fill prior alone, `d` from the built-in default prior alone |
 | `net$/d` | `est$/d` less `fill/d` times the loss per filled share |
 | `cap$` | Capital both bids tie up |
 | `APR%` | `est$/d` divided by `cap$`, times 365, before fill costs |
@@ -623,22 +634,42 @@ today. On a short-dated market L is negative and fills are welcome. For each
 favorite bid price b on the tick grid inside the reward band, with the size
 Q it rests at once the quotes are balanced,
 
-    net(b) = reward/day(b, Q) - fills/day(b, Q) * L(b)
+    net(b) = reward/day(b, Q) - Q * rate(m - b) * L(b)
 
-`fills/day` comes from the market's taker tape: the trades that sold the
-favorite or bought the longshot, which both fill favorite bids. Trades less
-than a minute apart chain into one sweep, for at most 10 minutes. A sweep of
-X shares fills min(Q, X - alpha * A) of a bid that waits behind A shares (every
-bid above b and those already at b), where alpha is `--depth-haircut`, since
-some of that depth is cancelled before a sweep arrives. The sum over the
-sweeps of the last `--fill-lookback-days` is divided by the days the tape
-covers. The data API serves only about 1,800 trades, so a busy market's tape
-covers less than the lookback. On top, `--sweep-prior-weight` sweeps per
-lookback are assumed to clear the whole book, so a quiet market never reads as
-never filling.
+where m is the midpoint once your quotes join the book, and rate(d) is how
+many times a day a sell sweep reaches more than d below the midpoint. A sweep
+that reaches your bid fills all of it.
 
-The model leaves out fills of the longshot bid, the sweep's price, and the
-farmer's own fill history.
+rate(d) comes from the market's fill history: its last 60 days of trades from
+the data API, the makers each trade filled included, and the favorite's
+minute midpoints from the CLOB. Trades that sold the favorite or bought the
+longshot hit favorite bids. Trades less than a minute apart chain into one
+sweep, for at most 10 minutes. A sweep counts at distance d when its deepest
+fill traded more than d below the midpoint a minute before it began, and that
+midpoint was at or above `--min-fav`. Sweeps within an hour of the last one
+counted are one event, because a burst fills a resting bid once. The data API
+serves only 2,000 rows of a market, so a busy market's history covers less
+than 60 days. Events are counted at 12 distances from 0 to 10c, and rate(d)
+runs in a straight line between them.
+
+Few markets see enough sweeps to be rated on their own. A scan therefore
+pools the histories of a random sample of the markets it values into a
+fill prior: per distance, the events a day across those markets, and a
+strength in days that says how much the markets differ around that pooled
+rate. The sample is random because the prior values mostly quiet markets,
+and the busy top markets would inflate it. A market's rate is its own count
+shrunk toward the prior,
+
+    rate(d) = (k + s * p) / (t + s)
+
+where k is the market's events at d, t its days of history, p the pooled rate
+and s the prior's strength. A nearer bid never gets a lower rate than a
+farther one. A scan needs at least 20 sampled histories to fit a prior; with
+fewer, the stored prior stays. Until a scan stores one, a built-in prior fit from
+256 markets in October 2026 stands in.
+
+The model leaves out fills of the longshot bid, and the farmer's own record of
+its fills.
 
 The `markets` table in `farm.db` is the interface to the farmer (see
 [The farm.db contract](#the-farmdb-contract)). A scan updates the metrics,
@@ -686,13 +717,17 @@ unchanged stays quiet:
 `score` is the per-share reward score at the current midpoint. `Q1` and `Q2`
 are the planned score on each side. Polymarket pays on the smaller one. The
 `bid ... net` part is the favorite bid chosen and its net per day, or why
-there is none, such as `no fill tape yet` or `no favorite bid pays: best net
--$0.12/day at 93.8c`.
+there is none, such as `no fill history yet` or `no favorite bid pays: best
+net -$0.12/day at 93.8c`.
 
-The farmer reads each market's taker tape every 10 minutes while the market
-is about to quote, and retries a failed read after a minute, keeping the last
-tape. Until a market's first tape lands it places no favorite bid, and only
-the exits rest.
+A thread beside the main loop reads each approved market's fill history, so a
+cycle never waits on those reads. It reads a market as soon as the farmer
+manages it, then every hour, and again at once when `min_fav` changes. A
+failed read keeps the last history and is retried after two minutes. Until a
+market's first history lands, the farmer places no favorite bid there, and
+only the exits rest. A read that found no midpoints counts as no history. The
+farmer values fills on the fill prior the last scan stored, read again every
+cycle.
 
 #### The four slots
 
@@ -782,10 +817,11 @@ command-line flags give the defaults, and each row replaces one of them
 while it exists. The keys are the option names with underscores, and the
 seconds options end in `_s`: `capital`, `max_lead`, `ask_offset`,
 `min_capture`, `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`,
-`hurdle_rate`, `depth_haircut`, `fill_lookback_days`, `sweep_prior_weight`,
-`drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
-`expiry_buffer_days`. Each value is a JSON number. Opening the database deletes
-a `fav_target_score` row left from before fill-cost pricing.
+`hurdle_rate`, `drop_threshold`, `drop_window_s`, `cooldown_s`,
+`naked_cooldown_s`, and `expiry_buffer_days`. Each value is a JSON number.
+Opening the database deletes rows of retired settings: `fav_target_score`,
+from before fill-cost pricing, and `depth_haircut`, `fill_lookback_days` and
+`sweep_prior_weight`, from before fill histories.
 `farm_db.put_setting` refuses an unknown key or an out-of-range value. A bad row written another
 way is ignored, with an `ALERT` event. When the effective config changes, the
 farmer logs a `SETTINGS` event with the old and new values. A changed setting
@@ -874,9 +910,6 @@ it does not manage.
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets at least this share of the best price's |
 | `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus p_true discounted at this rate to the end date |
-| `--depth-haircut` | 0.5 | Share of the bids ahead of the favorite bid a sell sweep must get through before it reaches ours |
-| `--fill-lookback-days` | 30 | Days of taker trades the fill estimate reads |
-| `--sweep-prior-weight` | 0.25 | Assumed sweeps per lookback that clear the whole book, on top of the ones seen |
 | `--drop-threshold` | 0.03 | Fall in the favorite's best ask that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |
@@ -925,7 +958,7 @@ Each column has exactly one writer process:
 | `farm_state` | Farmer | One row per managed market, replaced every cycle: phase and reason, midpoints, Q1 and Q2, capital, naked USD in use, and JSON for the position, the four slots (resting order, target, live score, decision and reason), the favorite book inside the reward band with your orders marked, backoffs, and `scoring_pct` (live only) |
 | `farmer_status` | Farmer | One row: mode, pid, start time, last cycle, interval, heartbeat, managed count, effective config, and `stopped_at` once it exits |
 | `farm_events` | Farmer | Changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`, `ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, `SETTINGS`. Rows older than 30 days are deleted at startup |
-| `settings` | Console or CLI | Overrides of the farmer's command-line options. Keys starting with `scan.` are not farmer options and the farmer ignores them: `scan.params` holds the console's last scan parameters, `scan.last` the last scan's funnel, written by every scan |
+| `settings` | Console or CLI | Overrides of the farmer's command-line options. Keys starting with `scan.` are not farmer options, and the farmer never reports them as unknown settings: `scan.params` holds the console's last scan parameters, and every scan writes `scan.last`, its funnel, and `scan.fill_prior`, the fill prior it fit when at least 20 sampled histories read, which the next scan, the farmer and the console value fills on |
 | `commands` | Console inserts, farmer stamps `consumed_at` and `result` | One-off requests. `stop` is the only kind |
 | `rewards_daily` | Farmer, live only | Your reward earnings per market per day, fetched every 10 minutes |
 | `farm_mids` | Farmer | At most one row per managed market per minute, in dry run too: the midpoint, the book midpoint, and the prices the `FAV_BID` and `LONG_BID` rest at after that cycle (NULL when the slot rests nothing). Rows older than 7 days are deleted at startup. The console draws its midpoint chart from it |
@@ -976,7 +1009,7 @@ Pages:
 #### Running a scan from the console
 
 The Discover page runs the same scan as `python reward_screener.py scan`, in a
-background thread of the console. It takes about a minute. The page shows
+background thread of the console. It takes two to three minutes. The page shows
 the current stage while it runs, then the counts and the duration, or the
 error. Only one scan runs at a time: a second request while one runs gets
 "A scan is already in progress". The form starts from the parameters of the
@@ -1000,8 +1033,9 @@ rows and its funnel in one transaction and never changes your decisions.
   that the cap is outside the band. The live preview below it shows the price
   the farmer would pick under that cap and its net per day. Until you type a
   p_true, it values the market at the book midpoint, as the scan does. Its
-  fills come from the tape the scan stored, or from the prior alone, which
-  the preview says. That score is measured against the midpoint
+  fills come from the history the scan stored and the stored fill prior. A
+  market the scan did not read is valued on the prior alone, and the preview
+  says so; with no prior stored yet, it says to run a scan. That score is measured against the midpoint
   the capped bid creates. It also warns when your naked budget is below the
   planned longshot leg, which the scan priced within its own naked budget.
   It uses the effective

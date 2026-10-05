@@ -45,8 +45,10 @@ A scan is three stages:
   3. Plan our two quotes against each book at every favorite bid price in
      the band, estimate the score already resting there, and value each plan
      as our share of the pool less the cost of its expected fills, with the
-     book midpoint standing in for p_true. Fills come from a prior first;
-     the top markets then read their taker tape and are valued again.
+     book midpoint standing in for p_true. Fills come from the last scan's
+     cross-market prior first; the top markets then read their fill
+     history, a new prior is fit from those, and every market is valued
+     again on it.
      Markets rank by expected net return over the farm horizon, capped so a
      two-year market does not dwarf everything.
 
@@ -66,6 +68,7 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 from collections import Counter
@@ -95,10 +98,20 @@ GAMMA_REQUEST_LIMIT = 100
 # even at one read every two seconds.
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_WAIT_MAX_S = 5.0
-# /trades pages; past about 1,800 rows of a market it returns nothing.
-TAPE_PAGE = 1000
-TAPE_PAGES = 2
-TAPE_THREADS = 4
+# /trades pages; past 2,000 rows of a market it returns nothing.
+TRADES_PAGE = 1000
+TRADES_PAGES = 2
+# /prices-history rejects an interval over about 15 days.
+MIDS_CHUNK_S = 14 * 86400
+# Mids are read from this long before a history starts, so a quiet stretch
+# with no mid point does not push the start later.
+MIDS_LEAD_S = 3600
+HISTORY_THREADS = 4
+# The fill prior is fit on this many markets drawn at random from those it
+# values, not on the top ones: those are the busiest, and most of the rest are
+# quiet.
+PRIOR_SAMPLE = 60
+FILLS_COST_TOO_MUCH = "fills cost more than the rewards"
 
 # A longshot bid at or below this price is the FLOOR mode.
 FLOOR_PRICE = 0.002
@@ -151,13 +164,10 @@ SCAN_HELP = {
                       "leaves",
     "hurdle_rate": "Yearly return capital must beat; a filled share costs its price "
                    "minus the midpoint discounted at this rate to the end date",
-    "depth_haircut": "Share of the bids ahead of the favorite bid a sweep must get "
-                     "through before it reaches ours",
-    "fill_lookback_days": "Days of taker trades the fill estimate reads",
-    "sweep_prior_weight": "Assumed sweeps per lookback that clear the whole book, on top "
-                          "of the ones seen",
-    "tape_markets": "How many of the top markets read their taker tape; the rest are "
-                    "ranked on the prior alone",
+    "tape_markets": "How many of the top markets read their fill history; the "
+                    "cross-market fill prior is fit from a random sample of every "
+                    "market it values, and a market not read is valued on that "
+                    "prior alone",
 }
 
 
@@ -260,26 +270,26 @@ class Assessment(NamedTuple):
     best_ask: Optional[float] = None
     # The fill cost of the favorite bid. est_daily_usd, daily_yield and apr
     # stay the gross reward; rank_score is the net yield. fill_source is
-    # "tape" when fills came from the market's taker tape, "prior" when only
-    # from the prior; tape is the tape as fill_cost.tape_to_json stores it.
+    # fill_cost.fill_source's; history is the market's fill history as
+    # fill_cost.history_to_json stores it, when it was read.
     fills_per_day: Optional[float] = None
     fill_cost_usd: Optional[float] = None
     net_daily_usd: Optional[float] = None
     net_apr: Optional[float] = None
     loss_per_share: Optional[float] = None
-    fav_ahead: Optional[float] = None
     fill_source: Optional[str] = None
-    tape: Optional[dict] = None
+    history: Optional[dict] = None
 
 
 class Outlook(NamedTuple):
     """What valuing a quote needs beyond the book, worked out by the caller:
-    the daily pool, the years to resolution, the taker tape, and the model."""
+    the daily pool, the years to resolution, the fill curve, and the hurdle
+    rate a filled share is discounted at."""
 
     rate_per_day: float
     years_left: float
-    tape: fill_cost.Tape
-    fill: fill_cost.FillParams
+    fills: fill_cost.FillCurve
+    hurdle_rate: float
 
 
 class QuoteValue(NamedTuple):
@@ -289,7 +299,6 @@ class QuoteValue(NamedTuple):
 
     price: Optional[float]
     size: float
-    ahead: float
     capital_usd: float
     reward_per_day: float
     fills_per_day: float
@@ -326,9 +335,7 @@ class ScreenConfig(NamedTuple):
     min_rate: float = 0.0
     fragile_drop: float = 0.03
     hurdle_rate: float = 0.40
-    depth_haircut: float = 0.5
-    fill_lookback_days: float = 30.0
-    sweep_prior_weight: float = 0.25
+    # How many markets read their fill history; the key predates histories.
     tape_markets: float = 100.0
     # Keys of CATEGORIES whose markets the prefilter skips.
     excluded_categories: tuple = ("sports", "esports", "crypto")
@@ -338,6 +345,9 @@ class ScanResult(NamedTuple):
     assessments: list
     reward_ids: set
     funnel: farm_db.ScanFunnel
+    # The fill prior this scan fit, or None when too few histories were read
+    # and the stored one stands.
+    prior: Optional[fill_cost.Prior] = None
 
 
 class GammaInfo(NamedTuple):
@@ -556,12 +566,6 @@ def fav_bid_candidates(levels, v, tick, min_size, max_lead, cap=None):
     return prices
 
 
-def fill_params(config):
-    """The fill model's parameters from a ScreenConfig or a FarmConfig."""
-    return fill_cost.FillParams(config.hurdle_rate, config.depth_haircut,
-                                config.fill_lookback_days, config.sweep_prior_weight)
-
-
 def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook):
     """What a configuration of our quotes earns per day, net of what its fills cost.
 
@@ -569,24 +573,23 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
     quotes join it, my_q our Q_min there, and bid the favorite bid's (price,
     size), or None. The reward is our share of the pool against
     competing_score. A fill of the favorite bid loses
-    fill_cost.loss_per_share against p_true, and the bid fills as the tape's
-    sweeps reach it behind every bid at or above its price.
+    fill_cost.loss_per_share against p_true, and the whole bid fills each
+    time a sweep reaches past its distance below mid: a sweep would find our
+    bid in the book, so mid is the one our quotes create.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
     if bid is None:
-        return QuoteValue(None, 0.0, 0.0, capital_usd, reward, 0.0, 0.0)
+        return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0)
     price, size = bid
-    ahead = fill_cost.depth_ahead(levels.bids, price)
     return QuoteValue(
         price=price,
         size=size,
-        ahead=ahead,
         capital_usd=capital_usd,
         reward_per_day=reward,
-        fills_per_day=fill_cost.fills_per_day(outlook.tape, size, ahead, outlook.fill),
+        fills_per_day=size * outlook.fills.per_day(mid - price),
         loss_per_share=fill_cost.loss_per_share(price, p_true, outlook.years_left,
-                                                outlook.fill.hurdle_rate),
+                                                outlook.hurdle_rate),
     )
 
 
@@ -653,7 +656,7 @@ def plan_quotes(market, levels, config, outlook, p_true):
     if best is None:
         return Skip(reason)
     if best[1].net_per_day <= 0:
-        return Skip("fills cost more than the rewards")
+        return Skip(FILLS_COST_TOO_MUCH)
     return best
 
 
@@ -661,11 +664,13 @@ def days_until(end_date, buffer_days, now):
     return (end_date - timedelta(days=buffer_days) - now).total_seconds() / 86400
 
 
-def assess(market, levels, config, now, tape=None):
+def assess(market, levels, config, now, prior, history=None):
     """Plan quotes on one market's favorite book and value them. Returns Assessment or Skip.
 
-    With no tape the fills come from the prior alone. There is no p_true at
-    scan time, so a fill is costed against the book midpoint.
+    Fills come from fill_cost.fill_curve on the market's history and the
+    fill prior, read at config.min_fav; with no history, from the prior
+    alone. There is no p_true at scan time, so a fill is costed against the
+    book midpoint.
     """
     days_left = days_until(market.end_date, config.expiry_buffer_days, now)
     if days_left < config.min_window_days:
@@ -679,8 +684,7 @@ def assess(market, levels, config, now, tape=None):
         return Skip("fragile midpoint")
 
     outlook = Outlook(market.rate_per_day, fill_cost.years_until(market.end_date, now),
-                      tape or fill_cost.Tape.unobserved(config.fill_lookback_days),
-                      fill_params(config))
+                      fill_cost.fill_curve(history, prior, config.min_fav), config.hurdle_rate)
     planned = plan_quotes(market, levels, config, outlook, book_mid)
     if isinstance(planned, Skip):
         return planned
@@ -723,9 +727,8 @@ def assess(market, levels, config, now, tape=None):
         net_daily_usd=value.net_per_day,
         net_apr=value.net_apr,
         loss_per_share=value.loss_per_share,
-        fav_ahead=value.ahead,
-        fill_source="tape" if outlook.tape.observed else "prior",
-        tape=fill_cost.tape_to_json(tape) if tape else None,
+        fill_source=fill_cost.fill_source(history, prior, config.min_fav),
+        history=fill_cost.history_to_json(history) if history else None,
     )
 
 
@@ -881,6 +884,63 @@ def apply_gamma(market, info):
     )
 
 
+class TradeRow(NamedTuple):
+    """One /trades row. The first six fields identify it in both the taker
+    listing and the full one."""
+
+    tx: str
+    wallet: str
+    asset: str
+    side: str
+    size: float
+    price: float
+    at: float
+
+
+def parse_trade(row):
+    """A /trades row as a TradeRow, or None when it lacks a transaction, an
+    asset, a BUY or SELL side, a positive size, a price inside (0, 1) or a
+    timestamp."""
+    if not isinstance(row, dict):
+        return None
+    side = str(row.get("side") or "").upper()
+    tx, asset = str(row.get("transactionHash") or ""), str(row.get("asset") or "")
+    size, price = _float(row.get("size")), _float(row.get("price"))
+    at = _float(row.get("timestamp"))
+    if (not tx or not asset or side not in ("BUY", "SELL") or size is None or not size > 0
+            or price is None or not 0 < price < 1 or at is None or not at > 0):
+        return None
+    return TradeRow(tx, str(row.get("proxyWallet") or ""), asset, side, size, price, at)
+
+
+def parse_hits(taker_rows, all_rows, fav_token_id):
+    """[fill_cost.Hit] from a market's /trades rows: taker_rows from
+    takerOnly=true, all_rows from takerOnly=false, which also lists a row for
+    every maker a taker trade filled.
+
+    A taker hits favorite bids by selling the favorite, or by buying the other
+    outcome at 1 - price, matched against favorite bids by minting a pair.
+    Maker rows are all_rows less taker_rows, as a multiset on their first six
+    fields; a maker's favorite bid filled when it bought the favorite, or sold
+    the other outcome at 1 - price. A hit's deepest price is the lowest of its
+    own and of its transaction's maker fills. Malformed rows are dropped.
+    """
+    taker = [t for t in map(parse_trade, taker_rows) if t]
+    unmatched = Counter(t[:6] for t in taker)
+    deepest = {}
+    for t in filter(None, map(parse_trade, all_rows)):
+        if unmatched[t[:6]]:
+            unmatched[t[:6]] -= 1
+        elif (t.side == "BUY") == (t.asset == fav_token_id):
+            deepest[t.tx] = min(deepest.get(t.tx, 1.0), _fav_price(t, fav_token_id))
+    return [fill_cost.Hit(t.at, min(_fav_price(t, fav_token_id), deepest.get(t.tx, 1.0)))
+            for t in taker if (t.side == "SELL") == (t.asset == fav_token_id)]
+
+
+def _fav_price(trade, fav_token_id):
+    return trade.price if trade.asset == fav_token_id else 1 - trade.price
+
+
 # ---------------------------------------------------------------------------
 # Fetching
 # ---------------------------------------------------------------------------
@@ -978,85 +1038,107 @@ def get_with_retry(http, url, params, timeout):
     return resp
 
 
-def parse_hits(rows, fav_token_id):
-    """(hits on favorite bids, unix time of the oldest row) from /trades rows.
+def fetch_trades(http, condition_id, taker_only, cutoff, timeout=20):
+    """(rows, complete_from) of the market's /trades listing, newest first;
+    raises on a failed read.
 
-    Rows are taker trades. A taker selling the favorite hits favorite bids,
-    and so does a taker buying the other outcome, matched against favorite
-    bids at 1 - price by minting a pair. A row that is neither, or malformed,
-    is no hit but still marks how far back the fetched history reaches.
+    Pages stop at a short page, at one reaching past cutoff, or at
+    TRADES_PAGES, the most the API serves. complete_from is cutoff unless the
+    row cap ended the listing first, then the oldest row's unix time.
     """
-    hits, oldest = [], None
-    for row in rows:
-        at = _float(row.get("timestamp"))
-        if at is None:
-            continue
-        oldest = at if oldest is None else min(oldest, at)
-        side, asset = str(row.get("side") or "").upper(), str(row.get("asset") or "")
-        size = _float(row.get("size"))
-        if not asset or size is None or size <= 0:
-            continue
-        if (side == "SELL" and asset == fav_token_id) or (side == "BUY" and asset != fav_token_id):
-            hits.append(fill_cost.Hit(at, size))
-    return hits, oldest
-
-
-def fetch_tape(http, condition_id, fav_token_id, now, lookback_days, timeout=20):
-    """The market's taker tape over the lookback as a fill_cost.Tape; raises on a failed read.
-
-    Pages stop at a short page, at one reaching past the lookback, or at
-    TAPE_PAGES, the most the API serves anyway.
-    """
-    cutoff = now.timestamp() - lookback_days * fill_cost.DAY_S
-    hits, oldest, full_page_seen = [], None, False
-    for page in range(TAPE_PAGES):
-        rows = get_with_retry(
+    rows, times = [], []
+    for page in range(TRADES_PAGES):
+        got = get_with_retry(
             http, f"{DATA_API_HOST}/trades",
-            {"market": condition_id, "takerOnly": "true", "limit": TAPE_PAGE,
-             "offset": page * TAPE_PAGE},
+            {"market": condition_id, "takerOnly": "true" if taker_only else "false",
+             "limit": TRADES_PAGE, "offset": page * TRADES_PAGE},
             timeout,
-        ).json() or []
-        page_hits, page_oldest = parse_hits(rows, fav_token_id)
-        hits.extend(page_hits)
-        if page_oldest is not None:
-            oldest = page_oldest if oldest is None else min(oldest, page_oldest)
-        if len(rows) < TAPE_PAGE:
-            break
-        full_page_seen = True
-        if oldest is not None and oldest < cutoff:
-            break
-    return fill_cost.make_tape(hits, oldest, now, lookback_days, full_page_seen)
+        ).json()
+        got = got if isinstance(got, list) else []
+        rows.extend(got)
+        times.extend(t for t in (_float(r.get("timestamp")) for r in got if isinstance(r, dict))
+                     if t is not None)
+        if len(got) < TRADES_PAGE or min(times, default=cutoff) < cutoff:
+            return rows, cutoff
+    return rows, max(cutoff, min(times, default=cutoff))
 
 
-def fetch_tapes(http, markets, now, lookback_days):
-    """{condition_id: Tape} over TAPE_THREADS threads; a failed market is left out."""
+def fetch_mids(http, token_id, start, end, timeout=20):
+    """The token's minute mids [(unix t, price)] from start to end, sorted,
+    read in MIDS_CHUNK_S chunks; raises on a failed read."""
+    mids = set()
+    for lo in range(int(start), int(end), MIDS_CHUNK_S):
+        data = get_with_retry(
+            http, f"{CLOB_HOST}/prices-history",
+            {"market": token_id, "startTs": lo, "endTs": min(int(end), lo + MIDS_CHUNK_S),
+             "fidelity": 1},
+            timeout,
+        ).json()
+        for point in (data.get("history") if isinstance(data, dict) else None) or []:
+            if isinstance(point, dict):
+                t, p = _float(point.get("t")), _float(point.get("p"))
+                if t is not None and p is not None:
+                    mids.add((t, p))
+    return sorted(mids)
+
+
+def fetch_history(http, condition_id, fav_token_id, now, floor, timeout=20):
+    """One market's fill_cost.History; raises on a failed read.
+
+    All rows come first because they reach the row cap soonest, then taker
+    rows only back to where all rows are complete, then mids only from where
+    both are.
+    """
+    cutoff = now.timestamp() - fill_cost.HISTORY_DAYS * fill_cost.DAY_S
+    every, every_from = fetch_trades(http, condition_id, False, cutoff, timeout)
+    taker, taker_from = fetch_trades(http, condition_id, True, every_from, timeout)
+    start = max(every_from, taker_from)
+    mids = fetch_mids(http, fav_token_id, start - fill_cost.PRE_SWEEP_S - MIDS_LEAD_S,
+                      now.timestamp(), timeout)
+    hits = parse_hits(taker, every, fav_token_id)
+    return fill_cost.make_history(hits, mids, start, now, floor)
+
+
+def fetch_histories(http, markets, now, floor):
+    """{condition_id: History} over HISTORY_THREADS threads; a failed market is left out."""
     def fetch(market):
         try:
-            return market.condition_id, fetch_tape(http, market.condition_id,
-                                                   market.fav_token_id, now, lookback_days)
+            return market.condition_id, fetch_history(http, market.condition_id,
+                                                      market.fav_token_id, now, floor)
         except Exception as e:
-            print(f"  Warning: trades of {market.slug or market.condition_id} failed ({e})")
+            print(f"  Warning: fill history of {market.slug or market.condition_id} failed ({e})")
             return market.condition_id, None
 
     if not markets:
         return {}
-    with ThreadPoolExecutor(min(len(markets), TAPE_THREADS)) as pool:
-        return {cid: tape for cid, tape in pool.map(fetch, markets) if tape is not None}
+    with ThreadPoolExecutor(min(len(markets), HISTORY_THREADS)) as pool:
+        return {cid: history for cid, history in pool.map(fetch, markets) if history is not None}
+
+
+def load_prior(conn):
+    """The fill prior the last scan stored, or fill_cost.DEFAULT_PRIOR when none
+    is stored or it does not parse."""
+    stored = farm_db.load_scan_json(conn, farm_db.SCAN_FILL_PRIOR_KEY)
+    return fill_cost.prior_from_json(stored) or fill_cost.DEFAULT_PRIOR
 
 
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
 
-def run_scan(config, now, on_stage=lambda stage: None):
+def run_scan(config, now, prior, on_stage=lambda stage: None):
     """Fetch, screen, and assess, naming each stage to on_stage as it starts.
 
-    Every market is first assessed with fills from the prior alone, which
-    overrates it whenever a fill costs money (L > 0, nearly every bid at scan
-    time). Only the top tape_markets of that ranking then read their taker
-    tape and are assessed again; one whose fills then cost more than its
-    rewards is dropped. This is a heuristic cut, not an exhaustive search: a
-    market below the cut keeps its prior-only, optimistic figures.
+    prior is the stored fill prior. Every market is first assessed on it,
+    only to rank them. The top tape_markets of that ranking read their fill
+    history, and so do PRIOR_SAMPLE markets drawn at random, seeded by now,
+    from every market whose fills the first pass valued, those it dropped as
+    costing too much included, so a stored prior that ran high cannot narrow
+    its own sample. A new prior is fit from the sample's histories alone, so
+    it matches the markets it values rather than the busy top; too few leave
+    prior standing. Every market is then assessed again on that prior, each
+    one read on its own history too, and only this second pass's skips count.
+    A market that read no history is valued on the prior alone.
     """
     scan_started = time.monotonic()
     with httpx.Client() as http:
@@ -1099,7 +1181,7 @@ def run_scan(config, now, on_stage=lambda stage: None):
               f"({time.monotonic() - started:.1f}s)")
 
     on_stage("assessing")
-    assessments, skipped = [], Counter()
+    candidates, skipped = [], Counter()
     for market in survivors:
         levels = books.get(market.fav_token_id)
         if levels is None:
@@ -1113,46 +1195,60 @@ def run_scan(config, now, on_stage=lambda stage: None):
         market = apply_gamma(market, info)
         if levels.tick:
             market = market._replace(tick=levels.tick)
-        result = assess(market, levels, config, now)
-        if isinstance(result, Skip):
-            skipped[result.reason] += 1
-            continue
-        if info is not None:
-            result = result._replace(
-                volume24hr=info.volume24hr, holding_rewards=info.holding_rewards
-            )
-        assessments.append(result)
-    assessments.sort(key=lambda a: a.rank_score, reverse=True)
+        candidates.append((market, levels, info))
+    ranked, _, valued = assess_all(candidates, config, now, prior, {})
 
-    top = assessments[:int(config.tape_markets)]
-    on_stage(f"reading fill tapes for {len(top):,} markets")
+    top = [a.market for a in ranked[:int(config.tape_markets)]]
+    sample = random.Random(now.timestamp()).sample(valued, min(PRIOR_SAMPLE, len(valued)))
+    top_ids = {m.condition_id for m in top}
+    reads = top + [m for m in sample if m.condition_id not in top_ids]
+    on_stage(f"reading fill histories for {len(reads):,} markets")
     started = time.monotonic()
     with httpx.Client() as http:
-        tapes = fetch_tapes(http, [a.market for a in top], now, config.fill_lookback_days)
-    taped = {}
-    for a in top:
-        tape = tapes.get(a.market.condition_id)
-        if tape is not None:
-            taped[a.market.condition_id] = assess(a.market, books[a.market.fav_token_id],
-                                                  config, now, tape)
-    kept = []
-    for a in assessments:
-        result = taped.get(a.market.condition_id, a)
-        if isinstance(result, Skip):
-            skipped[result.reason] += 1
-        else:
-            kept.append(result._replace(volume24hr=a.volume24hr,
-                                        holding_rewards=a.holding_rewards))
-    assessments = sorted(kept, key=lambda a: a.rank_score, reverse=True)
-    print(f"Tapes: {len(tapes):,} of {len(top):,} read "
-          f"({time.monotonic() - started:.1f}s)")
+        histories = fetch_histories(http, reads, now, config.min_fav)
+    fitted = fill_cost.fit_prior(
+        [histories[m.condition_id] for m in sample if m.condition_id in histories],
+        now, config.min_fav)
+    print(f"Histories: {len(histories):,} of {len(reads):,} read, {len(top):,} top and "
+          f"{len(reads) - len(top):,} more of {len(sample):,} sampled "
+          f"({time.monotonic() - started:.1f}s); "
+          + (f"fill prior fit from {fitted.markets:,} sampled" if fitted
+             else "too few sampled to fit a fill prior, the stored one stands"))
+
+    assessments, assess_skips, _ = assess_all(candidates, config, now, fitted or prior,
+                                              histories)
+    skipped.update(assess_skips)
     print(f"Assessed: {len(assessments):,} kept; skipped {tally(skipped)}")
     funnel = farm_db.ScanFunnel(
         at=now, duration_s=round(time.monotonic() - scan_started, 1), listed=len(listing),
         prefiltered=len(survivors), assessed=len(assessments),
         prefilter_skips=prefilter_skips, assess_skips=dict(skipped.most_common()),
     )
-    return ScanResult(assessments, {item.get("condition_id") for item in listing}, funnel)
+    return ScanResult(assessments, {item.get("condition_id") for item in listing}, funnel,
+                      fitted)
+
+
+def assess_all(candidates, config, now, prior, histories):
+    """(assessments by rank_score, best first, a Counter of why the rest were
+    skipped, and the markets whose fills were valued: those kept and those
+    whose fills cost too much) of (market, levels, Gamma info) candidates,
+    each valued on prior and on its own history when histories holds one."""
+    assessments, skipped, valued = [], Counter(), []
+    for market, levels, info in candidates:
+        result = assess(market, levels, config, now, prior, histories.get(market.condition_id))
+        if isinstance(result, Skip):
+            skipped[result.reason] += 1
+            if result.reason == FILLS_COST_TOO_MUCH:
+                valued.append(market)
+            continue
+        valued.append(market)
+        if info is not None:
+            result = result._replace(
+                volume24hr=info.volume24hr, holding_rewards=info.holding_rewards
+            )
+        assessments.append(result)
+    assessments.sort(key=lambda a: a.rank_score, reverse=True)
+    return assessments, skipped, valued
 
 
 def assessment_record(a):
@@ -1177,9 +1273,14 @@ def scan_row(a):
 
 
 def store(conn, result, now):
-    """Keep a scan in farm.db: its rows, the reward set, and its funnel."""
+    """Keep a scan in farm.db: its rows, the reward set, its funnel and the
+    fill prior it fit."""
     farm_db.store_scan(conn, [scan_row(a) for a in result.assessments], result.reward_ids,
-                       now, result.funnel)
+                       now, result.funnel,
+                       prior=result.prior and fill_cost.prior_to_json(result.prior))
+
+
+FILL_SOURCE_MARK = {"history": "h", "prior": "p", "default": "d"}
 
 
 def print_table(assessments):
@@ -1198,7 +1299,7 @@ def print_table(assessments):
         print(
             f"{rank:>3} {a.plan.mode.value:6} {fav:>14} {m.rate_per_day:>6.0f} "
             f"{m.v * 100:>4.1f} {m.min_size:>4.0f} {a.est_daily_usd:>7.2f} "
-            f"{a.fills_per_day:>5.0f}{'p' if a.fill_source == 'prior' else 't'} "
+            f"{a.fills_per_day:>5.1f}{FILL_SOURCE_MARK[a.fill_source]} "
             f"{a.net_daily_usd:>7.2f} {a.capital_usd:>6.0f} {a.apr * 100:>6.0f} "
             f"{a.net_apr * 100:>6.0f} {a.days_left:>5.0f} "
             f"{a.depth_ahead_ratio:>6.1f} {human_volume(a.volume24hr):>7} "
@@ -1223,9 +1324,6 @@ def config_from(args):
         min_rate=args.min_rate,
         fragile_drop=args.fragile_drop,
         hurdle_rate=args.hurdle_rate,
-        depth_haircut=args.depth_haircut,
-        fill_lookback_days=args.fill_lookback_days,
-        sweep_prior_weight=args.sweep_prior_weight,
         tape_markets=args.tape_markets,
         excluded_categories=args.exclude,
     )
@@ -1246,10 +1344,9 @@ def category_list(text):
 
 def cmd_scan(args):
     now = datetime.now(timezone.utc)
-    result = run_scan(config_from(args), now)
-    assessments = result.assessments
-
     conn = farm_db.open_db(args.db)
+    result = run_scan(config_from(args), now, load_prior(conn))
+    assessments = result.assessments
     store(conn, result, now)
     conn.close()
     print(f"Stored {len(assessments):,} assessments in {args.db}")

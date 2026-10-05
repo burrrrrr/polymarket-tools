@@ -37,7 +37,7 @@ FALLEN_BOOK = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
 def assessed_row(cid, slug, book, now, rank, question=None, days=100):
     market = RewardMarket(cid, slug, question or f"{slug}?", now + timedelta(days=days), False,
                           0.001, f"tok-{cid}", "No", 50.0, 0.035, 20.0)
-    a = reward_screener.assess(market, book, ScreenConfig(), now)
+    a = reward_screener.assess(market, book, ScreenConfig(), now, fill_cost.DEFAULT_PRIOR)
     assert not isinstance(a, reward_screener.Skip), a
     return reward_screener.scan_row(a._replace(rank_score=rank))
 
@@ -286,12 +286,12 @@ class ReviewTest(Writes):
             r'<dt class="lbl">([^<]+)<button[^>]*></button></dt>\s*<dd class="mono[^"]*">'
             r'([^<]*?)\s*<', fragment.group(1)))
 
-    def planned(self, p_true, capital):
+    def planned(self, p_true, capital, prior=fill_cost.DEFAULT_PRIOR):
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
         row = {**dict(self.row("0xddd")), "p_true": p_true, "naked_budget_usd": 25.0,
                "capital_usd": capital}
         return views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
-                                 self.now, False)
+                                 self.now, False, prior)
 
     def test_live_partial_projects_the_plan_out_of_band(self):
         fragment, figures = self.projection(self.live())
@@ -302,7 +302,20 @@ class ReviewTest(Writes):
         scan = json.loads(self.row("0xddd")["metrics"])
         self.assertIn(f"scan {scan['share'] * 100:.1f}%", fragment)
         self.assertIn(f"scan {views.usd(scan['est_daily_usd'])}", fragment)
-        self.assertIn("Fills from the prior alone", fragment)
+        self.assertIn("Fills from the built-in default prior: run a scan.", fragment)
+
+    def test_projection_names_the_scan_prior_it_values_fills_on(self):
+        rates = tuple(r * 3 for r in fill_cost.DEFAULT_PRIOR.rates)
+        prior = fill_cost.DEFAULT_PRIOR._replace(rates=rates, markets=37, at=self.now)
+        farm_db.store_scan(self.db, [], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now,
+                           prior=fill_cost.prior_to_json(prior))
+        fragment, figures = self.projection(self.live())
+        self.assertIn(f"Fills from the cross-market prior alone (37 markets, scan of "
+                      f"{views.stamp_local(self.now)})", fragment)
+        self.assertEqual(figures["Net/day"],
+                         views.usd(self.planned(0.97, None, prior).value.net_per_day))
+        self.assertNotEqual(figures["Net/day"],
+                            views.usd(self.planned(0.97, None).value.net_per_day))
 
     def test_projection_follows_the_terms_being_typed(self):
         full = self.projection(self.live())[1]
@@ -337,20 +350,22 @@ class ReviewTest(Writes):
 
     def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
         text = self.live()
-        for needle in ("Buy No 95.0c", "Buy Yes 1.7c", "bid at 95.0c", "ask at 98.3c",
-                       "our bid 95.0c", "best bid 95.5c", "best ask 97.0c",
-                       "longshot bid (mirror) 98.3c"):
-            self.assertIn(needle, text)
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
         fm = reward_farmer.farm_market(
             {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
              "capital_usd": None}, self.remote.info("0xddd"), cfg)
         target = reward_farmer.target_orders(
             fm, BUDGET_BOOK, reward_farmer.Position(), cfg, True,
-            reward_farmer.market_outlook(fm, None, None, cfg, self.now), bid_without_tape=True)
+            reward_farmer.market_outlook(fm, None, None, fill_cost.DEFAULT_PRIOR, cfg, self.now),
+            bid_without_history=True)
         self.assertEqual([i.slot.name for i in target.intents], ["FAV_BID", "LONG_BID"])
         for intent in target.intents:
             self.assertIn(f"{intent.slot.name} {views.shares(intent.size)}</td>", text)
+        bid = views.cents(target.intents[0].price)
+        for needle in (f"Buy No {bid}", "Buy Yes 1.7c", f"bid at {bid}", "ask at 98.3c",
+                       f"our bid {bid}", "best bid 95.5c", "best ask 97.0c",
+                       "longshot bid (mirror) 98.3c"):
+            self.assertIn(needle, text)
 
     def test_live_plan_follows_the_terms_being_typed(self):
         full = self.live()
@@ -360,11 +375,11 @@ class ReviewTest(Writes):
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
         self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
-        # Capped at 93.0c the bid scores 0.02, and with one assumed book-clearing
-        # sweep a month its fills cost more than that earns.
-        farm_db.put_settings(self.db, {"sweep_prior_weight": 1.0}, self.now)
-        self.assertIn("The farmer would place nothing: no favorite bid pays: best net "
-                      "-$0.09/day at 93.0c.", self.live(p_true="95"))
+        # Capped at 93.0c the bid scores 0.02, and at a 300% hurdle its fills
+        # cost more than that earns.
+        farm_db.put_settings(self.db, {"hurdle_rate": 3.0}, self.now)
+        self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
+                                                 r"bid pays: best net -\$\d+\.\d\d/day at 9\d\.\dc\.")
 
     def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
         from farm_console.app import utc_now
@@ -378,7 +393,9 @@ class ReviewTest(Writes):
         self.assertIn("Could not read the live book: ConnectionError: clob unreachable",
                       self.live())
         self.remote.fail_book = False
-        self.assertIn("Buy No 95.0c", self.live())
+        text = self.live()
+        self.assertIn("Buy No", text)
+        self.assertNotIn("Could not read the live book", text)
 
     def test_live_plan_without_p_true_values_the_market_at_the_book_midpoint(self):
         # p_true 96.0c, the book midpoint, less the 2c margin caps the bid at 94.0c.
@@ -386,29 +403,41 @@ class ReviewTest(Writes):
         self.assertIn("Buy No 94.0c", text)
         self.assertIn("valued at the book midpoint", text)
 
-    def preview(self, metrics_tape=None):
+    def preview(self, **stored):
+        """(live_review, the farmer's own target) of 0xddd with these metrics keys stored."""
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
         row = dict(self.row("0xddd"))
         metrics = json.loads(row["metrics"])
         row.update(p_true=0.97, naked_budget_usd=25.0, capital_usd=None,
-                   metrics=json.dumps({**metrics, "tape": metrics_tape}))
+                   metrics=json.dumps({**metrics, **stored}))
         live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
-                                 self.now, False)
+                                 self.now, False, fill_cost.DEFAULT_PRIOR)
         fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg)
-        outlook = reward_farmer.market_outlook(fm, None, fill_cost.tape_from_json(metrics_tape),
-                                               cfg, self.now)
+        history = fill_cost.history_from_json(stored.get("history"))
+        outlook = reward_farmer.market_outlook(fm, None, history, fill_cost.DEFAULT_PRIOR, cfg,
+                                               self.now)
         return live, reward_farmer.target_orders(fm, BUDGET_BOOK, reward_farmer.Position(),
-                                                 cfg, True, outlook, bid_without_tape=True)
+                                                 cfg, True, outlook, bid_without_history=True)
 
-    def test_live_plan_prices_fills_from_the_tape_the_scan_stored(self):
-        tape = fill_cost.Tape((fill_cost.Sweep(self.now.timestamp() - 60, 5000.0),), 30.0,
-                              fetched_at=self.now)
-        live, target = self.preview(fill_cost.tape_to_json(tape))
-        self.assertEqual(live.fill_source, "tape")
+    def test_live_plan_prices_fills_from_the_history_the_scan_stored(self):
+        busy = fill_cost.History((40, 30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0), 60.0, self.now, 0.90)
+        live, target = self.preview(history=fill_cost.history_to_json(busy))
+        self.assertEqual(live.fill_source, "history")
         self.assertEqual(live.value, target.fav.best)
-        prior, _ = self.preview()
-        self.assertEqual(prior.fill_source, "prior")
-        self.assertGreater(live.value.fills_per_day, prior.value.fills_per_day)
+        default, _ = self.preview()
+        self.assertEqual(default.fill_source, "default")
+        self.assertGreater(live.value.fills_per_day, default.value.fills_per_day)
+
+    def test_a_row_holding_only_an_old_tape_previews_on_the_prior(self):
+        old = {"sweeps": [[self.now.timestamp() - 60, 5000.0]], "span_days": 30.0,
+               "observed": True, "capped": False, "fetched_at": self.now.isoformat()}
+        live, target = self.preview(tape=old)
+        self.assertEqual(live.fill_source, "default")
+        self.assertEqual(live.value, target.fav.best)
+        self.set_metrics("0xddd", tape=old)
+        text = self.live()
+        self.assertNotIn("Could not read the live book", text)
+        self.assertIn("Fills from the built-in default prior", text)
 
     def test_live_region_of_a_managed_market_shows_the_book_without_a_plan(self):
         text = self.live(A)
@@ -667,18 +696,21 @@ class FakeScan:
         self.now = now
         self.release = threading.Event()
         self.configs = []
+        self.priors = []
         self.error = None
         self.rows = rows
+        self.fitted = fill_cost.DEFAULT_PRIOR._replace(markets=25, at=now)
 
-    def __call__(self, config, now, on_stage):
+    def __call__(self, config, now, prior, on_stage):
         self.configs.append(config)
+        self.priors.append(prior)
         on_stage("listing reward markets")
         self.release.wait(5)
         if self.error:
             raise self.error
         funnel = farm_db.ScanFunnel(now, 61.0, 18952, 4664, 1, {"favorite too cheap": 7397},
                                     {"one-sided book": 49})
-        return reward_screener.ScanResult(list(self.rows), {"0xnew"}, funnel)
+        return reward_screener.ScanResult(list(self.rows), {"0xnew"}, funnel, self.fitted)
 
 
 def scan_form(**changes):
@@ -693,7 +725,7 @@ class ScanTest(Writes):
         market = RewardMarket("0xnew", "novel", "Novel market?", self.now + timedelta(days=100),
                               False, 0.001, "tok-new", "No", 50.0, 0.035, 20.0)
         self.fake = FakeScan(self.now, [reward_screener.assess(market, FLOOR_BOOK, ScreenConfig(),
-                                                               self.now)])
+                                                               self.now, fill_cost.DEFAULT_PRIOR)])
         return {"scan": self.fake}
 
     def wait_for(self, phase):
@@ -730,6 +762,8 @@ class ScanTest(Writes):
         self.assertIn('name="min_fav" value="0.92"', page)
         self.assertEqual(farm_db.load_scan_params(self.db)["capital"], 300.0)
         self.assertEqual(farm_db.load_scan_funnel(self.db).listed, 18952)
+        self.assertEqual(self.fake.priors, [fill_cost.DEFAULT_PRIOR])
+        self.assertEqual(reward_screener.load_prior(self.db), self.fake.fitted)
 
     def test_a_failed_scan_says_why_and_stores_nothing(self):
         self.fake.error = RuntimeError("clob down")
@@ -739,6 +773,7 @@ class ScanTest(Writes):
         self.assertIn("RuntimeError: clob down", text)
         self.assertIsNone(farm_db.load_scan_funnel(self.db))
         self.assertIsNone(self.row("0xnew"))
+        self.assertEqual(reward_screener.load_prior(self.db), fill_cost.DEFAULT_PRIOR)
 
     def test_invalid_parameters_start_nothing_and_persist_nothing(self):
         for name, value in (("min_fav", "2"), ("capital", "0"), ("max_lead", "abc"),
@@ -778,7 +813,9 @@ class ScanTest(Writes):
 
     def test_stored_parameters_from_an_older_screener_still_load(self):
         farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01,
-                                          "fav_target_score": 0.45,
+                                          "fav_target_score": 0.45, "depth_haircut": 0.5,
+                                          "fill_lookback_days": 30.0,
+                                          "sweep_prior_weight": 0.25,
                                           "excluded_categories": ["politics", "golf"]}, self.now)
         resp = self.client.get("/discover")
         self.assertEqual(resp.status_code, 200)
@@ -790,8 +827,9 @@ class ScanTest(Writes):
         self.assertIn('name="max_lead" value="0.005"', resp.text)
         self.assertIn('name="fragile_drop" value="0.03"', resp.text)
         self.assertIn('name="naked_budget" value="10"', resp.text)
-        self.assertNotIn("bid_offset", resp.text)
-        self.assertNotIn("fav_target_score", resp.text)
+        for retired in ("bid_offset", "fav_target_score", "depth_haircut",
+                        "fill_lookback_days", "sweep_prior_weight"):
+            self.assertNotIn(retired, resp.text)
 
 
 class DiscoverTest(Writes):

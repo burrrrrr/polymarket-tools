@@ -51,15 +51,17 @@ GLOSSARY = {
                                        "plus the longshot bid."),
     "apr": Term("APR", "Estimated $/day ÷ capital × 365, before fill costs. A ranking figure, "
                        "not a forecast."),
-    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: the "
-                                       "taker sells seen on the market's tape that would get "
-                                       "past the bids ahead of ours, plus the assumed sweeps "
-                                       "that clear the book (Sweep prior weight per "
-                                       "lookback). With no tape read, it rests on that "
-                                       "assumption alone and is optimistic."),
+    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: its "
+                                       "size × how often a sell sweep reached that far below "
+                                       "the midpoint in the market's last 60 days, at most "
+                                       "once an hour, shrunk toward the rate the last scan "
+                                       "pooled across markets. Without the market's history "
+                                       "it is that pooled rate alone, and the farmer does not "
+                                       "bid."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
                                        "minus p_true discounted at the hurdle rate to the end "
-                                       "date. Without a p_true it uses the midpoint."),
+                                       "date. Without a p_true it uses the midpoint. A sweep "
+                                       "that reaches the bid fills all of it."),
     "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
                                "this."),
     "net_daily": Term("Net/day", "The favorite bid's share of the pool less what its fills "
@@ -233,22 +235,14 @@ GLOSSARY = {
                                        "discounted at this rate to the end date. On a "
                                        "short-dated market that cost is negative and fills "
                                        "are welcome."),
-    "depth_haircut": Term("Depth haircut", "The share of the bids ahead of ours a sell sweep "
-                                           "must get through before it reaches our favorite "
-                                           "bid. Below 1 because some of that depth is "
-                                           "cancelled before a sweep arrives."),
-    "fill_lookback_days": Term("Fill lookback", "Days of taker trades the fill estimate "
-                                                "reads. The data API serves only the last "
-                                                "1,800 or so, so a busy market's estimate "
-                                                "covers less."),
-    "sweep_prior_weight": Term("Sweep prior weight", "Sweeps per lookback assumed to clear "
-                                                     "the whole book, on top of the ones "
-                                                     "seen, so a quiet market never reads as "
-                                                     "never filling."),
-    "tape_markets": Term("Markets with a tape", "How many of the top markets read their "
-                                                "taker trades to estimate fills. The rest "
-                                                "rank on the prior alone, which is "
-                                                "optimistic."),
+    "tape_markets": Term("Markets read for fills", "How many of the top markets read their "
+                                                   "fill history: 60 days of trades and "
+                                                   "midpoints. Up to 60 more drawn at random "
+                                                   "read theirs too, and the scan pools "
+                                                   "the random ones' sweeps into the fill "
+                                                   "prior every market is valued on, since "
+                                                   "the top ones are the busiest; a market "
+                                                   "not read has that prior alone."),
     "heartbeat": Term("Heartbeat", "If the farmer stops sending heartbeats for 10s, "
                                    "Polymarket cancels every order owned by these API "
                                    "credentials, possibly including your other tools' "

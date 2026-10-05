@@ -328,11 +328,11 @@ class Card:
     naked_paused: bool
     status: str
     # The farmer's favorite bid economics from its FAV_BID slot, the reason it
-    # has none, and the tape behind them; absent from farm_state rows that
-    # predate fill-cost pricing.
+    # has none, and the fill history behind them; absent from farm_state rows
+    # that predate fill-cost pricing, and history from rows that predate it.
     economics: Optional[dict] = None
     fav_reason: str = ""
-    tape: Optional[dict] = None
+    history: Optional[fill_cost.History] = None
 
 
 def card(market, state, status, now):
@@ -374,7 +374,8 @@ def card(market, state, status, now):
         naked_pct=round(min(100.0, state.naked_used_usd / budget * 100), 1) if budget else 0.0,
         position=state.position, paused=market.paused, naked_paused=market.naked_paused,
         status=market.status, economics=fav_view.get("economics"),
-        fav_reason=fav_view.get("fav_reason") or "", tape=fav_view.get("tape"),
+        fav_reason=fav_view.get("fav_reason") or "",
+        history=fill_cost.history_from_json(fav_view.get("history")),
     )
 
 
@@ -1004,10 +1005,12 @@ class LiveReview:
     bids: list
     outside_asks: float
     outside_bids: float
-    # The favorite bid's economics, whether its fills came from the scan's
-    # stored tape or the prior alone, and the daily pool it was valued against.
+    # The favorite bid's economics, where its fills came from (as
+    # fill_cost.fill_source names it) with the fill prior behind them, and
+    # the daily pool it was valued against.
     value: Optional[reward_farmer.QuoteValue] = None
-    fill_source: str = "prior"
+    fill_source: str = "default"
+    prior: Optional[fill_cost.Prior] = None
     pool_per_day: Optional[float] = None
 
     @property
@@ -1029,23 +1032,23 @@ def rewards_state(info, condition_id, total_rates):
     return active
 
 
-def live_review(row, info, levels, total_rates, cfg, now, managed):
+def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     """row: the market's farm.db row carrying the terms to preview; levels: the
     favorite token's live book; total_rates: as reward_farmer.rewards_active
-    takes it. Planning is the farmer's own, from a zero farm position, since a
-    new market's holdings become its baseline. A market the farmer already
-    manages gets the book without a plan.
+    takes it; prior: the stored fill prior. Planning is the farmer's own, from
+    a zero farm position, since a new market's holdings become its baseline.
+    A market the farmer already manages gets the book without a plan.
 
     A row with no p_true is valued at the book midpoint, as the scan values
-    it. Fills come from the tape the scan stored, or the prior alone without
-    one; the console never reads a tape itself, and the farmer would not bid
-    until it has read one."""
+    it. Fills come from the history the scan stored shrunk toward prior, or
+    prior alone without one; the console never reads a history itself, and
+    the farmer would not bid until it has read one."""
     metrics = json.loads(row["metrics"])
     fav = metrics["market"].get("fav_outcome") or "favorite"
     long = OTHER_OUTCOME.get(fav, "longshot")
     book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
     target, note, pool = reward_farmer.Target(book_mid, []), "", None
-    tape = fill_cost.tape_from_json(metrics.get("tape"))
+    history = fill_cost.history_from_json(metrics.get("history"))
     if row["p_true"] is None:
         row = {**dict(row), "p_true": book_mid}
     fm = reward_farmer.farm_market(row, info, cfg)
@@ -1063,10 +1066,10 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
         state = reward_farmer.step_state(reward_farmer.State(reward_farmer.Phase.QUOTING),
                                          obs, now, cfg)
         if state.phase is reward_farmer.Phase.QUOTING:
-            outlook = reward_farmer.market_outlook(fm, total_rates, tape, cfg, now)
+            outlook = reward_farmer.market_outlook(fm, total_rates, history, prior, cfg, now)
             pool = outlook.rate_per_day
             target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True,
-                                                 outlook, bid_without_tape=True)
+                                                 outlook, bid_without_history=True)
             if not target.intents:
                 note = f"The farmer would place nothing: {target.fav.reason}."
         else:
@@ -1119,7 +1122,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
     return LiveReview(now, fav, long, book_mid, mid, note, orders, strip,
                       list(reversed(ladder(ask_rows))), ladder(bid_rows),
                       outside_asks, outside_bids, target.fav.best,
-                      "tape" if tape is not None else "prior", pool)
+                      fill_cost.fill_source(history, prior, cfg.min_fav), prior, pool)
 
 
 @dataclass(frozen=True)

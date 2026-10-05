@@ -1,12 +1,14 @@
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import httpx
 
+import farm_db
 import reward_screener
 import fill_cost
-from fill_cost import Hit, Sweep, Tape
+from fill_cost import DISTANCES, FillCurve, History, Hit
 from reward_screener import (
     Levels,
     Mode,
@@ -18,8 +20,6 @@ from reward_screener import (
     created_mid,
     fav_bid_candidates,
     fav_ceiling,
-    fetch_tape,
-    fill_params,
     parse_gamma,
     parse_hits,
     plan_at,
@@ -133,12 +133,21 @@ class LongshotBidTest(unittest.TestCase):
 # TIGHT_BOOK with a bid behind the best one, so it is not fragile.
 DEEP_BOOK = TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0), (0.895, 1000.0)])
 SCAN_NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
-NO_PRIOR = fill_params(CONFIG._replace(sweep_prior_weight=0.0))
+# A scan's fill prior: the default rates, fit from 40 markets.
+PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=SCAN_NOW)
 
 
-def outlook(sweeps=(), params=NO_PRIOR, years=0.25, rate=100.0):
-    return Outlook(rate, years, Tape(tuple(Sweep(n, x) for n, x in enumerate(sweeps)), 30.0),
-                   params)
+def curve(*rates):
+    """A FillCurve with these rates from the first of DISTANCES, the last one
+    held to the end."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True)
+
+
+NO_FILLS = curve(0.0)
+
+
+def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40):
+    return Outlook(rate, years, fills, hurdle_rate)
 
 
 class FavBidCandidatesTest(unittest.TestCase):
@@ -163,22 +172,30 @@ class ValueQuoteTest(unittest.TestCase):
     THEIR_Q = (0.025 / 0.035) ** 2 * 100
 
     def test_net_is_the_pool_share_less_fills_times_the_discounted_loss(self):
-        # Behind 100 shares, haircut to 50: a 300-share sweep fills all 200
-        # shares, once in 10 days. A year at 40%: 0.98 / 1.4 = 0.70.
-        params = fill_cost.FillParams(0.40, 0.5, 30.0, 0.0)
-        view = Outlook(100.0, 1.0, Tape((Sweep(0, 300.0),), 10.0), params)
+        # 2c under the 0.96 midpoint a sweep reaches the bid 0.1 times a day and
+        # fills all 200 shares. A year at 40%: 0.98 / 1.4 = 0.70.
+        fills = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
-                                            (0.94, 200.0), 190.0, 0.98, view)
+                                            (0.94, 200.0), 190.0, 0.98, outlook(fills, years=1.0))
         self.assertAlmostEqual(value.reward_per_day, 50.0)
-        self.assertEqual(value.ahead, 100.0)
         self.assertAlmostEqual(value.fills_per_day, 20.0)
         self.assertAlmostEqual(value.loss_per_share, 0.24)
         self.assertAlmostEqual(value.net_per_day, 50.0 - 20.0 * 0.24)
         self.assertAlmostEqual(value.net_apr, (50.0 - 4.8) * 365 / 190.0)
 
+    def test_the_bid_fills_at_its_distance_below_the_mid_it_is_given(self):
+        # 1.25c under the midpoint, halfway between the 1c and 1.5c rates.
+        fills = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
+                                            (0.9475, 100.0), 95.0, 0.98, outlook(fills))
+        self.assertAlmostEqual(value.fills_per_day, 100 * 0.175)
+        moved = reward_screener.value_quote(self.BOOK, 0.9625, 0.035, 20.0, self.THEIR_Q,
+                                            (0.9475, 100.0), 95.0, 0.98, outlook(fills))
+        self.assertAlmostEqual(moved.fills_per_day, 100 * 0.15)
+
     def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
-                                            5.0, 0.98, outlook(sweeps=(1e6,)))
+                                            5.0, 0.98, outlook(curve(1e6)))
         self.assertEqual(value.fills_per_day, 0.0)
         self.assertAlmostEqual(value.net_per_day, 50.0)
 
@@ -189,39 +206,45 @@ class PlanQuotesTest(unittest.TestCase):
         self.assertEqual(plan.fav_bid_price, 0.955)
         self.assertEqual(value.fills_per_day, 0.0)
 
-    def test_sweeps_that_clear_the_top_of_the_book_push_the_bid_behind_it(self):
-        # 510-share sweeps fill all of a bid behind the 5-share dust at 0.955,
-        # but only 7.5 shares of one behind the 1,000 bid at 0.95.
-        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(sweeps=[510.0] * 60),
-                                  0.96)
-        self.assertLess(plan.fav_bid_price, 0.95)
+    def test_sweeps_through_the_top_of_the_book_push_the_bid_below_where_they_reach(self):
+        # A sweep reaches 1c under the 0.96 midpoint every day and never 1.5c;
+        # a fill there loses 6c, so the bid steps down to 1.5c under or more.
+        swept = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(swept), 0.96)
+        self.assertLessEqual(plan.fav_bid_price, 0.945)
         self.assertEqual(value.size, plan.fav_bid_size)
-        self.assertAlmostEqual(value.fills_per_day, 60 * 7.5 / 30)
+        self.assertEqual(value.fills_per_day, 0.0)
 
     def test_fills_costing_more_than_any_bid_earns_plan_nothing(self):
-        # 30 full clears a month, two years out at a 1,000% hurdle.
-        params = fill_params(CONFIG._replace(hurdle_rate=10.0, sweep_prior_weight=30.0))
-        self.assertEqual(plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(params=params, years=2.0),
-                                     0.96),
+        # A sweep through every bid each day, two years out at a 1,000% hurdle.
+        self.assertEqual(plan_quotes(MARKET, TIGHT_BOOK, CONFIG,
+                                     outlook(curve(1.0), years=2.0, hurdle_rate=10.0), 0.96),
                          Skip("fills cost more than the rewards"))
 
 
 class AssessTest(unittest.TestCase):
     def test_reward_stays_gross_and_the_rank_is_the_net_yield(self):
-        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW)
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
         self.assertEqual(a.fill_source, "prior")
-        self.assertIsNone(a.tape)
+        self.assertIsNone(a.history)
         self.assertGreater(a.fill_cost_usd, 0)
         self.assertAlmostEqual(a.est_daily_usd - a.fill_cost_usd, a.net_daily_usd)
         self.assertAlmostEqual(a.apr, a.est_daily_usd / a.capital_usd * 365)
         self.assertAlmostEqual(a.rank_score,
                                a.net_daily_usd / a.capital_usd * min(a.days_left, 90))
+        default = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, fill_cost.DEFAULT_PRIOR)
+        self.assertEqual(default.fill_source, "default")
 
-    def test_a_tape_replaces_the_prior_and_is_stored(self):
-        tape = Tape((Sweep(SCAN_NOW.timestamp() - 60, 510.0),), 30.0, fetched_at=SCAN_NOW)
-        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, tape)
-        self.assertEqual(a.fill_source, "tape")
-        self.assertEqual(fill_cost.tape_from_json(a.tape), tape)
+    def test_a_history_prices_the_fills_and_is_stored(self):
+        history = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90)
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR, history)
+        self.assertEqual(a.fill_source, "history")
+        self.assertEqual(fill_cost.history_from_json(a.history), history)
+        fills = fill_cost.fill_curve(history, PRIOR, CONFIG.min_fav)
+        self.assertAlmostEqual(a.fills_per_day,
+                               a.plan.fav_bid_size * fills.per_day(a.mid - a.plan.fav_bid_price))
+        prior_only = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
+        self.assertNotAlmostEqual(a.fills_per_day, prior_only.fills_per_day)
 
 
 def listing_item(cid, rate):
@@ -267,33 +290,80 @@ class ExcludedCategoryTest(unittest.TestCase):
 class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
-    def scan(self, tapes):
+    def scan(self, histories, prior=fill_cost.DEFAULT_PRIOR, tape_markets=2, sample=0,
+             books={}):
         asked = []
 
-        def fake_tapes(http, markets, now, lookback_days):
+        def fake_histories(http, markets, now, floor):
             asked.append([m.condition_id for m in markets])
-            return tapes
+            return {cid: h for cid, h in histories.items() if cid in asked[-1]}
 
         with mock.patch.multiple(
                 reward_screener,
                 fetch_paginated=lambda http, path: [listing_item(c, r) for c, r in self.RATES.items()],
                 fetch_total_rates=lambda http: dict(self.RATES),
-                fetch_levels=lambda http, ids: {t: DEEP_BOOK for t in ids},
+                fetch_levels=lambda http, ids: {t: books.get(t, DEEP_BOOK) for t in ids},
                 fetch_gamma=lambda http, ids: {},
-                fetch_tapes=fake_tapes), mock.patch("builtins.print"):
-            result = reward_screener.run_scan(CONFIG._replace(tape_markets=2), SCAN_NOW)
+                fetch_histories=fake_histories,
+                PRIOR_SAMPLE=sample), mock.patch("builtins.print"):
+            result = reward_screener.run_scan(CONFIG._replace(tape_markets=tape_markets),
+                                              SCAN_NOW, prior)
         return result, asked
 
-    def test_only_the_top_markets_read_a_tape_and_one_whose_fills_cost_too_much_drops(self):
-        # 100 sweeps a month that clear any bid, held two years at 40%.
-        heavy = Tape(tuple(Sweep(SCAN_NOW.timestamp() - n, 1e6) for n in range(100)), 30.0,
-                     fetched_at=SCAN_NOW)
-        result, asked = self.scan({"0x1": heavy})
+    # A sweep through every bid each hour for 60 days, held two years at 40%.
+    HEAVY = History((1440,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90)
+    BUSY = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90)
+    QUIET = History((0,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90)
+
+    def test_only_the_top_markets_read_a_history_and_one_whose_fills_cost_too_much_drops(self):
+        result, asked = self.scan({"0x1": self.HEAVY})
         self.assertEqual(asked, [["0x1", "0x2"]])
         self.assertEqual([a.market.condition_id for a in result.assessments], ["0x2", "0x3"])
-        self.assertEqual([a.fill_source for a in result.assessments], ["prior", "prior"])
+        self.assertEqual([a.fill_source for a in result.assessments], ["default", "default"])
         self.assertEqual(result.funnel.assess_skips, {"fills cost more than the rewards": 1})
         self.assertEqual(result.funnel.assessed, 2)
+        self.assertIsNone(result.prior)
+
+    def test_the_top_markets_histories_alone_fit_no_prior(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 1):
+            result, asked = self.scan({"0x1": self.QUIET, "0x2": self.QUIET})
+        self.assertEqual(asked, [["0x1", "0x2"]])
+        self.assertIsNone(result.prior)
+
+    def test_the_prior_is_fit_from_the_random_sample_and_each_sampled_market_its_own(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 1):
+            result, asked = self.scan(
+                {"0x1": self.BUSY, "0x2": self.QUIET, "0x3": self.QUIET},
+                tape_markets=1, sample=3)
+        self.assertEqual((asked[0][0], sorted(asked[0])), ("0x1", ["0x1", "0x2", "0x3"]))
+        self.assertEqual(result.prior.markets, 3)
+        self.assertEqual(result.prior.rates,
+                         tuple(e / 180.0 for e in self.BUSY.events))
+        self.assertEqual({a.market.condition_id: a.fill_source for a in result.assessments},
+                         {"0x1": "history", "0x2": "history", "0x3": "history"})
+
+    def test_the_sample_draws_markets_the_stored_prior_dropped_but_not_unpriced_ones(self):
+        steep = fill_cost.Prior((50.0,) * len(DISTANCES), (1000.0,) * len(DISTANCES), 1,
+                                SCAN_NOW, 0.90)
+        cheap = Levels(bids=[(0.80, 1000.0)], asks=[(0.82, 1000.0)], tick=0.001)
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
+            result, asked = self.scan({c: self.QUIET for c in self.RATES}, steep,
+                                      sample=3, books={"fav-0x3": cheap})
+        self.assertEqual(sorted(asked[0]), ["0x1", "0x2"])
+        self.assertEqual(result.prior.markets, 2)
+        self.assertEqual([a.market.condition_id for a in result.assessments], ["0x1", "0x2"])
+
+    def test_every_market_is_valued_again_on_the_prior_the_sample_fit(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
+            result, asked = self.scan({c: self.QUIET for c in self.RATES}, PRIOR,
+                                      tape_markets=0, sample=2)
+        self.assertEqual((result.prior.markets, result.prior.at), (2, SCAN_NOW))
+        [unread_id] = set(self.RATES) - set(asked[0])
+        unread = {a.market.condition_id: a for a in result.assessments}[unread_id]
+        self.assertEqual(unread.fill_source, "prior")
+        fills = fill_cost.fill_curve(None, result.prior, CONFIG.min_fav)
+        self.assertAlmostEqual(unread.fills_per_day, unread.plan.fav_bid_size
+                               * fills.per_day(unread.mid - unread.plan.fav_bid_price))
 
 
 class FragileMidTest(unittest.TestCase):
@@ -302,32 +372,32 @@ class FragileMidTest(unittest.TestCase):
     def test_one_bid_holding_the_favorite_above_min_fav_is_skipped(self):
         # The live DeepSeek book: a lone 20-share bid at 79c under asks at 99.7c.
         lone = Levels(bids=[(0.943, 20.0), (0.79, 20.0)], asks=[(0.985, 100.0)], tick=0.001)
-        self.assertEqual(assess(MARKET, lone, CONFIG, self.NOW), Skip("fragile midpoint"))
+        self.assertEqual(assess(MARKET, lone, CONFIG, self.NOW, PRIOR), Skip("fragile midpoint"))
 
     def test_last_qualifying_bid_counts_as_fragile(self):
         self.assertEqual(assess(MARKET, TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0)]),
-                                CONFIG, self.NOW), Skip("fragile midpoint"))
+                                CONFIG, self.NOW, PRIOR), Skip("fragile midpoint"))
 
     def test_dust_does_not_count_as_the_best_bid(self):
         # Pulling the 0.95 level leaves dust at 0.955 and a qualifying bid at 0.895:
         # (0.895 + 0.97) / 2 = 0.9325 is 2.75c under the 0.96 midpoint. Measured
         # from a midpoint that counted the dust, 0.9625, the fall would reach 3c.
         deep = TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0), (0.895, 1000.0)])
-        self.assertNotIsInstance(assess(MARKET, deep, CONFIG, self.NOW), Skip)
+        self.assertNotIsInstance(assess(MARKET, deep, CONFIG, self.NOW, PRIOR), Skip)
 
     def test_a_fall_of_fragile_drop_when_the_best_bid_leaves_is_fragile(self):
         # The Mistral book before its 0.93 bid left: pulling it drops the midpoint
         # from (0.93 + 0.997) / 2 = 0.9635 to (0.85 + 0.997) / 2 = 0.9235, still above
         # min_fav but 4c down: FAV_BID would follow from 0.935 (score 0.404) to 0.855 (0.027).
-        self.assertEqual(assess(MISTRAL_MARKET, MISTRAL_BOOK, CONFIG, self.NOW),
+        self.assertEqual(assess(MISTRAL_MARKET, MISTRAL_BOOK, CONFIG, self.NOW, PRIOR),
                          Skip("fragile midpoint"))
         self.assertNotIsInstance(assess(MISTRAL_MARKET, MISTRAL_BOOK,
-                                        CONFIG._replace(fragile_drop=0.05), self.NOW), Skip)
+                                        CONFIG._replace(fragile_drop=0.05), self.NOW, PRIOR), Skip)
 
     def test_a_smaller_fall_when_the_best_bid_leaves_is_not_fragile(self):
         # A 0.91 bid behind it holds the midpoint at (0.91 + 0.997) / 2 = 0.9535, 1c down.
         backed = MISTRAL_BOOK._replace(bids=[(0.93, 487.0), (0.91, 100.0), (0.85, 20.0)])
-        self.assertNotIsInstance(assess(MISTRAL_MARKET, backed, CONFIG, self.NOW), Skip)
+        self.assertNotIsInstance(assess(MISTRAL_MARKET, backed, CONFIG, self.NOW, PRIOR), Skip)
 
 
 class ResolutionSignalTest(unittest.TestCase):
@@ -357,90 +427,193 @@ class ResolutionSignalTest(unittest.TestCase):
         self.assertIsNone(resolution_signal(parse_gamma({"slug": "m"})))
 
 
-TAPE_NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+HISTORY_NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 FAV_TOKEN, LONG_TOKEN = "fav-token", "long-token"
 
 
-def trade(side, asset, size, seconds_ago):
-    return {"side": side, "asset": asset, "size": size,
-            "timestamp": int(TAPE_NOW.timestamp()) - seconds_ago, "price": 0.5}
+def priced(side, asset, price, tx="0xt", wallet="0xw", size=10.0, seconds_ago=60):
+    return {"transactionHash": tx, "proxyWallet": wallet, "side": side, "asset": asset,
+            "size": size, "price": price, "timestamp": int(HISTORY_NOW.timestamp()) - seconds_ago}
 
 
 class ParseHitsTest(unittest.TestCase):
-    def test_only_trades_that_sell_into_favorite_bids_are_hits(self):
-        rows = [
-            trade("SELL", FAV_TOKEN, 100, 10),
-            trade("BUY", LONG_TOKEN, 40, 20),
-            trade("BUY", FAV_TOKEN, 999, 30),
-            trade("SELL", LONG_TOKEN, 999, 40),
-        ]
-        hits, _ = parse_hits(rows, FAV_TOKEN)
-        now = TAPE_NOW.timestamp()
-        self.assertEqual(hits, [Hit(now - 10, 100.0), Hit(now - 20, 40.0)])
+    AT = HISTORY_NOW.timestamp() - 60
 
-    def test_a_malformed_row_is_no_hit_but_still_dates_the_history(self):
-        rows = [trade("SELL", FAV_TOKEN, 100, 10), trade("SELL", FAV_TOKEN, None, 500)]
-        hits, oldest = parse_hits(rows, FAV_TOKEN)
+    def test_a_hit_reaches_as_deep_as_the_makers_it_filled(self):
+        taker = [priced("SELL", FAV_TOKEN, 0.95, wallet="0xtaker")]
+        makers = [priced("BUY", FAV_TOKEN, 0.94, wallet="0xm1"),
+                  priced("SELL", LONG_TOKEN, 0.07, wallet="0xm2"),
+                  priced("BUY", FAV_TOKEN, 0.90, tx="0xother", wallet="0xm3")]
+        hits = parse_hits(taker, taker + makers, FAV_TOKEN)
         self.assertEqual(len(hits), 1)
-        self.assertEqual(oldest, TAPE_NOW.timestamp() - 500)
+        self.assertAlmostEqual(hits[0].deep, 0.93)
+
+    def test_buying_the_other_outcome_hits_favorite_bids_at_one_minus_its_price(self):
+        taker = [priced("BUY", LONG_TOKEN, 0.06), priced("BUY", FAV_TOKEN, 0.97, tx="0xlift"),
+                 priced("SELL", LONG_TOKEN, 0.05, tx="0xask")]
+        hits = parse_hits(taker, taker, FAV_TOKEN)
+        self.assertEqual(len(hits), 1)
+        self.assertAlmostEqual(hits[0].deep, 0.94)
+        self.assertEqual(hits[0].at, self.AT)
+
+    def test_maker_rows_are_what_is_left_after_each_taker_row_is_removed_once(self):
+        # Two taker orders in one transaction buy the favorite at 0.90; the
+        # full listing repeats them and adds one maker with the same key.
+        lift = priced("BUY", FAV_TOKEN, 0.90)
+        taker = [priced("SELL", FAV_TOKEN, 0.95), lift, lift]
+        maker = [priced("BUY", FAV_TOKEN, 0.94, wallet="0xm")]
+        self.assertAlmostEqual(parse_hits(taker, taker + maker, FAV_TOKEN)[0].deep, 0.94)
+        self.assertAlmostEqual(parse_hits(taker, taker + maker + [lift], FAV_TOKEN)[0].deep, 0.90)
+
+    def test_malformed_rows_are_dropped(self):
+        good = priced("SELL", FAV_TOKEN, 0.95)
+        bad = [
+            {**good, "transactionHash": None}, {**good, "asset": ""},
+            {**good, "side": "HOLD", "asset": LONG_TOKEN},
+            {**good, "size": 0}, {**good, "size": "lots"}, {**good, "price": 1.0},
+            {**good, "price": None}, {**good, "timestamp": None}, "row", None,
+        ]
+        self.assertEqual(parse_hits(bad, bad, FAV_TOKEN), [])
+        deep_but_broken = {**priced("BUY", FAV_TOKEN, 0.80, wallet="0xm"), "size": -5}
+        hits = parse_hits([good] + bad, [good, deep_but_broken] + bad, FAV_TOKEN)
+        self.assertEqual(hits, [Hit(self.AT, 0.95)])
 
 
-def trades_api(pages, statuses=()):
-    """An httpx client whose /trades answers pages[offset // 1000], after statuses."""
+DAY_S = 86400
+
+
+def hourly_mids(price, days=70):
+    return [(int(HISTORY_NOW.timestamp()) - 3600 * n, price) for n in range(days * 24)]
+
+
+def history_api(all_pages, taker_pages=(), mids=(), statuses=()):
+    """An httpx client serving /trades pages by takerOnly and offset, and the
+    mids inside each /prices-history interval, after statuses."""
     calls = []
 
     def handle(request):
         calls.append(request)
         if len(calls) <= len(statuses) and statuses[len(calls) - 1] == 429:
             return httpx.Response(429, headers={"retry-after": "2"})
-        offset = int(request.url.params["offset"])
-        page = pages[offset // 1000] if offset // 1000 < len(pages) else []
-        return httpx.Response(200, json=page)
+        params = request.url.params
+        if request.url.path == "/prices-history":
+            lo, hi = int(params["startTs"]), int(params["endTs"])
+            return httpx.Response(200, json={"history": [
+                {"t": t, "p": p} for t, p in mids
+                if not isinstance(t, (int, float)) or lo <= t <= hi]})
+        pages = taker_pages if params["takerOnly"] == "true" else all_pages
+        index = int(params["offset"]) // 1000
+        return httpx.Response(200, json=pages[index] if index < len(pages) else [])
 
     return httpx.Client(transport=httpx.MockTransport(handle)), calls
 
 
-class FetchTapeTest(unittest.TestCase):
-    def test_a_history_cut_by_the_row_cap_spans_only_the_rows_it_covers(self):
-        # 1,000 rows over the last 5 days, then 800 reaching back 8 days.
-        first = [trade("SELL", FAV_TOKEN, 1, 432 * n) for n in range(1000)]
-        second = [trade("BUY", FAV_TOKEN, 1, 432000 + 324 * n) for n in range(1, 801)]
-        http, calls = trades_api([first, second])
-        tape = fetch_tape(http, "0xc0nd", FAV_TOKEN, TAPE_NOW, 30.0)
-        self.assertEqual(len(calls), 2)
-        self.assertEqual([c.url.params["offset"] for c in calls], ["0", "1000"])
+def listed(calls, path):
+    return [c.url.params for c in calls if c.url.path == path]
+
+
+class FetchHistoryTest(unittest.TestCase):
+    def test_a_history_reads_all_rows_then_taker_rows_then_mids(self):
+        taker = [priced("SELL", FAV_TOKEN, 0.95, tx="0xa", wallet="0xt", seconds_ago=DAY_S)]
+        maker = [priced("BUY", FAV_TOKEN, 0.93, tx="0xa", wallet="0xm", seconds_ago=DAY_S)]
+        http, calls = history_api([taker + maker], [taker], hourly_mids(0.96))
+        history = reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        self.assertEqual([p["takerOnly"] for p in listed(calls, "/trades")], ["false", "true"])
+        self.assertEqual(calls[-1].url.path, "/prices-history")
+        reach = [history.events[fill_cost.DISTANCES.index(d)] for d in (0.02, 0.03)]
+        self.assertEqual(reach, [1, 0])
+        self.assertAlmostEqual(history.days, 60.0)
+        self.assertEqual((history.read_at, history.floor), (HISTORY_NOW, 0.90))
+
+    def test_mids_are_read_in_chunks_of_at_most_fourteen_days(self):
+        http, calls = history_api([[]], [[]], hourly_mids(0.96))
+        reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        chunks = [(int(p["startTs"]), int(p["endTs"])) for p in listed(calls, "/prices-history")]
+        self.assertEqual(len(chunks), 5)
+        self.assertTrue(all(0 < hi - lo <= 14 * DAY_S for lo, hi in chunks), chunks)
+        self.assertEqual([lo for lo, _ in chunks[1:]], [hi for _, hi in chunks[:-1]])
+        self.assertEqual(chunks[-1][1], int(HISTORY_NOW.timestamp()))
+        self.assertEqual(listed(calls, "/prices-history")[0]["fidelity"], "1")
+
+    def test_mids_repeated_across_chunks_or_malformed_are_read_once_or_dropped(self):
+        end = int(HISTORY_NOW.timestamp())
+        start = end - 20 * DAY_S
+        mids = [(start + 14 * DAY_S, 0.95), (start + 7, "x"), (None, 0.95), (start + 9, 0.94)]
+        http, _ = history_api([[]], mids=mids)
+        self.assertEqual(reward_screener.fetch_mids(http, FAV_TOKEN, start, end),
+                         [(start + 9, 0.94), (start + 14 * DAY_S, 0.95)])
+
+    def test_a_listing_cut_by_the_row_cap_is_complete_only_from_its_oldest_row(self):
+        # 2,000 rows reaching back 10 days: the taker rows are then read only
+        # back to there, and the history covers those 10 days.
+        first = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432 * n) for n in range(1000)]
+        second = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432000 + 432 * n)
+                  for n in range(1, 1001)]
+        taker = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=3600 * n) for n in range(1000)]
+        http, calls = history_api([first, second], [taker, taker], hourly_mids(0.96))
+        history = reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        trades = listed(calls, "/trades")
+        self.assertEqual([(p["takerOnly"], p["offset"]) for p in trades],
+                         [("false", "0"), ("false", "1000"), ("true", "0")])
+        self.assertAlmostEqual(history.days, 10.0)
+        oldest = HISTORY_NOW.timestamp() - 10 * DAY_S
+        self.assertEqual(int(listed(calls, "/prices-history")[0]["startTs"]), int(oldest - 60 - 3600))
+
+    def test_a_full_page_reaching_past_the_cutoff_is_complete_from_the_cutoff(self):
+        page = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=3600 * n) for n in range(1000)]
+        http, calls = history_api([page, page])
+        cutoff = HISTORY_NOW.timestamp() - 30 * DAY_S
+        rows, complete_from = reward_screener.fetch_trades(http, "0xc0nd", False, cutoff)
+        self.assertEqual((len(calls), len(rows), complete_from), (1, 1000, cutoff))
+
+    def test_a_short_page_is_the_whole_listing(self):
+        http, calls = history_api([], [[priced("SELL", FAV_TOKEN, 0.95)]])
+        cutoff = HISTORY_NOW.timestamp() - 30 * DAY_S
+        rows, complete_from = reward_screener.fetch_trades(http, "0xc0nd", True, cutoff)
+        self.assertEqual((len(calls), len(rows), complete_from), (1, 1, cutoff))
         self.assertEqual(calls[0].url.params["takerOnly"], "true")
-        self.assertTrue(tape.capped)
-        self.assertAlmostEqual(tape.span_days, 8.0)
-        self.assertAlmostEqual(sum(s.shares for s in tape.sweeps), 1000.0)
-
-    def test_a_full_page_reaching_past_the_lookback_reads_no_further(self):
-        page = [trade("SELL", FAV_TOKEN, 1, 3600 * n) for n in range(1000)]
-        http, calls = trades_api([page, page])
-        tape = fetch_tape(http, "0xc0nd", FAV_TOKEN, TAPE_NOW, 30.0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual((tape.span_days, tape.capped), (30.0, False))
-        self.assertEqual(len(tape.sweeps), 721)
-
-    def test_a_short_page_is_the_whole_history(self):
-        http, calls = trades_api([[trade("SELL", FAV_TOKEN, 5, 60)]])
-        tape = fetch_tape(http, "0xc0nd", FAV_TOKEN, TAPE_NOW, 30.0)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual((tape.span_days, tape.capped, tape.observed), (30.0, False, True))
 
     def test_a_rate_limited_read_waits_and_retries(self):
-        http, calls = trades_api([[trade("SELL", FAV_TOKEN, 5, 60)]], statuses=(429,))
+        http, calls = history_api([[priced("SELL", FAV_TOKEN, 0.95)]], statuses=(429,))
         with mock.patch("time.sleep") as sleep:
-            tape = fetch_tape(http, "0xc0nd", FAV_TOKEN, TAPE_NOW, 30.0)
+            rows, _ = reward_screener.fetch_trades(http, "0xc0nd", False, 0.0)
         self.assertEqual(len(calls), 2)
         self.assertEqual([c.args for c in sleep.call_args_list], [(2.0,)])
-        self.assertEqual(len(tape.sweeps), 1)
+        self.assertEqual(len(rows), 1)
 
-    def test_a_failed_market_is_left_out_of_the_tapes(self):
+    def test_a_failed_market_is_left_out_of_the_histories(self):
         http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
-        with mock.patch("builtins.print"):
-            tapes = reward_screener.fetch_tapes(http, [MARKET], TAPE_NOW, 30.0)
-        self.assertEqual(tapes, {})
+        with mock.patch("builtins.print") as printed:
+            histories = reward_screener.fetch_histories(http, [MARKET], HISTORY_NOW, 0.90)
+        self.assertEqual(histories, {})
+        self.assertIn("test-market", printed.call_args.args[0])
+
+
+class LoadPriorTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = farm_db.open_db(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def store(self, text):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (farm_db.SCAN_FILL_PRIOR_KEY, text, "2026-10-04T12:00:00+00:00"))
+
+    def test_no_stored_prior_reads_as_the_default(self):
+        self.assertEqual(reward_screener.load_prior(self.conn), fill_cost.DEFAULT_PRIOR)
+
+    def test_a_stored_prior_is_read_back(self):
+        prior = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=HISTORY_NOW)
+        self.store(json.dumps(fill_cost.prior_to_json(prior)))
+        self.assertEqual(reward_screener.load_prior(self.conn), prior)
+
+    def test_a_malformed_stored_prior_reads_as_the_default(self):
+        for text in ("{not json", json.dumps({"v": 1}), json.dumps([1, 2])):
+            with self.subTest(text=text):
+                self.conn.execute("DELETE FROM settings")
+                self.store(text)
+                self.assertEqual(reward_screener.load_prior(self.conn), fill_cost.DEFAULT_PRIOR)
 
 
 if __name__ == "__main__":

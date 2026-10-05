@@ -411,7 +411,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         with closing(connect()) as conn:
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
-    def plan_now(row, cfg, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
+    def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
                  capital=None):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None values it at the book midpoint."""
@@ -421,14 +421,14 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         info, rates = infos.get(cid), total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
         live = views.live_review({**dict(row), **terms}, info, books.get(fav_token), rates, cfg,
-                                 clock(), row["status"] == "approved")
+                                 clock(), row["status"] == "approved", prior)
         return live, views.rewards_state(info, cid, rates)
 
-    def quotable(row, cfg):
+    def quotable(row, cfg, prior):
         """(whether the farmer would quote this candidate now, its rewards state).
         A market whose book cannot be read counts, so its page can show why."""
         try:
-            live, active = plan_now(row, cfg)
+            live, active = plan_now(row, cfg, prior)
         except Exception:
             return True, None
         return bool(live.orders), active
@@ -450,13 +450,14 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         mode = parse_mode(mode)
         with closing(connect()) as conn:
             ids = farm_db.candidate_queue(conn, mode, after=condition_id)
-            cfg = farmer_config(conn)
+            cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
             rows = [farm_db.find_market(conn, cid) for cid in ids[:QUOTABLE_SCAN]]
         skipped, checked, found = 0, [], None
         with ThreadPoolExecutor(QUOTABLE_BATCH) as pool:
             for i in range(0, len(rows), QUOTABLE_BATCH):
                 batch = rows[i:i + QUOTABLE_BATCH]
-                for row, (ok, active) in zip(batch, pool.map(lambda r: quotable(r, cfg), batch)):
+                for row, (ok, active) in zip(batch, pool.map(lambda r: quotable(r, cfg, prior),
+                                                             batch)):
                     checked.append((row, active))
                     if ok:
                         found = row
@@ -489,10 +490,10 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             row = farm_db.find_market(conn, condition_id)
             if row is None:
                 raise HTTPException(404, f"no market {condition_id!r}")
-            cfg = farmer_config(conn)
+            cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
         try:
-            (live, active), error = plan_now(row, cfg, p, 0.0 if budget is None else budget,
-                                             cap), None
+            (live, active), error = plan_now(row, cfg, prior, p,
+                                             0.0 if budget is None else budget, cap), None
         except Exception as e:
             live, active, error = None, None, f"{type(e).__name__}: {e}"
         record_rewards([(row, active)])

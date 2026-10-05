@@ -34,7 +34,8 @@ IDLE = ScanJob(ScanPhase.IDLE)
 
 
 class ScanRunner:
-    """scan is reward_screener.run_scan or a stand-in with its signature."""
+    """scan is reward_screener.run_scan or a stand-in with its signature. It
+    starts from the fill prior the last scan stored."""
 
     def __init__(self, db_path, clock, scan=reward_screener.run_scan):
         self.db_path = db_path
@@ -58,9 +59,10 @@ class ScanRunner:
 
     def _run(self, config, started_at):
         try:
-            result = self.scan(config, started_at, on_stage=self._stage)
-            self._stage(f"storing {len(result.assessments):,} assessments")
             with closing(farm_db.open_db(self.db_path)) as conn:
+                result = self.scan(config, started_at, reward_screener.load_prior(conn),
+                                   on_stage=self._stage)
+                self._stage(f"storing {len(result.assessments):,} assessments")
                 reward_screener.store(conn, result, started_at)
             self.job = ScanJob(ScanPhase.DONE, "", started_at, self.clock(), result.funnel)
         except Exception as e:

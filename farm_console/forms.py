@@ -36,10 +36,7 @@ SCAN_FIELDS = {
     "min_rate": Field("Min pool ($/day)", bound=Bound(0)),
     "fragile_drop": Field("Fragile mid drop", bound=Bound(0, 1)),
     "hurdle_rate": Field("Hurdle rate", bound=Bound(0, 10)),
-    "depth_haircut": Field("Depth haircut", bound=Bound(0, 1)),
-    "fill_lookback_days": Field("Fill lookback (days)", bound=Bound(1, 365)),
-    "sweep_prior_weight": Field("Sweep prior weight", bound=Bound(0, 100)),
-    "tape_markets": Field("Markets with a tape", bound=Bound(0, 2000)),
+    "tape_markets": Field("Markets read for fills", bound=Bound(0, 2000)),
 }
 
 QUOTING, SAFETY = "Quoting", "Safety"
@@ -54,9 +51,6 @@ SETTING_FIELDS = {
     "min_low_score": Field("Min longshot score", QUOTING),
     "keep_ratio": Field("Keep ratio", QUOTING),
     "hurdle_rate": Field("Hurdle rate", QUOTING),
-    "depth_haircut": Field("Depth haircut", QUOTING),
-    "fill_lookback_days": Field("Fill lookback (days)", QUOTING),
-    "sweep_prior_weight": Field("Sweep prior weight", QUOTING),
     "drop_threshold": Field("Ask drop threshold", SAFETY),
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),

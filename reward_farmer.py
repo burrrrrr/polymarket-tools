@@ -18,10 +18,11 @@ farmer rests on both sides, in four slots per market:
   FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until the
             market resolves, so it costs the price less p_true discounted at
             the hurdle rate. The bid rests at the price in the band whose
-            rewards net of expected fills (from the market's taker tape) are
-            highest, never above p_true minus a margin, and only when that
-            net beats the orders without it. With no tape read yet it does
-            not rest at all.
+            rewards net of expected fills (from the market's fill history,
+            shrunk toward the last scan's cross-market prior) are highest,
+            never above p_true minus a margin, and only when that net beats
+            the orders without it. Until the market's history is read it
+            does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same.
@@ -155,12 +156,12 @@ from reward_screener import (
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
+    fetch_history,
     fetch_levels,
-    fetch_tape,
     fetch_total_rates,
-    fill_params,
     floor_to_tick,
     get_with_retry,
+    load_prior,
     longshot_bid,
     parse_time,
     q_min,
@@ -187,8 +188,9 @@ NET_KEEP_SLACK_USD = 0.02
 POSITIONS_S = 60
 MARKET_INFO_S = 300
 MARKET_INFO_RETRY_S = 60
-TAPE_S = 600
-TAPE_RETRY_S = 60
+HISTORY_S = 3600
+HISTORY_RETRY_S = 120
+HISTORY_TICK_S = 15
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
@@ -431,9 +433,6 @@ class FarmConfig(NamedTuple):
     naked_cooldown_s: float
     expiry_buffer_days: float
     hurdle_rate: float
-    depth_haircut: float
-    fill_lookback_days: float
-    sweep_prior_weight: float
 
 
 # ---------------------------------------------------------------------------
@@ -588,11 +587,11 @@ def live_rate(fm, total_rates):
     return fm.rate_per_day if rate is None else rate
 
 
-def market_outlook(fm, total_rates, tape, cfg, now):
-    """The Outlook a favorite bid on this market is valued with; no tape is
-    the prior alone."""
+def market_outlook(fm, total_rates, history, prior, cfg, now):
+    """The Outlook a favorite bid on this market is valued with: fills from its
+    history shrunk toward prior, or prior alone without a history."""
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   tape or fill_cost.Tape.unobserved(cfg.fill_lookback_days), fill_params(cfg))
+                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate)
 
 
 def value_of(target, fm, levels, outlook):
@@ -605,7 +604,7 @@ def value_of(target, fm, levels, outlook):
                        bid and (bid.price, bid.size), capital, fm.p_true, outlook)
 
 
-def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_tape=False):
+def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False):
     """The orders this market should rest, with the favorite bid at the price
     that earns the most net of what its fills cost.
 
@@ -613,16 +612,17 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     quotes_at and valued with value_quote on the plan as balanced. The
     baseline is the plan with no favorite bid: nothing, or the exits alone.
     The best price is quoted only when its net beats the baseline's reward,
-    and a tie goes to the lower price. A tape that was never read quotes the
-    baseline, so real money is never bid on the prior alone, unless
-    bid_without_tape (a preview of a market the farmer has not read yet).
+    and a tie goes to the lower price. Fills not drawn from the market's own
+    history quote the baseline, so real money is never bid on the prior
+    alone, unless bid_without_history (a preview of a market the farmer has
+    not read yet).
     """
     base = quotes_at(fm, levels, position, cfg, naked_allowed, None)
     if base.mid is None:
         return base._replace(fav=FavChoice(reason="one-sided book"))
     baseline = value_of(base, fm, levels, outlook).net_per_day
-    if not outlook.tape.observed and not bid_without_tape:
-        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline, "no fill tape yet"))
+    if not outlook.fills.from_history and not bid_without_history:
+        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline, "no fill history yet"))
 
     plans, curve = {}, {}
     for price in fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
@@ -857,13 +857,13 @@ def economics_view(fav):
             "baseline_per_day": fav.baseline_per_day}
 
 
-def slot_views(state, orders, target, preview, actions, backoffs, fm, position, cfg, tape):
+def slot_views(state, orders, target, preview, actions, backoffs, fm, position, cfg, history):
     """Per slot: the resting order, the target, and what this cycle decided.
 
     preview is what a paused market would place on resume; its intents show
     as the target with decision "preview" and are never acted on. FAV_BID
-    also carries the economics of the bid chosen (or previewed) and a summary
-    of the taker tape behind them.
+    also carries the economics of the bid chosen (or previewed) and the fill
+    history behind them.
     """
     intents = {i.slot: i for i in target.intents}
     previews = {i.slot: i for i in preview.intents} if preview else {}
@@ -906,7 +906,7 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
     fav = (preview or target).fav
     views[Slot.FAV_BID.name].update(
         economics=economics_view(fav), fav_reason=fav.reason,
-        tape=fill_cost.tape_summary(tape) if tape else None)
+        history=fill_cost.history_to_json(history) if history else None)
     return views
 
 
@@ -1138,6 +1138,60 @@ class TotalRates:
             self._stop.wait(TOTAL_RATES_S)
 
 
+class Want(NamedTuple):
+    """A market whose fill history the farmer wants, and the floor to read it at."""
+
+    fav_token_id: str
+    floor: float
+    label: str
+
+
+class Histories:
+    """Each active market's fill history, read on a thread of its own: a read
+    takes up to nine requests, and the main loop must not wait on them.
+
+    wanted ({condition_id: Want}) is written by the main loop alone, read
+    ({condition_id: fill_cost.History}) by the reader alone; each is replaced
+    whole, never mutated. A market is read once wanted, again every
+    HISTORY_S, and at once when what is wanted of it changes. A failed read
+    keeps the last history and retries after HISTORY_RETRY_S.
+    """
+
+    def __init__(self, stop, fetch):
+        self.wanted = {}
+        self.read = {}
+        self._due = {}
+        self._stop = stop
+        self._fetch = fetch
+
+    def refresh(self, http, now):
+        """Read every wanted market that is due, one at a time, publishing
+        read after each, and forget the markets no longer wanted."""
+        wanted = self.wanted
+        self.read = {cid: h for cid, h in self.read.items() if cid in wanted}
+        self._due = {cid: due for cid, due in self._due.items() if cid in wanted}
+        for cid, want in wanted.items():
+            if self._stop.is_set():
+                return
+            due, read_for = self._due.get(cid, (now, want))
+            if now < due and read_for == want:
+                continue
+            try:
+                history = self._fetch(http, cid, want.fav_token_id, now, want.floor)
+            except Exception as e:
+                log(f"Warning: fill history of {want.label} failed ({e})")
+                self._due[cid] = now + timedelta(seconds=HISTORY_RETRY_S), want
+                continue
+            self.read = {**self.read, cid: history}
+            self._due[cid] = now + timedelta(seconds=HISTORY_S), want
+
+    def run(self):
+        with httpx.Client() as http:
+            while not self._stop.is_set():
+                self.refresh(http, datetime.now(timezone.utc))
+                self._stop.wait(HISTORY_TICK_S)
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -1161,8 +1215,6 @@ class Managed:
         self.snapshot = None
         self.mid_sampled_at = None
         self.last_summary = None
-        self.tape = None
-        self.tape_due = None
 
 
 class Farmer:
@@ -1187,6 +1239,8 @@ class Farmer:
         self.stop = threading.Event()
         self.stop_reason = None
         self.total_rates = TotalRates(self.stop)
+        self.histories = Histories(self.stop, fetch_history)
+        self.prior = fill_cost.DEFAULT_PRIOR
         self.user = os.getenv("POLYMARKET_FUNDER_ADDRESS")
 
     def active(self):
@@ -1253,7 +1307,8 @@ class Farmer:
         self.http.close()
 
     def read_controls(self, now):
-        """Commands, settings, and approved markets, re-read from the DB every cycle."""
+        """Commands, settings, the fill prior, and approved markets, re-read
+        from the DB every cycle."""
         for command in farm_db.pending_commands(self.db):
             if command.kind == farm_db.CommandKind.STOP.value:
                 self.stop_reason = self.stop_reason or f"stop command {command.id}"
@@ -1263,6 +1318,7 @@ class Farmer:
             farm_db.consume_command(self.db, command.id, result, now)
             log(f"Command {command.id} {command.kind}: {result}")
         self.apply_settings(*farm_db.load_settings(self.db))
+        self.prior = load_prior(self.db)
         self.reload(now)
 
     def apply_settings(self, values, errors):
@@ -1290,20 +1346,6 @@ class Farmer:
                 due = now + timedelta(seconds=MARKET_INFO_RETRY_S)
             self.infos[condition_id] = (info, due)
         return info
-
-    def refresh_tape(self, managed, now):
-        """Re-read the market's taker tape every TAPE_S. A failed read keeps the
-        last tape and retries after TAPE_RETRY_S; until one lands, there is none."""
-        if managed.tape_due is not None and now < managed.tape_due:
-            return
-        fm = managed.fm
-        try:
-            managed.tape = fetch_tape(self.http, fm.condition_id, fm.fav_token_id, now,
-                                      self.cfg.fill_lookback_days)
-            managed.tape_due = now + timedelta(seconds=TAPE_S)
-        except Exception as e:
-            log(f"Warning: trades of {fm.label} failed ({e})")
-            managed.tape_due = now + timedelta(seconds=TAPE_RETRY_S)
 
     def reload(self, now):
         rows = farm_db.load_approved(self.db)
@@ -1337,6 +1379,10 @@ class Farmer:
                           cid, data={"from": None, "to": Phase.QUOTING.value})
             else:
                 managed.fm, managed.info = fm, info
+        # Quoting or not, so a market that starts quoting has its history already.
+        self.histories.wanted = {m.fm.condition_id: Want(m.fm.fav_token_id, self.cfg.min_fav,
+                                                         m.fm.label)
+                                 for m in self.active()}
 
     def refresh_positions(self, now):
         try:
@@ -1502,10 +1548,11 @@ class Farmer:
                       and step_state(managed.state, obs._replace(paused=False), now,
                                      self.cfg).phase is Phase.QUOTING)
         if managed.state.phase is Phase.QUOTING or previewing:
-            self.refresh_tape(managed, now)
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
-                market_outlook(fm, self.total_rates.rates, managed.tape, self.cfg, now),
+                market_outlook(fm, self.total_rates.rates,
+                               self.histories.read.get(fm.condition_id), self.prior,
+                               self.cfg, now),
             )
             if previewing:
                 preview = planned
@@ -1552,7 +1599,8 @@ class Farmer:
             naked_used_usd=naked_used(managed.position, orders),
             position=position_view(managed.held, managed.baseline, managed.position),
             slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
-                             managed.position, self.cfg, managed.tape),
+                             managed.position, self.cfg,
+                             self.histories.read.get(fm.condition_id)),
             book=book_view(levels, orders, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
             backoff={slot.name: {"until": stamp(b.until), "attempts": b.attempts}
@@ -1728,6 +1776,7 @@ def run(args):
     signal.signal(signal.SIGTERM, on_sigterm)
 
     threading.Thread(target=farmer.total_rates.run, daemon=True).start()
+    threading.Thread(target=farmer.histories.run, daemon=True).start()
     if args.live and args.heartbeat:
         threading.Thread(target=heartbeat, args=(client, farmer.stop), daemon=True).start()
         log("Heartbeat on: if it stops for 10s Polymarket cancels this key's open orders")
@@ -1779,9 +1828,6 @@ def config_from(args):
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
-        depth_haircut=args.depth_haircut,
-        fill_lookback_days=args.fill_lookback_days,
-        sweep_prior_weight=args.sweep_prior_weight,
     )
 
 
@@ -1838,11 +1884,6 @@ Examples:
         ("--hurdle-rate", float, 0.40, "Yearly return capital must beat; a filled share "
                                        "costs its price minus p_true discounted at this "
                                        "rate to the end date"),
-        ("--depth-haircut", float, 0.5, "Share of the bids ahead of the favorite bid a sell "
-                                        "sweep must get through before it reaches ours"),
-        ("--fill-lookback-days", float, 30.0, "Days of taker trades the fill estimate reads"),
-        ("--sweep-prior-weight", float, 0.25, "Assumed sweeps per lookback that clear the "
-                                             "whole book, on top of the ones seen"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

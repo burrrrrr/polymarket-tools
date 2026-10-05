@@ -21,7 +21,9 @@
     <dd class="mono">{{ '{:,.0f}%'.format(v.reward_per_day * 365 / v.capital_usd * 100) }} <span class="muted">net {{ '{:,.0f}%'.format(v.net_apr * 100) }}{{ tip('net_apr') }}</span></dd>
   </dl>
   {%- if l.fill_source == 'prior' %}
-  <p class="c-warn">Fills from the prior alone: no bid until the tape is read.</p>
+  <p class="c-warn">Fills from the cross-market prior alone ({{ l.prior.markets }} markets, scan of {{ l.prior.at | stamp_local }}): the farmer bids only after it reads this market's history.</p>
+  {%- elif l.fill_source == 'default' %}
+  <p class="c-warn">Fills from the built-in default prior: run a scan. The farmer bids only after it reads this market's history.</p>
   {%- endif %}
 {%- endif %}
 </div>

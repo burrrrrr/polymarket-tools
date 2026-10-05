@@ -1,6 +1,7 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -41,7 +42,8 @@ from reward_farmer import (
     target_orders,
     without_backed_off,
 )
-from fill_cost import Sweep, Tape
+import fill_cost
+from fill_cost import DISTANCES, FillCurve, History
 from reward_screener import Levels
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
@@ -63,9 +65,6 @@ CFG = FarmConfig(
     naked_cooldown_s=3600.0,
     expiry_buffer_days=7.0,
     hurdle_rate=0.40,
-    depth_haircut=0.5,
-    fill_lookback_days=30.0,
-    sweep_prior_weight=1.0,
 )
 
 
@@ -122,19 +121,26 @@ def q_sums(target):
     return q_one, q_two
 
 
-# A tape read with no sweeps on it: fills come from the prior alone.
-QUIET = Tape((), 30.0, fetched_at=NOW)
+def curve(*rates):
+    """Fills drawn from the market's history: these rates from the first of
+    DISTANCES, the last one held to the end."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True)
 
 
-def sweeps(*sizes):
-    return Tape(tuple(Sweep(NOW.timestamp() - n, x) for n, x in enumerate(sizes)), 30.0,
-                fetched_at=NOW)
+# A quiet market: a sweep reaches a bid at the midpoint about once a month,
+# and one 3c under about once a quarter.
+QUIET = curve(0.033, 0.03, 0.027, 0.024, 0.021, 0.018, 0.015, 0.011)
+# A sweep reaches 1c under the midpoint every day, and never 1.5c.
+SWEPT = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+# A scan's fill prior, and a market history with no sweeps in 60 days.
+PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=NOW)
+NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90)
 
 
-def plan(fm, book, position=Position(), cfg=CFG, naked=True, tape=QUIET):
-    """target_orders against a book, valued at the scan's rate with this tape."""
-    return target_orders(fm, book, position, cfg, naked,
-                         market_outlook(fm, None, tape, cfg, NOW))
+def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET):
+    """target_orders against a book, valued at the scan's rate with these fills."""
+    outlook = market_outlook(fm, None, None, PRIOR, cfg, NOW)._replace(fills=fills)
+    return target_orders(fm, book, position, cfg, naked, outlook)
 
 
 class BalancingTest(unittest.TestCase):
@@ -274,51 +280,59 @@ class TargetOrdersTest(unittest.TestCase):
         self.assertEqual((target.mid, target.intents), (None, []))
 
 
-# FLOOR_BOOK with 2,000 more shares bid at 98.0c: a bid there or under waits
-# behind 3,000 shares, at 98.1c or over behind 1,000.
-STACKED_BOOK = Levels(bids=[(0.985, 1000.0), (0.980, 2000.0)], asks=[(0.995, 1000.0)],
-                      tick=0.001)
-
-
 class NetPricingTest(unittest.TestCase):
-    def test_no_tape_places_no_favorite_bid_but_keeps_the_exits(self):
-        held = Position(long_shares=200.0, long_avg=0.005)
-        target = plan(market(), FLOOR_BOOK, held, tape=None)
+    def outlook(self, fm, history):
+        return market_outlook(fm, None, history, PRIOR, CFG, NOW)
+
+    def test_no_history_places_no_favorite_bid_but_keeps_the_exits(self):
+        fm, held = market(), Position(long_shares=200.0, long_avg=0.005)
+        target = target_orders(fm, FLOOR_BOOK, held, CFG, True, self.outlook(fm, None))
         intents = by_slot(target)
         self.assertNotIn(Slot.FAV_BID, intents)
-        self.assertEqual(target.fav.reason, "no fill tape yet")
+        self.assertEqual(target.fav.reason, "no fill history yet")
         # With no favorite bid the exit mirrors the highest bid allowed, 99.0c.
         self.assertEqual(intents[Slot.LONG_ASK].price, 0.010)
 
-    def test_a_preview_without_a_tape_prices_on_the_prior(self):
+    def test_a_history_of_no_days_places_no_favorite_bid(self):
+        # A read whose mids came back empty saw nothing of the market.
         fm = market()
-        target = target_orders(fm, FLOOR_BOOK, Position(), CFG, True,
-                               market_outlook(fm, None, None, CFG, NOW), bid_without_tape=True)
+        read = target_orders(fm, FLOOR_BOOK, Position(), CFG, True,
+                             self.outlook(fm, NO_SWEEPS))
+        self.assertIn(Slot.FAV_BID, by_slot(read))
+        empty = target_orders(fm, FLOOR_BOOK, Position(), CFG, True,
+                              self.outlook(fm, NO_SWEEPS._replace(days=0.0)))
+        self.assertNotIn(Slot.FAV_BID, by_slot(empty))
+        self.assertEqual(empty.fav.reason, "no fill history yet")
+
+    def test_a_preview_without_a_history_prices_on_the_prior(self):
+        fm = market()
+        target = target_orders(fm, FLOOR_BOOK, Position(), CFG, True, self.outlook(fm, None),
+                               bid_without_history=True)
         self.assertIn(Slot.FAV_BID, by_slot(target))
 
-    def test_a_quiet_tape_bids_the_highest_price_allowed(self):
+    def test_a_quiet_market_bids_the_highest_price_allowed(self):
         # p_true 0.995 less the 1c margin caps the 99.0c ceiling at 98.5c.
         target = plan(market(), FLOOR_BOOK)
         self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.985)
         self.assertEqual(target.fav.best.price, 0.985)
 
-    def test_sweeps_through_the_top_of_the_book_push_the_bid_behind_the_deep_level(self):
-        # 1,400-share sweeps, 60 a month, get 900 past the 1,000 ahead of 98.1c
-        # (haircut to 500) and nothing past the 3,000 ahead of 98.0c.
+    def test_sweeps_through_the_top_of_the_book_push_the_bid_below_where_they_reach(self):
+        # The 98.5c cap sits 0.5c under the 99.0c midpoint, where a sweep fills
+        # the bid daily; it steps down to 1.5c under or more, which none reach.
         fm = market()
-        target = plan(fm, STACKED_BOOK, tape=sweeps(*[1400.0] * 60))
+        target = plan(fm, FLOOR_BOOK, fills=SWEPT)
         fav = by_slot(target)[Slot.FAV_BID]
-        self.assertLessEqual(fav.price, 0.980)
-        self.assertEqual(by_slot(plan(fm, STACKED_BOOK))[Slot.FAV_BID].price, 0.985)
-        balanced = by_slot(quotes_at(fm, STACKED_BOOK, Position(), CFG, True, fav.price))
+        self.assertLessEqual(fav.price, 0.975)
+        self.assertEqual(target.fav.best.fills_per_day, 0.0)
+        balanced = by_slot(quotes_at(fm, FLOOR_BOOK, Position(), CFG, True, fav.price))
         self.assertEqual(fav.size, balanced[Slot.FAV_BID].size)
-        self.assertAlmostEqual(target.fav.best.fills_per_day, fav.size / 30)
 
     def test_fills_costing_more_than_the_bid_earns_place_none_but_keep_the_exit(self):
-        # 30 full clears a month at a 1,000% hurdle: each fill loses most of its price.
-        costly = CFG._replace(hurdle_rate=10.0, sweep_prior_weight=30.0)
+        # A sweep through every bid each day at a 1,000% hurdle: each fill
+        # loses most of its price.
+        costly = CFG._replace(hurdle_rate=10.0)
         held = Position(fav_shares=100.0, fav_avg=0.97)
-        target = plan(market(), FLOOR_BOOK, held, cfg=costly)
+        target = plan(market(), FLOOR_BOOK, held, cfg=costly, fills=curve(1.0))
         intents = by_slot(target)
         self.assertNotIn(Slot.FAV_BID, intents)
         self.assertIn(Slot.FAV_ASK, intents)
@@ -326,20 +340,23 @@ class NetPricingTest(unittest.TestCase):
                          r"^no favorite bid pays: best net -\$\d+\.\d\d/day at \d+\.\dc$")
 
     def test_a_short_dated_market_welcomes_fills_up_to_the_ev_cap(self):
-        # Two days out a 98.5c fill of a 99.5c share gains 0.8c: sweeps only add.
+        # Two days out a 98.5c fill of a 99.5c share gains 0.8c: the sweeps
+        # that push a long-dated bid down only add here.
         fm = market(end_date=NOW + timedelta(days=2))
-        target = plan(fm, FLOOR_BOOK, tape=sweeps(*[1e5] * 30))
+        target = plan(fm, FLOOR_BOOK, fills=SWEPT)
         self.assertLess(target.fav.best.loss_per_share, 0)
         self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.985)
 
-    def test_the_outlook_takes_the_live_rate_and_the_end_date(self):
+    def test_the_outlook_takes_the_live_rate_the_end_date_and_the_fill_curve(self):
         fm = market(rate_per_day=100.0, end_date=NOW + timedelta(days=365.25))
-        outlook = market_outlook(fm, {"0xc0nd": 40.0}, QUIET, CFG, NOW)
-        self.assertEqual((outlook.rate_per_day, outlook.years_left), (40.0, 1.0))
-        self.assertEqual(market_outlook(fm, {"0xother": 40.0}, QUIET, CFG, NOW).rate_per_day,
-                         100.0)
-        self.assertEqual(market_outlook(fm, None, None, CFG, NOW).tape,
-                         Tape.unobserved(CFG.fill_lookback_days))
+        outlook = market_outlook(fm, {"0xc0nd": 40.0}, NO_SWEEPS, PRIOR, CFG, NOW)
+        self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate),
+                         (40.0, 1.0, CFG.hurdle_rate))
+        self.assertEqual(outlook.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, CFG.min_fav))
+        self.assertTrue(outlook.fills.from_history)
+        unread = market_outlook(fm, {"0xother": 40.0}, None, PRIOR, CFG, NOW)
+        self.assertEqual(unread.rate_per_day, 100.0)
+        self.assertEqual(unread.fills, fill_cost.fill_curve(None, PRIOR, CFG.min_fav))
 
 
 def live(order_id, slot, price, size):
@@ -348,7 +365,7 @@ def live(order_id, slot, price, size):
 
 
 class ReconcileTest(unittest.TestCase):
-    """On FLOOR_BOOK with a quiet tape: FAV_BID 98.5c x 507.61, LONG_BID 0.1c x 675.82."""
+    """On FLOOR_BOOK in a quiet market: FAV_BID 98.5c x 507.61, LONG_BID 0.1c x 675.82."""
 
     def setUp(self):
         self.fm = market()
@@ -662,7 +679,7 @@ class WideBookTest(unittest.TestCase):
         fm = market(v=0.085, min_size=20.0, p_true=0.96)
         target = plan(fm, WORKED_BOOK, cfg=defaults)
         fav = by_slot(target)[Slot.FAV_BID]
-        # A quiet tape bids the 93.9c ceiling, 0.5c over the best bid; the 0.940
+        # A quiet market bids the 93.9c ceiling, 0.5c over the best bid; the 0.940
         # EV cap does not bind.
         self.assertEqual(fav.price, 0.939)
         self.assertAlmostEqual(target.mid, 0.9645)
@@ -730,6 +747,60 @@ class FetchHoldingsTest(unittest.TestCase):
         self.assertEqual(len(calls), reward_farmer.RATE_LIMIT_RETRIES + 1)
 
 
+class HistoriesTest(unittest.TestCase):
+    WANT = reward_farmer.Want(FAV, 0.90, "test-market")
+
+    def setUp(self):
+        self.fetch = mock.Mock(return_value=NO_SWEEPS)
+        self.histories = reward_farmer.Histories(threading.Event(), self.fetch)
+        self.histories.wanted = {"0xc0nd": self.WANT}
+        patcher = mock.patch.object(reward_farmer, "log")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def refresh_at(self, *seconds):
+        """Refresh at each NOW + seconds; the read after each."""
+        seen = []
+        for s in seconds:
+            self.histories.refresh(None, NOW + timedelta(seconds=s))
+            seen.append(self.histories.read.get("0xc0nd"))
+        return seen
+
+    def test_a_wanted_market_is_read_at_once_then_hourly(self):
+        self.refresh_at(0, 5, 3599, 3600)
+        self.assertEqual([c.args[3] for c in self.fetch.call_args_list],
+                         [NOW, NOW + timedelta(seconds=3600)])
+        self.assertEqual(self.fetch.call_args.args[1:], ("0xc0nd", FAV,
+                                                         NOW + timedelta(seconds=3600), 0.90))
+
+    def test_a_failed_first_read_leaves_no_history_and_retries_after_two_minutes(self):
+        self.fetch.side_effect = [httpx.ConnectError("data API down"), NO_SWEEPS]
+        self.assertEqual(self.refresh_at(0, 119, 120), [None, None, NO_SWEEPS])
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_a_failed_reread_keeps_the_last_history(self):
+        later = NO_SWEEPS._replace(events=(1,) * len(DISTANCES))
+        self.fetch.side_effect = [NO_SWEEPS, httpx.ConnectError("data API down"), later]
+        self.assertEqual(self.refresh_at(0, 3600, 3700, 3720), [NO_SWEEPS] * 3 + [later])
+
+    def test_a_market_no_longer_wanted_is_forgotten(self):
+        other = reward_farmer.Want("other-fav", 0.90, "other")
+        self.histories.wanted = {"0xc0nd": self.WANT, "0xother": other}
+        self.refresh_at(0)
+        self.histories.wanted = {"0xother": other}
+        self.refresh_at(5)
+        self.assertEqual(self.histories.read, {"0xother": NO_SWEEPS})
+        self.histories.wanted = {"0xc0nd": self.WANT}
+        self.refresh_at(10)
+        self.assertEqual(self.fetch.call_count, 3)
+
+    def test_a_changed_floor_rereads_at_once(self):
+        self.refresh_at(0)
+        self.histories.wanted = {"0xc0nd": self.WANT._replace(floor=0.92)}
+        self.refresh_at(5)
+        self.assertEqual([c.args[4] for c in self.fetch.call_args_list], [0.90, 0.92])
+
+
 CID = "0xc0nd"
 INFO = MarketInfo((FAV, LONG), 0.035, 50.0, 0.001, False, True, False)
 METRICS = {"market": {"fav_token_id": FAV, "slug": "test-market", "question": "Test?",
@@ -753,16 +824,16 @@ class FarmerCycleTest(unittest.TestCase):
         farm_db.store_scan(self.ui, [farm_db.ScanRow(
             CID, "test-market", "Test?", (NOW + timedelta(days=100)).isoformat(), 1.0,
             json.dumps(METRICS),
-        )], [CID], NOW)
+        )], [CID], NOW, prior=fill_cost.prior_to_json(PRIOR))
         farm_db.approve_market(self.ui, CID, 0.995, 25.0)
         self.book_fetches = 0
         self.on_book_fetch = lambda count: None
         self.info = mock.Mock(return_value=INFO)
-        self.tape = mock.Mock(return_value=QUIET)
+        self.history = mock.Mock(return_value=NO_SWEEPS)
         self.book = FLOOR_BOOK
         for name, fake in (
             ("fetch_market_info", self.info),
-            ("fetch_tape", self.tape),
+            ("fetch_history", self.history),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
@@ -778,11 +849,14 @@ class FarmerCycleTest(unittest.TestCase):
         self.on_book_fetch(self.book_fetches)
         return {FAV: self.book}
 
-    def started_farmer(self):
+    def started_farmer(self, read_histories=True):
+        """A started farmer, its histories read as the reader thread would."""
         farmer = Farmer(self.args, config_from(self.args))
         self.addCleanup(farmer.http.close)
         self.addCleanup(farmer.db.close)
         farmer.start()
+        if read_histories:
+            farmer.histories.refresh(farmer.http, NOW)
         return farmer
 
     def query(self, sql, *params):
@@ -1078,49 +1152,38 @@ class FarmerCycleTest(unittest.TestCase):
         self.assertEqual([(r["fav_bid"], r["long_bid"]) for r in rows], [(0.975, 0.001)] * 3)
         self.assertEqual((rows[0]["mid"], rows[0]["book_mid"]), (0.99, 0.99))
 
-    def cycle_at(self, *seconds):
-        """Cycle one farmer at each NOW + seconds. Returns, per cycle, the tape
-        reads so far and the FAV_BID slot's (decision, reason)."""
-        clock, seen = [NOW], []
+    def test_until_its_history_lands_a_market_places_no_favorite_bid(self):
+        farmer = self.started_farmer(read_histories=False)
+        farmer.cycle()
+        fav = self.farm_state()[1]["FAV_BID"]
+        self.assertEqual((fav["decision"], fav["reason"]), ("none", "no fill history yet"))
+        self.assertEqual(self.history.call_count, 0)
+        self.assertEqual(farmer.histories.wanted,
+                         {CID: reward_farmer.Want(FAV, CFG.min_fav, "test-market")})
+        farmer.histories.refresh(farmer.http, NOW)
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
 
-        class Clock(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return clock[0]
-
-        with mock.patch.object(reward_farmer, "datetime", Clock):
-            farmer = self.started_farmer()
-            for s in seconds:
-                clock[0] = NOW + timedelta(seconds=s)
-                farmer.cycle()
-                fav = self.farm_state()[1]["FAV_BID"]
-                seen.append((self.tape.call_count, fav["decision"], fav["reason"]))
-        return seen
-
-    def test_the_tape_is_read_once_per_ten_minutes(self):
-        reads = [n for n, _, _ in self.cycle_at(0, 5, 300, 599, 600)]
-        self.assertEqual(reads, [1, 1, 1, 1, 2])
-
-    def test_until_a_tape_lands_there_is_no_favorite_bid_and_the_read_retries_in_a_minute(self):
-        self.tape.side_effect = [httpx.ConnectError("data API down"), QUIET]
-        self.assertEqual(self.cycle_at(0, 30, 60), [
-            (1, "none", "no fill tape yet"), (1, "none", "no fill tape yet"), (2, "place", "")])
-
-    def test_a_failed_reread_keeps_bidding_on_the_last_tape(self):
-        self.tape.side_effect = [QUIET, httpx.ConnectError("data API down"), QUIET]
-        self.assertEqual(self.cycle_at(0, 600, 630, 660), [
-            (1, "place", ""), (2, "hold", ""), (2, "hold", ""), (3, "hold", "")])
-
-    def test_the_favorite_bid_slot_shows_its_economics_and_tape(self):
-        self.tape.return_value = sweeps(100.0, 50.0)
+    def test_a_history_of_no_days_places_no_favorite_bid(self):
+        self.history.return_value = NO_SWEEPS._replace(days=0.0)
         self.started_farmer().cycle()
-        _, slots = self.farm_state()
-        economics = slots["FAV_BID"]["economics"]
-        self.assertEqual(economics["price"], slots["FAV_BID"]["target"]["price"])
+        fav = self.farm_state()[1]["FAV_BID"]
+        self.assertEqual((fav["decision"], fav["reason"]), ("none", "no fill history yet"))
+        self.assertNotIn("PLACE FAV_BID", [f"{e['kind']} {e['slot']}" for e in self.events()])
+
+    def test_the_favorite_bid_slot_shows_its_economics_and_history_on_the_stored_prior(self):
+        history = History((4, 3, 3, 2, 2, 1, 1, 0, 0, 0, 0, 0), 60.0, NOW, 0.90)
+        self.history.return_value = history
+        self.started_farmer().cycle()
+        row, slots = self.farm_state()
+        economics, target = slots["FAV_BID"]["economics"], slots["FAV_BID"]["target"]
+        self.assertEqual(economics["price"], target["price"])
         self.assertAlmostEqual(economics["net_per_day"], economics["reward_per_day"]
                                - economics["fills_per_day"] * economics["loss_per_share"])
-        self.assertEqual((slots["FAV_BID"]["tape"]["sweeps"], slots["FAV_BID"]["tape"]["shares"]),
-                         (2, 150.0))
+        fills = fill_cost.fill_curve(history, PRIOR, 0.90)
+        self.assertAlmostEqual(economics["fills_per_day"],
+                               target["size"] * fills.per_day(row["mid"] - target["price"]))
+        self.assertEqual(slots["FAV_BID"]["history"], fill_cost.history_to_json(history))
 
     def test_paused_market_samples_no_resting_bids(self):
         farm_db.set_paused(self.ui, CID, True)
