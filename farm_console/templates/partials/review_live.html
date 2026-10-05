@@ -1,3 +1,4 @@
+{% include "partials/review_projection.html" %}
 {%- if error %}
 <div class="note-box small"><span class="c-bad">Could not read the live book: {{ error }}</span> Trying again in a few seconds.</div>
 {%- else %}
@@ -25,10 +26,7 @@
     </tbody>
   </table>
 </div>
-<span class="small muted">{{ l.orders | sum(attribute='cost') | usd }} tied up in total. The farmer plans the same way on its first cycle after approval.</span>
-{%- if l.value %}
-<span class="small mono">Net {{ l.value.net_per_day | usd }}/day{{ tip('net_daily') }}: reward {{ l.value.reward_per_day | usd }} − {{ '%.1f' % l.value.fills_per_day }} fills/day{{ tip('fills_per_day') }} × {{ l.value.loss_per_share | cents }} a share{% if l.fill_source == 'prior' %}, fills from the prior alone: no tape was read for this market, and the farmer bids only once it reads one{% endif %}.</span>
-{%- endif %}
+<span class="small muted">The farmer plans the same way on its first cycle after approval.</span>
 {%- endif %}
 {%- if l.strip %}
 <div>

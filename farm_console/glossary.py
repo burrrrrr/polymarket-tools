@@ -45,7 +45,7 @@ GLOSSARY = {
                                             "book's best bid and ask."),
     "min_size": Term("Min size", "Orders smaller than this many shares earn no rewards."),
     "est_daily": Term("Est $/day", "Our estimated share of the daily pool if the book stays "
-                                   "as it was when scanned and nobody reacts. Use it to rank "
+                                   "as it was when read and nobody reacts. Use it to rank "
                                    "markets; it is optimistic."),
     "planned_capital": Term("Capital", "USD the planned quotes would tie up: the favorite bid "
                                        "plus the longshot bid."),
@@ -55,12 +55,11 @@ GLOSSARY = {
                                        "taker sells seen on the market's tape that would get "
                                        "past the bids ahead of ours, plus the assumed sweeps "
                                        "that clear the book (Sweep prior weight per "
-                                       "lookback). (prior) means no tape "
-                                       "was read, only that assumption, so the figure is "
-                                       "optimistic."),
+                                       "lookback). With no tape read, it rests on that "
+                                       "assumption alone and is optimistic."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
                                        "minus p_true discounted at the hurdle rate to the end "
-                                       "date. The scan has no p_true and uses the midpoint."),
+                                       "date. Without a p_true it uses the midpoint."),
     "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
                                "this."),
     "net_daily": Term("Net/day", "The favorite bid's share of the pool less what its fills "

@@ -1,13 +1,13 @@
 <div class="note-box small" style="line-height: 1.5">
 {%- if error %}
-  <span class="c-bad">Could not read the wallet's holdings: {{ error }}</span> The farmer reads them again when it starts managing the market and records whatever it finds then as the baseline.
+  <span class="c-bad">Could not read the wallet's holdings: {{ error }}</span> The farmer takes its baseline at start.
 {%- else %}
   {%- set fav, long = position.fav_shares, position.long_shares %}
   {%- if fav == 0 and long == 0 %}
-  The wallet holds none of this market. The baseline will be 0, so every share the farmer buys is farm inventory.
+  Wallet holds none, so every fill is farm inventory.
   {%- else %}
-  The wallet holds {{ fav | shares }} {{ m.fav_outcome or 'favorite' }}{% if fav %} at {{ position.fav_avg | cents }}{% endif %} and {{ long | shares }} {{ long_outcome }}{% if long %} at {{ position.long_avg | cents }}{% endif %}. These become the baseline: the farmer never sells them and farms only shares above them.
+  Wallet holds {{ fav | shares }} {{ m.fav_outcome or 'favorite' }}{% if fav %} at {{ position.fav_avg | cents }}{% endif %}, {{ long | shares }} {{ long_outcome }}{% if long %} at {{ position.long_avg | cents }}{% endif %}: the baseline, never sold.
   {%- endif %}
-  {%- if market.baseline_fav is not none %} The live farmer's recorded baseline is {{ market.baseline_fav | shares }} / {{ market.baseline_long | shares }} (fav / long).{% endif %}
+  {%- if market.baseline_fav is not none %} Recorded baseline {{ market.baseline_fav | shares }} / {{ market.baseline_long | shares }} (fav / long).{% endif %}
 {%- endif %}
 </div>

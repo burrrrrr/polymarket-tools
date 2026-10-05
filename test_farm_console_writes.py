@@ -3,6 +3,7 @@ import re
 import threading
 import time
 import unittest
+from dataclasses import replace
 from datetime import timedelta
 
 from fastapi.testclient import TestClient
@@ -241,14 +242,14 @@ class ReviewTest(Writes):
         self.assertIn('href="/review/0xddd">Previous', page)
         self.assertIn('href="/review/0xfff">Next', page)
 
-    def test_page_shows_live_region_stats_and_decision(self):
+    def test_page_shows_live_region_and_decision(self):
         page = self.client.get("/review/0xddd").text
         self.assertIn('name="naked_budget" value="10"', page)
         self.assertIn('type="number" min="1" max="99" step="1"', page)
         mid = json.loads(self.row("0xddd")["metrics"])["book_mid"]
         self.assertIn(f'data-start="{round(mid * 100)}"', page)
         for needle in ("BUDGET", "Claude triage (planned)", "Approve and start quoting",
-                       "Est $/day", "Reject", 'hx-get="/partials/review/0xddd/live"',
+                       "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
                        'hx-include="#d-p_true, #d-naked_budget, #d-capital"'):
             self.assertIn(needle, page)
@@ -257,6 +258,82 @@ class ReviewTest(Writes):
     def live(self, cid="0xddd", **terms):
         terms = {"p_true": "97", "naked_budget": "25", "capital": "", **terms}
         return self.client.get(f"/partials/review/{cid}/live", params=terms).text
+
+    def set_metrics(self, cid, **changes):
+        metrics = {**json.loads(self.row(cid)["metrics"]), **changes}
+        self.db.execute("UPDATE markets SET metrics = ? WHERE condition_id = ?",
+                        (json.dumps(metrics), cid))
+        self.db.commit()
+
+    def test_page_header_carries_the_market_facts_and_no_scan_stats(self):
+        page = self.client.get("/review/0xddd").text
+        self.assertIn("ahead 1.4x", page)
+        self.assertIn("holding rewards unknown", page)
+        self.assertNotIn("vol ", page)
+        self.assertNotIn('class="panel pad stats"', page)
+        self.assertIn("Planning against the live book...", page)
+        self.set_metrics("0xddd", volume24hr=12345.0, holding_rewards=False)
+        page = self.client.get("/review/0xddd").text
+        self.assertIn("vol 12.3k", page)
+        self.assertNotIn("holding rewards", page)
+
+    def projection(self, text):
+        """Label to value text of each figure in the projection fragment."""
+        fragment = re.search(r'<div id="projection" class="projection note-box small" '
+                             r'hx-swap-oob="true">(.*?)</div>', text, re.S)
+        self.assertIsNotNone(fragment, "no out-of-band projection")
+        return fragment.group(1), dict(re.findall(
+            r'<dt class="lbl">([^<]+)<button[^>]*></button></dt>\s*<dd class="mono[^"]*">'
+            r'([^<]*?)\s*<', fragment.group(1)))
+
+    def planned(self, p_true, capital):
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
+        row = {**dict(self.row("0xddd")), "p_true": p_true, "naked_budget_usd": 25.0,
+               "capital_usd": capital}
+        return views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
+                                 self.now, False)
+
+    def test_live_partial_projects_the_plan_out_of_band(self):
+        fragment, figures = self.projection(self.live())
+        live = self.planned(0.97, None)
+        self.assertEqual(figures["Est share"], f"{live.share * 100:.1f}%")
+        self.assertEqual(figures["Net/day"], views.usd(live.value.net_per_day))
+        self.assertEqual(figures["Capital"], views.usd(sum(o.cost for o in live.orders)))
+        scan = json.loads(self.row("0xddd")["metrics"])
+        self.assertIn(f"scan {scan['share'] * 100:.1f}%", fragment)
+        self.assertIn(f"scan {views.usd(scan['est_daily_usd'])}", fragment)
+        self.assertIn("Fills from the prior alone", fragment)
+
+    def test_projection_follows_the_terms_being_typed(self):
+        full = self.projection(self.live())[1]
+        for terms, p_true, capital in (({"capital": "100"}, 0.97, 100.0),
+                                       ({"p_true": "96"}, 0.96, None)):
+            with self.subTest(**terms):
+                figures = self.projection(self.live(**terms))[1]
+                self.assertNotEqual(figures["Net/day"], full["Net/day"])
+                self.assertNotEqual(figures["Capital"], full["Capital"])
+                self.assertEqual(figures["Est share"],
+                                 f"{self.planned(p_true, capital).share * 100:.1f}%")
+
+    def test_projection_says_why_it_has_no_figures(self):
+        self.remote.fail_book = True
+        fragment, figures = self.projection(self.live())
+        self.assertIn("No projection while the live book can't be read", fragment)
+        self.assertEqual(figures, {})
+        self.remote.fail_book = False
+        fragment, figures = self.projection(self.live(A))
+        self.assertIn("The farmer manages this market", fragment)
+        self.assertEqual(figures, {})
+
+    def test_share_is_our_score_against_the_competing_score(self):
+        live, target = self.preview()
+        my_q = reward_farmer.q_min(*reward_farmer.q_totals(target.intents), target.mid)
+        comp_q = reward_screener.competing_score(BUDGET_BOOK, target.mid, 0.035, 20.0)
+        self.assertEqual(live.pool_per_day, 50.0)
+        self.assertAlmostEqual(live.share, live.value.reward_per_day / live.pool_per_day)
+        self.assertAlmostEqual(live.share, my_q / (my_q + comp_q))
+        self.assertIsNone(replace(live, pool_per_day=0.0).share)
+        self.assertIsNone(replace(live, value=None).share)
 
     def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
         text = self.live()
@@ -520,18 +597,18 @@ class ReviewTest(Writes):
                                params={"p_true": p_true, "naked_budget": budget}).text
 
     def test_ev_check_uncapped_capped_and_out_of_band(self):
-        self.assertIn("Planned bid 95.5c is at or under your cap of 96.0c", self.ev("0xddd", "98"))
+        uncapped = self.ev("0xddd", "98")
+        self.assertIn('class="ev c-good"', uncapped)
+        self.assertRegex(uncapped, r"95\.5c.*96\.0c cap \(p_true − 2\.0c\)")
         capped = self.ev("0xddd", "96")
-        self.assertIn("Planned bid 95.5c is above your cap of 94.0c (p_true minus 2.0c). "
-                      "The farmer bids no higher than 94.0c, which scores 0.184", capped)
         self.assertIn('class="ev c-warn"', capped)
-        self.assertIn("outside the reward band", self.ev("0xddd", "93"))
+        self.assertIn("capped at 94.0c (p_true − 2.0c): scores 0.184, not 0.617", capped)
+        self.assertRegex(self.ev("0xddd", "93"), r"capped at 91\.0c .*outside the band.*no reward")
         self.assertIn("whole percent from 1 to 99", self.ev("0xddd", "150"))
 
     def test_ev_check_uses_the_effective_ev_margin(self):
         farm_db.put_setting(self.db, "ev_margin", 0.025, self.now)
-        self.assertIn("Planned bid 95.5c is above your cap of 94.5c (p_true minus 2.5c)",
-                      self.ev("0xddd", "97"))
+        self.assertIn("capped at 94.5c (p_true − 2.5c)", self.ev("0xddd", "97"))
 
     def test_ev_check_scores_the_capped_bid_against_the_mid_it_creates(self):
         # Book 93.4c / 99.0c with v 8.5c. The old plan's 97.0c bid created a 98.0c
@@ -540,19 +617,19 @@ class ReviewTest(Writes):
                    "plan": {"fav_bid_price": 0.97, "mid": 0.98, "fav_bid_score": 0.779,
                             "low_price": 0.001, "low_size": 100.0, "mode": "floor"}}
         text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines)
-        self.assertIn("The farmer bids no higher than 95.0c, which scores 0.585 per share", text)
+        self.assertIn("capped at 95.0c (p_true − 1.0c): scores 0.585, not 0.779", text)
         self.assertNotIn("0.419", text)
         del metrics["best_bid"], metrics["best_ask"]
-        self.assertIn("which scores 0.419 per share",
+        self.assertIn("scores 0.419, not 0.779",
                       " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines))
 
     def test_ev_check_warns_when_budget_is_below_the_longshot_leg(self):
         plan = json.loads(self.row("0xddd")["metrics"])["plan"]
         cost = plan["low_price"] * plan["low_size"]
-        self.assertIn(f"ties up ${cost:,.2f}, above your $5.00 naked budget",
+        self.assertIn(f"Longshot ${cost:,.2f} is over your $5.00 budget",
                       self.ev("0xddd", "97", "5"))
-        self.assertNotIn("ties up", self.ev("0xddd", "97", str(cost)))
-        self.assertIn("above your $0.00 naked budget", self.ev("0xeee", "99", "0"))
+        self.assertNotIn("Longshot", self.ev("0xddd", "97", str(cost)))
+        self.assertIn("over your $0.00 budget", self.ev("0xeee", "99", "0"))
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
         from farm_console.app import utc_now
@@ -576,10 +653,9 @@ class ReviewTest(Writes):
 
     def test_holdings_show_the_baseline_or_say_the_fetch_failed(self):
         text = self.client.get("/partials/review/0xddd/holdings").text
-        self.assertIn("The wallet holds 12 No at 95.1c and 0 Yes. These become the baseline",
-                      text)
+        self.assertIn("holds 12 No at 95.1c, 0 Yes: the baseline", text)
         self.remote.position = reward_farmer.Position()
-        self.assertIn("holds none of this market",
+        self.assertIn("holds none, so every fill is farm inventory",
                       self.client.get("/partials/review/0xddd/holdings").text)
         self.remote.fail_position = True
         self.assertIn("Could not read the wallet's holdings: ConnectionError: data api down",

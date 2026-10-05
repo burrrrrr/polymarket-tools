@@ -250,21 +250,6 @@ class CardsTest(unittest.TestCase):
 
 
 class FillCostFiguresTest(unittest.TestCase):
-    def test_review_stats_show_dashes_without_fill_figures(self):
-        stats = {label: value for label, value, _ in views.review_stats({})}
-        self.assertEqual([stats[k] for k in ("Fills/day", "Fill cost/day", "Net APR")],
-                         ["--"] * 3)
-
-    def test_fills_estimated_from_the_prior_alone_say_so(self):
-        stats = {label: value for label, value, _ in views.review_stats(
-            {"fills_per_day": 16.94, "fill_source": "prior", "fill_cost_usd": 1.2,
-             "net_apr": 0.25})}
-        self.assertEqual((stats["Fills/day"], stats["Fill cost/day"], stats["Net APR"]),
-                         ("16.9 (prior)", "$1.20", "25%"))
-        taped = dict((label, value) for label, value, _ in views.review_stats(
-            {"fills_per_day": 3.0, "fill_source": "tape"}))
-        self.assertEqual(taped["Fills/day"], "3")
-
     def test_discover_ranks_by_net_apr_and_old_rows_show_their_gross_apr(self):
         new = market(A, "a")._replace(metrics={**metrics("a"), "apr": 0.9, "net_apr": 0.4})
         old = market(B, "b")._replace(metrics={**metrics("b"), "apr": 0.9})

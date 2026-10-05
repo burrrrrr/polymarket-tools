@@ -73,8 +73,9 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     app.add_middleware(security.Guard, port=port, token=token)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     templates = Jinja2Templates(directory=HERE / "templates")
+    versions = {f.name: int(f.stat().st_mtime) for f in (HERE / "static").iterdir()}
     for name in ("cents", "usd", "shares", "score", "clock", "stamp_local", "span",
-                 "number_text"):
+                 "number_text", "human_volume"):
         templates.env.filters[name] = getattr(views, name)
     templates.env.globals.update(PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE,
                                  token=token, TOKEN_FIELD=security.TOKEN_FIELD,
@@ -82,7 +83,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                  CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
                                  polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
                                  review_url=views.review_url, MODES=views.MODES,
-                                 glossary=glossary.GLOSSARY)
+                                 glossary=glossary.GLOSSARY,
+                                 static=lambda name: f"/static/{name}?v={versions[name]}")
     runner = ScanRunner(db_path, clock, scan)
     rules = remote.TtlCache(fetch_rules, remote.RULES_TTL, clock)
     infos = remote.TtlCache(fetch_info, remote.INFO_TTL, clock)
@@ -368,7 +370,6 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "plan": market.metrics.get("plan"),
             "queue": views.queue(farm_db.candidate_queue(conn, mode), market.condition_id),
             "queue_mode": mode, "skipped": skipped,
-            "stats": views.review_stats(market.metrics),
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
             "ev": views.ev_check(market.metrics, forms.parse_p_true(values["p_true"]),
                                  values["naked_budget"], ev_margin),
@@ -496,8 +497,10 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             live, active, error = None, None, f"{type(e).__name__}: {e}"
         record_rewards([(row, active)])
         candidate = row["status"] == "candidate"
+        scan = json.loads(row["metrics"])
         return templates.TemplateResponse(request, "partials/review_live.html", {
             "live": live, "error": error, "p_true_missing": p is None,
+            "scan_share": scan.get("share"), "scan_daily": scan.get("est_daily_usd"),
             "budget_missing": budget is None, "candidate": candidate,
             "left_queue": candidate and active is False,
             "skip_url": f"/review/{condition_id}/next-quotable"

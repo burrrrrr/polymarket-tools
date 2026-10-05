@@ -1004,10 +1004,18 @@ class LiveReview:
     bids: list
     outside_asks: float
     outside_bids: float
-    # The favorite bid's economics, and whether its fills came from the scan's
-    # stored tape or the prior alone.
+    # The favorite bid's economics, whether its fills came from the scan's
+    # stored tape or the prior alone, and the daily pool it was valued against.
     value: Optional[reward_farmer.QuoteValue] = None
     fill_source: str = "prior"
+    pool_per_day: Optional[float] = None
+
+    @property
+    def share(self):
+        """Our share of the pool: value_quote pays the pool times our share of the score."""
+        if self.value is None or not self.pool_per_day:
+            return None
+        return self.value.reward_per_day / self.pool_per_day
 
 
 def rewards_state(info, condition_id, total_rates):
@@ -1036,7 +1044,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
     fav = metrics["market"].get("fav_outcome") or "favorite"
     long = OTHER_OUTCOME.get(fav, "longshot")
     book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
-    target, note = reward_farmer.Target(book_mid, []), ""
+    target, note, pool = reward_farmer.Target(book_mid, []), "", None
     tape = fill_cost.tape_from_json(metrics.get("tape"))
     if row["p_true"] is None:
         row = {**dict(row), "p_true": book_mid}
@@ -1056,6 +1064,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
                                          obs, now, cfg)
         if state.phase is reward_farmer.Phase.QUOTING:
             outlook = reward_farmer.market_outlook(fm, total_rates, tape, cfg, now)
+            pool = outlook.rate_per_day
             target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True,
                                                  outlook, bid_without_tape=True)
             if not target.intents:
@@ -1110,31 +1119,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed):
     return LiveReview(now, fav, long, book_mid, mid, note, orders, strip,
                       list(reversed(ladder(ask_rows))), ladder(bid_rows),
                       outside_asks, outside_bids, target.fav.best,
-                      "tape" if tape is not None else "prior")
-
-
-def review_stats(metrics):
-    """(label, value, glossary key) of each yield figure."""
-    def pct(value):
-        return "--" if value is None else f"{value * 100:,.0f}%"
-
-    ahead = metrics.get("depth_ahead_ratio")
-    fills = metrics.get("fills_per_day")
-    prior = " (prior)" if metrics.get("fill_source") == "prior" else ""
-    return [
-        ("Est share", pct(metrics.get("share")), "est_share"),
-        ("Est $/day", usd(metrics.get("est_daily_usd")), "est_daily"),
-        ("Capital", usd(metrics.get("capital_usd")), "planned_capital"),
-        ("APR", pct(metrics.get("apr")), "apr"),
-        ("Fills/day", "--" if fills is None else f"{shares(round(fills, 1))}{prior}",
-         "fills_per_day"),
-        ("Fill cost/day", usd(metrics.get("fill_cost_usd")), "fill_cost"),
-        ("Net APR", pct(metrics.get("net_apr")), "net_apr"),
-        ("Depth ahead", "--" if ahead is None else f"{ahead:.1f}x", "ahead"),
-        ("Holding rewards", {True: "yes", False: "no"}.get(metrics.get("holding_rewards"),
-                                                           "unknown"), "holding_rewards"),
-        ("Vol 24h", human_volume(metrics.get("volume24hr")), "vol24h"),
-    ]
+                      "tape" if tape is not None else "prior", pool)
 
 
 @dataclass(frozen=True)
@@ -1166,10 +1151,10 @@ def ev_check(metrics, p_true, budget_text, ev_margin):
         return EvCheck("c-warn", [P_TRUE_ERROR])
     tick = m.get("tick") or 0.001
     bid, cap = plan["fav_bid_price"], floor_to_tick(p_true - ev_margin, tick)
-    margin = f"p_true minus {cents(ev_margin)}"
+    margin = f"p_true − {cents(ev_margin)}"
     if bid <= cap + 1e-9:
-        tone, lines = "c-good", [f"Planned bid {cents(bid)} is at or under your cap of "
-                                 f"{cents(cap)} ({margin}). A fill is +EV by your estimate."]
+        tone, lines = "c-good", [f"Bid {cents(bid)} is within your {cents(cap)} cap ({margin}): "
+                                 f"a fill is +EV."]
     else:
         best_bid, best_ask = metrics.get("best_bid"), metrics.get("best_ask")
         # A scan row from before the book's best levels were stored has only the
@@ -1177,18 +1162,13 @@ def ev_check(metrics, p_true, budget_text, ev_margin):
         mid = (plan["mid"] if best_bid is None or best_ask is None
                else created_mid(cap, best_bid, best_ask))
         capped = share_score(m.get("v") or 0.0, mid - cap) if cap >= tick else 0.0
-        then = (f"The farmer bids no higher than {cents(cap)}, which scores {capped:.3f} per "
-                f"share instead of {plan['fav_bid_score']:.3f}." if capped > 0 else
-                f"{cents(cap)} is outside the reward band, so the farmer places no favorite "
-                f"bid and the market earns nothing.")
-        tone, lines = "c-warn", [f"Planned bid {cents(bid)} is above your cap of "
-                                 f"{cents(cap)} ({margin}). {then}"]
+        then = (f"scores {capped:.3f}, not {plan['fav_bid_score']:.3f}." if capped > 0 else
+                "outside the band, so no favorite bid and no reward.")
+        tone, lines = "c-warn", [f"Bid capped at {cents(cap)} ({margin}): {then}"]
     budget = _float(budget_text)
     long_cost = plan["low_price"] * plan["low_size"]
     if budget is not None and budget < long_cost - 1e-9:
         tone = "c-warn"
-        lines.append(f"The planned longshot bid ties up {usd(long_cost)}, above your "
-                     f"{usd(budget)} naked budget. The farmer re-prices it within the budget, "
-                     f"never above the cheapest price scoring the min longshot score, and "
-                     f"trims the favorite bid if it still falls short.")
+        lines.append(f"Longshot {usd(long_cost)} is over your {usd(budget)} budget: "
+                     f"re-priced to fit.")
     return EvCheck(tone, lines)

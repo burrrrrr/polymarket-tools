@@ -1,0 +1,27 @@
+<div id="projection" class="projection note-box small" hx-swap-oob="true">
+{%- set l = live %}
+{%- if error %}
+  <span class="c-bad">No projection while the live book can't be read.</span>
+{%- elif not l.orders or not l.value %}
+  {{ l.note or "The farmer plans no favorite bid here, so there is no reward to project." }}
+{%- else %}
+  {%- set v = l.value %}
+  <dl>
+    <dt class="lbl">Est share{{ tip('est_share') }}</dt>
+    <dd class="mono">{{ '%.1f%%' % (l.share * 100) if l.share is not none else '--' }} <span class="muted">scan {{ '%.1f%%' % (scan_share * 100) if scan_share is not none else '--' }}</span></dd>
+    <dt class="lbl">Reward/day{{ tip('est_daily') }}</dt>
+    <dd class="mono">{{ v.reward_per_day | usd }} <span class="muted">scan {{ scan_daily | usd }}</span></dd>
+    <dt class="lbl">Fill cost/day{{ tip('fill_cost') }}</dt>
+    <dd class="mono">{{ v.fill_cost_per_day | usd }} <span class="muted">· {{ '%.1f' % v.fills_per_day }} × {{ v.loss_per_share | cents }}{{ tip('fills_per_day') }}</span></dd>
+    <dt class="lbl">Net/day{{ tip('net_daily') }}</dt>
+    <dd class="mono projection-net">{{ v.net_per_day | usd }}</dd>
+    <dt class="lbl">Capital{{ tip('planned_capital') }}</dt>
+    <dd class="mono">{{ v.capital_usd | usd }}</dd>
+    <dt class="lbl">APR{{ tip('apr') }}</dt>
+    <dd class="mono">{{ '{:,.0f}%'.format(v.reward_per_day * 365 / v.capital_usd * 100) }} <span class="muted">net {{ '{:,.0f}%'.format(v.net_apr * 100) }}{{ tip('net_apr') }}</span></dd>
+  </dl>
+  {%- if l.fill_source == 'prior' %}
+  <p class="c-warn">Fills from the prior alone: no bid until the tape is read.</p>
+  {%- endif %}
+{%- endif %}
+</div>

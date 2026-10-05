@@ -19,7 +19,6 @@ TIP = re.compile(r'<button type="button" class="tip" aria-label="([^"]*)" data-t
 DYNAMIC = {
     "name": set(forms.SCAN_FIELDS),
     "r.key": set(forms.SETTING_FIELDS),
-    "key": {key for _, _, key in views.review_stats({})},
     "term": {"favorite", "longshot"},
     "c.phase": {*views.PHASES, views.WAITING},
     "m.phase": {*views.PHASES, views.WAITING},
@@ -89,12 +88,12 @@ class RenderedTipsTest(Writes):
               "earned_today", "q1_q2", "QUOTING"},
         "/discover": {"min_fav", "min_rate", "fragile_drop", "mode", "favorite", "pool", "band",
                       "est_daily", "planned_capital", "net_apr", "days", "ahead", "vol24h"},
-        "/review/0xddd": {"budget", "band", "min_size", "band_strip", "est_share", "ahead",
-                          "apr", "fills_per_day", "fill_cost", "net_apr",
+        "/review/0xddd": {"budget", "band", "min_size", "band_strip", "ahead",
                           "holding_rewards", "p_true", "naked_budget", "capital_cap",
                           "ev_check", "start_paused"},
         "/partials/review/0xddd/live?p_true=97&naked_budget=25": {
-            "score_per_share", "ties_up", "FAV_BID", "LONG_BID"},
+            "score_per_share", "ties_up", "FAV_BID", "LONG_BID", "est_share", "est_daily",
+            "fill_cost", "fills_per_day", "net_daily", "planned_capital", "apr", "net_apr"},
         "/markets": {"QUOTING", "WAITING", "mid_effective", "book_mid", "q1_q2",
                      "naked_budget", "farm_inventory", "baseline", "FAV_BID", "LONG_ASK",
                      "hold", "expiry_cutoff", "naked_leg", "floor"},
@@ -119,8 +118,10 @@ class RenderedTipsTest(Writes):
                 self.assertEqual(keys - {by_text[text] for _, text in found}, set())
 
     def test_base_page_loads_tips_js_as_javascript(self):
-        self.assertIn('<script src="/static/tips.js" defer></script>', self.client.get("/").text)
-        resp = self.client.get("/static/tips.js")
+        mtime = int((TEMPLATES.parent / "static" / "tips.js").stat().st_mtime)
+        url = f"/static/tips.js?v={mtime}"
+        self.assertIn(f'<script src="{url}" defer></script>', self.client.get("/").text)
+        resp = self.client.get(url)
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.headers["content-type"].startswith("text/javascript"))
 
