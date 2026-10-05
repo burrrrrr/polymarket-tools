@@ -48,8 +48,9 @@ market's end date minus the expiry buffer (7 days), when the market retires.
 Each market has a lifecycle, advanced every cycle by `step_state`:
 
   QUOTING      orders rest as planned.
-  COOLDOWN     the favorite's best ask fell fast; quotes come down for a while,
-               because sellers repricing the favorite down is how a bid gets
+  COOLDOWN     the favorite's ask, read where its asks add up to three reward
+               minimums, fell fast; quotes come down for a while, because
+               sellers repricing the favorite down is how a bid gets
                filled right before the news arrives. A bid leaving never
                cools down: it looks the same cancelled or sold into, and the
                plan just follows the bids that remain.
@@ -166,7 +167,6 @@ from reward_screener import (
     _make_output_safe,
     adjust_levels,
     adjusted_mid,
-    best_price,
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
@@ -198,6 +198,9 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 # A resting favorite bid stays while its net trails the best price's by no
 # more than this, in $/day, or (1 - keep_ratio) of the best net if larger.
 NET_KEEP_SLACK_USD = 0.02
+
+# An ask drop is measured where the asks add up to this many reward minimums.
+DROP_DEPTH = 3
 
 POSITIONS_S = 60
 MARKET_INFO_S = 300
@@ -401,10 +404,11 @@ class State(NamedTuple):
 class Observation(NamedTuple):
     """What step_state and naked_allowed see of a market in one cycle.
 
-    mid and ask are the adjusted midpoint and the best ask of at least
-    min_size in the book without our orders; recent_asks holds (time, ask)
-    from earlier cycles. paused and naked_paused are the human's flags on the
-    market row; naked_cooldown_until is set by the farmer after a longshot fill.
+    mid is the adjusted midpoint and ask is the price at which the asks add
+    up to DROP_DEPTH reward minimums, both in the book without our orders;
+    recent_asks holds (time, ask) from earlier cycles. paused and naked_paused
+    are the human's flags on the market row; naked_cooldown_until is set by
+    the farmer after a longshot fill.
     """
 
     mid: Optional[float]
@@ -737,8 +741,23 @@ RETIRE_CHECKS = (
 )
 
 
+def drop_ask(asks, min_size):
+    """Price at which the best-first asks add up to DROP_DEPTH * min_size, or None.
+
+    Measured at depth rather than at the first min_size level, so a single
+    reward-minimum lot coming and going on a thin book cannot move it.
+    """
+    need = DROP_DEPTH * min_size - 1e-9
+    depth = 0.0
+    for price, size in asks:
+        depth += size
+        if depth >= need:
+            return price
+    return None
+
+
 def ask_dropped(recent_asks, ask, now, cfg):
-    """Whether the best ask fell by drop_threshold from any point in the window.
+    """Whether the drop ask fell by drop_threshold from any point in the window.
 
     Only the ask counts. A bid leaving looks the same whether it was cancelled
     or sold into, and the farmer re-plans against the bids that remain, while
@@ -1668,7 +1687,7 @@ class Farmer:
         managed.orders = orders
         book = strip_own(levels, orders, fm) if self.live else levels
         book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
-        book_ask = best_price(book.asks, fm.min_size)
+        book_ask = drop_ask(book.asks, fm.min_size)
         obs = Observation(
             mid=book_mid,
             ask=book_ask,

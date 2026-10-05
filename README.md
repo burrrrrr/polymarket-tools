@@ -781,8 +781,10 @@ these orders.
 Each market is in one of six states:
 
 - `QUOTING`: orders rest as planned.
-- `COOLDOWN`: the favorite's best ask of at least the reward minimum size
-  fell by `--drop-threshold` within `--drop-window` seconds. All orders come
+- `COOLDOWN`: the favorite's ask fell by `--drop-threshold` within
+  `--drop-window` seconds. The ask is the price at which the favorite's asks
+  add up to three reward minimums, so one minimum-size lot that comes and
+  goes on a thin book does not move it. All orders come
   down for `--cooldown` seconds. A falling offer is sellers repricing the
   favorite down. Only the ask counts, because a bid that leaves looks the same
   whether it was cancelled or sold into. When a bid leaves, the farmer keeps
@@ -934,7 +936,7 @@ it does not manage.
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets at least this share of the best price's |
 | `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus p_true discounted at this rate over its expected hold |
 | `--stuck-share` | 0.25 | Share of fills never sold back, held to the end date; the rest exit at the market's measured exit rate |
-| `--drop-threshold` | 0.03 | Fall in the favorite's best ask that starts a cooldown |
+| `--drop-threshold` | 0.03 | Fall in the favorite's ask, where its asks add up to three reward minimums, that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |
 | `--naked-cooldown` | 3600 | Seconds without a longshot bid after a longshot fill |

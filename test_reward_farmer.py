@@ -27,6 +27,7 @@ from reward_farmer import (
     Farmer,
     build_parser,
     config_from,
+    drop_ask,
     farm_position,
     fill_events,
     keep_failure,
@@ -482,8 +483,26 @@ QUOTING = State(Phase.QUOTING)
 
 
 def asked(price, seconds_ago=30):
-    """recent_asks holding one best ask seen seconds_ago."""
+    """recent_asks holding one ask seen seconds_ago."""
     return ((NOW - timedelta(seconds=seconds_ago), price),)
+
+
+class DropAskTest(unittest.TestCase):
+    def test_a_reward_minimum_lot_flickering_on_a_thin_book_does_not_move_it(self):
+        # A live book with min_size 40: the 40@0.962 lot came and went each cycle.
+        rest = [(0.980, 5.81), (0.992, 10.45), (0.993, 380.0), (0.994, 250.0)]
+        self.assertEqual(drop_ask([(0.962, 40.0)] + rest, 40.0), 0.993)
+        self.assertEqual(drop_ask(rest, 40.0), 0.993)
+
+    def test_it_is_the_level_where_depth_reaches_three_minimums(self):
+        asks = [(0.95, 30.0), (0.96, 50.0), (0.97, 50.0), (0.98, 500.0)]
+        self.assertEqual(drop_ask(asks, 40.0), 0.97)
+
+    def test_depth_exactly_three_minimums_counts(self):
+        self.assertEqual(drop_ask([(0.95, 60.0), (0.96, 60.0), (0.97, 100.0)], 40.0), 0.96)
+
+    def test_a_book_shallower_than_three_minimums_has_none(self):
+        self.assertIsNone(drop_ask([(0.95, 50.0), (0.96, 60.0)], 40.0))
 
 
 class StepStateTest(unittest.TestCase):
@@ -1256,7 +1275,7 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(after[2], {"FAV_BID": (0.855, 584.79), "LONG_BID": (0.001, 795.97)})
         self.assertNotIn("PHASE", [kind for kind, _ in events])
 
-    def test_best_ask_falling_by_the_threshold_cools_down(self):
+    def test_deep_asks_falling_by_the_threshold_cool_down(self):
         fallen = MISTRAL_BOOK._replace(asks=[(0.967, 150.0)] + MISTRAL_BOOK.asks[1:])
         (_, after), events = self.replay(MISTRAL_BOOK, fallen)
         self.assertEqual(after, ("COOLDOWN", "ask drop", {}))

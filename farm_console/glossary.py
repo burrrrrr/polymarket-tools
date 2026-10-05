@@ -160,9 +160,10 @@ GLOSSARY = {
 
     # phases
     "QUOTING": Term("Quoting", "Orders are resting and earning rewards."),
-    "COOLDOWN": Term("Cooldown", "The favorite's best ask fell sharply (by at least the drop "
-                                 "threshold within the drop window). All orders are pulled "
-                                 "until the cooldown ends."),
+    "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
+                                 "threshold within the drop window). The ask is the price "
+                                 "at which the favorite's asks add up to three reward "
+                                 "minimums. All orders are pulled until the cooldown ends."),
     "BELOW_RANGE": Term("Below range", "The favorite's midpoint is below the minimum. All "
                                        "orders are pulled until it recovers 0.5c above it."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "
@@ -203,13 +204,13 @@ GLOSSARY = {
                                      "fraction of its target. A favorite bid stays while it "
                                      "earns at least this fraction of the best price's net "
                                      "$/day."),
-    "drop_threshold": Term("Ask drop threshold", "A fall this large in the favorite's best "
+    "drop_threshold": Term("Ask drop threshold", "A fall this large in the favorite's "
                                                  "ask within the drop window starts a "
                                                  "cooldown. Only the ask counts, because a "
                                                  "bid leaving looks the same cancelled or "
                                                  "sold into, and the farmer re-plans against "
                                                  "the bids that remain."),
-    "drop_window_s": Term("Drop window", "How many seconds back the best ask's fall is "
+    "drop_window_s": Term("Drop window", "How many seconds back the ask's fall is "
                                          "measured."),
     "cooldown_s": Term("Cooldown", "Seconds all orders stay pulled after an ask drop."),
     "naked_cooldown_s": Term("Naked cooldown", "Pause the naked leg this long, in seconds, "

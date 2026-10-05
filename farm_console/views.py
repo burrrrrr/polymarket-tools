@@ -13,7 +13,7 @@ from urllib.parse import quote, urlencode
 import fill_cost
 import reward_farmer
 from farm_db import EventKind, FarmerStatus, resting_order
-from reward_screener import Skip, adjusted_mid, best_price, created_mid, floor_to_tick
+from reward_screener import Skip, adjusted_mid, created_mid, floor_to_tick
 from reward_screener import score as share_score
 
 from .forms import P_TRUE_ERROR
@@ -1059,7 +1059,7 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
         obs = reward_farmer.Observation(
-            mid=book_mid, ask=best_price(levels.asks, info.min_size), recent_asks=(),
+            mid=book_mid, ask=reward_farmer.drop_ask(levels.asks, info.min_size), recent_asks=(),
             rewards_active=reward_farmer.rewards_active(info, fm.condition_id, total_rates),
             accepting_orders=info.accepting_orders, closed=info.closed, approved=True,
             expires_at=fm.expires_at)
