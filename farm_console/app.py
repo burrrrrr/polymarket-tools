@@ -588,11 +588,15 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                      max(1, page))
 
     def scan_values(conn):
-        """The scan form's values: the last ones run, else the screener's defaults."""
+        """The scan form's {name: text}: the last parameters run, else the screener's defaults."""
         stored = farm_db.load_scan_params(conn)
-        # Parameters a scan no longer takes stay in old rows; drop them.
-        return {**reward_screener.ScreenConfig()._asdict(),
-                **{k: v for k, v in stored.items() if k in reward_screener.ScreenConfig._fields}}
+        # Parameters a scan no longer takes stay in old rows; drop them, and
+        # categories the screener no longer offers.
+        config = reward_screener.ScreenConfig()._replace(
+            **{k: v for k, v in stored.items() if k in reward_screener.ScreenConfig._fields})
+        excluded = [c for c in config.excluded_categories if c in reward_screener.CATEGORIES]
+        return {**{name: views.number_text(getattr(config, name)) for name in forms.SCAN_FIELDS},
+                **{forms.exclude_field(c): "1" for c in excluded}}
 
     def discover_response(request, conn, filters, status_code=200, values=None, errors=None,
                           refused=None):
@@ -603,12 +607,13 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             mode=filters.mode, text=filters.q, min_days=filters.min_days,
             buffer_days=effective(conn, "expiry_buffer_days"), now=now,
             limit=views.DISCOVER_PAGE, offset=(filters.page - 1) * views.DISCOVER_PAGE)
-        values = values or {k: views.number_text(v) for k, v in scan_values(conn).items()}
+        values = values or scan_values(conn)
         return templates.TemplateResponse(request, "discover.html", {
             "chrome": views.chrome(snap, now), "now": now, "page": "discover",
             "vm": views.discover_page(filters, markets, total, snap.status, now),
             "funnel": farm_db.load_scan_funnel(conn), "job": runner.job,
             "fields": forms.SCAN_FIELDS, "values": values, "errors": errors or {},
+            "categories": {forms.exclude_field(c): c for c in reward_screener.CATEGORIES},
             "refused": refused, "modes": views.MODES, "statuses": views.STATUS_FILTERS,
         }, status_code=status_code)
 

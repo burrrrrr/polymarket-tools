@@ -56,6 +56,7 @@ farmer can reuse them verbatim against its own live books.
 Usage:
   python reward_screener.py                          # scan with defaults
   python reward_screener.py scan --mode floor --top 20
+  python reward_screener.py scan --exclude sports,politics
   python reward_screener.py list --status approved
   python reward_screener.py approve some-market-slug --p-true 0.97
   python reward_screener.py reject some-market-slug --note "resolution risk"
@@ -111,6 +112,24 @@ TWO_SIDED_ABOVE = 0.90
 # prefilter only drops markets that are clearly too cheap, and the real
 # midpoint check happens on the book.
 PREFILTER_SLACK = 0.03
+
+# Categories a scan can leave out, each the listing tags (lowercase) that put
+# a market in it. Some NFL, tennis and UFC markets lack the Sports tag, hence
+# the extra sports tags. Polymarket tags every esports market Sports too, so
+# excluding sports excludes esports with it.
+CATEGORIES = {
+    "sports": frozenset({"sports", "sport", "football", "nfl", "tennis", "combat sports",
+                         "ufc"}),
+    "esports": frozenset({"esports"}),
+    "crypto": frozenset({"crypto"}),
+    "politics": frozenset({"politics"}),
+    "geopolitics": frozenset({"geopolitics"}),
+    "economy": frozenset({"economy"}),
+    "finance": frozenset({"finance"}),
+    "tech": frozenset({"tech"}),
+    "culture": frozenset({"culture"}),
+    "weather": frozenset({"weather"}),
+}
 
 COMMANDS = ("scan", "list", "approve", "reject")
 
@@ -311,6 +330,8 @@ class ScreenConfig(NamedTuple):
     fill_lookback_days: float = 30.0
     sweep_prior_weight: float = 0.25
     tape_markets: float = 100.0
+    # Keys of CATEGORIES whose markets the prefilter skips.
+    excluded_categories: tuple = ("sports", "esports", "crypto")
 
 
 class ScanResult(NamedTuple):
@@ -729,6 +750,12 @@ def _float(value):
         return None
 
 
+def in_excluded_category(tags, excluded):
+    """Whether a listing's tags put it in any of the excluded CATEGORIES."""
+    lowered = {str(t).lower() for t in tags or ()}
+    return any(lowered & CATEGORIES[c] for c in excluded)
+
+
 def screen_listing(item, total_rates, config, now):
     """Turn one /sampling-markets item into a RewardMarket, or say why not.
 
@@ -739,6 +766,8 @@ def screen_listing(item, total_rates, config, now):
         return Skip("inactive")
     if not item.get("accepting_orders") or not item.get("enable_order_book"):
         return Skip("not accepting orders")
+    if in_excluded_category(item.get("tags"), config.excluded_categories):
+        return Skip("excluded category")
 
     rewards = item.get("rewards") or {}
     v = (_float(rewards.get("max_spread")) or 0) / 100
@@ -1198,7 +1227,21 @@ def config_from(args):
         fill_lookback_days=args.fill_lookback_days,
         sweep_prior_weight=args.sweep_prior_weight,
         tape_markets=args.tape_markets,
+        excluded_categories=args.exclude,
     )
+
+
+def category_list(text):
+    """CATEGORIES keys from comma-separated text; blank or "none" is none."""
+    names = tuple(n.strip().lower() for n in text.split(",") if n.strip())
+    if names == ("none",):
+        return ()
+    unknown = [n for n in names if n not in CATEGORIES]
+    if unknown:
+        raise argparse.ArgumentTypeError(
+            f"unknown categor{'y' if len(unknown) == 1 else 'ies'} {', '.join(unknown)}; "
+            f"choose from {', '.join(CATEGORIES)}")
+    return names
 
 
 def cmd_scan(args):
@@ -1332,6 +1375,11 @@ Examples:
         default = ScreenConfig._field_defaults[field]
         scan.add_argument(f"--{field.replace('_', '-')}", type=float, default=default,
                           help=f"{help_text} (default: {default})")
+    excluded = ",".join(ScreenConfig._field_defaults["excluded_categories"])
+    scan.add_argument("--exclude", type=category_list, default=excluded,
+                      metavar="CATEGORIES",
+                      help=f"Comma-separated categories to skip, or 'none' to keep all; from "
+                           f"{', '.join(CATEGORIES)} (default: {excluded})")
     scan.add_argument("--mode", choices=("any", "floor", "budget"), default="any",
                       help="Show only this mode in the table (all are stored)")
     scan.add_argument("--top", type=int, default=40, help="Rows to show (default: 40)")

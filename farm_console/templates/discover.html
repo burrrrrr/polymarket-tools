@@ -25,6 +25,14 @@
     </div>
     {%- endfor %}
   </div>
+  <div class="field">
+    <div class="label-row"><span class="lbl" id="scan-exclude">Exclude categories</span>{{ tip('excluded_categories') }}</div>
+    <div class="actions" role="group" aria-labelledby="scan-exclude" style="gap: 14px">
+      {%- for name, category in categories.items() %}
+      <label class="check"><input type="checkbox" name="{{ name }}" value="1"{{ ' checked' if values.get(name) == '1' }}> {{ category | title }}</label>
+      {%- endfor %}
+    </div>
+  </div>
   {%- if refused %}<p class="field-error" role="alert" style="margin: 0">{{ refused }}</p>{% endif %}
   {% include "partials/scan_status.html" %}
 </form>

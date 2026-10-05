@@ -217,6 +217,11 @@ GLOSSARY = {
                                             "alone."),
     "min_rate": Term("Min pool", "Skip markets whose daily reward pool is smaller than this, "
                                  "in USD."),
+    "excluded_categories": Term("Exclude categories", "Skip markets Polymarket tags with a "
+                                                      "checked category. Every esports "
+                                                      "market is also tagged sports, so "
+                                                      "excluding sports excludes esports "
+                                                      "too."),
     "fragile_drop": Term("Fragile mid drop", "Skip markets whose midpoint would fall this "
                                              "much if their best bid left. Our favorite bid "
                                              "would follow the next bid down and its score "

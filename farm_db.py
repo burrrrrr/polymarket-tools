@@ -284,7 +284,7 @@ def load_scan_funnel(conn):
 
 
 def put_scan_params(conn, params, now):
-    """The scan parameters the console last ran with, as {field: number}."""
+    """The scan parameters the console last ran with, as ScreenConfig._asdict()."""
     with conn:
         _put_json(conn, SCAN_PARAMS_KEY, params, now)
 

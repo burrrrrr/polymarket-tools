@@ -608,8 +608,10 @@ class FakeScan:
 
 
 def scan_form(**changes):
-    values = {k: views.number_text(v) for k, v in ScreenConfig()._asdict().items()}
-    return {**values, **changes}
+    config = ScreenConfig()
+    values = {k: views.number_text(getattr(config, k)) for k in forms.SCAN_FIELDS}
+    excluded = {forms.exclude_field(c): "1" for c in config.excluded_categories}
+    return {**values, **excluded, **changes}
 
 
 class ScanTest(Writes):
@@ -681,11 +683,34 @@ class ScanTest(Writes):
         self.assertIn('name="fragile_drop" value="0.03"', page)
         self.assertIn('name="naked_budget" value="10"', page)
 
+    def test_form_excludes_sports_crypto_and_esports_by_default(self):
+        page = self.client.get("/discover").text
+        for category in reward_screener.CATEGORIES:
+            checked = category in ("sports", "esports", "crypto")
+            with self.subTest(category=category):
+                self.assertEqual(f'name="exclude_{category}" value="1" checked' in page, checked)
+                self.assertIn(f'name="exclude_{category}" value="1"', page)
+
+    def test_excluded_categories_are_what_is_checked_and_are_remembered(self):
+        form = {**scan_form(exclude_politics="1"), "exclude_sports": ""}
+        self.fake.release.set()
+        self.post("/discover/scan", **form)
+        self.wait_for("Done")
+        self.assertEqual(self.fake.configs[0].excluded_categories,
+                         ("esports", "crypto", "politics"))
+        page = self.client.get("/discover").text
+        self.assertIn('name="exclude_politics" value="1" checked', page)
+        self.assertNotIn('name="exclude_sports" value="1" checked', page)
+
     def test_stored_parameters_from_an_older_screener_still_load(self):
         farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01,
-                                          "fav_target_score": 0.45}, self.now)
+                                          "fav_target_score": 0.45,
+                                          "excluded_categories": ["politics", "golf"]}, self.now)
         resp = self.client.get("/discover")
         self.assertEqual(resp.status_code, 200)
+        self.assertIn('name="exclude_politics" value="1" checked', resp.text)
+        self.assertNotIn('name="exclude_sports" value="1" checked', resp.text)
+        self.assertNotIn("golf", resp.text)
         self.assertIn('name="capital" value="300"', resp.text)
         self.assertIn('name="hurdle_rate" value="0.4"', resp.text)
         self.assertIn('name="max_lead" value="0.005"', resp.text)

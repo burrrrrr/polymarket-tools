@@ -480,6 +480,7 @@ your decisions, so rescanning is always safe.
 ```bash
 python reward_screener.py                     # same as 'scan' with defaults
 python reward_screener.py scan --mode floor --top 20 --json scan.json
+python reward_screener.py scan --exclude sports,politics
 python reward_screener.py list --status approved
 python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --budget 25
 python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --capital 200
@@ -530,6 +531,12 @@ Key `scan` options:
   midpoint by this much. When that maker leaves, our favorite bid follows the
   next bid down and its reward score collapses. A market is also fragile when
   pulling that bid leaves no bid or drops the midpoint under `--min-fav`.
+- `--exclude` (sports,esports,crypto) skips, as `excluded category`, every
+  market whose listing tags put it in one of these comma-separated
+  categories: sports, esports, crypto, politics, geopolitics, economy,
+  finance, tech, culture, weather. `--exclude none` keeps them all. Every
+  esports market is also tagged sports, so excluding sports excludes esports
+  too. The console's scan form has a checkbox for each.
 - `--mode` filters the table only. Every assessment is stored.
 
 The table columns:
@@ -938,7 +945,7 @@ control the farmer. Every change it makes goes through `farm_db` into
 `farm.db`, and the farmer picks it up on its next cycle.
 
 ```bash
-python -m farm_console --db farm.db --port 8787   # then open http://127.0.0.1:8787
+ --port 8787   # then open http://127.0.0.1:8787
 ```
 
 Run it next to the farmer on the same database, in its own terminal. Neither

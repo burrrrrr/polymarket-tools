@@ -9,7 +9,7 @@ from typing import NamedTuple, Optional
 
 import farm_db
 from farm_db import Bound
-from reward_screener import ScreenConfig
+from reward_screener import CATEGORIES, ScreenConfig
 
 NOTE_MAX = 500
 CANCEL_ALL_WORD = "CANCEL"
@@ -131,6 +131,11 @@ def parse_note(form):
     return note or None, {}
 
 
+def exclude_field(category):
+    """The scan form's checkbox name for excluding one CATEGORIES key."""
+    return f"exclude_{category}"
+
+
 def parse_scan(form):
     """A ScreenConfig from the scan parameters form."""
     values, errors = {}, {}
@@ -140,7 +145,8 @@ def parse_scan(form):
             errors[name] = f"Out of range for {field.label.lower()}."
         else:
             values[name] = value
-    return (None if errors else ScreenConfig(**values)), errors
+    excluded = tuple(c for c in CATEGORIES if form.get(exclude_field(c)) == "1")
+    return (None if errors else ScreenConfig(**values, excluded_categories=excluded)), errors
 
 
 def parse_settings(form, group):

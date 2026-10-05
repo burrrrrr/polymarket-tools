@@ -232,6 +232,38 @@ def listing_item(cid, rate):
                        {"token_id": f"long-{cid}", "price": 0.04, "outcome": "Yes"}]}
 
 
+class ExcludedCategoryTest(unittest.TestCase):
+    def screen(self, tags, config=ScreenConfig()):
+        item = {**listing_item("0x1", 100.0), "tags": tags}
+        return reward_screener.screen_listing(item, {"0x1": 100.0}, config, SCAN_NOW)
+
+    def test_sports_crypto_and_esports_are_skipped_by_default(self):
+        for tags in (["Sports", "NBA"], ["Crypto", "Bitcoin"], ["Esports", "lol"],
+                     ["football", "NFL (All)", "NFL"]):
+            with self.subTest(tags=tags):
+                self.assertEqual(self.screen(tags), Skip("excluded category"))
+
+    def test_other_and_missing_tags_pass(self):
+        for tags in (["Politics", "Elections"], [], None):
+            with self.subTest(tags=tags):
+                self.assertIsInstance(self.screen(tags), RewardMarket)
+
+    def test_only_the_configured_categories_are_skipped(self):
+        config = ScreenConfig(excluded_categories=("politics",))
+        self.assertIsInstance(self.screen(["Sports"], config), RewardMarket)
+        self.assertEqual(self.screen(["POLITICS"], config), Skip("excluded category"))
+        self.assertIsInstance(self.screen(["Crypto"], ScreenConfig(excluded_categories=())),
+                              RewardMarket)
+
+    def test_the_cli_takes_a_comma_list_or_none(self):
+        parse = lambda *argv: reward_screener.build_parser().parse_args(["scan", *argv]).exclude
+        self.assertEqual(parse(), ("sports", "esports", "crypto"))
+        self.assertEqual(parse("--exclude", "Politics, tech"), ("politics", "tech"))
+        self.assertEqual(parse("--exclude", "none"), ())
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            parse("--exclude", "sports,golf")
+
+
 class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
