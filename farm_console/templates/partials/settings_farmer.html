@@ -8,7 +8,10 @@
       <span class="small muted">The farmer has never run against this database.</span>
       {%- endif %}
     </div>
-    <button class="btn" type="button" hx-post="/farmer/stop" hx-target="closest div[hx-get]" hx-swap="innerHTML" hx-confirm="Stop the farmer? A live farmer cancels the orders on its managed markets before it exits. Starting it again needs the terminal." {{ 'disabled' if not live.running }}>Stop farmer</button>
+    <div class="actions">
+      <button class="btn" type="button" hx-post="/farmer/stop" hx-target="closest div[hx-get]" hx-swap="innerHTML" hx-confirm="Stop the farmer? A live farmer cancels the orders on its managed markets before it exits. Starting it again needs the terminal." {{ 'disabled' if not live.running }}>Stop farmer</button>
+      <button class="btn" type="button" hx-post="/farmer/stop" hx-vals='{"keep_orders": "1"}' hx-target="closest div[hx-get]" hx-swap="innerHTML" hx-confirm="Stop the farmer and keep its orders? They rest unmanaged until the farmer starts again: no cooldowns, retirement, or fill handling, and they expire only at their GTD date. A market you unapprove before restarting keeps its orders until then. With the heartbeat on, Polymarket cancels them within about 10s anyway. Starting it again needs the terminal." {{ 'disabled' if not live.running }}>Stop, keep orders</button>{{ tip('keep_orders') }}
+    </div>
   </div>
   {%- if status %}
   <dl class="facts">

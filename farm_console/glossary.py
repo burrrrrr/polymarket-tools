@@ -247,6 +247,15 @@ GLOSSARY = {
                                    "Polymarket cancels every order owned by these API "
                                    "credentials, possibly including your other tools' "
                                    "orders."),
+    "keep_orders": Term("Stop, keep orders", "Stops the farmer but leaves its orders "
+                                             "resting, unmanaged until it starts again: no "
+                                             "cooldowns, retirement, or fill handling, and "
+                                             "they expire only at their GTD date. On start "
+                                             "it keeps the ones still close to target; a "
+                                             "market you unapprove meanwhile keeps its "
+                                             "orders until they expire. "
+                                             "The heartbeat, if on, cancels them within "
+                                             "about 10s."),
     "cancel_all": Term("Cancel all", "Pauses every approved market, so the farmer cancels all "
                                      "their orders. Markets you don't farm are untouched."),
 }

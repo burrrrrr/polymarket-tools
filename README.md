@@ -792,8 +792,9 @@ Each market is in one of six states:
 Every cycle the farmer re-reads the approved rows, their controls, the
 settings, and the commands from `farm.db`. A new approval, a rejection, a
 pause, or a setting therefore takes effect within one `--interval`. The farmer
-reads positions every 60 seconds and each market's CLOB record (reward terms,
-tick, trading status) every 5 minutes.
+reads positions every 60 seconds and every market's Gamma record (reward terms,
+tick, trading status) every 5 minutes, in batched requests on a thread of its
+own, and a newly approved market's at once.
 
 #### Pausing, settings, and stopping
 

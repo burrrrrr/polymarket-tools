@@ -1,6 +1,6 @@
 """What the Review page fetches on demand: a market's resolution rules from
-Gamma, the funder's holdings in it, its CLOB record and live book, and the
-total reward rates, all read the way the farmer reads them."""
+Gamma, the funder's holdings in it, its Gamma market record and live book, and
+the total reward rates, all read the way the farmer reads them."""
 
 import threading
 from datetime import datetime, timedelta
@@ -13,8 +13,8 @@ import reward_screener
 from reward_screener import CLOB_HOST, GAMMA_HOST, parse_levels, parse_time
 
 RULES_TTL = timedelta(minutes=10)
-# The CLOB record holds the reward terms and tick, which rarely change; the
-# book is cached just long enough that several open tabs share one fetch.
+# The Gamma market record holds the reward terms and tick, which rarely change;
+# the book is cached just long enough that several open tabs share one fetch.
 INFO_TTL = timedelta(minutes=5)
 BOOK_TTL = timedelta(seconds=2)
 TOTAL_RATES_TTL = timedelta(seconds=reward_farmer.TOTAL_RATES_S)
@@ -41,13 +41,21 @@ def fetch_rules(condition_id):
                  parse_time(entry.get("endDate")))
 
 
+def _market_info(http, condition_id):
+    infos = reward_farmer.fetch_market_infos(http, [condition_id], timeout=TIMEOUT_S)
+    info = infos.get(condition_id)
+    if info is None:
+        raise LookupError("Gamma has no record of this market")
+    return info
+
+
 def fetch_position(user, condition_id, fav_token_id):
     """The wallet's reward_farmer.Position in this market, from the same data API
-    positions and CLOB market record the farmer uses."""
+    positions and Gamma market record the farmer uses."""
     if not user:
         raise LookupError("POLYMARKET_FUNDER_ADDRESS is not set in .env")
     with httpx.Client() as http:
-        info = reward_farmer.fetch_market_info(http, condition_id, timeout=TIMEOUT_S)
+        info = _market_info(http, condition_id)
         holdings = reward_farmer.fetch_holdings(http, user, timeout=TIMEOUT_S)
     longs = [t for t in info.token_ids if t != fav_token_id]
     fav = holdings.get(fav_token_id, (0.0, 0.0))
@@ -56,9 +64,9 @@ def fetch_position(user, condition_id, fav_token_id):
 
 
 def fetch_info(condition_id):
-    """The market's reward_farmer.MarketInfo from the CLOB."""
+    """The market's reward_farmer.MarketInfo from its Gamma record."""
     with httpx.Client() as http:
-        return reward_farmer.fetch_market_info(http, condition_id, timeout=TIMEOUT_S)
+        return _market_info(http, condition_id)
 
 
 def fetch_book(token_id):

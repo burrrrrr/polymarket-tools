@@ -104,7 +104,7 @@ class RenderedTipsTest(Writes):
         "/activity": {"earned_today", "scoring_share", "est_daily"},
         "/activity?tab=fills": {"edge_vs_p_true", "FAV_BID"},
         "/activity?tab=inventory": {"baseline", "farm_inventory"},
-        "/settings": {*forms.SETTING_FIELDS, "heartbeat", "cancel_all"},
+        "/settings": {*forms.SETTING_FIELDS, "heartbeat", "keep_orders", "cancel_all"},
     }
 
     def test_each_page_renders_labelled_tips_for_its_terms(self):

@@ -939,6 +939,15 @@ class SettingsTest(Writes):
         self.assertIn("was consumed at", text)
         self.assertIn(": stopping.", text)
 
+    def test_stop_keeping_orders_sends_the_payload_a_plain_stop_leaves_out(self):
+        page = self.client.get("/settings").text
+        self.assertIn('hx-post="/farmer/stop" hx-vals=\'{"keep_orders": "1"}\'', page)
+        self.assertIn('hx-confirm="Stop the farmer and keep its orders?', page)
+        self.post("/farmer/stop")
+        self.post("/farmer/stop", keep_orders="1")
+        self.assertEqual([c.payload for c in farm_db.pending_commands(self.db)],
+                         [None, {"keep_orders": True}])
+
     def test_cancel_all_needs_the_typed_word_on_the_server(self):
         for typed in ("", "cancel", "CANCEL ALL", "yes"):
             with self.subTest(typed=typed):

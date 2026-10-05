@@ -808,11 +808,131 @@ METRICS = {"market": {"fav_token_id": FAV, "slug": "test-market", "question": "T
                       "fav_outcome": "No", "rate_per_day": 100.0}}
 
 
+class MarketInfosTest(unittest.TestCase):
+    OTHER = "0xother"
+
+    def setUp(self):
+        self.fetch = mock.Mock(return_value={CID: INFO})
+        self.infos = reward_farmer.MarketInfos(threading.Event(), self.fetch)
+        self.infos.wanted = frozenset({CID})
+        patcher = mock.patch.object(reward_farmer, "log")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def refresh_at(self, *seconds):
+        """Refresh at each NOW + seconds; CID's info after each."""
+        seen = []
+        for s in seconds:
+            self.infos.refresh(None, NOW + timedelta(seconds=s))
+            seen.append(self.infos.read.get(CID))
+        return seen
+
+    def fetch_counts_at(self, *seconds):
+        """Refresh at each NOW + seconds; the fetch count after each."""
+        counts = []
+        for s in seconds:
+            self.infos.refresh(None, NOW + timedelta(seconds=s))
+            counts.append(self.fetch.call_count)
+        return counts
+
+    def test_wanted_markets_are_read_at_once_then_every_five_minutes(self):
+        self.assertEqual(self.fetch_counts_at(0, 5, 299, 300, 305), [1, 1, 1, 2, 2])
+        self.assertEqual(self.fetch.call_args.args[1], {CID})
+        self.assertEqual(self.infos.read, {CID: INFO})
+
+    def test_a_newly_wanted_market_is_read_at_once(self):
+        self.refresh_at(0)
+        self.fetch.return_value = {CID: INFO, self.OTHER: INFO}
+        self.infos.wanted = frozenset({CID, self.OTHER})
+        self.assertEqual(self.fetch_counts_at(5), [2])
+        self.assertEqual(self.fetch.call_args.args[1], {CID, self.OTHER})
+        self.assertEqual(self.infos.read, {CID: INFO, self.OTHER: INFO})
+
+    def test_no_wanted_markets_make_no_request(self):
+        self.infos.wanted = frozenset()
+        self.assertEqual(self.fetch_counts_at(0, 300), [0, 0])
+
+    def test_a_failed_first_read_leaves_nothing_and_retries_after_a_minute(self):
+        self.fetch.side_effect = [httpx.ConnectError("Gamma down"), {CID: INFO}]
+        self.assertEqual(self.refresh_at(0, 59, 60), [None, None, INFO])
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_a_failed_reread_keeps_the_last_infos(self):
+        later = INFO._replace(v=0.045)
+        self.fetch.side_effect = [{CID: INFO}, httpx.ConnectError("Gamma down"), {CID: later}]
+        self.assertEqual(self.refresh_at(0, 300, 359, 360), [INFO] * 3 + [later])
+
+    def test_a_market_no_longer_wanted_drops_out_and_rejoining_rereads_at_once(self):
+        self.fetch.return_value = {CID: INFO, self.OTHER: INFO}
+        self.infos.wanted = frozenset({CID, self.OTHER})
+        self.refresh_at(0)
+        self.infos.wanted = frozenset({self.OTHER})
+        self.assertEqual(self.fetch_counts_at(5), [1])
+        self.assertEqual(self.infos.read, {self.OTHER: INFO})
+        self.infos.wanted = frozenset({CID, self.OTHER})
+        self.assertEqual(self.fetch_counts_at(10), [2])
+        self.assertEqual(self.infos.read, {CID: INFO, self.OTHER: INFO})
+
+    def test_a_market_the_fetch_leaves_out_keeps_its_last_info(self):
+        later = INFO._replace(v=0.045)
+        self.infos.wanted = frozenset({CID, self.OTHER})
+        self.fetch.side_effect = [{CID: INFO, self.OTHER: INFO}, {self.OTHER: later}]
+        self.assertEqual(self.refresh_at(0, 300, 305), [INFO] * 3)
+        self.assertEqual(self.infos.read, {CID: INFO, self.OTHER: later})
+        self.assertEqual(self.fetch.call_count, 2)
+
+    def test_a_market_the_fetch_never_returns_is_not_refetched_every_tick(self):
+        self.infos.wanted = frozenset({CID, self.OTHER})
+        self.assertEqual(self.fetch_counts_at(0, 5, 10), [1, 1, 1])
+        self.assertEqual(self.infos.read, {CID: INFO})
+
+
+def gamma_api(rows):
+    """An httpx client whose Gamma /markets answers with the rows asked for,
+    open or closed as the request asks, as Gamma does; and its requests."""
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        ids = request.url.params.get_list("condition_ids")
+        closed = request.url.params["closed"] == "true"
+        return httpx.Response(200, json=[r for r in rows
+                                         if r["conditionId"] in ids and r["closed"] == closed])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+GAMMA_ROW = {"conditionId": CID, "clobTokenIds": json.dumps([FAV, LONG]),
+             "rewardsMaxSpread": 3.5, "rewardsMinSize": 50, "orderPriceMinTickSize": 0.001,
+             "negRisk": False, "acceptingOrders": True, "closed": False}
+
+
+class FetchMarketInfosTest(unittest.TestCase):
+    def test_ids_are_read_in_chunks_of_a_hundred_open_and_closed(self):
+        ids = [f"0x{i:03d}" for i in range(150)]
+        http, calls = gamma_api([])
+        self.assertEqual(reward_farmer.fetch_market_infos(http, ids), {})
+        asked = [(c.url.params["closed"], c.url.params.get_list("condition_ids"),
+                  c.url.params["limit"]) for c in calls]
+        self.assertEqual(len(asked), 4)
+        for closed, chunk, limit in asked:
+            self.assertLessEqual(len(chunk), 100)
+            self.assertEqual(limit, str(len(chunk)))
+        for closed in ("false", "true"):
+            self.assertEqual(sorted(i for c, chunk, _ in asked if c == closed for i in chunk), ids)
+
+    def test_open_and_closed_gamma_rows_parse_to_market_infos(self):
+        shut = {**GAMMA_ROW, "conditionId": "0xshut", "acceptingOrders": False, "closed": True}
+        http, _ = gamma_api([GAMMA_ROW, shut])
+        self.assertEqual(reward_farmer.fetch_market_infos(http, [CID, "0xshut", "0xnone"]),
+                         {CID: INFO, "0xshut": INFO._replace(accepting_orders=False, closed=True)})
+
+
 class RanAway(BaseException):
     """Raised by a fake when the farmer keeps cycling after it should have stopped."""
 
 
-class FarmerCycleTest(unittest.TestCase):
+class FarmerHarness(unittest.TestCase):
     """The daemon against a scratch farm.db, with the network faked."""
 
     def setUp(self):
@@ -828,11 +948,11 @@ class FarmerCycleTest(unittest.TestCase):
         farm_db.approve_market(self.ui, CID, 0.995, 25.0)
         self.book_fetches = 0
         self.on_book_fetch = lambda count: None
-        self.info = mock.Mock(return_value=INFO)
+        self.infos = mock.Mock(return_value={CID: INFO})
         self.history = mock.Mock(return_value=NO_SWEEPS)
         self.book = FLOOR_BOOK
         for name, fake in (
-            ("fetch_market_info", self.info),
+            ("fetch_market_infos", self.infos),
             ("fetch_history", self.history),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
@@ -847,11 +967,11 @@ class FarmerCycleTest(unittest.TestCase):
     def fake_levels(self, http, token_ids):
         self.book_fetches += 1
         self.on_book_fetch(self.book_fetches)
-        return {FAV: self.book}
+        return dict.fromkeys(token_ids, self.book)
 
-    def started_farmer(self, read_histories=True):
+    def started_farmer(self, read_histories=True, client=None):
         """A started farmer, its histories read as the reader thread would."""
-        farmer = Farmer(self.args, config_from(self.args))
+        farmer = Farmer(self.args, config_from(self.args), client)
         self.addCleanup(farmer.http.close)
         self.addCleanup(farmer.db.close)
         farmer.start()
@@ -872,6 +992,8 @@ class FarmerCycleTest(unittest.TestCase):
         row = self.query("SELECT * FROM farm_state WHERE condition_id = ?", CID)[0]
         return row, json.loads(row["slots"])
 
+
+class FarmerCycleTest(FarmerHarness):
     def test_dry_cycle_publishes_state_status_and_places(self):
         farmer = self.started_farmer()
         farmer.cycle()
@@ -1089,6 +1211,17 @@ class FarmerCycleTest(unittest.TestCase):
         self.assertEqual(farm_db.find_market(self.ui, CID)["status"], "approved")
         self.assertEqual(self.events(before), [])
 
+    def test_a_retired_market_still_approved_is_no_longer_read(self):
+        farm_db.put_setting(self.ui, "expiry_buffer_days", 1000, NOW)
+        farmer = self.started_farmer()
+        self.assertEqual(farmer.infos.wanted, {CID})
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(farmer.infos.wanted, frozenset())
+        farmer.infos.refresh(farmer.http, NOW + timedelta(seconds=600))
+        self.assertEqual(farmer.infos.read, {})
+        self.assertEqual(self.infos.call_count, 1)
+
     def test_rows_of_markets_no_longer_managed_are_deleted(self):
         with self.ui:
             self.ui.execute("INSERT INTO farm_state (condition_id, updated_at, phase) "
@@ -1101,7 +1234,7 @@ class FarmerCycleTest(unittest.TestCase):
         """Cycle a market on the Mistral terms once per book. Returns, per cycle,
         (phase, reason, {slot: (price, size)} of the bids it targets), and the
         events of all the cycles."""
-        self.info.return_value = INFO._replace(v=0.085, min_size=20.0)
+        self.infos.return_value = {CID: INFO._replace(v=0.085, min_size=20.0)}
         farmer = self.started_farmer()
         before = self.last_event_id()
         seen = []
@@ -1164,6 +1297,40 @@ class FarmerCycleTest(unittest.TestCase):
         farmer.cycle()
         self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
 
+    def first_bid_on_stored_history(self, history):
+        """The favorite bid slot of a restarted farmer's first cycle, its
+        farm_state row holding `history`, before the reader reads any."""
+        self.started_farmer().cycle()
+        slots = self.farm_state()[1]
+        slots["FAV_BID"]["history"] = history
+        with self.ui:
+            self.ui.execute("UPDATE farm_state SET slots = ?", (json.dumps(slots),))
+        self.started_farmer(read_histories=False).cycle()
+        self.assertEqual(self.history.call_count, 1)
+        self.history.reset_mock()
+        return self.farm_state()[1]["FAV_BID"]
+
+    def stored(self, age_s):
+        return fill_cost.history_to_json(NO_SWEEPS._replace(
+            read_at=datetime.now(timezone.utc) - timedelta(seconds=age_s)))
+
+    def test_a_restart_quotes_the_favorite_bid_on_a_fresh_stored_history(self):
+        fav = self.first_bid_on_stored_history(self.stored(60))
+        self.assertEqual((fav["decision"], fav["target"]["price"]), ("place", 0.975))
+
+    def test_a_restart_ignores_a_stored_history_older_than_its_refresh(self):
+        fav = self.first_bid_on_stored_history(self.stored(reward_farmer.HISTORY_S + 60))
+        self.assertEqual((fav["decision"], fav["reason"]), ("none", "no fill history yet"))
+
+    def test_a_restart_ignores_a_missing_or_malformed_stored_history(self):
+        fresh = self.stored(60)
+        for history in (None, "junk", {**fresh, "events": "junk"}, {**fresh, "read_at": "soon"},
+                        {**fresh, "v": 99}):
+            with self.subTest(history=history):
+                fav = self.first_bid_on_stored_history(history)
+                self.assertEqual((fav["decision"], fav["reason"]),
+                                 ("none", "no fill history yet"))
+
     def test_a_history_of_no_days_places_no_favorite_bid(self):
         self.history.return_value = NO_SWEEPS._replace(days=0.0)
         self.started_farmer().cycle()
@@ -1203,6 +1370,382 @@ class FarmerCycleTest(unittest.TestCase):
         self.started_farmer()
         self.assertEqual([r["at"] for r in self.query("SELECT at FROM farm_mids")],
                          [farm_db.stamp(now - timedelta(days=6))])
+
+
+CID2, FAV2, LONG2 = "0xc0nd2", "fav-token-2", "long-token-2"
+INFO2 = INFO._replace(token_ids=(FAV2, LONG2))
+
+
+class LiveFarmerTest(FarmerHarness):
+    """A live farmer on two markets against a mock CLOB that rests what it accepts."""
+
+    def setUp(self):
+        super().setUp()
+        metrics = {"market": {**METRICS["market"], "fav_token_id": FAV2, "slug": "other-market"}}
+        farm_db.store_scan(self.ui, [farm_db.ScanRow(
+            CID2, "other-market", "Other?", (NOW + timedelta(days=100)).isoformat(), 1.0,
+            json.dumps(metrics),
+        )], [CID, CID2], NOW)
+        farm_db.approve_market(self.ui, CID2, 0.995, 25.0)
+        self.infos.return_value = {CID: INFO, CID2: INFO2}
+        self.market_of = {FAV: CID, LONG: CID, FAV2: CID2, LONG2: CID2}
+        self.resting = {}
+        self.posted = 0
+        self.rejected_tokens = set()
+        self.client = mock.Mock()
+        self.client.get_balance_allowance.return_value = {"balance": "10000000000"}
+        self.client.get_reward_percentages.return_value = {}
+        self.client.get_earnings_for_user_for_day.return_value = []
+        self.clob_ticks = {CID: "0.001", CID2: "0.001"}
+        self.cached_ticks = {}
+        self.client.get_clob_market_info.side_effect = self.get_clob_market_info
+        self.client.get_tick_size.side_effect = self.get_tick_size
+        self.client.create_order.side_effect = self.create_order
+        self.client.post_orders.side_effect = self.post_orders
+        self.client.get_open_orders.side_effect = self.get_open_orders
+        self.client.cancel_orders.side_effect = self.cancel_orders
+
+    def get_clob_market_info(self, condition_id):
+        for token_id, cid in self.market_of.items():
+            if cid == condition_id:
+                self.cached_ticks[token_id] = self.clob_ticks[cid]
+        return {}
+
+    def get_tick_size(self, token_id):
+        return self.cached_ticks.setdefault(token_id, self.clob_ticks[self.market_of[token_id]])
+
+    def create_order(self, args, options):
+        """Signs as the client does: never finer than the tick it has cached."""
+        cached = self.get_tick_size(args.token_id)
+        if float(options.tick_size) < float(cached):
+            raise ValueError(f"invalid tick size ({options.tick_size}), "
+                             f"minimum for the market is {cached}")
+        return args
+
+    def post_orders(self, batch, post_only):
+        responses = []
+        for item in batch:
+            order = item.order
+            if order.token_id in self.rejected_tokens:
+                responses.append({"success": False, "errorMsg": "post-only order crosses"})
+                continue
+            self.posted += 1
+            order_id = f"o{self.posted}"
+            self.resting[order_id] = {
+                "id": order_id, "market": self.market_of[order.token_id],
+                "asset_id": order.token_id, "side": order.side, "price": str(order.price),
+                "original_size": str(order.size), "size_matched": "0",
+            }
+            responses.append({"success": True, "orderID": order_id, "errorMsg": ""})
+        return responses
+
+    def get_open_orders(self):
+        return list(self.resting.values())
+
+    def cancel_orders(self, order_ids):
+        for order_id in order_ids:
+            del self.resting[order_id]
+        return {"canceled": list(order_ids), "not_canceled": {}}
+
+    def posted_tokens(self):
+        return [sorted(item.order.token_id for item in c.args[0])
+                for c in self.client.post_orders.call_args_list]
+
+    def test_one_cycle_posts_both_markets_places_in_one_batch(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+        self.client.cancel_orders.assert_not_called()
+
+    def test_one_cycle_cancels_both_markets_orders_in_one_call(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        resting = set(self.resting)
+        self.assertEqual(len(resting), 4)
+        for cid in (CID, CID2):
+            farm_db.set_paused(self.ui, cid, True)
+        farmer.cycle()
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [resting])
+        self.assertEqual(self.resting, {})
+
+    def test_a_rejection_in_the_shared_batch_backs_off_only_its_markets_slot(self):
+        self.rejected_tokens = {FAV2}
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.assertEqual(self.client.post_orders.call_count, 1)
+        self.assertEqual({cid: set(m.backoffs) for cid, m in farmer.markets.items()},
+                         {CID: set(), CID2: {Slot.FAV_BID}})
+        flagged = [(e["kind"], e["condition_id"], e["slot"]) for e in self.events()
+                   if e["kind"] in ("REJECT", "BACKOFF")]
+        self.assertEqual(flagged, [("REJECT", CID2, "FAV_BID"), ("BACKOFF", CID2, "FAV_BID")])
+
+    def test_a_failed_batch_alerts_each_market_in_it_with_its_own_count(self):
+        self.client.post_orders.side_effect = httpx.ConnectError("down")
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        alerts = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "ALERT"]
+        self.assertEqual(alerts, [(CID, "post of 2 orders failed on test-market: down"),
+                                  (CID2, "post of 2 orders failed on other-market: down")])
+
+    def test_a_cycle_lists_every_open_order_once_and_holds_each_markets_orders(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        resting = dict(self.resting)
+        self.client.reset_mock()
+        farmer.cycle()
+        self.client.get_open_orders.assert_called_once_with()
+        self.client.cancel_orders.assert_not_called()
+        self.client.post_orders.assert_not_called()
+        self.assertEqual(self.resting, resting)
+
+    def test_an_order_on_an_unmanaged_token_is_left_alone(self):
+        self.resting["foreign"] = {
+            "id": "foreign", "market": CID, "asset_id": "foreign-token", "side": "BUY",
+            "price": "0.5", "original_size": "10", "size_matched": "0",
+        }
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+        self.client.cancel_orders.assert_not_called()
+        self.assertIn("foreign", self.resting)
+        self.assertEqual({cid: sorted(o.token_id for o in m.orders)
+                          for cid, m in farmer.markets.items()},
+                         {CID: sorted([FAV, LONG]), CID2: sorted([FAV2, LONG2])})
+
+    def test_a_failed_listing_plans_no_market_until_it_reads_again(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        gone = next(i for i, e in self.resting.items() if e["asset_id"] == FAV2)
+        del self.resting[gone]
+        self.client.reset_mock()
+        self.client.get_open_orders.side_effect = httpx.ConnectError("down")
+        farmer.cycle()
+        self.assertIn(mock.call("Warning: open orders unavailable (down); planning no market"),
+                      reward_farmer.log.call_args_list)
+        self.client.post_orders.assert_not_called()
+        self.client.cancel_orders.assert_not_called()
+        self.client.get_open_orders.side_effect = self.get_open_orders
+        farmer.cycle()
+        self.assertEqual(self.posted_tokens(), [[FAV2]])
+        self.client.cancel_orders.assert_not_called()
+
+    def stopped_after_a_cycle(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.client.reset_mock()
+        return farmer
+
+    def test_stopping_lists_once_and_cancels_only_the_managed_markets_orders(self):
+        farmer = self.stopped_after_a_cycle()
+        managed_ids = set(self.resting)
+        self.resting["foreign"] = {"id": "foreign", "market": "0xunmanaged", "asset_id": "x"}
+        farmer.shutdown("test", cancel=True)
+        self.client.get_open_orders.assert_called_once_with()
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [managed_ids])
+        self.assertEqual(list(self.resting), ["foreign"])
+        self.client.cancel_market_orders.assert_not_called()
+        cancels = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "CANCEL"]
+        self.assertEqual(cancels, [(CID, "Cancelled 2 orders on test-market"),
+                                   (CID2, "Cancelled 2 orders on other-market")])
+
+    def test_stopping_finds_orders_by_token_whatever_the_listing_calls_the_market(self):
+        farmer = self.stopped_after_a_cycle()
+        for entry in self.resting.values():
+            entry["market"] = entry["market"].upper()
+        farmer.shutdown("test", cancel=True)
+        self.assertEqual(self.resting, {})
+        self.client.cancel_market_orders.assert_not_called()
+
+    def test_an_order_the_stop_could_not_cancel_alerts_on_its_market(self):
+        farmer = self.stopped_after_a_cycle()
+        stuck = next(i for i, e in self.resting.items() if e["market"] == CID2)
+        self.client.cancel_orders.side_effect = None
+        self.client.cancel_orders.return_value = {"not_canceled": {stuck: "matched"}}
+        farmer.shutdown("test", cancel=True)
+        flagged = [(e["kind"], e["condition_id"], e["message"]) for e in self.events()
+                   if e["kind"] in ("CANCEL", "ALERT")]
+        self.assertEqual(flagged, [
+            ("CANCEL", CID, "Cancelled 2 orders on test-market"),
+            ("CANCEL", CID2, "Cancelled 1 orders on other-market"),
+            ("ALERT", CID2, f"Warning: cancelling {stuck} on other-market failed (matched)"),
+        ])
+
+    def test_a_failed_listing_on_stop_falls_back_to_a_cancel_per_market(self):
+        farmer = self.stopped_after_a_cycle()
+        self.client.get_open_orders.side_effect = httpx.ConnectError("down")
+        farmer.shutdown("test", cancel=True)
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual([c.args[0].market for c in self.client.cancel_market_orders.call_args_list],
+                         [CID, CID2])
+
+    def market_info_fetches(self):
+        return sorted(c.args[0] for c in self.client.get_clob_market_info.call_args_list)
+
+    def test_a_new_markets_clob_info_is_read_once(self):
+        farmer = self.started_farmer(client=self.client)
+        self.assertEqual(self.market_info_fetches(), [CID, CID2])
+        farmer.cycle()
+        self.assertEqual(self.market_info_fetches(), [CID, CID2])
+
+    def test_a_failed_clob_info_read_does_not_stop_the_cycle(self):
+        self.client.get_clob_market_info.side_effect = httpx.ConnectError("down")
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        warnings = [c.args[0] for c in reward_farmer.log.call_args_list
+                    if c.args[0].startswith("Warning: market info")]
+        self.assertEqual(sorted(warnings), ["Warning: market info for other-market unavailable (down)",
+                                            "Warning: market info for test-market unavailable (down)"])
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+
+    def test_a_market_whose_tick_shrank_refreshes_the_clients_tick_before_signing(self):
+        self.clob_ticks[CID] = "0.01"
+        farmer = self.started_farmer(client=self.client)
+        self.clob_ticks[CID] = "0.001"
+        farmer.cycle()
+        self.assertEqual(self.market_info_fetches(), [CID, CID, CID2])
+        self.assertEqual({c.args[1].tick_size for c in self.client.create_order.call_args_list},
+                         {"0.001"})
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+
+    def test_a_failed_tick_refresh_warns_and_the_other_market_still_posts(self):
+        self.clob_ticks[CID] = "0.01"
+        farmer = self.started_farmer(client=self.client)
+        self.client.get_clob_market_info.side_effect = httpx.ConnectError("down")
+        farmer.cycle()
+        self.assertIn(mock.call("Warning: tick size of test-market unavailable (down)"),
+                      reward_farmer.log.call_args_list)
+        self.assertEqual(self.posted_tokens(), [sorted([FAV2, LONG2])])
+        alerts = [(e["condition_id"], e["slot"]) for e in self.events() if e["kind"] == "ALERT"]
+        self.assertEqual(alerts, [(CID, "FAV_BID"), (CID, "LONG_BID")])
+
+    def run_live(self, *flags, stop):
+        """run() live, calling stop() after the first cycle that leaves orders
+        resting; self.at_stop is what rested then."""
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) > 500:
+                raise RanAway
+            self.at_stop = dict(self.resting)
+            if self.resting:
+                stop()
+
+        args = build_parser().parse_args(["--db", self.path, "--interval", "0.01", "--live",
+                                          *flags])
+        with mock.patch.dict(os.environ, {"POLYMARKET_FUNDER_ADDRESS": "0xme"}), \
+                mock.patch("config.load_config"), \
+                mock.patch("config.create_client", return_value=self.client), \
+                mock.patch("key_loader.cleanup_key_source"), \
+                mock.patch.object(reward_farmer.time, "sleep", sleep):
+            reward_farmer.run(args)
+
+    def stop_command(self, payload=None):
+        def stop():
+            if not self.query("SELECT 1 FROM commands"):
+                farm_db.send_command(self.ui, CommandKind.STOP, NOW, payload)
+        return stop
+
+    def stop_event(self):
+        event = next(e for e in self.events() if e["kind"] == "STOP")
+        return event["message"], json.loads(event["data"])
+
+    def interrupt(self):
+        raise KeyboardInterrupt
+
+    def test_a_stop_command_keeping_orders_leaves_them_resting(self):
+        self.run_live(stop=self.stop_command({"keep_orders": True}))
+        self.assertTrue(self.at_stop)
+        self.assertEqual(self.resting, self.at_stop)
+        self.client.cancel_market_orders.assert_not_called()
+        command = self.query("SELECT * FROM commands")[0]
+        self.assertEqual(command["result"], "stopping, keeping orders")
+        self.assertEqual(self.stop_event(), (
+            f"Stopped: stop command {command['id']}; orders left resting",
+            {"reason": f"stop command {command['id']}", "orders_kept": True}))
+
+    def test_a_plain_stop_command_still_cancels(self):
+        self.run_live(stop=self.stop_command())
+        self.assertTrue(self.at_stop)
+        self.assertEqual(self.resting, {})
+        self.assertEqual(self.stop_event()[1]["orders_kept"], False)
+
+    def test_an_interrupt_under_keep_orders_leaves_them_resting(self):
+        self.run_live("--keep-orders", stop=self.interrupt)
+        self.assertTrue(self.at_stop)
+        self.assertEqual(self.resting, self.at_stop)
+        self.assertEqual(self.stop_event(), ("Stopped: interrupted; orders left resting",
+                                             {"reason": "interrupted", "orders_kept": True}))
+
+    def test_an_interrupt_without_keep_orders_cancels(self):
+        self.run_live(stop=self.interrupt)
+        self.assertTrue(self.at_stop)
+        self.assertEqual(self.resting, {})
+
+    def test_a_crash_under_keep_orders_still_cancels(self):
+        def crash():
+            raise RuntimeError("boom")
+
+        with self.assertRaises(RuntimeError):
+            self.run_live("--keep-orders", stop=crash)
+        self.assertTrue(self.at_stop)
+        self.assertEqual(self.resting, {})
+
+    def test_keeping_orders_under_the_heartbeat_alerts_that_it_will_cancel_them(self):
+        self.args = build_parser().parse_args(["--db", self.path, "--heartbeat"])
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farm_db.send_command(self.ui, CommandKind.STOP, NOW, {"keep_orders": True})
+        farmer.cycle()
+        farmer.shutdown(farmer.stop_reason, cancel=not farmer.keep_orders)
+        alerts = [e["message"] for e in self.events() if e["kind"] == "ALERT"]
+        self.assertEqual(alerts, ["ALERT: keeping orders, but the heartbeat stops with the "
+                                  "farmer and Polymarket cancels them within about 10s"])
+        self.assertEqual(self.stop_event()[1]["orders_kept"], False)
+
+    def test_a_restarted_farmer_holds_the_orders_the_last_run_kept(self):
+        first = self.started_farmer(client=self.client)
+        first.cycle()
+        kept = dict(self.resting)
+        self.assertEqual(len(kept), 4)
+        first.shutdown("test", cancel=False)
+        self.client.reset_mock()
+
+        second = self.started_farmer(client=self.client)
+        second.cycle()
+        self.client.cancel_orders.assert_not_called()
+        self.client.post_orders.assert_not_called()
+        self.assertEqual(self.resting, kept)
+        _, slots = self.farm_state()
+        self.assertEqual({s["decision"] for s in slots.values() if s["order"]}, {"hold"})
+
+    def test_a_restart_holds_the_kept_orders_before_reading_any_history(self):
+        self.history.return_value = NO_SWEEPS._replace(read_at=datetime.now(timezone.utc))
+        first = self.started_farmer(client=self.client)
+        first.cycle()
+        kept = dict(self.resting)
+        self.assertEqual(len(kept), 4)
+        first.shutdown("test", cancel=False)
+        self.client.reset_mock()
+        self.history.reset_mock()
+
+        second = self.started_farmer(read_histories=False, client=self.client)
+        second.cycle()
+        self.history.assert_not_called()
+        self.client.cancel_orders.assert_not_called()
+        self.client.post_orders.assert_not_called()
+        self.assertEqual(self.resting, kept)
+
+
+class ParserTest(unittest.TestCase):
+    def test_keep_orders_and_heartbeat_are_rejected_together(self):
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            build_parser().parse_args(["--keep-orders", "--heartbeat"])
+        for flag in ("--keep-orders", "--heartbeat"):
+            build_parser().parse_args([flag])
 
 
 if __name__ == "__main__":

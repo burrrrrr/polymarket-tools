@@ -726,9 +726,11 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
 
     @app.post("/farmer/stop", response_class=HTMLResponse)
     async def stop_farmer(request: Request):
+        keep = (await form_of(request)).get("keep_orders") == "1"
         now = clock()
         with closing(connect()) as conn:
-            farm_db.send_command(conn, CommandKind.STOP, now)
+            farm_db.send_command(conn, CommandKind.STOP, now,
+                                 {"keep_orders": True} if keep else None)
             return templates.TemplateResponse(request, "partials/settings_farmer.html", {
                 "now": now, **settings_context(conn, now)})
 

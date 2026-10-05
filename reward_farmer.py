@@ -59,7 +59,7 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                When resuming would quote, the orders it would place are
                published to farm_state as a preview and never sent.
   UNREWARDED   the total reward listing no longer pays the market; its own
-               CLOB record keeps showing the old rate after rewards end.
+               market record keeps showing the old rate after rewards end.
                Checked before the pause. When rewards return it goes through
                the pause and the checks above.
   RETIRED      market closed or not accepting orders, no longer approved, or
@@ -81,6 +81,16 @@ change in the console takes effect within one interval. It publishes what it
 is doing to farm_state, farmer_status, farm_events, and (one sample per market
 per minute) farm_mids, in dry run and live alike; only live mode writes to
 markets (retirement, baselines).
+
+Stopping cancels the live orders on the managed markets, whether by a stop
+command, Ctrl+C, SIGTERM, or a crash; only a finished --once run leaves them
+resting. A stop command asking to keep orders, or Ctrl+C and SIGTERM under
+--keep-orders, leaves them resting too. Until the next start they are
+unmanaged: no cooldowns, retirement, or fill handling. The next start adopts
+the ones still close to target and replaces the rest; a market no longer
+approved by then is not managed, and its orders rest until they expire.
+--heartbeat cannot keep orders: Polymarket cancels them 10s after the
+heartbeats stop.
 
 The farmer never sells shares that were in the wallet before it managed the
 market. The first time it sees an approved market it records the holdings as
@@ -107,6 +117,7 @@ Usage:
   python reward_farmer.py                      # dry run on farm.db, forever
   python reward_farmer.py --db scratch.db --once
   python reward_farmer.py --live               # sign and post real orders
+  python reward_farmer.py --live --keep-orders # Ctrl+C leaves orders resting
 """
 
 import argparse
@@ -117,6 +128,7 @@ import signal
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
@@ -132,7 +144,6 @@ from farm_db import EventKind, stamp
 from py_clob_client_v2.clob_types import (
     AssetType,
     BalanceAllowanceParams,
-    OpenOrderParams,
     OrderArgsV2,
     OrderMarketCancelParams,
     OrderType,
@@ -141,9 +152,11 @@ from py_clob_client_v2.clob_types import (
 )
 
 from reward_screener import (
-    CLOB_HOST,
     DATA_API_HOST,
+    GAMMA_HOST,
+    GAMMA_REQUEST_LIMIT,
     RATE_LIMIT_RETRIES,
+    Levels,
     Outlook,
     QuoteValue,
     Skip,
@@ -188,6 +201,7 @@ NET_KEEP_SLACK_USD = 0.02
 POSITIONS_S = 60
 MARKET_INFO_S = 300
 MARKET_INFO_RETRY_S = 60
+MARKET_INFO_TICK_S = 5
 HISTORY_S = 3600
 HISTORY_RETRY_S = 120
 HISTORY_TICK_S = 15
@@ -407,7 +421,7 @@ class Observation(NamedTuple):
 
 
 class MarketInfo(NamedTuple):
-    """The CLOB's market record: tokens, reward terms, and trading status."""
+    """Gamma's market record: tokens, reward terms, and trading status."""
 
     token_ids: tuple
     v: float
@@ -963,16 +977,13 @@ def naked_used(position, orders):
 # ---------------------------------------------------------------------------
 
 def parse_market_info(entry):
-    rewards = entry.get("rewards") or {}
     return MarketInfo(
-        token_ids=tuple(
-            str(t["token_id"]) for t in entry.get("tokens") or [] if t.get("token_id")
-        ),
-        v=(_float(rewards.get("max_spread")) or 0) / 100,
-        min_size=_float(rewards.get("min_size")) or 0,
-        tick=_float(entry.get("minimum_tick_size")) or 0.01,
-        neg_risk=bool(entry.get("neg_risk")),
-        accepting_orders=bool(entry.get("accepting_orders")),
+        token_ids=tuple(str(t) for t in json.loads(entry.get("clobTokenIds") or "[]") if t),
+        v=(_float(entry.get("rewardsMaxSpread")) or 0) / 100,
+        min_size=_float(entry.get("rewardsMinSize")) or 0,
+        tick=_float(entry.get("orderPriceMinTickSize")) or 0.01,
+        neg_risk=bool(entry.get("negRisk")),
+        accepting_orders=bool(entry.get("acceptingOrders")),
         closed=bool(entry.get("closed")),
     )
 
@@ -990,7 +1001,7 @@ def rewards_active(info, condition_id, total_rates):
 
 
 def farm_market(row, info, cfg):
-    """An approved DB row plus the CLOB record as a FarmMarket, or Skip."""
+    """An approved DB row plus its market record as a FarmMarket, or Skip."""
     market = json.loads(row["metrics"])["market"]
     fav = market["fav_token_id"]
     others = [t for t in info.token_ids if t != fav]
@@ -1052,10 +1063,22 @@ def parse_open_order(entry, fm):
 # Fetching
 # ---------------------------------------------------------------------------
 
-def fetch_market_info(http, condition_id, timeout=20):
-    resp = http.get(f"{CLOB_HOST}/markets/{condition_id}", timeout=timeout)
-    resp.raise_for_status()
-    return parse_market_info(resp.json())
+def fetch_market_infos(http, condition_ids, timeout=20):
+    """{condition_id: MarketInfo} for every market Gamma returns.
+
+    Gamma leaves closed markets out unless asked for closed markets alone, so
+    each chunk is read twice, open and closed.
+    """
+    infos = {}
+    for chunk in _chunks(list(condition_ids), GAMMA_REQUEST_LIMIT):
+        for closed in ("false", "true"):
+            params = [("condition_ids", c) for c in chunk]
+            params += [("closed", closed), ("limit", str(len(chunk)))]
+            entries = get_with_retry(http, f"{GAMMA_HOST}/markets", params, timeout).json()
+            for entry in entries or []:
+                if isinstance(entry, dict) and entry.get("conditionId"):
+                    infos[str(entry["conditionId"])] = parse_market_info(entry)
+    return infos
 
 
 def fetch_holdings(http, user, timeout=30):
@@ -1151,10 +1174,11 @@ class Histories:
     takes up to nine requests, and the main loop must not wait on them.
 
     wanted ({condition_id: Want}) is written by the main loop alone, read
-    ({condition_id: fill_cost.History}) by the reader alone; each is replaced
-    whole, never mutated. A market is read once wanted, again every
-    HISTORY_S, and at once when what is wanted of it changes. A failed read
-    keeps the last history and retries after HISTORY_RETRY_S.
+    ({condition_id: fill_cost.History}) by the reader alone once Farmer.start
+    has seeded it; each is replaced whole, never mutated. A market is read
+    once wanted, even if seeded, again every HISTORY_S, and at once when
+    what is wanted of it changes. A failed read keeps the last history and
+    retries after HISTORY_RETRY_S.
     """
 
     def __init__(self, stop, fetch):
@@ -1192,6 +1216,56 @@ class Histories:
                 self._stop.wait(HISTORY_TICK_S)
 
 
+class MarketInfos:
+    """Each wanted market's record, read on a thread of its own: the records
+    come in batched Gamma requests, and the main loop must not wait on them.
+
+    wanted (a frozenset of condition ids) is written by the main loop alone,
+    read ({condition_id: MarketInfo}) by the reader alone; each is replaced
+    whole, never mutated. Every wanted market is read in one fetch every
+    MARKET_INFO_S, and at once when a market joins wanted. A failed fetch
+    keeps the last records and retries after MARKET_INFO_RETRY_S; a market a
+    fetch leaves out keeps its last record.
+    """
+
+    def __init__(self, stop, fetch):
+        self.wanted = frozenset()
+        self.read = {}
+        self._due = None
+        self._read_for = frozenset()
+        self._stop = stop
+        self._fetch = fetch
+
+    def refresh(self, http, now):
+        """Read every wanted market if due or one joined, and forget the
+        markets no longer wanted."""
+        wanted = self.wanted
+        self.read = {cid: info for cid, info in self.read.items() if cid in wanted}
+        self._read_for &= wanted
+        fresh = self._due is not None and now < self._due
+        if not wanted or (fresh and wanted <= self._read_for):
+            return
+        self._read_for = wanted
+        try:
+            infos = self._fetch(http, wanted)
+        except Exception as e:
+            log(f"Warning: market data fetch failed ({e})")
+            self._due = now + timedelta(seconds=MARKET_INFO_RETRY_S)
+            return
+        missing = wanted - infos.keys()
+        if missing:
+            log(f"Warning: Gamma left out {len(missing)} wanted markets "
+                f"({', '.join(sorted(missing))}); keeping their last data")
+        self.read = {**self.read, **{cid: infos[cid] for cid in wanted - missing}}
+        self._due = now + timedelta(seconds=MARKET_INFO_S)
+
+    def run(self):
+        with httpx.Client() as http:
+            while not self._stop.is_set():
+                self.refresh(http, datetime.now(timezone.utc))
+                self._stop.wait(MARKET_INFO_TICK_S)
+
+
 # ---------------------------------------------------------------------------
 # Daemon
 # ---------------------------------------------------------------------------
@@ -1217,6 +1291,17 @@ class Managed:
         self.last_summary = None
 
 
+class Plan(NamedTuple):
+    """One market's cycle, planned and reported, waiting to be executed."""
+    managed: Managed
+    levels: Levels
+    book_mid: Optional[float]
+    target: Target
+    preview: Optional[Target]
+    orders: list
+    actions: list
+
+
 class Farmer:
     def __init__(self, args, cfg, client=None):
         self.args = args
@@ -1226,7 +1311,6 @@ class Farmer:
         self.http = httpx.Client()
         self.db = farm_db.open_db(args.db)
         self.markets = {}
-        self.infos = {}
         self.skips = {}
         self.setting_errors = {}
         self.events = []
@@ -1238,7 +1322,9 @@ class Farmer:
         self.sim_ids = 0
         self.stop = threading.Event()
         self.stop_reason = None
+        self.keep_orders = False
         self.total_rates = TotalRates(self.stop)
+        self.infos = MarketInfos(self.stop, fetch_market_infos)
         self.histories = Histories(self.stop, fetch_history)
         self.prior = fill_cost.DEFAULT_PRIOR
         self.user = os.getenv("POLYMARKET_FUNDER_ADDRESS")
@@ -1285,6 +1371,11 @@ class Farmer:
                   data={"pid": os.getpid(), "events_pruned": pruned,
                         "mids_pruned": mids_pruned, "commands_expired": expired})
         self.read_controls(now)
+        # The first records are read here, before the reader thread starts, so
+        # the first cycle (all of a --once run) manages the markets.
+        self.infos.refresh(self.http, now)
+        self.reload(now)
+        self.seed_histories(now)
         self.refresh_positions(now)
         self.positions_at = time.monotonic() + POSITIONS_S
         if not self.markets:
@@ -1293,12 +1384,25 @@ class Farmer:
             self.check_collateral()
         self.flush()
 
+    def seed_histories(self, now):
+        """Take each wanted market's history from its farm_state row while it
+        is fresh, so the first cycle keeps the favorite bids the last run left
+        resting instead of cancelling them until the reader gets round to it."""
+        stored = farm_db.read_farm_states(self.db)
+        histories = {cid: fill_cost.history_from_json(
+                         stored[cid].slots.get(Slot.FAV_BID.name, {}).get("history"))
+                     for cid in self.histories.wanted if cid in stored}
+        self.histories.read = {cid: h for cid, h in histories.items()
+                               if h and now - h.read_at < timedelta(seconds=HISTORY_S)}
+
     def shutdown(self, reason, cancel):
-        """Stop the way Ctrl+C does: live orders come down unless the run just ended."""
+        """Stop the threads and publish the stop, cancelling the live orders if asked."""
         if self.live and cancel:
             self.cancel_managed()
         self.stop.set()
-        self.emit(EventKind.STOP, f"Stopped: {reason}", data={"reason": reason})
+        kept = self.live and not cancel and not self.args.heartbeat
+        self.emit(EventKind.STOP, f"Stopped: {reason}" + ("; orders left resting" if kept else ""),
+                  data={"reason": reason, "orders_kept": kept})
         try:
             self.flush(stopped_at=datetime.now(timezone.utc))
         except Exception as e:
@@ -1311,8 +1415,14 @@ class Farmer:
         from the DB every cycle."""
         for command in farm_db.pending_commands(self.db):
             if command.kind == farm_db.CommandKind.STOP.value:
-                self.stop_reason = self.stop_reason or f"stop command {command.id}"
-                result = "stopping"
+                if self.stop_reason is None:
+                    self.stop_reason = f"stop command {command.id}"
+                    self.keep_orders = bool((command.payload or {}).get("keep_orders"))
+                    if self.keep_orders and self.live and self.args.heartbeat:
+                        self.emit(EventKind.ALERT,
+                                  "ALERT: keeping orders, but the heartbeat stops with the "
+                                  "farmer and Polymarket cancels them within about 10s")
+                result = "stopping, keeping orders" if self.keep_orders else "stopping"
             else:
                 result = f"unknown command {command.kind!r}"
             farm_db.consume_command(self.db, command.id, result, now)
@@ -1334,32 +1444,24 @@ class Farmer:
         ), data=diff)
         self.cfg = cfg
 
-    def market_info(self, condition_id, label, now):
-        """The CLOB market record, refetched every MARKET_INFO_S; None until one lands."""
-        info, due = self.infos.get(condition_id, (None, now))
-        if now >= due:
-            try:
-                info = fetch_market_info(self.http, condition_id)
-                due = now + timedelta(seconds=MARKET_INFO_S)
-            except Exception as e:
-                log(f"Warning: market data for {label} failed ({e})")
-                due = now + timedelta(seconds=MARKET_INFO_RETRY_S)
-            self.infos[condition_id] = (info, due)
-        return info
-
     def reload(self, now):
         rows = farm_db.load_approved(self.db)
+        added = []
         for cid, managed in list(self.markets.items()):
             was_approved, managed.approved = managed.approved, cid in rows
             if managed.state.phase is Phase.RETIRED and managed.approved and not was_approved:
                 # Re-approved after retiring: start over as if newly approved.
                 del self.markets[cid]
+        self.infos.wanted = frozenset(
+            cid for cid in rows
+            if cid not in self.markets or self.markets[cid].state.phase is not Phase.RETIRED
+        )
         for cid, row in rows.items():
             managed = self.markets.get(cid)
             if managed is not None and managed.state.phase is Phase.RETIRED:
                 continue
             label = row["slug"] or cid
-            info = self.market_info(cid, label, now)
+            info = self.infos.read.get(cid)
             if info is None:
                 continue
             fm = farm_market(row, info, self.cfg)
@@ -1377,12 +1479,30 @@ class Farmer:
                           f"v {fm.v * 100:.1f}c, min {fm.min_size:g}, tick {fm.tick:g}, "
                           f"expires {fm.expires_at:%Y-%m-%d}",
                           cid, data={"from": None, "to": Phase.QUOTING.value})
+                added.append(fm)
             else:
                 managed.fm, managed.info = fm, info
+        if self.live and added:
+            self.prewarm(added)
         # Quoting or not, so a market that starts quoting has its history already.
         self.histories.wanted = {m.fm.condition_id: Want(m.fm.fav_token_id, self.cfg.min_fav,
                                                          m.fm.label)
                                  for m in self.active()}
+
+    def prewarm(self, fms):
+        """Read each market's CLOB info, which the client caches per token.
+
+        Best effort: without it the first sign of each token after a
+        restart waits on the client's own tick size lookup.
+        """
+        def fetch(fm):
+            try:
+                self.client.get_clob_market_info(fm.condition_id)
+            except Exception as e:
+                log(f"Warning: market info for {fm.label} unavailable ({e})")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(fetch, fms))
 
     def refresh_positions(self, now):
         try:
@@ -1466,14 +1586,22 @@ class Farmer:
             if cid in info:
                 self.resolutions[cid] = resolution_signal(info[cid])
 
-    def open_orders(self, managed):
+    def market_of_token(self):
+        return {token_id: cid for cid, m in self.markets.items()
+                for token_id in (m.fm.fav_token_id, m.fm.long_token_id)}
+
+    def open_orders(self):
+        """{condition_id: [LiveOrder]} for every managed market; one listing live."""
         if not self.live:
-            return list(managed.sim_orders)
-        entries = self.client.get_open_orders(
-            OpenOrderParams(market=managed.fm.condition_id)
-        )
-        orders = [parse_open_order(e, managed.fm) for e in entries]
-        return [o for o in orders if o is not None]
+            return {cid: list(m.sim_orders) for cid, m in self.markets.items()}
+        orders = {cid: [] for cid in self.markets}
+        market_of = self.market_of_token()
+        for entry in self.client.get_open_orders():
+            cid = market_of.get(str(entry.get("asset_id") or ""))
+            order = parse_open_order(entry, self.markets[cid].fm) if cid else None
+            if order is not None:
+                orders[cid].append(order)
+        return orders
 
     def cycle(self):
         now = self.last_cycle_at = datetime.now(timezone.utc)
@@ -1491,27 +1619,50 @@ class Farmer:
             self.refresh_rewards(now)
             self.rewards_at = time.monotonic() + REWARDS_S
 
+        try:
+            orders = self.open_orders()
+        except Exception as e:
+            # Planning on no orders would duplicate the ones actually resting.
+            log(f"Warning: open orders unavailable ({e}); planning no market")
+            self.flush()
+            return
         active = self.active()
         books = fetch_levels(self.http, [m.fm.fav_token_id for m in active])
+        plans = []
         for managed in active:
             try:
-                self.step_market(managed, books.get(managed.fm.fav_token_id), now)
+                plan = self.step_market(managed, books.get(managed.fm.fav_token_id),
+                                        orders[managed.fm.condition_id], now)
             except Exception as e:
                 log(f"Error on {managed.fm.label}: {e}")
+                continue
+            if plan is not None:
+                plans.append(plan)
+        try:
+            placed = self.execute(plans)
+        except Exception as e:
+            log(f"Error executing the cycle's orders: {e}")
+            placed = {}
+        for plan in plans:
+            try:
+                self.settle(plan, placed, now)
+            except Exception as e:
+                log(f"Error on {plan.managed.fm.label}: {e}")
         self.flush()
 
-    def step_market(self, managed, levels, now):
+    def step_market(self, managed, levels, orders, now):
+        """Advance the lifecycle and plan the orders; None when there is no plan."""
         fm = managed.fm
         if levels is None:
             log(f"{fm.label}: no book this cycle")
-            return
+            return None
         if managed.position is None:
             log(f"{fm.label}: no position yet; not quoting")
-            return
+            return None
         if levels.tick:
             fm = managed.fm = fm._replace(tick=levels.tick)
 
-        orders = managed.orders = self.open_orders(managed)
+        managed.orders = orders
         book = strip_own(levels, orders, fm) if self.live else levels
         book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
         book_ask = best_price(book.asks, fm.min_size)
@@ -1564,8 +1715,16 @@ class Farmer:
             now,
         )
         self.report(managed, target, orders, actions)
-        for slot, placed in self.execute(managed, actions).items():
-            if placed:
+        return Plan(managed, levels, book_mid, target, preview, orders, actions)
+
+    def settle(self, plan, placed, now):
+        """Back off rejected slots, publish the market's view, and retire it if due."""
+        managed = plan.managed
+        fm = managed.fm
+        for (condition_id, slot), accepted in placed.items():
+            if condition_id != fm.condition_id:
+                continue
+            if accepted:
                 managed.backoffs.pop(slot, None)
                 continue
             backoff = managed.backoffs[slot] = next_backoff(managed.backoffs.get(slot), now)
@@ -1573,8 +1732,7 @@ class Farmer:
                       f"  {slot.name} on {fm.label}: backing off {backoff.delay_s:g}s",
                       fm.condition_id, slot,
                       data={"until": stamp(backoff.until), "attempts": backoff.attempts})
-        managed.snapshot = self.market_state(managed, levels, book_mid, target, preview, orders,
-                                             actions, now)
+        managed.snapshot = self.market_state(plan, now)
         if (managed.mid_sampled_at is None
                 or (now - managed.mid_sampled_at).total_seconds() >= MID_SAMPLE_S):
             managed.mid_sampled_at = now
@@ -1582,7 +1740,8 @@ class Farmer:
         if managed.state.phase is Phase.RETIRED:
             self.retire(managed)
 
-    def market_state(self, managed, levels, book_mid, target, preview, orders, actions, now):
+    def market_state(self, plan, now):
+        managed, levels, book_mid, target, preview, orders, actions = plan
         fm, state = managed.fm, managed.state
         q1, q2 = q_totals(target.intents)
         return farm_db.FarmState(
@@ -1642,62 +1801,95 @@ class Farmer:
                           f"{i.size:>9.2f}  score {i.score:.3f}  {fm.label}",
                           fm.condition_id, i.slot, i.price, i.size, i.score)
 
-    def execute(self, managed, actions):
-        """Carry out the actions. Returns {slot: whether its place was accepted}."""
-        placed = {a.intent.slot: False for a in actions if isinstance(a, Place)}
+    def execute(self, plans):
+        """Carry out every plan's actions, all cancels before any place.
+
+        Returns {(condition_id, slot): whether its place was accepted}.
+        """
+        placed = {(p.managed.fm.condition_id, a.intent.slot): False
+                  for p in plans for a in p.actions if isinstance(a, Place)}
         if not self.live:
-            cancelled = {i for a in actions if isinstance(a, Cancel) for i in a.order_ids}
-            kept = [o for o in managed.sim_orders if o.id not in cancelled]
-            for a in actions:
-                if isinstance(a, Place):
-                    self.sim_ids += 1
-                    i = a.intent
-                    kept.append(LiveOrder(f"sim-{self.sim_ids}", i.slot, i.token_id,
-                                          i.side, i.price, i.size))
-            managed.sim_orders = kept
+            for p in plans:
+                self.simulate(p.managed, p.actions)
             return dict.fromkeys(placed, True)
+        self.cancel_planned(plans)
+        for fm, i in self.post_planned(plans):
+            placed[(fm.condition_id, i.slot)] = True
+        return placed
 
-        fm = managed.fm
-        for a in actions:
-            if isinstance(a, Cancel):
-                try:
-                    resp = self.client.cancel_orders(list(a.order_ids))
-                    failed = (resp or {}).get("not_canceled") or {}
-                    for order_id, why in dict(failed).items():
-                        self.emit(EventKind.ALERT, f"  cancel {order_id} failed: {why}",
-                                  fm.condition_id, data={"order_id": order_id})
-                except Exception as e:
-                    self.emit(EventKind.ALERT, f"  cancel failed on {fm.label}: {e}",
-                              fm.condition_id)
-
-        signed = []
-        options = PartialCreateOrderOptions(tick_size=f"{fm.tick:g}", neg_risk=fm.neg_risk)
-        expiration = int(fm.expires_at.timestamp())
+    def simulate(self, managed, actions):
+        """Dry run: carry the actions out on the market's simulated orders."""
+        cancelled = {i for a in actions if isinstance(a, Cancel) for i in a.order_ids}
+        kept = [o for o in managed.sim_orders if o.id not in cancelled]
         for a in actions:
             if isinstance(a, Place):
+                self.sim_ids += 1
                 i = a.intent
-                try:
-                    order = self.client.create_order(
-                        OrderArgsV2(token_id=i.token_id, price=i.price, size=i.size,
-                                    side=i.side, expiration=expiration),
-                        options,
-                    )
-                    signed.append((i, order))
-                except Exception as e:
-                    self.emit(EventKind.ALERT, f"  sign {i.slot.name} failed on {fm.label}: {e}",
-                              fm.condition_id, i.slot)
+                kept.append(LiveOrder(f"sim-{self.sim_ids}", i.slot, i.token_id,
+                                      i.side, i.price, i.size))
+        managed.sim_orders = kept
+
+    def cancel_planned(self, plans):
+        """Every plan's cancels in one call."""
+        fm_of = {order_id: p.managed.fm for p in plans for a in p.actions
+                 if isinstance(a, Cancel) for order_id in a.order_ids}
+        if not fm_of:
+            return
+        try:
+            resp = self.client.cancel_orders(list(fm_of))
+        except Exception as e:
+            for fm in {fm.condition_id: fm for fm in fm_of.values()}.values():
+                self.emit(EventKind.ALERT, f"  cancel failed on {fm.label}: {e}",
+                          fm.condition_id)
+            return
+        failed = (resp or {}).get("not_canceled") or {}
+        for order_id, why in dict(failed).items():
+            fm = fm_of.get(order_id)
+            self.emit(EventKind.ALERT, f"  cancel {order_id} failed: {why}",
+                      fm.condition_id if fm else None, data={"order_id": order_id})
+
+    def post_planned(self, plans):
+        """Sign every plan's places and post them in shared batches.
+
+        Returns the (fm, intent) of each place the CLOB accepted.
+        """
+        signed = []
+        for p in plans:
+            fm = p.managed.fm
+            self.refresh_tick(fm, {a.intent.token_id for a in p.actions if isinstance(a, Place)})
+            options = PartialCreateOrderOptions(tick_size=f"{fm.tick:g}", neg_risk=fm.neg_risk)
+            expiration = int(fm.expires_at.timestamp())
+            for a in p.actions:
+                if isinstance(a, Place):
+                    i = a.intent
+                    try:
+                        order = self.client.create_order(
+                            OrderArgsV2(token_id=i.token_id, price=i.price, size=i.size,
+                                        side=i.side, expiration=expiration),
+                            options,
+                        )
+                        signed.append((fm, i, order))
+                    except Exception as e:
+                        self.emit(EventKind.ALERT,
+                                  f"  sign {i.slot.name} failed on {fm.label}: {e}",
+                                  fm.condition_id, i.slot)
+        accepted = []
         for chunk in _chunks(signed, POST_BATCH_LIMIT):
             try:
                 responses = self.client.post_orders(
-                    [PostOrdersV2Args(order=o, orderType=OrderType.GTD) for _, o in chunk],
+                    [PostOrdersV2Args(order=o, orderType=OrderType.GTD) for _, _, o in chunk],
                     post_only=True,
                 )
             except Exception as e:
-                self.emit(EventKind.ALERT,
-                          f"  post of {len(chunk)} orders failed on {fm.label}: {e}",
-                          fm.condition_id)
+                by_market = {}
+                for fm, _, _ in chunk:
+                    by_market.setdefault(fm.condition_id, []).append(fm)
+                for fms in by_market.values():
+                    self.emit(EventKind.ALERT,
+                              f"  post of {len(fms)} orders failed on {fms[0].label}: {e}",
+                              fms[0].condition_id)
                 continue
-            for (i, _), resp in zip(chunk, responses if isinstance(responses, list) else []):
+            for (fm, i, _), resp in zip(chunk, responses if isinstance(responses, list) else []):
                 if not isinstance(resp, dict) or not resp.get("success") or resp.get("errorMsg"):
                     self.emit(EventKind.REJECT,
                               f"  {i.slot.name} {cents(i.price, fm.tick)} rejected on "
@@ -1705,8 +1897,22 @@ class Farmer:
                               fm.condition_id, i.slot, i.price, i.size, i.score,
                               data={"response": resp if isinstance(resp, dict) else str(resp)})
                 else:
-                    placed[i.slot] = True
-        return placed
+                    accepted.append((fm, i))
+        return accepted
+
+    def refresh_tick(self, fm, token_ids):
+        """Re-read the market's CLOB info when the client's cached tick for a
+        token about to be signed is coarser than the book's.
+
+        The client caches a token's tick for the life of the process and
+        refuses to sign finer, and Polymarket narrows a market's tick past
+        0.96. Best effort: on failure the signing fails and alerts.
+        """
+        try:
+            if any(float(self.client.get_tick_size(t)) > fm.tick for t in token_ids):
+                self.client.get_clob_market_info(fm.condition_id)
+        except Exception as e:
+            log(f"Warning: tick size of {fm.label} unavailable ({e})")
 
     def retire(self, managed):
         fm, reason = managed.fm, managed.state.reason
@@ -1739,6 +1945,35 @@ class Farmer:
                       data={"balance_usd": balance, "planned_usd": planned})
 
     def cancel_managed(self):
+        """Cancel every open order on a managed market: one listing, one cancel.
+
+        Orders left resting while the farmer is down are what stopping
+        guards against, so any failure falls back to a cancel per market.
+        """
+        market_of = self.market_of_token()
+        try:
+            entries = [e for e in self.client.get_open_orders()
+                       if str(e.get("asset_id") or "") in market_of]
+            resp = self.client.cancel_orders([e["id"] for e in entries]) if entries else None
+            failed = dict((resp or {}).get("not_canceled") or {})
+        except Exception as e:
+            log(f"Warning: bulk cancel failed ({e}); cancelling market by market")
+            self.cancel_by_market()
+            return
+        sent = {}
+        for e in entries:
+            sent.setdefault(market_of[str(e["asset_id"])], []).append(e["id"])
+        for cid, ids in sent.items():
+            label = self.markets[cid].fm.label
+            n = sum(order_id not in failed for order_id in ids)
+            self.emit(EventKind.CANCEL, f"Cancelled {n} orders on {label}", cid)
+            for order_id in ids:
+                if order_id in failed:
+                    self.emit(EventKind.ALERT,
+                              f"Warning: cancelling {order_id} on {label} failed "
+                              f"({failed[order_id]})", cid, data={"order_id": order_id})
+
+    def cancel_by_market(self):
         for cid, managed in self.markets.items():
             try:
                 self.client.cancel_market_orders(OrderMarketCancelParams(market=cid))
@@ -1776,16 +2011,17 @@ def run(args):
     signal.signal(signal.SIGTERM, on_sigterm)
 
     threading.Thread(target=farmer.total_rates.run, daemon=True).start()
-    threading.Thread(target=farmer.histories.run, daemon=True).start()
     if args.live and args.heartbeat:
         threading.Thread(target=heartbeat, args=(client, farmer.stop), daemon=True).start()
         log("Heartbeat on: if it stops for 10s Polymarket cancels this key's open orders")
 
-    # A stop command or Ctrl+C cancels live orders; so does a crash. Only a
-    # finished --once run leaves them resting.
     reason, cancel = "--once finished", False
     try:
         farmer.start()
+        # Only now: start() reads the first records and seeds the histories
+        # itself, and only one thread may write each.
+        threading.Thread(target=farmer.infos.run, daemon=True).start()
+        threading.Thread(target=farmer.histories.run, daemon=True).start()
         while True:
             started = time.monotonic()
             try:
@@ -1793,14 +2029,14 @@ def run(args):
             except Exception as e:
                 log(f"Cycle failed: {e}")
             if farmer.stop_reason is not None:
-                reason, cancel = farmer.stop_reason, True
+                reason, cancel = farmer.stop_reason, not farmer.keep_orders
                 log("Stopping")
                 break
             if args.once:
                 break
             time.sleep(max(0.0, args.interval - (time.monotonic() - started)))
     except KeyboardInterrupt:
-        reason, cancel = "interrupted", True
+        reason, cancel = "interrupted", not args.keep_orders
         log("Stopping")
     except BaseException as e:
         reason, cancel = f"crashed: {e!r}", True
@@ -1849,7 +2085,18 @@ Examples:
     parser.add_argument("--live", action="store_true",
                         help="Sign and post real orders (default: dry run)")
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
-    parser.add_argument(
+    stopping = parser.add_mutually_exclusive_group()
+    stopping.add_argument(
+        "--keep-orders", action="store_true",
+        help=(
+            "Live only: Ctrl+C and SIGTERM leave the managed orders resting instead "
+            "of cancelling them. They rest unmanaged until the farmer starts again: "
+            "no cooldowns, retirement, or fill handling, and they expire only at "
+            "their GTD date. A crash still cancels them. Not with --heartbeat, which "
+            "cancels them 10s after the farmer stops."
+        ),
+    )
+    stopping.add_argument(
         "--heartbeat", action="store_true",
         help=(
             "Live only: post a heartbeat every 5s. WARNING: if heartbeats then "
