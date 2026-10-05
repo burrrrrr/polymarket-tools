@@ -19,7 +19,7 @@ from reward_screener import score as share_score
 from .forms import P_TRUE_ERROR
 
 SLOTS = ("FAV_BID", "LONG_BID", "FAV_ASK", "LONG_ASK")
-PHASES = ("QUOTING", "COOLDOWN", "BELOW_RANGE", "PAUSED", "RETIRED")
+PHASES = ("QUOTING", "COOLDOWN", "BELOW_RANGE", "PAUSED", "UNREWARDED", "RETIRED")
 WAITING = "WAITING"
 
 # A farmer whose last cycle is older than this many intervals is not running.
@@ -31,7 +31,7 @@ FEED_EVENTS = 12
 LOG_PAGE = 50
 
 PHASE_TONE = {"QUOTING": "t-q", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
-              "PAUSED": "t-n", "RETIRED": "t-r", WAITING: "t-n"}
+              "PAUSED": "t-n", "UNREWARDED": "t-n", "RETIRED": "t-r", WAITING: "t-n"}
 SLOT_TONE = {"FAV_BID": "t-f", "FAV_ASK": "t-f", "LONG_BID": "t-b", "LONG_ASK": "t-b"}
 KIND_TEXT_TONE = {
     EventKind.PHASE: "c-warn", EventKind.BACKOFF: "c-warn", EventKind.RETIRE: "c-warn",

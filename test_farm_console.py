@@ -467,6 +467,15 @@ class RoutesTest(Console):
                 for needle in needles:
                     self.assertIn(needle, resp.text)
 
+    def test_an_unrewarded_market_lists_under_its_own_phase(self):
+        self.publish(states=[state(A, "UNREWARDED", "rewards removed")._replace(
+            updated_at=self.now)])
+        resp = self.client.get("/markets?phase=UNREWARDED")
+        self.assertEqual(resp.status_code, 200)
+        for needle in ("alpha?", "rewards removed", "reward listing no longer pays this market"):
+            self.assertIn(needle, resp.text)
+        self.assertNotIn("bravo?", resp.text)
+
     def test_log_kind_filter_excludes_other_kinds(self):
         text = self.client.get("/activity?tab=log&kind=FILL").text
         self.assertNotIn("FAV_BID 98.0c alpha", text)

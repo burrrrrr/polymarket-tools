@@ -501,9 +501,18 @@ class StepStateTest(unittest.TestCase):
         obs = observe(expires_at=NOW)
         self.assertEqual(step_state(QUOTING, obs, NOW, CFG).phase, Phase.RETIRED)
 
-    def test_rewards_removed_retires(self):
+    def test_rewards_ending_pulls_the_quotes_without_retiring(self):
         state = step_state(QUOTING, observe(rewards_active=False), NOW, CFG)
-        self.assertEqual(state, State(Phase.RETIRED, reason="rewards removed"))
+        self.assertEqual(state, State(Phase.UNREWARDED, reason="rewards removed"))
+
+    def test_rewards_returning_go_through_the_normal_checks(self):
+        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        self.assertEqual(step_state(unrewarded, observe(rewards_active=False), NOW, CFG),
+                         unrewarded)
+        self.assertEqual(step_state(unrewarded, observe(), NOW, CFG), QUOTING)
+        self.assertEqual(step_state(unrewarded, observe(mid=None), NOW, CFG), QUOTING)
+        self.assertEqual(step_state(unrewarded, observe(mid=0.89), NOW, CFG),
+                         State(Phase.BELOW_RANGE))
 
     def test_decided_market_retires_with_the_reason(self):
         for signal in ("event closed", "resolution proposed"):
@@ -520,7 +529,7 @@ class StepStateTest(unittest.TestCase):
             self.assertEqual(step_state(QUOTING, obs, NOW, CFG).phase, Phase.RETIRED)
 
     def test_retired_is_terminal(self):
-        retired = State(Phase.RETIRED, reason="rewards removed")
+        retired = State(Phase.RETIRED, reason="market closed")
         self.assertEqual(step_state(retired, observe(), NOW, CFG), retired)
 
     def test_below_range_then_resume_above_margin(self):
@@ -542,11 +551,25 @@ class StepStateTest(unittest.TestCase):
         for state in (cooling, State(Phase.BELOW_RANGE)):
             self.assertEqual(step_state(state, observe(paused=True), NOW, CFG).phase, Phase.PAUSED)
 
-    def test_retire_beats_pause(self):
+    def test_retire_beats_rewards_ending_and_pause(self):
         paused = State(Phase.PAUSED, reason="paused by operator")
+        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        obs = observe(closed=True, paused=True, rewards_active=False)
+        for state in (QUOTING, paused, unrewarded):
+            self.assertEqual(step_state(state, obs, NOW, CFG),
+                             State(Phase.RETIRED, reason="market closed"))
+
+    def test_rewards_ending_beats_pause(self):
+        paused = State(Phase.PAUSED, reason="paused by operator")
+        obs = observe(paused=True, rewards_active=False)
         for state in (QUOTING, paused):
-            retired = step_state(state, observe(paused=True, rewards_active=False), NOW, CFG)
-            self.assertEqual(retired, State(Phase.RETIRED, reason="rewards removed"))
+            self.assertEqual(step_state(state, obs, NOW, CFG),
+                             State(Phase.UNREWARDED, reason="rewards removed"))
+
+    def test_rewards_returning_to_a_paused_market_leave_it_paused(self):
+        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        self.assertEqual(step_state(unrewarded, observe(paused=True), NOW, CFG),
+                         State(Phase.PAUSED, reason="paused by operator"))
 
     def test_naked_paused_forces_no_long_bid(self):
         held = Position(fav_shares=100.0, fav_avg=0.97)
@@ -659,11 +682,16 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(stripped.asks, [(0.995, 1000.0)])
 
     def test_sponsored_only_rewards_stay_active(self):
-        info = MarketInfo((FAV, LONG), 0.0, 0.085, 50.0, 0.001, False, True, False)
+        info = MarketInfo((FAV, LONG), 0.085, 50.0, 0.001, False, True, False)
         self.assertTrue(rewards_active(info, "0xc0nd", {"0xc0nd": 2.1}))
         self.assertTrue(rewards_active(info, "0xc0nd", None))
         self.assertFalse(rewards_active(info, "0xc0nd", {"0xother": 2.1}))
-        self.assertFalse(rewards_active(info._replace(native_rate=5.0, v=0.0), "0xc0nd", None))
+        self.assertFalse(rewards_active(info._replace(v=0.0), "0xc0nd", None))
+
+    def test_rewards_end_when_the_listing_drops_the_market(self):
+        info = MarketInfo((FAV, LONG), 0.085, 20.0, 0.001, False, True, False)
+        self.assertFalse(rewards_active(info, "0xc0nd", {"0xother": 2.1}))
+        self.assertTrue(rewards_active(info, "0xc0nd", None))
 
     def test_fill_events_name_the_slot_that_filled(self):
         before = Position(fav_shares=100.0, fav_avg=0.97, long_shares=0.0)
@@ -703,7 +731,7 @@ class FetchHoldingsTest(unittest.TestCase):
 
 
 CID = "0xc0nd"
-INFO = MarketInfo((FAV, LONG), 5.0, 0.035, 50.0, 0.001, False, True, False)
+INFO = MarketInfo((FAV, LONG), 0.035, 50.0, 0.001, False, True, False)
 METRICS = {"market": {"fav_token_id": FAV, "slug": "test-market", "question": "Test?",
                       "end_date": (NOW + timedelta(days=100)).isoformat(),
                       "fav_outcome": "No", "rate_per_day": 100.0}}
@@ -795,6 +823,25 @@ class FarmerCycleTest(unittest.TestCase):
         self.assertEqual(self.events(before), [])
         _, slots = self.farm_state()
         self.assertEqual(slots["FAV_BID"]["decision"], "hold")
+
+    def test_summary_line_prints_only_when_it_changes(self):
+        farmer = self.started_farmer()
+
+        def summaries():
+            lines = [c.args[0] for c in reward_farmer.log.call_args_list]
+            reward_farmer.log.reset_mock()
+            return [line for line in lines if " | hold " in line]
+
+        farmer.cycle()
+        self.assertRegex(summaries()[0], r"QUOTING .* \| hold 0 cancel 0 place 2$")
+        farmer.cycle()
+        self.assertRegex(summaries()[0], r"QUOTING .* \| hold 2 cancel 0 place 0$")
+        farmer.cycle()
+        self.assertEqual(summaries(), [])
+
+        farm_db.set_paused(self.ui, CID, True)
+        farmer.cycle()
+        self.assertRegex(summaries()[0], r"^test-market: PAUSED .* hold 0 cancel 2 place 0$")
 
     def test_pause_cancels_everything_next_cycle_and_resume_quotes_again(self):
         farmer = self.started_farmer()
@@ -929,6 +976,21 @@ class FarmerCycleTest(unittest.TestCase):
         phase, kinds = self.phase_and_kinds(farmer, before)
         self.assertEqual((phase, kinds), ("QUOTING", ["PHASE", "PLACE", "PLACE"]))
         self.assertIn("Managing test-market", self.events(before)[0]["message"])
+
+    def test_rewards_ending_pulls_orders_and_returning_rewards_quote_again(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        before = self.last_event_id()
+
+        farmer.total_rates.rates = {"0xother": 1.0}
+        self.assertEqual(self.phase_and_kinds(farmer, before),
+                         ("UNREWARDED", ["PHASE", "CANCEL", "CANCEL"]))
+        before = self.last_event_id()
+        self.assertEqual(self.phase_and_kinds(farmer, before), ("UNREWARDED", []))
+
+        farmer.total_rates.rates = {CID: 100.0}
+        self.assertEqual(self.phase_and_kinds(farmer, before),
+                         ("QUOTING", ["PHASE", "PLACE", "PLACE"]))
 
     def test_approved_again_still_retires_on_expiry(self):
         farmer = self.started_farmer()

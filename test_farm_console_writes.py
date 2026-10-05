@@ -188,7 +188,6 @@ class FakeRemote:
         self.books = {}
         self.book_calls = 0
         self.fail_book = False
-        self.native_rates = {}
         self.total_rates = {}
         self.totals_gate = threading.Event()
         self.totals_gate.set()
@@ -206,8 +205,7 @@ class FakeRemote:
         return self.position
 
     def info(self, condition_id):
-        return reward_farmer.MarketInfo((f"tok-{condition_id}", "tok-long"),
-                                        self.native_rates.get(condition_id, 50.0), 0.035, 20.0,
+        return reward_farmer.MarketInfo((f"tok-{condition_id}", "tok-long"), 0.035, 20.0,
                                         0.001, False, True, False)
 
     def totals(self):
@@ -397,9 +395,10 @@ class ReviewTest(Writes):
         self.assertEqual(resp.headers["location"], "/review")
 
     def rewards_end_for(self, *cids, sponsored=()):
-        """Native rates of 0 for cids, and a loaded total listing naming only sponsored."""
-        self.remote.native_rates.update({cid: 0.0 for cid in cids})
-        self.remote.total_rates = {"0xelsewhere": 1.0, **{cid: 5.0 for cid in sponsored}}
+        """A loaded total listing that drops cids, except those kept by sponsored pools."""
+        every = [r[0] for r in self.db.execute("SELECT condition_id FROM markets")]
+        self.remote.total_rates = {cid: 5.0 for cid in every
+                                   if cid not in cids or cid in sponsored}
         self.app.state.total_rates.refresh()
 
     def discover_ids(self):
@@ -430,7 +429,6 @@ class ReviewTest(Writes):
 
     def test_rewards_unknown_until_the_totals_land_writes_nothing(self):
         farm_db.set_rewards_active(self.db, "0xfff", False)
-        self.remote.native_rates.update({"0xeee": 0.0, "0xfff": 0.0})
         self.remote.total_rates = {"0xelsewhere": 1.0}
         self.remote.totals_gate.clear()
         self.addCleanup(self.remote.totals_gate.set)

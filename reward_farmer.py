@@ -57,9 +57,13 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                moment the flag clears and goes through the checks above.
                When resuming would quote, the orders it would place are
                published to farm_state as a preview and never sent.
-  RETIRED      rewards removed, market closed or not accepting orders, no
-               longer approved, or the expiry buffer reached. Terminal, and
-               checked before the pause. A market a human approves again
+  UNREWARDED   the total reward listing no longer pays the market; its own
+               CLOB record keeps showing the old rate after rewards end.
+               Checked before the pause. When rewards return it goes through
+               the pause and the checks above.
+  RETIRED      market closed or not accepting orders, no longer approved, or
+               the expiry buffer reached. Terminal, and checked before the
+               rewards and the pause. A market a human approves again
                after the farmer saw it unapproved starts over from QUOTING
                with fresh runtime state, through the same checks.
 
@@ -361,6 +365,7 @@ class Phase(Enum):
     COOLDOWN = "COOLDOWN"
     BELOW_RANGE = "BELOW_RANGE"
     PAUSED = "PAUSED"
+    UNREWARDED = "UNREWARDED"
     RETIRED = "RETIRED"
 
 
@@ -403,7 +408,6 @@ class MarketInfo(NamedTuple):
     """The CLOB's market record: tokens, reward terms, and trading status."""
 
     token_ids: tuple
-    native_rate: float
     v: float
     min_size: float
     tick: float
@@ -707,7 +711,6 @@ def reconcile(target, live_orders, fm, position, cfg):
 # ---------------------------------------------------------------------------
 
 RETIRE_CHECKS = (
-    ("rewards removed", lambda obs, now: not obs.rewards_active),
     ("market closed", lambda obs, now: obs.closed),
     ("not accepting orders", lambda obs, now: not obs.accepting_orders),
     ("no longer approved", lambda obs, now: not obs.approved),
@@ -734,9 +737,11 @@ def step_state(state, obs, now, cfg):
     for reason, applies in RETIRE_CHECKS:
         if applies(obs, now):
             return State(Phase.RETIRED, reason=reason)
+    if not obs.rewards_active:
+        return State(Phase.UNREWARDED, reason="rewards removed")
     if obs.paused:
         return State(Phase.PAUSED, reason="paused by operator")
-    if state.phase is Phase.PAUSED:
+    if state.phase in (Phase.PAUSED, Phase.UNREWARDED):
         state = State(Phase.QUOTING)
     if obs.mid is None:
         return state
@@ -963,9 +968,6 @@ def parse_market_info(entry):
         token_ids=tuple(
             str(t["token_id"]) for t in entry.get("tokens") or [] if t.get("token_id")
         ),
-        native_rate=sum(
-            _float(r.get("rewards_daily_rate")) or 0 for r in rewards.get("rates") or []
-        ),
         v=(_float(rewards.get("max_spread")) or 0) / 100,
         min_size=_float(rewards.get("min_size")) or 0,
         tick=_float(entry.get("minimum_tick_size")) or 0.01,
@@ -976,16 +978,15 @@ def parse_market_info(entry):
 
 
 def rewards_active(info, condition_id, total_rates):
-    """Native rates show on the market; sponsored-only pools only in the total.
+    """Whether the total listing, sponsored pools included, still pays the market.
 
-    total_rates is None until the first fetch of the slow total listing
-    finishes, and a market is not retired on a rate nobody has read yet.
+    The market record keeps its native rates after its rewards end, so only
+    the listing decides. total_rates is None until the first fetch of the slow
+    listing finishes, and a market is not pulled on a rate nobody has read yet.
     """
     if info.v <= 0:
         return False
-    if info.native_rate > 0 or total_rates is None:
-        return True
-    return total_rates.get(condition_id, 0) > 0
+    return total_rates is None or total_rates.get(condition_id, 0) > 0
 
 
 def farm_market(row, info, cfg):
@@ -1159,6 +1160,7 @@ class Managed:
         self.sim_orders = []
         self.snapshot = None
         self.mid_sampled_at = None
+        self.last_summary = None
         self.tape = None
         self.tape_due = None
 
@@ -1568,9 +1570,12 @@ class Farmer:
         best = target.fav.best
         fav = (f"bid {cents(best.price, fm.tick)} net {signed_usd(best.net_per_day)}/day"
                if best else target.fav.reason or "no bid")
-        log(f"{fm.label}: {managed.state.phase.value} mid {mid} "
-            f"Q1 {q1:.1f} Q2 {q2:.1f} | {fav} | hold {held} cancel {len(cancelled)} "
-            f"place {placed}")
+        summary = (f"{fm.label}: {managed.state.phase.value} mid {mid} "
+                   f"Q1 {q1:.1f} Q2 {q2:.1f} | {fav} | hold {held} cancel {len(cancelled)} "
+                   f"place {placed}")
+        if summary != managed.last_summary:
+            managed.last_summary = summary
+            log(summary)
         slot_order = list(Slot)
         for o in sorted(orders, key=lambda o: slot_order.index(o.slot)):
             if o.id not in cancelled:

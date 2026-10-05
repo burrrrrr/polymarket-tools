@@ -163,9 +163,11 @@ GLOSSARY = {
                                        "orders are pulled until it recovers 0.5c above it."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "
                              "it."),
-    "RETIRED": Term("Retired", "The farmer stopped managing this market: rewards removed, "
-                               "market closed or decided, expiry cutoff reached, or you "
-                               "retired it."),
+    "UNREWARDED": Term("Unrewarded", "Polymarket's reward listing no longer pays this "
+                                     "market. All orders are pulled, and quoting resumes "
+                                     "on its own if rewards return."),
+    "RETIRED": Term("Retired", "The farmer stopped managing this market: market closed or "
+                               "decided, expiry cutoff reached, or you retired it."),
     "WAITING": Term("Waiting", "Approved, but the farmer hasn't picked it up yet. It starts "
                                "on its next cycle."),
 

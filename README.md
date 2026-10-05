@@ -672,7 +672,9 @@ python reward_farmer.py --live                # real orders
 python reward_farmer.py --live --heartbeat    # real orders with the dead-man switch
 ```
 
-Each cycle prints one summary line per market, then one line per action:
+A cycle prints a market's summary line only when it differs from the last
+one printed for that market, then one line per action. A market resting
+unchanged stays quiet:
 
 ```text
 [16:36:06] some-market: QUOTING mid 96.9c Q1 308.1 Q2 308.1 | bid 94.9c net $3.12/day | hold 0 cancel 0 place 2
@@ -720,7 +722,7 @@ these orders.
 
 #### Market lifecycle
 
-Each market is in one of five states:
+Each market is in one of six states:
 
 - `QUOTING`: orders rest as planned.
 - `COOLDOWN`: the favorite's best ask of at least the reward minimum size
@@ -734,11 +736,16 @@ Each market is in one of five states:
 - `PAUSED`: you set `paused = 1` on the market. All orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
-- `RETIRED`: the market's rewards were removed, it closed or stopped
-  accepting orders, you no longer approve it, it reached its end date
-  minus `--expiry-buffer-days`, or Gamma shows it is already decided (its
-  event closed or a resolution was proposed; checked once a minute). All
-  orders are cancelled. In live mode the
+- `UNREWARDED`: the market left the total reward listing. Its own CLOB
+  record keeps showing the old rate after rewards end, so only the listing
+  counts. All orders come down, but the farmer keeps managing the market.
+  When the listing pays it again, the market goes through the checks above,
+  the pause included, and quotes again unless one of them holds it. This
+  check wins over a pause.
+- `RETIRED`: the market closed or stopped accepting orders, you no longer
+  approve it, it reached its end date minus `--expiry-buffer-days`, or Gamma
+  shows it is already decided (its event closed or a resolution was
+  proposed; checked once a minute). All orders are cancelled. In live mode the
   database row becomes `retired` with a note. A row you rejected keeps its
   `rejected` status. Retirement wins over a pause. If you approve a retired
   market again after the farmer has seen it unapproved, the farmer manages it
@@ -1070,9 +1077,10 @@ a minute. The resolution rules come from Gamma when you open a Review page
 and are kept for 10 minutes. The live check needs the total reward listing,
 which includes sponsored pools and takes most of a minute to read. The console
 reads it in a background thread when a Review page first asks, then at most
-every 5 minutes. Until it lands, a candidate with no native reward rate keeps
-its place in the queue. If Gamma or the data API is unreachable, that
-panel says so and offers a retry; the rest of the page still works.
+every 5 minutes. Until it lands, the console records no rewards change and
+the queue keeps every candidate where it is. If Gamma or the data API is
+unreachable, that panel says so and offers a retry; the rest of the page still
+works.
 
 htmx 2.0.11 and htmx-ext-sse 2.2.4 are vendored in `farm_console/static/`, so
 the console works offline except for the IBM Plex fonts, which fall back to
