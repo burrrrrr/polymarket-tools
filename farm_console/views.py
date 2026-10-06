@@ -405,6 +405,16 @@ def markets_page(snap, phase, now):
 # Overview
 # ---------------------------------------------------------------------------
 
+def live_daily(state):
+    """The reward $/day the farmer modeled this cycle against the live pool and
+    book, 0.0 quoting without a favorite bid, or None when not quoting: a
+    paused market's economics are only a preview."""
+    if state.phase != "QUOTING":
+        return None
+    economics = (state.slots.get("FAV_BID") or {}).get("economics")
+    return economics["reward_per_day"] if economics else 0.0
+
+
 @dataclass(frozen=True)
 class Totals:
     quoting: int
@@ -414,7 +424,12 @@ class Totals:
     naked_budget_usd: float
     inventory_usd: float
     est_daily_usd: float
+    live_daily_usd: float
     earned_today_usd: Optional[float]
+
+    @property
+    def live_hourly_usd(self):
+        return self.live_daily_usd / 24
 
 
 def totals(snap, now):
@@ -441,6 +456,7 @@ def totals(snap, now):
         inventory_usd=sum(inventory(s) for s in snap.states.values()),
         est_daily_usd=sum(snap.markets[c].metrics.get("est_daily_usd", 0.0)
                           for c in quoting if c in snap.markets),
+        live_daily_usd=sum(live_daily(s) or 0.0 for s in snap.states.values()),
         earned_today_usd=sum(earned) if earned else None,
     )
 
@@ -704,10 +720,16 @@ TABS = ("rewards", "fills", "inventory", "log")
 class RewardRow:
     condition_id: str
     name: str
+    rate_daily_usd: Optional[float]
     est_daily_usd: Optional[float]
     scoring_pct: Optional[float]
     today_usd: float
     week_usd: float
+    total_usd: float
+
+    @property
+    def rate_hourly_usd(self):
+        return None if self.rate_daily_usd is None else self.rate_daily_usd / 24
 
 
 @dataclass(frozen=True)
@@ -715,14 +737,22 @@ class RewardsTab:
     mode: Optional[str]
     today_usd: Optional[float]
     week_usd: Optional[float]
+    total_usd: Optional[float]
     est_daily_usd: float
+    live_daily_usd: float
     quoting: int
     realised_ratio: Optional[float]
     rows: list
     daily: list
 
+    @property
+    def live_hourly_usd(self):
+        return self.live_daily_usd / 24
 
-def rewards_tab(snap, now):
+
+def rewards_tab(snap, earned_totals, now):
+    """earned_totals is {condition_id: usd} over every recorded day; the
+    snapshot's rewards reach back 30 days only."""
     today = now.strftime("%Y-%m-%d")
     week_start = (now - timedelta(days=6)).strftime("%Y-%m-%d")
     by_market = {}
@@ -730,18 +760,22 @@ def rewards_tab(snap, now):
         today_usd, week_usd = by_market.get(cid, (0.0, 0.0))
         by_market[cid] = (today_usd + (amount if date == today else 0.0),
                           week_usd + (amount if date >= week_start else 0.0))
-    cids = list(dict.fromkeys([*snap.states, *by_market]))
-    rows = [RewardRow(
+    cids = dict.fromkeys([*snap.states, *by_market, *earned_totals])
+    rows = sorted((RewardRow(
         cid, _name(snap, cid),
+        live_daily(snap.states[cid]) if cid in snap.states else None,
         snap.markets[cid].metrics.get("est_daily_usd") if cid in snap.markets else None,
         snap.states[cid].scoring_pct if cid in snap.states else None,
         *by_market.get(cid, (0.0, 0.0)),
-    ) for cid in cids]
+        earned_totals.get(cid, 0.0),
+    ) for cid in cids), key=lambda r: (r.rate_daily_usd is None, -(r.rate_daily_usd or 0.0),
+                                       -r.total_usd))
     t = totals(snap, now)
     week = sum(r.week_usd for r in rows) if snap.rewards else None
     ratio = week / 7 / t.est_daily_usd if week is not None and t.est_daily_usd else None
     return RewardsTab(liveness(snap.status, now).mode, t.earned_today_usd, week,
-                      t.est_daily_usd, t.quoting, ratio, rows, snap.rewards)
+                      sum(earned_totals.values()) if earned_totals else None,
+                      t.est_daily_usd, t.live_daily_usd, t.quoting, ratio, rows, snap.rewards)
 
 
 @dataclass(frozen=True)

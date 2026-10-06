@@ -200,6 +200,41 @@ class TotalsTest(unittest.TestCase):
         self.assertAlmostEqual(t.fav_bid_usd, 48.0)
         self.assertIsNone(t.earned_today_usd)
 
+    def test_live_rate_counts_quoting_economics_only(self):
+        def with_economics(reward):
+            slots = quoting_slots()
+            slots["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": reward}
+            return slots
+
+        quoting = state(A, slots=with_economics(4.8))
+        no_fav_bid = state(B)
+        paused = state(C, "PAUSED", "paused by operator", slots=with_economics(7.0))
+        cooling = state("0xddd", "COOLDOWN", slots=with_economics(9.0))
+        self.assertEqual([views.live_daily(s) for s in (quoting, no_fav_bid, paused, cooling)],
+                         [4.8, 0.0, None, None])
+        t = views.totals(snap([quoting, no_fav_bid, paused, cooling]), NOW)
+        self.assertAlmostEqual(t.live_daily_usd, 4.8)
+        self.assertAlmostEqual(t.live_hourly_usd, 0.2)
+
+
+class RewardsTabTest(unittest.TestCase):
+    def test_rows_rank_by_live_rate_and_totals_reach_past_thirty_days(self):
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": 2.4}
+        preview = quoting_slots()
+        preview["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": 50.0}
+        old = "0xold"
+        s = snap([state(B), state(C, "PAUSED", slots=preview), state(A, slots=slots)],
+                 [market(A, "a"), market(B, "b"), market(C, "c")],
+                 rewards=[("2026-10-04", A, 1.0), ("2026-10-01", B, 0.5)])
+        tab = views.rewards_tab(s, {A: 10.0, B: 0.5, old: 3.0}, NOW)
+        self.assertEqual([(r.condition_id, r.rate_daily_usd, r.total_usd) for r in tab.rows],
+                         [(A, 2.4, 10.0), (B, 0.0, 0.5), (old, None, 3.0), (C, None, 0.0)])
+        self.assertAlmostEqual(tab.rows[0].rate_hourly_usd, 0.1)
+        self.assertIsNone(tab.rows[2].rate_hourly_usd)
+        self.assertEqual((tab.total_usd, tab.live_daily_usd, tab.quoting), (13.5, 2.4, 2))
+        self.assertIsNone(views.rewards_tab(snap([state(A)]), {}, NOW).total_usd)
+
 
 class BandStripTest(unittest.TestCase):
     def test_marks_on_the_favorite_axis(self):
@@ -477,6 +512,29 @@ class RoutesTest(Console):
                     self.assertIn(shown, resp.text)
                 else:
                     self.assertNotIn("sweeps", resp.text)
+
+    def test_the_rewards_kpi_shows_the_live_rate_beside_the_screener(self):
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = ECONOMICS
+        self.publish(states=[state(A, slots=slots)._replace(updated_at=self.now)])
+        text = self.client.get("/partials/overview/kpis").text
+        self.assertIn("$5.00/day", text)
+        self.assertIn("$0.21/hr live · screener $10.00", text)
+
+    def test_the_rewards_tab_shows_each_market_rate_and_total_earned(self):
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = ECONOMICS
+        self.publish(states=[state(A, slots=slots)._replace(updated_at=self.now)])
+        farm_db.store_rewards(self.db, (self.now - timedelta(days=40)).strftime("%Y-%m-%d"),
+                              {A: 7.0}, self.now)
+        farm_db.store_rewards(self.db, self.now.strftime("%Y-%m-%d"), {A: 1.25}, self.now)
+        text = self.client.get("/activity?tab=rewards").text
+        self.assertIn("<th>Market</th><th>Rate now $/hr", text)
+        self.assertIn('<td class="mono">$0.21</td><td class="mono">$5.00</td>'
+                      '<td class="mono">$10.00</td><td class="mono">n/a</td>'
+                      '<td class="mono">$1.25</td><td class="mono">$1.25</td>'
+                      '<td class="mono">$8.25</td></tr>', text)
+        self.assertIn('<span class="mono value">$8.25</span>', text)
 
     def test_an_unrewarded_market_lists_under_its_own_phase(self):
         self.publish(states=[state(A, "UNREWARDED", "rewards removed")._replace(

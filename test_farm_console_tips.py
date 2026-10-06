@@ -84,7 +84,7 @@ class RenderedTipsTest(Writes):
 
     # Per page, keys whose tips must be there.
     PAGES = {
-        "/": {"capital_in_bids", "naked_at_risk", "farm_inventory", "est_daily",
+        "/": {"capital_in_bids", "naked_at_risk", "farm_inventory", "rate_now", "est_daily",
               "earned_today", "q1_q2", "QUOTING"},
         "/discover": {"min_fav", "min_rate", "fragile_drop", "mode", "favorite", "pool", "band",
                       "est_daily", "planned_capital", "net_apr", "days", "ahead", "vol24h"},
@@ -101,7 +101,7 @@ class RenderedTipsTest(Writes):
                           "expiry_cutoff", "net_daily", "backoff", "book_in_band",
                           "score_per_share",
                           "baseline", "longshot", "edge_vs_p_true"},
-        "/activity": {"earned_today", "scoring_share", "est_daily"},
+        "/activity": {"earned_today", "scoring_share", "est_daily", "rate_now", "earned_total"},
         "/activity?tab=fills": {"edge_vs_p_true", "FAV_BID"},
         "/activity?tab=inventory": {"baseline", "farm_inventory"},
         "/settings": {*forms.SETTING_FIELDS, "heartbeat", "keep_orders", "cancel_all"},

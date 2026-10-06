@@ -1011,8 +1011,16 @@ control the farmer. Every change it makes goes through `farm_db` into
 `farm.db`, and the farmer picks it up on its next cycle.
 
 ```bash
- --port 8787   # then open http://127.0.0.1:8787
+python -m farm_console                    # production farm.db on port 8787
+python -m farm_console --db scratch.db    # another database
+python -m farm_console --port 8788        # another port
 ```
+
+Then open http://127.0.0.1:8787. Run it from the repository root (or with
+the repository on `PYTHONPATH`) so Python can find the `farm_console`
+package. `--db` defaults to the repository's `farm.db`, the production
+database, wherever you start the console from. A relative `--db` path is
+read from the current directory.
 
 Run it next to the farmer on the same database, in its own terminal. Neither
 process needs the other: the console shows the last state the farmer

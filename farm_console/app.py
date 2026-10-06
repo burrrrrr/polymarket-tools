@@ -223,7 +223,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     def activity_vm(conn, now, tab, kind, condition_id, before):
         snap = snapshot(conn, now)
         if tab == "rewards":
-            vm = views.rewards_tab(snap, now)
+            vm = views.rewards_tab(snap, farm_db.read_reward_totals(conn), now)
         elif tab == "fills":
             vm = views.fills_tab(snap, farm_db.read_events(conn, kinds=(EventKind.FILL,),
                                                            limit=500))

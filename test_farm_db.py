@@ -363,5 +363,16 @@ class PublishTest(ScratchDb):
         self.assertEqual([r[0] for r in conn.execute("SELECT message FROM farm_events")], ["new"])
 
 
+class RewardTotalsTest(ScratchDb):
+    def test_sums_every_day_per_market_and_a_refetched_day_counts_once(self):
+        conn = self.open()
+        self.assertEqual(farm_db.read_reward_totals(conn), {})
+        farm_db.store_rewards(conn, "2026-08-01", {"0xa": 2.0, "0xb": 1.0}, NOW)
+        farm_db.store_rewards(conn, "2026-10-03", {"0xa": 0.5}, NOW)
+        farm_db.store_rewards(conn, "2026-10-04", {"0xa": 0.25}, NOW)
+        farm_db.store_rewards(conn, "2026-10-04", {"0xa": 0.75}, NOW)
+        self.assertEqual(farm_db.read_reward_totals(conn), {"0xa": 3.25, "0xb": 1.0})
+
+
 if __name__ == "__main__":
     unittest.main()

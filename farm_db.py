@@ -963,3 +963,9 @@ def read_rewards(conn, since_date):
         "SELECT date, condition_id, earnings_usd FROM rewards_daily WHERE date >= ? "
         "ORDER BY date, condition_id", (since_date,),
     )]
+
+
+def read_reward_totals(conn):
+    """{condition_id: earnings_usd} summed over every recorded day."""
+    return dict(conn.execute(
+        "SELECT condition_id, SUM(earnings_usd) FROM rewards_daily GROUP BY condition_id"))
