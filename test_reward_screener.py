@@ -1,3 +1,4 @@
+import base64
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -608,6 +609,59 @@ class FetchHistoryTest(unittest.TestCase):
             histories = reward_screener.fetch_histories(http, [MARKET], HISTORY_NOW, 0.90)
         self.assertEqual(histories, {})
         self.assertIn("test-market", printed.call_args.args[0])
+
+
+REWARD_ROWS = [(f"0x{n:04d}", n % 7 + 1) for n in range(2000)]
+
+
+def offset_cursor(offset):
+    return base64.b64encode(str(offset).encode()).decode()
+
+
+def rewards_api(rows, gone=lambda offset: 0, next_cursor=None):
+    """A /rewards/markets/current over rows [(condition_id, rate)], paged as the
+    CLOB pages it: 500 rows from a base64 row offset, LTE= after a short page.
+    gone(offset) is how many leading rows have left the listing by the time the
+    page at that offset is read. A cursor that is not an offset ends the listing."""
+    offsets = []
+
+    def handle(request):
+        try:
+            offset = int(base64.b64decode(request.url.params["next_cursor"]))
+        except ValueError:
+            return httpx.Response(200, json={"data": [], "next_cursor": "LTE="})
+        offsets.append(offset)
+        page = rows[gone(offset):][offset:offset + 500]
+        cursor = offset_cursor(offset + 500) if len(page) == 500 else "LTE="
+        return httpx.Response(200, json={
+            "data": [{"condition_id": c, "total_daily_rate": r} for c, r in page],
+            "next_cursor": next_cursor or cursor, "limit": 500, "count": len(page)})
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), offsets
+
+
+class FetchTotalRatesTest(unittest.TestCase):
+    def test_markets_leaving_mid_read_skip_no_market_still_listed(self):
+        http, _ = rewards_api(REWARD_ROWS, gone=lambda offset: 50 if offset >= 800 else 0)
+        rates = reward_screener.fetch_total_rates(http)
+        self.assertEqual([c for c, r in REWARD_ROWS[50:] if rates.get(c) != r], [])
+        self.assertLessEqual(set(rates), {c for c, _ in REWARD_ROWS})
+
+    def test_a_listing_that_keeps_shifting_past_the_overlap_raises_after_rereading(self):
+        http, offsets = rewards_api(REWARD_ROWS, gone=lambda offset: 150 if offset >= 800 else 0)
+        with self.assertRaises(RuntimeError):
+            reward_screener.fetch_total_rates(http)
+        self.assertEqual(offsets.count(0), reward_screener.REWARDS_ATTEMPTS)
+
+    def test_a_listing_not_sorted_by_condition_id_raises(self):
+        http, _ = rewards_api(REWARD_ROWS[::-1])
+        with self.assertRaises(ValueError):
+            reward_screener.fetch_total_rates(http)
+
+    def test_a_cursor_that_is_not_a_row_offset_raises(self):
+        http, _ = rewards_api(REWARD_ROWS, next_cursor="aWQ6MTI4NDk2OA==")
+        with self.assertRaises(ValueError):
+            reward_screener.fetch_total_rates(http)
 
 
 class LoadPriorTest(unittest.TestCase):

@@ -89,7 +89,7 @@ def in_background(work):
 
 
 class TotalRates:
-    """The fetch_total_rates map, which pages for most of a minute.
+    """The fetch_total_rates map, which takes about ten seconds to read.
 
     get() never waits on it. It returns the last map, None until the first
     fetch lands, and starts a refresh through spawn when there is no map yet or

@@ -14,3 +14,6 @@ __pycache__/
 farm.db
 farm.db-wal
 farm.db-shm
+
+# raw data from the 2026-10-07 unlisted-gap scoring check
+scoring_watch.csv

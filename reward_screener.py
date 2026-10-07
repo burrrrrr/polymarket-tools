@@ -66,6 +66,7 @@ Usage:
 """
 
 import argparse
+import base64
 import json
 import math
 import os
@@ -90,6 +91,16 @@ DATA_API_HOST = os.getenv("POLYMARKET_DATA_API_HOST", "https://data-api.polymark
 # Cursor values the CLOB uses to start and end a paginated listing.
 FIRST_CURSOR = "MA=="
 LAST_CURSOR = "LTE="
+
+# /rewards/markets/current serves 500 rows a page, sorted by condition id,
+# from a cursor that is the row offset in base64. A market leaving between two
+# page reads moves every later row up one, so pages read end to end skip a
+# market still listed. Pages read 400 rows apart overlap by 100 instead, and a
+# read whose neighbouring pages stop overlapping is read again.
+REWARDS_PAGE = 500
+REWARDS_STRIDE = 400
+REWARDS_THREADS = 8
+REWARDS_ATTEMPTS = 3
 
 # Most tokens /books accepts in one request; 501 is refused as too large.
 BOOKS_REQUEST_LIMIT = 500
@@ -967,10 +978,72 @@ def fetch_paginated(http, path, timeout=30):
     return items
 
 
+def offset_cursor(offset):
+    return base64.b64encode(str(offset).encode()).decode()
+
+
+def fetch_rewards_page(http, offset, timeout):
+    """The rows of the /rewards/markets/current page at this row offset; raises
+    when its cursor is no longer the row offset the fetch builds on."""
+    page = get_with_retry(http, f"{CLOB_HOST}/rewards/markets/current",
+                          {"next_cursor": offset_cursor(offset)}, timeout).json()
+    rows = page.get("data") or []
+    allowed = {LAST_CURSOR}
+    if len(rows) == REWARDS_PAGE:
+        allowed.add(offset_cursor(offset + REWARDS_PAGE))
+    if page.get("next_cursor") not in allowed:
+        raise ValueError(f"/rewards/markets/current cursor {page.get('next_cursor')!r} "
+                         f"after offset {offset} is not a row offset")
+    return rows
+
+
+def read_rewards_pages(pool, http, timeout):
+    """The pages REWARDS_STRIDE rows apart, read in parallel batches, through
+    the first short one."""
+    pages, offset = [], 0
+    while True:
+        batch = [offset + i * REWARDS_STRIDE for i in range(REWARDS_THREADS)]
+        for rows in pool.map(lambda o: fetch_rewards_page(http, o, timeout), batch):
+            pages.append(rows)
+            if len(rows) < REWARDS_PAGE:
+                return pages
+        offset += REWARDS_THREADS * REWARDS_STRIDE
+
+
+def stitch_rewards_pages(pages):
+    """The rows of read_rewards_pages, each market once, or None when two
+    neighbouring pages do not overlap and rows between them may be missing.
+
+    Each page covers a contiguous run of condition ids, so overlapping runs
+    hold every market listed throughout both reads. Raises when a page is not
+    sorted by condition id, which that relies on.
+    """
+    for rows in pages:
+        ids = [r["condition_id"] for r in rows]
+        if any(a >= b for a, b in zip(ids, ids[1:])):
+            raise ValueError("/rewards/markets/current is not sorted by condition id")
+    for before, after in zip(pages, pages[1:]):
+        if not after or after[0]["condition_id"] > before[-1]["condition_id"]:
+            return None
+    return list({r["condition_id"]: r for rows in pages for r in rows}.values())
+
+
+def fetch_rewards_listing(http, timeout=30):
+    """Every /rewards/markets/current row, each market once. Raises when the
+    listing shifts past the overlap on every one of REWARDS_ATTEMPTS reads."""
+    with ThreadPoolExecutor(REWARDS_THREADS) as pool:
+        for _ in range(REWARDS_ATTEMPTS):
+            rows = stitch_rewards_pages(read_rewards_pages(pool, http, timeout))
+            if rows is not None:
+                return rows
+    raise RuntimeError(f"/rewards/markets/current shifted past the page overlap "
+                       f"on {REWARDS_ATTEMPTS} reads")
+
+
 def fetch_total_rates(http):
     """{condition_id: total_daily_rate}, sponsored rewards included."""
     rates = {}
-    for item in fetch_paginated(http, "/rewards/markets/current"):
+    for item in fetch_rewards_listing(http):
         rate = _float(item.get("total_daily_rate"))
         if item.get("condition_id") and rate is not None:
             rates[item["condition_id"]] = rate

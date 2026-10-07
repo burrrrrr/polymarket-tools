@@ -487,9 +487,9 @@ python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --capital
 python reward_screener.py reject <slug-or-condition-id> --note "resolution risk"
 ```
 
-A scan takes two to three minutes. About a minute of that is
-`/rewards/markets/current`, which pages slowly, and most of the rest is
-reading the fill histories. It prints one line per stage with the counts it
+Most of a scan is reading the fill histories. `/rewards/markets/current`
+takes about ten seconds, read as overlapping pages so a market that leaves
+mid-read cannot hide one still listed. It prints one line per stage with the counts it
 kept and the reasons it skipped the rest, then a table sorted by rank.
 
 A scan assesses every market twice. The first pass costs fills from the fill
@@ -1143,7 +1143,7 @@ The midpoint chart reads `farm_mids`, which the farmer fills with one sample
 per market per minute. A market's chart is empty until the farmer has run for
 a minute. The resolution rules come from Gamma when you open a Review page
 and are kept for 10 minutes. The live check needs the total reward listing,
-which includes sponsored pools and takes most of a minute to read. The console
+which includes sponsored pools and takes about ten seconds to read. The console
 reads it in a background thread when a Review page first asks, then at most
 every 5 minutes. Until it lands, the console records no rewards change and
 the queue keeps every candidate where it is. If Gamma or the data API is

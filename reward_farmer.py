@@ -1162,7 +1162,7 @@ def row_baseline(row):
 class TotalRates:
     """The total daily rate of every reward market, sponsored pools included.
 
-    The listing that has them pages slowly (most of a minute), so a thread
+    The listing that has them takes about ten seconds to read, so a thread
     refreshes it while the main loop keeps quoting. `rates` is None until the
     first fetch lands and is replaced whole, never mutated.
     """
