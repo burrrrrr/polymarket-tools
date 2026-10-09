@@ -632,12 +632,12 @@ class ReviewTest(Writes):
         resp = self.client.get("/review/0xddd/next-quotable", follow_redirects=False)
         self.assertEqual(resp.headers["location"], "/review")
 
-    def rewards_end_for(self, *cids, sponsored=()):
-        """A loaded total listing that drops cids, except those kept by sponsored pools."""
+    def rewards_end_for(self, *cids):
+        """A loaded total listing that drops cids."""
         from farm_console.app import utc_now
         every = [r[0] for r in self.db.execute("SELECT condition_id FROM markets")]
         self.remote.total_rates = {cid: 5.0 for cid in every
-                                   if cid not in cids or cid in sponsored}
+                                   if cid not in cids}
         settle_total_rates()
         self.clock[0] = (self.clock[0] or utc_now()) + remote.TOTAL_RATES_TTL
         self.app.state.total_rates.refresh()
@@ -659,9 +659,9 @@ class ReviewTest(Writes):
         resp = self.client.get("/review/0xeee/next-quotable", follow_redirects=False)
         self.assertEqual(resp.headers["location"], "/review/0xfff")
 
-    def test_sponsored_rewards_keep_a_candidate_and_returning_rewards_restore_one(self):
+    def test_returning_rewards_restore_a_candidate(self):
         farm_db.set_rewards_active(self.db, "0xeee", False)
-        self.rewards_end_for("0xeee", sponsored=["0xeee"])
+        self.rewards_end_for()
         text = self.live("0xeee")
         self.assertNotIn("rewards removed", text)
         self.assertIn("Buy No", text)

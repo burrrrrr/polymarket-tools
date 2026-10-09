@@ -668,11 +668,16 @@ def offset_cursor(offset):
     return base64.b64encode(str(offset).encode()).decode()
 
 
-def rewards_api(rows, gone=lambda offset: 0, next_cursor=None):
+NATIVE_CONFIG = [{"asset_address": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+                  "start_date": "2026-10-01", "end_date": "2500-12-31", "rate_per_day": 1}]
+
+
+def rewards_api(rows, gone=lambda offset: 0, next_cursor=None, sponsored_only=()):
     """A /rewards/markets/current over rows [(condition_id, rate)], paged as the
     CLOB pages it: 500 rows from a base64 row offset, LTE= after a short page.
     gone(offset) is how many leading rows have left the listing by the time the
-    page at that offset is read. A cursor that is not an offset ends the listing."""
+    page at that offset is read. A cursor that is not an offset ends the listing.
+    Each row has a native reward config, except the sponsored_only ones."""
     offsets = []
 
     def handle(request):
@@ -684,7 +689,9 @@ def rewards_api(rows, gone=lambda offset: 0, next_cursor=None):
         page = rows[gone(offset):][offset:offset + 500]
         cursor = offset_cursor(offset + 500) if len(page) == 500 else "LTE="
         return httpx.Response(200, json={
-            "data": [{"condition_id": c, "total_daily_rate": r} for c, r in page],
+            "data": [{"condition_id": c, "total_daily_rate": r,
+                      "rewards_config": [] if c in sponsored_only else NATIVE_CONFIG}
+                     for c, r in page],
             "next_cursor": next_cursor or cursor, "limit": 500, "count": len(page)})
 
     return httpx.Client(transport=httpx.MockTransport(handle)), offsets
@@ -696,6 +703,13 @@ class FetchTotalRatesTest(unittest.TestCase):
         rates = reward_screener.fetch_total_rates(http)
         self.assertEqual([c for c, r in REWARD_ROWS[50:] if rates.get(c) != r], [])
         self.assertLessEqual(set(rates), {c for c, _ in REWARD_ROWS})
+
+    def test_a_market_paid_only_by_sponsors_is_left_out(self):
+        sponsored = {REWARD_ROWS[3][0], REWARD_ROWS[1200][0]}
+        http, _ = rewards_api(REWARD_ROWS, sponsored_only=sponsored)
+        rates = reward_screener.fetch_total_rates(http)
+        self.assertEqual(sorted(sponsored & rates.keys()), [])
+        self.assertEqual([c for c, r in REWARD_ROWS if c not in sponsored and rates.get(c) != r], [])
 
     def test_a_listing_that_keeps_shifting_past_the_overlap_raises_after_rereading(self):
         http, offsets = rewards_api(REWARD_ROWS, gone=lambda offset: 150 if offset >= 800 else 0)

@@ -822,7 +822,7 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(stripped.bids, [(0.985, 1000.0)])
         self.assertEqual(stripped.asks, [(0.995, 1000.0)])
 
-    def test_sponsored_only_rewards_stay_active(self):
+    def test_rewards_need_a_listed_rate_and_a_max_spread(self):
         info = MarketInfo((FAV, LONG), 0.085, 50.0, 0.001, False, True, False)
         self.assertTrue(rewards_active(info, "0xc0nd", {"0xc0nd": 2.1}))
         self.assertTrue(rewards_active(info, "0xc0nd", None))

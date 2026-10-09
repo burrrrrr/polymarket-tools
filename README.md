@@ -1143,7 +1143,8 @@ The midpoint chart reads `farm_mids`, which the farmer fills with one sample
 per market per minute. A market's chart is empty until the farmer has run for
 a minute. The resolution rules come from Gamma when you open a Review page
 and are kept for 10 minutes. The live check needs the total reward listing,
-which includes sponsored pools and takes about ten seconds to read. The console
+which includes sponsored pools, leaves out markets paid only by sponsors, and
+takes about ten seconds to read. The console
 reads it in a background thread when a Review page first asks, then at most
 every 5 minutes. Until it lands, the console records no rewards change and
 the queue keeps every candidate where it is. If Gamma or the data API is

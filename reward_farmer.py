@@ -1085,7 +1085,8 @@ def parse_market_info(entry):
 
 
 def rewards_active(info, condition_id, total_rates):
-    """Whether the total listing, sponsored pools included, still pays the market.
+    """Whether the total listing, which leaves out markets paid only by
+    sponsors, still pays the market.
 
     The market record keeps its native rates after its rewards end, so only
     the listing decides. total_rates is None until the first fetch of the slow
@@ -1234,7 +1235,8 @@ def row_baseline(row):
 
 
 class TotalRates:
-    """The total daily rate of every reward market, sponsored pools included.
+    """The total daily rate of every market with native rewards, sponsored pools
+    included.
 
     The listing that has them takes about ten seconds to read, so a thread
     refreshes it while the main loop keeps quoting. `rates` is None until the

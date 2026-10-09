@@ -80,8 +80,8 @@ def fetch_book(token_id):
 
 
 def fetch_total_rates():
-    """{condition_id: total daily rate} of every reward market, sponsored pools
-    included."""
+    """{condition_id: total daily rate} of every market with native rewards,
+    sponsored pools included."""
     with httpx.Client() as http:
         return reward_screener.fetch_total_rates(http)
 

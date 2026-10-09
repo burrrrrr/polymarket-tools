@@ -37,8 +37,8 @@ is split in proportion to that score.
 A scan is three stages:
 
   1. List every reward market from /sampling-markets, with the daily rate
-     from /rewards/markets/current (which includes sponsored rewards) fetched
-     concurrently, and drop anything that cannot qualify without a book:
+     from /rewards/markets/current (which includes sponsored rewards, and
+     leaves out markets paid only by sponsors) fetched concurrently, and drop anything that cannot qualify without a book:
      closed, not accepting orders, too close to expiry, favorite too cheap.
   2. Fetch the favorite token's order book for each survivor (the two outcome
      books of a market mirror each other exactly, so one is enough) and the
@@ -1061,11 +1061,13 @@ def fetch_rewards_listing(http, timeout=30):
 
 
 def fetch_total_rates(http):
-    """{condition_id: total_daily_rate}, sponsored rewards included."""
+    """{condition_id: total_daily_rate}, sponsored rewards included, of the
+    markets with native rewards. A market paid only by sponsors is left out:
+    those draw bots into mispriced books, and some listed ones pay nothing."""
     rates = {}
     for item in fetch_rewards_listing(http):
         rate = _float(item.get("total_daily_rate"))
-        if item.get("condition_id") and rate is not None:
+        if item.get("condition_id") and item.get("rewards_config") and rate is not None:
             rates[item["condition_id"]] = rate
     return rates
 
