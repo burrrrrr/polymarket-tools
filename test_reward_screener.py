@@ -21,11 +21,13 @@ from reward_screener import (
     created_mid,
     fav_bid_candidates,
     fav_ceiling,
+    longshot_bid,
     parse_gamma,
     parse_hits,
     plan_at,
     plan_quotes,
     resolution_signal,
+    round_size_down,
     score,
 )
 
@@ -111,12 +113,14 @@ class LongshotBidTest(unittest.TestCase):
         self.assertLessEqual(plan.low_price * plan.low_size, CONFIG.naked_budget)
 
     def test_a_budget_short_at_every_price_falls_back_and_trims_the_favorite_bid(self):
-        # Every cover costs at least the floor's $0.80.
+        # Every cover costs at least the floor's $0.80. $0.50 buys 9.97 of
+        # score at 0.1c (500 shares scoring 0.0199) and 3.15 at the 1.6c
+        # ceiling (31.25 scoring 0.101), so the bid sits at the floor.
         plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
                        CONFIG._replace(naked_budget=0.5), 0.855)
-        self.assertEqual((plan.low_price, plan.low_size), (0.016, 31.25))
-        self.assertGreaterEqual(plan.low_score, CONFIG.min_low_score)
-        self.assertEqual(plan.mode, Mode.BUDGET)
+        self.assertEqual((plan.low_price, plan.low_size), (0.001, 500.0))
+        self.assertEqual(plan.mode, Mode.FLOOR)
+        self.assertLess(plan.low_score * plan.low_size, plan.fav_bid_score * 584.79)
         self.assertAlmostEqual(plan.fav_bid_size,
                                plan.low_score * plan.low_size / plan.fav_bid_score, delta=0.01)
 
@@ -126,9 +130,29 @@ class LongshotBidTest(unittest.TestCase):
                                       CONFIG._replace(min_low_score=0.99), 0.855), Skip)
 
     def test_a_budget_under_the_reward_minimum_size_plans_nothing(self):
-        # $0.30 buys 18.75 shares at 1.6c, under the 20-share minimum.
+        # $0.019 buys 19 shares at 0.1c, the most of any price, under the
+        # 20-share minimum.
         self.assertIsInstance(plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
-                                      CONFIG._replace(naked_budget=0.3), 0.855), Skip)
+                                      CONFIG._replace(naked_budget=0.019), 0.855), Skip)
+
+    def test_a_short_budget_buys_the_most_score_at_the_floor_near_the_band_edge(self):
+        # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
+        # 0.00716, so $10 buys 10000 shares and 71.6 of score; the 1.7c ceiling
+        # scores 0.109 and buys 64.4. Neither covers the 72 needed.
+        book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1)
+        self.assertEqual((bid.price, bid.size), (0.001, round_size_down(10.0 / 0.001)))
+        self.assertAlmostEqual(bid.score * bid.size, 71.6, delta=0.05)
+        self.assertAlmostEqual(bid.score, score(0.065, 0.0595))
+
+    def test_a_short_budget_sits_at_the_ceiling_when_it_buys_the_most_score(self):
+        # Favorite midpoint 0.96, v 0.035: nothing under 0.6c scores, and the
+        # score $25 buys rises with price up to the 1.7c ceiling (172.9 at
+        # 1470.58 shares versus 154.3 at 1.6c).
+        book = Levels(bids=[(0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+        bid = longshot_bid(book, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1)
+        self.assertEqual((bid.price, bid.size), (0.017, 1470.58))
+        self.assertAlmostEqual(bid.score, score(0.035, 0.023))
 
 
 # TIGHT_BOOK with a bid behind the best one, so it is not fragile.

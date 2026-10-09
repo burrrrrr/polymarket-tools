@@ -109,8 +109,13 @@ minutes, and resets on the next accepted place.
 Reconciling keeps an existing order when it is still close enough to target
 (same price grid, most of the target score, size within -20%/+25%) instead of
 replacing it on every wiggle of the midpoint. A favorite bid is held to most
-of the best price's net instead of the score. Replacing an order loses its
-queue position and costs two API calls, so this hysteresis matters.
+of the best price's net instead of the score and to the size planned at its
+own price, and the orders that balance it are planned around the bid that
+stays rather than the target. A longshot bid is kept while it covers
+keep_ratio of the score it balances, up to twice it above the floor, at a
+price no higher than target or within two ticks of the min-score price. Replacing an order loses its queue
+position, costs two API calls, and scores nothing for the ~30 seconds before
+Polymarket starts scoring the new order, so this hysteresis matters.
 
 Planning, reconciling, and the lifecycle are pure functions; the daemon around
 them only fetches, executes, and logs.
@@ -194,6 +199,20 @@ RESUME_MARGIN = 0.005
 
 # An order whose size left this band around the target gets replaced.
 KEEP_SIZE_RANGE = (0.8, 1.25)
+
+# A longshot bid above the floor covering more than this multiple of the score
+# it balances gets replaced, so a kept bid cannot ratchet up to the whole naked
+# budget where a fill costs real money; at 0.1c the extra cover costs cents.
+LONG_COVER_MAX = 2.0
+
+# A longshot bid priced over target stays while it is within this many ticks
+# of the cheapest price scoring min_low_score, which moves a tick with each
+# tick of mid: the cheapest covering price swings with a two-tick wobble.
+LONG_PRICE_SLACK_TICKS = 2
+
+# The CLOB lists some orders one size step (0.01 share) under the size placed,
+# so a cover check exact to the share would replace them every cycle.
+SIZE_STEP = 0.01
 
 # A resting favorite bid stays while its net trails the best price's by no
 # more than this, in $/day, or (1 - keep_ratio) of the best net if larger.
@@ -519,12 +538,13 @@ def plan_fav_ask_price(fm, levels, book_mid, position, cfg):
     return price
 
 
-def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price):
+def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None):
     """The orders this market would rest with its favorite bid at fav_price, or
     with no favorite bid when fav_price is None, scored against the mid they create.
 
     `levels` is the favorite book without our own resting orders. The bid is
-    sized from the capital left after favorite inventory at cost. Sizes are
+    sized from the capital left after favorite inventory at cost, or starts at
+    fav_size when given (a bid already resting). Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
     LONG_BID at the cheapest price that covers the rest within the budget, no
     higher than the min_low_score price (longshot_bid), then the favorite bid
@@ -540,9 +560,11 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price):
     tick, v = fm.tick, fm.v
 
     fav_bid = None
-    if fav_price is not None:
+    if fav_price is not None and fav_size is None:
         room = fm.capital - position.fav_shares * position.fav_avg
-        fav_bid = fav_price, round_size_down(max(0.0, room) / fav_price)
+        fav_size = round_size_down(max(0.0, room) / fav_price)
+    if fav_price is not None:
+        fav_bid = fav_price, fav_size
     long_ask = fav_ask = None
     if position.long_shares >= fm.min_size:
         long_ask = plan_long_ask_price(fm, levels, fav_price, cfg)
@@ -671,9 +693,22 @@ def keep_failure(order, intent, target, fm, position, cfg):
 
     A favorite bid is judged by its net on target.fav.curve rather than its
     score: the net-best price moves a tick with every wiggle of the midpoint,
-    while the net at the resting price barely changes.
+    while the net at the resting price barely changes. Its size is held to
+    the plan at its own price too, since a budget-trimmed bid's size moves a
+    third between neighboring prices.
+    A longshot bid is judged by the score it covers rather than its size: near
+    the band edge a half-tick of mid moves its per-share score, and so the
+    covering size, by a third. Score is min(Q_one, Q_two), so a shortfall
+    loses that fraction of the score while over-coverage at the floor costs
+    almost nothing. But a replacement scores nothing for about 30 seconds
+    (Polymarket starts scoring an order ~30s after it is placed, measured
+    live), and above a 0.90 mid that zeroes the whole market, so the bid is
+    replaced only once it covers less than keep_ratio of the need. A bid
+    priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
+    price scoring min_low_score, the fill-risk bound the plan prices under.
     """
     low, high = KEEP_SIZE_RANGE
+    size = intent.size
     if (order.token_id, order.side) != (intent.token_id, intent.side):
         return "wrong token or side"
     if not on_tick(order.price, fm.tick):
@@ -683,14 +718,28 @@ def keep_failure(order, intent, target, fm, position, cfg):
         value = fav.curve.get(round(order.price, tick_decimals(fm.tick)))
         if value is None:
             return "outside the bid candidates"
+        size = value.size
         slack = max((1 - cfg.keep_ratio) * abs(fav.best.net_per_day), NET_KEEP_SLACK_USD)
         if (value.net_per_day < fav.best.net_per_day - slack
                 or value.net_per_day <= fav.baseline_per_day):
             return "net below keep ratio"
+    elif order.slot is Slot.LONG_BID:
+        need = intent.score * intent.size
+        per_share = order_score(Slot.LONG_BID, order.price, target.mid, fm.v)
+        covers = per_share * order.size_remaining
+        under = round(order.price - (LONG_PRICE_SLACK_TICKS + 1) * fm.tick, tick_decimals(fm.tick))
+        if order.price > intent.price + 1e-9 and under >= fm.tick - 1e-9 and (
+                order_score(Slot.LONG_BID, under, target.mid, fm.v) >= cfg.min_low_score):
+            return "above the target price"
+        if covers + per_share * SIZE_STEP < cfg.keep_ratio * need - 1e-9:
+            return "short of the cover needed"
+        if order.price > fm.tick + 1e-9 and covers > LONG_COVER_MAX * need + 1e-9:
+            return "over twice the cover needed"
     elif order_score(order.slot, order.price, target.mid, fm.v) < (
             cfg.keep_ratio * intent.score - 1e-12):
         return "score below keep ratio"
-    if not low * intent.size - 1e-9 <= order.size_remaining <= high * intent.size + 1e-9:
+    if order.slot is not Slot.LONG_BID and not (
+            low * size - 1e-9 <= order.size_remaining <= high * size + 1e-9):
         return "size out of range"
     if order.slot is Slot.FAV_BID and order.price > ev_cap(fm, cfg) + 1e-9:
         return "above the EV cap"
@@ -699,6 +748,31 @@ def keep_failure(order, intent, target, fm, position, cfg):
     if order.slot is Slot.LONG_BID and order.price * order.size_remaining > naked_room(fm, position) + 1e-9:
         return "over the naked budget"
     return None
+
+
+def around_kept_bid(target, orders, fm, levels, position, cfg, naked_allowed):
+    """The target re-planned around the favorite bid reconcile will keep.
+
+    The orders that balance a favorite bid must balance the one resting, not
+    a target the hysteresis never places: the net-best price wobbles a tick
+    between cycles, and a LONG_BID sized for it swings and gets replaced
+    while the favorite bid it covers never moves. Unchanged when no favorite
+    bid rests within keep, or the kept one already is the target, or the
+    kept one cannot be balanced. target.fav stays the net-best choice.
+    """
+    intent = next((i for i in target.intents if i.slot is Slot.FAV_BID), None)
+    if intent is None:
+        return target
+    kept = next((o for o in orders if o.slot is Slot.FAV_BID
+                 and keep_failure(o, intent, target, fm, position, cfg) is None), None)
+    if kept is None or (abs(kept.price - intent.price) < fm.tick / 2
+                        and abs(kept.size_remaining - intent.size) < 0.005):
+        return target
+    around = quotes_at(fm, levels, position, cfg, naked_allowed, kept.price,
+                       kept.size_remaining)
+    if not any(i.slot is Slot.FAV_BID for i in around.intents):
+        return target
+    return around._replace(fav=target.fav)
 
 
 def reconcile(target, live_orders, fm, position, cfg):
@@ -833,8 +907,8 @@ def farm_position(held, baseline):
     the data API has no per-lot cost.
     """
     return held._replace(
-        fav_shares=round(max(0.0, held.fav_shares - baseline.fav), 2),
-        long_shares=round(max(0.0, held.long_shares - baseline.long), 2),
+        fav_shares=round_size_down(max(0.0, held.fav_shares - baseline.fav)),
+        long_shares=round_size_down(max(0.0, held.long_shares - baseline.long)),
     )
 
 
@@ -1730,7 +1804,8 @@ class Farmer:
             if previewing:
                 preview = planned
             else:
-                target = planned
+                target = around_kept_bid(planned, orders, fm, book, managed.position,
+                                         self.cfg, naked_allowed(obs, now))
         actions = without_backed_off(
             reconcile(target, orders, fm, managed.position, self.cfg),
             managed.backoffs,

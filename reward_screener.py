@@ -496,15 +496,21 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
     most room. The cheaper the bid, the deeper it shows on the favorite's ask
     side and the more No buyers fill ahead of it, so a 0.1c bid scoring 0.02
     beats a 1.6c bid scoring 0.10. When no price up to the ceiling covers, the
-    bid sits at the ceiling with the size room buys, and the caller trims the
-    favorite bid to the Q_two that reaches; None when room buys less than
-    min_size there. With no ceiling under the crossing limit there is no bid,
-    even if a lower-scoring price could cover.
+    bid goes to the price where the size room buys scores the most, ties to
+    the cheaper, and the caller trims the favorite bid to the Q_two that
+    reaches; None when room buys less than min_size there. Score per dollar
+    is U-shaped in price: 0.1c buys ten times the shares of 1c, so near the
+    band edge the floor with the whole room often beats the ceiling (Pfizer,
+    $10 at a 0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c
+    ceiling, 49.8 at 1c). Sitting at the ceiling there made the plan jump
+    between the floor and the ceiling as the need crossed what the floor
+    covers, replacing the bid every few cycles. With no ceiling under the
+    crossing limit there is no bid, even if a lower-scoring price could cover.
 
     Near the band edge a small move of the midpoint changes the score, and so
-    the covering size, a lot, and KEEP_SIZE_RANGE replaces the bid more
-    often. That is accepted: at the floor, losing queue position only makes a
-    fill less likely.
+    the covering size, a lot. The farmer keeps a resting bid while it still
+    covers most of the score it balances (see keep_failure), so the swing
+    does not replace it.
 
     `levels` is the favorite book and `mid` the favorite midpoint. The
     longshot ask is the mirror of the raw favorite best bid; a longshot bid
@@ -528,8 +534,10 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
             size = max(min_size, round_size_up(need / s))
             if size * price <= room + 1e-9:
                 return LongshotBid(price, size, s)
-    price, s = scored[-1]
-    size = round_size_down(room / price)
+    price, size, s = max(
+        ((p, round_size_down(room / p), s) for p, s in scored if s > 0),
+        key=lambda bid: (bid[2] * bid[1], -bid[0]),
+    )
     return LongshotBid(price, size, s) if size >= min_size else None
 
 

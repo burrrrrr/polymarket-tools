@@ -25,6 +25,7 @@ from reward_farmer import (
     Slot,
     State,
     Farmer,
+    around_kept_bid,
     build_parser,
     config_from,
     drop_ask,
@@ -34,6 +35,7 @@ from reward_farmer import (
     market_outlook,
     naked_allowed,
     next_backoff,
+    order_score,
     quotes_at,
     ratchet_baseline,
     reconcile,
@@ -45,7 +47,7 @@ from reward_farmer import (
 )
 import fill_cost
 from fill_cost import DISTANCES, FillCurve, History
-from reward_screener import Levels
+from reward_screener import Levels, round_size_up
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
@@ -383,12 +385,92 @@ class ReconcileTest(unittest.TestCase):
         order = live("a", Slot.FAV_BID, price, self.intents[Slot.FAV_BID].size)
         return keep_failure(order, self.intents[Slot.FAV_BID], target, self.fm, Position(), CFG)
 
+    def long_keep(self, price, size, cfg=CFG):
+        order = live("b", Slot.LONG_BID, price, size)
+        return keep_failure(order, self.intents[Slot.LONG_BID], self.target, self.fm, Position(), cfg)
+
     def test_keeps_orders_within_hysteresis(self):
         orders = [
             live("a", Slot.FAV_BID, 0.984, 450.0),
-            live("b", Slot.LONG_BID, 0.001, 600.0),
+            live("b", Slot.LONG_BID, 0.001, 700.0),
         ]
         self.assertEqual(self.run_reconcile(orders), [])
+
+    def test_a_long_bid_covering_more_than_the_need_but_under_twice_stays(self):
+        orders = [
+            live("a", Slot.FAV_BID, 0.985, 507.61),
+            live("b", Slot.LONG_BID, 0.001, 900.0),
+        ]
+        self.assertEqual(self.run_reconcile(orders), [])
+
+    def test_a_long_bid_covering_most_of_the_need_stays(self):
+        # 600 of 675.82 shares cover 0.89 of the need, over the 0.8 keep ratio.
+        self.assertIsNone(self.long_keep(0.001, 600.0))
+
+    def test_a_long_bid_short_of_the_need_is_replaced(self):
+        # 500 shares cover 0.74 of the need.
+        self.assertEqual(self.long_keep(0.001, 500.0), "short of the cover needed")
+
+    def test_a_long_bid_the_clob_lists_a_cent_short_stays(self):
+        # The CLOB lists some orders 0.01 share under the size placed. Held to
+        # the whole need, that share step is the only slack.
+        exact = CFG._replace(keep_ratio=1.0)
+        size = self.intents[Slot.LONG_BID].size
+        self.assertIsNone(self.long_keep(0.001, round(size - 0.01, 2), exact))
+        self.assertEqual(self.long_keep(0.001, round(size - 0.02, 2), exact),
+                         "short of the cover needed")
+
+    def test_a_floor_long_bid_covering_over_twice_the_need_stays(self):
+        # At 0.1c the extra cover costs a few cents of naked budget.
+        self.assertIsNone(self.long_keep(0.001, 1400.0))
+
+    def test_a_long_bid_above_the_floor_covering_over_twice_the_need_is_replaced(self):
+        fm = market(naked_budget_usd=100.0)
+        target = plan(fm, BUDGET_BOOK)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertGreater(low.price, 0.001)
+        order = live("b", Slot.LONG_BID, low.price, round(low.size * 2.1, 2))
+        self.assertEqual(keep_failure(order, low, target, fm, Position(), CFG),
+                         "over twice the cover needed")
+
+    def test_a_long_bid_up_to_two_ticks_over_the_min_score_price_stays(self):
+        # At a 0.9355 midpoint with v 6.5c the cheapest longshot price scoring
+        # 0.1 is 2.1c, and the plan covers at 1.4c. A bid placed when the mid
+        # sat two ticks lower rests at 2.3c; it still covers, so it stays.
+        book = Levels(bids=[(0.93, 1000.0)], asks=[(0.936, 1000.0)], tick=0.001)
+        fm = market(v=0.065, min_size=50.0, naked_budget_usd=30.0, p_true=0.96, capital=100.0)
+        cfg = CFG._replace(ev_margin=0.02)
+        target = plan(fm, book, cfg=cfg)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual(low.price, 0.014)
+
+        def keep_at(price):
+            size = round_size_up(low.score * low.size / order_score(Slot.LONG_BID, price, target.mid, fm.v))
+            return keep_failure(live("b", Slot.LONG_BID, price, size), low, target, fm, Position(), cfg)
+
+        self.assertIsNone(keep_at(0.023))
+        self.assertEqual(keep_at(0.024), "above the target price")
+
+    def test_a_long_bid_priced_above_the_target_is_replaced(self):
+        # The min-score price on FLOOR_BOOK is 0.1c, so 0.4c is three ticks over.
+        self.assertEqual(self.long_keep(0.004, 675.82), "above the target price")
+
+    def test_balancing_orders_are_planned_around_the_kept_favorite_bid(self):
+        kept = live("a", Slot.FAV_BID, 0.981, 507.61)
+        around = around_kept_bid(self.target, [kept], self.fm, FLOOR_BOOK, Position(), CFG, True)
+        intents = by_slot(around)
+        self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.FAV_BID].size), (0.981, 507.61))
+        q_one, q_two = q_sums(around)
+        self.assertGreaterEqual(q_two, q_one - 1e-9)
+        self.assertLess(intents[Slot.LONG_BID].size, self.intents[Slot.LONG_BID].size)
+        self.assertEqual(around.fav, self.target.fav)
+        orders = [kept, live("b", Slot.LONG_BID, 0.001, intents[Slot.LONG_BID].size)]
+        self.assertEqual(reconcile(around, orders, self.fm, Position(), CFG), [])
+
+    def test_a_target_whose_favorite_bid_is_not_kept_is_left_as_planned(self):
+        orders = [live("a", Slot.FAV_BID, 0.95, 507.61)]
+        around = around_kept_bid(self.target, orders, self.fm, FLOOR_BOOK, Position(), CFG, True)
+        self.assertIs(around, self.target)
 
     def test_a_deeper_bid_earning_most_of_the_best_net_stays(self):
         # 98.1c scores (2.6 / 3.5)^2 = 0.55, under 0.8 of the target's 0.73,
@@ -409,6 +491,20 @@ class ReconcileTest(unittest.TestCase):
 
     def test_a_bid_above_the_candidates_is_replaced(self):
         self.assertEqual(self.keep(0.99), "outside the bid candidates")
+
+    def test_a_favorite_bid_is_sized_against_the_plan_at_its_own_price(self):
+        # A $0.30 naked budget trims the favorite bid to what the floor bid
+        # covers, so the plan rests 300 shares at 98.1c and 225.33 at the
+        # target's 98.5c, and 98.1c nets within a cent of the best.
+        fm = market(naked_budget_usd=0.3)
+        target = plan(fm, FLOOR_BOOK)
+        fav = by_slot(target)[Slot.FAV_BID]
+        self.assertEqual((fav.price, fav.size), (0.985, 225.33))
+        resting = live("a", Slot.FAV_BID, 0.981, 300.0)
+        self.assertIsNone(keep_failure(resting, fav, target, fm, Position(), CFG))
+        oversized = live("a", Slot.FAV_BID, 0.981, 400.0)
+        self.assertEqual(keep_failure(oversized, fav, target, fm, Position(), CFG),
+                         "size out of range")
 
     def test_places_every_target_when_nothing_rests(self):
         actions = self.run_reconcile([])
@@ -647,6 +743,13 @@ class BaselineTest(unittest.TestCase):
         refilled = Position(fav_shares=300.0, long_shares=50.0)
         self.assertEqual(ratchet_baseline(lowered, refilled), lowered)
         self.assertEqual(farm_position(refilled, lowered).fav_shares, 50.0)
+
+    def test_the_exit_never_sells_more_than_the_wallet_holds(self):
+        held = Position(fav_shares=199.457693, fav_avg=0.97)
+        farm = farm_position(held, Baseline(fav=0.0, long=0.0))
+        self.assertEqual(farm.fav_shares, 199.45)
+        ask = by_slot(plan(market(), FLOOR_BOOK, farm))[Slot.FAV_ASK]
+        self.assertLessEqual(ask.size, held.fav_shares)
 
 
 class BackoffTest(unittest.TestCase):
