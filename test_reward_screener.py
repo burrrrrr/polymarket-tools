@@ -312,7 +312,7 @@ class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
     def scan(self, histories, prior=fill_cost.DEFAULT_PRIOR, tape_markets=2, sample=0,
-             books={}):
+             books={}, rejected=frozenset()):
         asked = []
 
         def fake_histories(http, markets, now, floor):
@@ -328,7 +328,7 @@ class RunScanTest(unittest.TestCase):
                 fetch_histories=fake_histories,
                 PRIOR_SAMPLE=sample), mock.patch("builtins.print"):
             result = reward_screener.run_scan(CONFIG._replace(tape_markets=tape_markets),
-                                              SCAN_NOW, prior)
+                                              SCAN_NOW, prior, frozenset(rejected))
         return result, asked
 
     # A sweep through every bid each hour for 60 days, none of them recovered,
@@ -345,6 +345,15 @@ class RunScanTest(unittest.TestCase):
         self.assertEqual(result.funnel.assess_skips, {"fills cost more than the rewards": 1})
         self.assertEqual(result.funnel.assessed, 2)
         self.assertIsNone(result.prior)
+
+    def test_a_rejected_market_gives_its_top_slot_to_the_next_but_is_still_assessed(self):
+        result, asked = self.scan({}, rejected={"0x1"})
+        self.assertEqual(asked, [["0x2", "0x3"]])
+        self.assertIn("0x1", [a.market.condition_id for a in result.assessments])
+
+    def test_a_rejected_market_can_still_be_sampled(self):
+        result, asked = self.scan({}, tape_markets=0, sample=3, rejected={"0x1"})
+        self.assertIn("0x1", asked[0])
 
     def test_the_top_markets_histories_alone_fit_no_prior(self):
         with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 1):

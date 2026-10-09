@@ -61,6 +61,7 @@ class ScanRunner:
         try:
             with closing(farm_db.open_db(self.db_path)) as conn:
                 result = self.scan(config, started_at, reward_screener.load_prior(conn),
+                                   rejected=farm_db.condition_ids(conn, "rejected"),
                                    on_stage=self._stage)
                 self._stage(f"storing {len(result.assessments):,} assessments")
                 reward_screener.store(conn, result, started_at)

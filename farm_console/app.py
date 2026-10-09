@@ -89,11 +89,17 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     rules = remote.TtlCache(fetch_rules, remote.RULES_TTL, clock)
     infos = remote.TtlCache(fetch_info, remote.INFO_TTL, clock)
     books = remote.TtlCache(fetch_book, remote.BOOK_TTL, clock)
-    app.state.total_rates = total_rates = remote.TotalRates(
-        fetch_total_rates, remote.TOTAL_RATES_TTL, clock)
 
     def connect():
         return farm_db.open_db(db_path)
+
+    def record_paying(rates):
+        with closing(connect()) as conn:
+            farm_db.set_candidates_rewards_active(
+                conn, {cid for cid, rate in rates.items() if rate > 0})
+
+    app.state.total_rates = total_rates = remote.TotalRates(
+        fetch_total_rates, remote.TOTAL_RATES_TTL, clock, on_rates=record_paying)
 
     def snapshot(conn, now):
         states = farm_db.read_farm_states(conn)
@@ -397,6 +403,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     def review_first(request: Request, mode: Optional[str] = None):
         now = clock()
         mode = parse_mode(mode)
+        # A stale map refreshes in the background, sweeping ended rewards from the queue.
+        total_rates.get()
         with closing(connect()) as conn:
             ids = farm_db.candidate_queue(conn, mode)
             if ids:
@@ -606,6 +614,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                           refused=None):
         now = clock()
         snap = snapshot(conn, now)
+        # A stale map refreshes in the background, sweeping ended rewards from the queue.
+        total_rates.get()
         markets, total = farm_db.search_markets(
             conn, statuses=() if filters.status == "all" else (filters.status,),
             mode=filters.mode, text=filters.q, min_days=filters.min_days,

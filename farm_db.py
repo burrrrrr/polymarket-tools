@@ -374,6 +374,12 @@ def list_markets(conn, status, limit):
     ).fetchall()
 
 
+def condition_ids(conn, status):
+    """The condition ids of every market with this status."""
+    return frozenset(r[0] for r in conn.execute(
+        "SELECT condition_id FROM markets WHERE status = ?", (status,)))
+
+
 # ---------------------------------------------------------------------------
 # Console and CLI: decisions and level-triggered controls
 # ---------------------------------------------------------------------------
@@ -431,6 +437,17 @@ def set_rewards_active(conn, condition_id, active):
     with conn:
         conn.execute("UPDATE markets SET rewards_active = ? WHERE condition_id = ?",
                      (int(active), condition_id))
+
+
+def set_candidates_rewards_active(conn, paying):
+    """Mark each candidate's rewards active iff its condition id is in paying."""
+    with conn:
+        conn.execute(
+            "WITH paying(id) AS (SELECT value FROM json_each(?)) "
+            "UPDATE markets SET rewards_active = (condition_id IN paying) "
+            "WHERE status = 'candidate' "
+            "AND rewards_active IS NOT (condition_id IN paying)",
+            (json.dumps(list(paying)),))
 
 
 def set_naked_paused(conn, condition_id, paused):

@@ -12,12 +12,12 @@ import farm_db
 import fill_cost
 import reward_farmer
 import reward_screener
-from farm_console import forms, views
+from farm_console import forms, remote, views
 from farm_console.app import create_app
 from farm_console.remote import Rules
 from farm_db import CommandKind
 from reward_screener import Levels, RewardMarket, ScreenConfig
-from test_farm_console import A, B, C, ORIGIN, Console
+from test_farm_console import A, B, C, ORIGIN, Console, settle_total_rates
 
 # Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
 # sits at the cheapest price covering the favorite bid within the budget (BUDGET), and
@@ -506,9 +506,12 @@ class ReviewTest(Writes):
 
     def rewards_end_for(self, *cids, sponsored=()):
         """A loaded total listing that drops cids, except those kept by sponsored pools."""
+        from farm_console.app import utc_now
         every = [r[0] for r in self.db.execute("SELECT condition_id FROM markets")]
         self.remote.total_rates = {cid: 5.0 for cid in every
                                    if cid not in cids or cid in sponsored}
+        settle_total_rates()
+        self.clock[0] = (self.clock[0] or utc_now()) + remote.TOTAL_RATES_TTL
         self.app.state.total_rates.refresh()
 
     def discover_ids(self):
@@ -537,6 +540,25 @@ class ReviewTest(Writes):
         self.assertEqual(self.row("0xeee")["rewards_active"], 1)
         self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xeee", "0xfff"])
 
+    def test_a_totals_refresh_sweeps_the_queue_with_no_market_opened(self):
+        self.rewards_end_for("0xeee")
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xfff"])
+        self.rewards_end_for()
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xeee", "0xfff"])
+        self.assertEqual(self.row(A)["rewards_active"], 1)
+
+    def test_listing_the_queue_refreshes_stale_totals(self):
+        from farm_console.app import utc_now
+        start = utc_now()
+        for i, (url, ended, queue) in enumerate((("/review", "0xddd", ["0xeee", "0xfff"]),
+                                                 ("/discover", "0xeee", ["0xddd", "0xfff"]))):
+            self.clock[0] = start + i * remote.TOTAL_RATES_TTL
+            self.remote.total_rates = {cid: 5.0 for cid in ("0xddd", "0xeee", "0xfff")
+                                       if cid != ended}
+            self.client.get(url, follow_redirects=False)
+            settle_total_rates()
+            self.assertEqual(farm_db.candidate_queue(self.db), queue)
+
     def test_rewards_unknown_until_the_totals_land_writes_nothing(self):
         farm_db.set_rewards_active(self.db, "0xfff", False)
         self.remote.total_rates = {"0xelsewhere": 1.0}
@@ -553,6 +575,8 @@ class ReviewTest(Writes):
 
     def test_skip_passes_over_a_candidate_whose_rewards_ended_and_records_it(self):
         self.rewards_end_for("0xeee")
+        # A scan since the listing landed has put it back in the queue.
+        farm_db.set_rewards_active(self.db, "0xeee", True)
         resp = self.client.get("/review/0xddd/next-quotable", follow_redirects=False)
         self.assertEqual(resp.headers["location"], "/review/0xfff?skipped=1")
         self.assertEqual(self.row("0xeee")["rewards_active"], 0)
@@ -701,13 +725,15 @@ class FakeScan:
         self.release = threading.Event()
         self.configs = []
         self.priors = []
+        self.rejecteds = []
         self.error = None
         self.rows = rows
         self.fitted = fill_cost.DEFAULT_PRIOR._replace(markets=25, at=now)
 
-    def __call__(self, config, now, prior, on_stage):
+    def __call__(self, config, now, prior, rejected, on_stage):
         self.configs.append(config)
         self.priors.append(prior)
+        self.rejecteds.append(rejected)
         on_stage("listing reward markets")
         self.release.wait(5)
         if self.error:
@@ -741,6 +767,7 @@ class ScanTest(Writes):
         self.fail(f"scan never reached {phase}: {text.text}")
 
     def test_scan_runs_once_at_a_time_and_stores_its_result(self):
+        farm_db.reject_market(self.db, "0xeee", "")
         resp = self.post("/discover/scan", **scan_form(min_fav="0.92", capital="300"))
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/discover"))
         self.wait_for("Scanning: listing reward markets")
@@ -767,6 +794,7 @@ class ScanTest(Writes):
         self.assertEqual(farm_db.load_scan_params(self.db)["capital"], 300.0)
         self.assertEqual(farm_db.load_scan_funnel(self.db).listed, 18952)
         self.assertEqual(self.fake.priors, [fill_cost.DEFAULT_PRIOR])
+        self.assertEqual(self.fake.rejecteds, [frozenset({C, "0xeee"})])
         self.assertEqual(reward_screener.load_prior(self.db), self.fake.fitted)
 
     def test_a_failed_scan_says_why_and_stores_nothing(self):

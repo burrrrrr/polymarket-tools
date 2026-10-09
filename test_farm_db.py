@@ -246,10 +246,34 @@ class RewardsActiveTest(ScratchDb):
         farm_db.set_rewards_active(self.conn, "0xb", True)
         self.assertEqual(farm_db.candidate_queue(self.conn), ["0xa", "0xc", "0xb", "0xd"])
 
+    def test_the_paying_set_decides_every_candidate_and_no_decided_market(self):
+        farm_db.reject_market(self.conn, "0xd", "")
+        farm_db.set_rewards_active(self.conn, "0xc", False)
+        farm_db.set_candidates_rewards_active(self.conn, {"0xc"})
+        self.assertEqual(farm_db.candidate_queue(self.conn), ["0xc"])
+        farm_db.set_candidates_rewards_active(self.conn, {"0xa", "0xb", "0xd", "0xelsewhere"})
+        self.assertEqual(farm_db.candidate_queue(self.conn), ["0xa", "0xb"])
+        farm_db.retire_market(self.conn, "0xapproved", "")
+        farm_db.set_candidates_rewards_active(self.conn, set())
+        self.assertEqual(
+            dict(self.conn.execute("SELECT condition_id, rewards_active FROM markets")),
+            {"0xa": 0, "0xb": 0, "0xc": 0, "0xd": 1, "0xapproved": 1})
+
     def test_queue_after_a_market_keeps_its_place_once_it_has_left(self):
         self.assertEqual(farm_db.candidate_queue(self.conn, after="0xc"), ["0xb", "0xd"])
         farm_db.set_rewards_active(self.conn, "0xc", False)
         self.assertEqual(farm_db.candidate_queue(self.conn, after="0xc"), ["0xb", "0xd"])
+
+
+class ConditionIdsTest(ScratchDb):
+    def test_ids_with_the_status_only(self):
+        conn = self.open()
+        seed(conn, "0xa", "0xb", "0xc")
+        farm_db.reject_market(conn, "0xa", "")
+        farm_db.reject_market(conn, "0xc", "")
+        farm_db.approve_market(conn, "0xb", 0.97, 25.0)
+        self.assertEqual(farm_db.condition_ids(conn, "rejected"), frozenset({"0xa", "0xc"}))
+        self.assertEqual(farm_db.condition_ids(conn, "candidate"), frozenset())
 
 
 class ControlsTest(ScratchDb):

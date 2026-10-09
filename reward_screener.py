@@ -1208,7 +1208,7 @@ def load_prior(conn):
 # Scan
 # ---------------------------------------------------------------------------
 
-def run_scan(config, now, prior, on_stage=lambda stage: None):
+def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: None):
     """Fetch, screen, and assess, naming each stage to on_stage as it starts.
 
     prior is the stored fill prior. Every market is first assessed on it,
@@ -1216,11 +1216,14 @@ def run_scan(config, now, prior, on_stage=lambda stage: None):
     history, and so do PRIOR_SAMPLE markets drawn at random, seeded by now,
     from every market whose fills the first pass valued, those it dropped as
     costing too much included, so a stored prior that ran high cannot narrow
-    its own sample. A new prior is fit from the sample's histories alone, so
-    it matches the markets it values rather than the busy top; too few leave
-    prior standing. Every market is then assessed again on that prior, each
-    one read on its own history too, and only this second pass's skips count.
-    A market that read no history is valued on the prior alone.
+    its own sample. The top passes over the condition ids in rejected, giving
+    their slots to the next markets down the ranking, but a rejected market is
+    assessed like any other and may still be sampled. A new prior is fit from
+    the sample's histories alone, so it matches the markets it values rather
+    than the busy top; too few leave prior standing. Every market is then
+    assessed again on that prior, each one read on its own history too, and
+    only this second pass's skips count. A market that read no history is
+    valued on the prior alone.
     """
     scan_started = time.monotonic()
     with httpx.Client() as http:
@@ -1280,7 +1283,14 @@ def run_scan(config, now, prior, on_stage=lambda stage: None):
         candidates.append((market, levels, info))
     ranked, _, valued = assess_all(candidates, config, now, prior, {})
 
-    top = [a.market for a in ranked[:int(config.tape_markets)]]
+    top, passed_over = [], 0
+    for a in ranked:
+        if len(top) == int(config.tape_markets):
+            break
+        if a.market.condition_id in rejected:
+            passed_over += 1
+        else:
+            top.append(a.market)
     sample = random.Random(now.timestamp()).sample(valued, min(PRIOR_SAMPLE, len(valued)))
     top_ids = {m.condition_id for m in top}
     reads = top + [m for m in sample if m.condition_id not in top_ids]
@@ -1291,7 +1301,8 @@ def run_scan(config, now, prior, on_stage=lambda stage: None):
     fitted = fill_cost.fit_prior(
         [histories[m.condition_id] for m in sample if m.condition_id in histories],
         now, config.min_fav)
-    print(f"Histories: {len(histories):,} of {len(reads):,} read, {len(top):,} top and "
+    print(f"Histories: {len(histories):,} of {len(reads):,} read, {len(top):,} top "
+          f"({passed_over:,} rejected passed over) and "
           f"{len(reads) - len(top):,} more of {len(sample):,} sampled "
           f"({time.monotonic() - started:.1f}s); "
           + (f"fill prior fit from {fitted.markets:,} sampled" if fitted
@@ -1428,7 +1439,8 @@ def category_list(text):
 def cmd_scan(args):
     now = datetime.now(timezone.utc)
     conn = farm_db.open_db(args.db)
-    result = run_scan(config_from(args), now, load_prior(conn))
+    result = run_scan(config_from(args), now, load_prior(conn),
+                      farm_db.condition_ids(conn, "rejected"))
     assessments = result.assessments
     store(conn, result, now)
     conn.close()

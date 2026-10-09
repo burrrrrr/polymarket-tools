@@ -420,6 +420,23 @@ class TotalRatesTest(unittest.TestCase):
             self.assertEqual(self.rates.get(), {"0xa": 1.0})
         self.assertEqual(self.calls, 3)
 
+    def test_a_failing_listener_never_stalls_the_refreshes(self):
+        def listener(rates):
+            raise RuntimeError("db locked")
+        self.rates = remote.TotalRates(self.fetch, timedelta(minutes=5), lambda: self.now,
+                                       on_rates=listener)
+        self.answers = [{"0xa": 1.0}, {"0xb": 2.0}]
+        self.rates.refresh()
+        self.now = NOW + timedelta(minutes=5)
+        self.rates.refresh()
+        self.assertEqual((self.calls, self.rates.get()), (2, {"0xb": 2.0}))
+
+
+def settle_total_rates():
+    for thread in threading.enumerate():
+        if thread.name == "console-total-rates":
+            thread.join(10)
+
 
 class Console(unittest.TestCase):
     """The app against a scratch farm.db seeded through farm_db."""
@@ -444,7 +461,10 @@ class Console(unittest.TestCase):
             Event(self.now, EventKind.FILL, "FILL alpha FAV_BID 5 shares @ 98.0c", A, "FAV_BID", 0.98, 5.0),
         ], mids=[MidSample(A, self.now - timedelta(minutes=m), 0.99, 0.99, 0.98, 0.001)
                  for m in (30, 20, 10)])
-        self.app = create_app(self.path, **self.app_kwargs())
+        # Listing the queue starts a total-rates fetch, which must neither reach
+        # the network nor outlive the scratch directory.
+        self.addCleanup(settle_total_rates)
+        self.app = create_app(self.path, **{"fetch_total_rates": dict, **self.app_kwargs()})
         self.client = TestClient(self.app, base_url=ORIGIN)
 
     def app_kwargs(self):

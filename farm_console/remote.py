@@ -94,14 +94,15 @@ class TotalRates:
     get() never waits on it. It returns the last map, None until the first
     fetch lands, and starts a refresh through spawn when there is no map yet or
     the last refresh started ttl ago. A failed or empty fetch keeps the old
-    map, as in the farmer.
+    map, as in the farmer. Each map that lands is passed to on_rates.
     """
 
-    def __init__(self, fetch, ttl, clock, spawn=in_background):
+    def __init__(self, fetch, ttl, clock, spawn=in_background, on_rates=lambda rates: None):
         self.fetch = fetch
         self.ttl = ttl
         self.clock = clock
         self.spawn = spawn
+        self.on_rates = on_rates
         self.rates = None
         self._started = None
         self._running = False
@@ -130,6 +131,7 @@ class TotalRates:
             rates = self.fetch()
             if rates:
                 self.rates = rates
+                self.on_rates(rates)
         except Exception:
             pass
         finally:
