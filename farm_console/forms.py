@@ -120,11 +120,26 @@ def preview_terms(form):
             None if "capital" in errors else _number(form.get("capital")))
 
 
-def parse_note(form):
+class Rejection(NamedTuple):
+    reason: Optional[farm_db.RejectReason]
+    note: Optional[str]
+    mute_event: bool
+
+
+def parse_rejection(form):
+    """A reject: an optional RejectReason, an optional note, and whether to mute
+    the event too."""
+    errors, reason = {}, None
+    if form.get("reason"):
+        try:
+            reason = farm_db.RejectReason(form["reason"])
+        except ValueError:
+            errors["reason"] = "Pick a reason from the list, or none."
     note = (form.get("note") or "").strip()
     if len(note) > NOTE_MAX:
-        return None, {"note": f"Keep the note under {NOTE_MAX} characters."}
-    return note or None, {}
+        errors["note"] = f"Keep the note under {NOTE_MAX} characters."
+    return ((None if errors else Rejection(reason, note or None, form.get("mute_event") == "1")),
+            errors)
 
 
 def exclude_field(category):
@@ -162,3 +177,34 @@ def parse_cancel_all(form):
     if (form.get("confirm") or "").strip() != CANCEL_ALL_WORD:
         return {"confirm": f"Type {CANCEL_ALL_WORD} to confirm."}
     return {}
+
+
+TRIAGE_BATCH_DEFAULT = 20
+TRIAGE_BATCH = Bound(1, 100)
+
+
+def _count(text, bound):
+    """A whole number within bound from user text, or None."""
+    value = _number(text)
+    if value is None or value != int(value) or not bound.admits(value):
+        return None
+    return int(value)
+
+
+def parse_triage_batch(form):
+    """How many queued candidates to send to Claude; blank means the default."""
+    text = (form.get("n") or "").strip()
+    n = _count(text, TRIAGE_BATCH) if text else TRIAGE_BATCH_DEFAULT
+    if n is None:
+        return None, {"n": f"Enter a whole number from {TRIAGE_BATCH.low:.0f} to "
+                           f"{TRIAGE_BATCH.high:.0f}."}
+    return n, {}
+
+
+def parse_triage_auto(form):
+    """farm_db's triage.auto_top_n: how many new candidates a scan sends to Claude."""
+    n = _count(form.get("auto_top_n"), farm_db.TRIAGE_AUTO)
+    if n is None:
+        return None, {"auto_top_n": f"Enter a whole number from 0 (off) to "
+                                    f"{farm_db.TRIAGE_AUTO.high:.0f}."}
+    return n, {}

@@ -45,6 +45,20 @@
     {%- if market.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
     {{ polymarket_link(market.slug) }}
   </div>
+  {%- if m.event_slug or m.tags %}
+  <form class="actions" method="post" action="/review/{{ cid }}/mute" style="gap: 8px">
+    {{ token_field() }}
+    <input type="hidden" name="queue_mode" value="{{ queue_mode or '' }}">
+    {%- if m.event_slug %}
+    <span class="small muted">Event</span><span class="small">{{ m.event_title or m.event_slug }}</span>
+    <button class="btn small-btn" type="submit" name="event" value="{{ m.event_slug }}" title="Hide this event's candidates from the queue">Mute event</button>
+    {%- endif %}
+    {%- if m.tags %}<span class="small muted">Tags</span>{% endif %}
+    {%- for t in m.tags %}
+    <span class="badge t-n">{{ t }}</span><button class="btn small-btn" type="submit" name="tag" value="{{ t }}" title="Hide candidates tagged {{ t }} from the queue">Mute</button>
+    {%- endfor %}
+  </form>
+  {%- endif %}
   {%- if market.note %}<span class="small muted">Note: {{ market.note }}</span>{% endif %}
 </header>
 
@@ -67,11 +81,10 @@
       </div>
     </section>
 
-    <section class="panel pad stack triage" aria-disabled="true">
-      <div class="actions">
-        <span class="badge t-n">Claude triage</span>
-        <span class="small muted" style="flex: 1 1 280px">Planned: a verdict, a p_true estimate and resolution-risk notes for each candidate.</span>
-        <button class="btn" type="button" disabled>Claude triage (planned)</button>
+    <section class="panel pad stack">
+      <h2>Claude triage</h2>
+      <div hx-get="/partials/review/{{ cid }}/triage" hx-trigger="load" hx-swap="outerHTML">
+        <span class="small muted">Loading Claude's triage...</span>
       </div>
     </section>
   </div>
@@ -116,10 +129,25 @@
       {%- if market.status != 'approved' %}
       <label class="check"><input type="checkbox" name="start_paused" value="1"{{ ' checked' if values.start_paused }}> Start paused{{ tip('start_paused') }}</label>
       {%- endif %}
+      {%- if market.status == 'rejected' %}
+      <button class="btn btn-strong" type="submit" formaction="/review/{{ cid }}/unreject" formnovalidate>Un-reject (back to the queue)</button>
+      <button class="btn" type="submit">Approve and start quoting</button>
+      {%- else %}
       <button class="btn btn-strong" type="submit">{{ {'approved': 'Save terms', 'retired': 'Re-approve and start quoting'}.get(market.status, 'Approve and start quoting') }}</button>
+      {%- endif %}
       {%- if market.status == 'approved' %}
       <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/retire" formnovalidate onclick="return confirm('Retire this market? The farmer cancels its orders and stops managing it.')">Retire</button>
       {%- else %}
+      <div class="field">
+        <label class="lbl" for="d-reason">Reject reason (optional)</label>
+        <select class="inp" id="d-reason" name="reason" {{ 'aria-invalid="true"' | safe if errors.reason }}>
+          <option value="">No reason</option>
+          {%- for r in REJECT_REASONS %}
+          <option value="{{ r.value }}"{{ ' selected' if values.reason == r.value }}>{{ r.label }}</option>
+          {%- endfor %}
+        </select>
+        {{ field_error(errors, 'reason') }}
+      </div>
       <div class="field">
         <label class="lbl" for="d-note">Reject note (optional)</label>
         <div class="input-row">
@@ -128,6 +156,9 @@
         </div>
         {{ field_error(errors, 'note') }}
       </div>
+      {%- if m.event_slug %}
+      <label class="check"><input type="checkbox" name="mute_event" value="1"{{ ' checked' if values.mute_event }}> Also mute this event{{ ': ' ~ m.event_title if m.event_title }}</label>
+      {%- endif %}
       {%- endif %}
     </form>
   </aside>

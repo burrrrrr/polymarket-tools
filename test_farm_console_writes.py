@@ -12,12 +12,14 @@ import farm_db
 import fill_cost
 import reward_farmer
 import reward_screener
+import triage
 from farm_console import forms, remote, views
-from farm_console.app import create_app
+from farm_console.app import create_app, utc_now
 from farm_console.remote import Rules
 from farm_db import CommandKind
 from reward_screener import Levels, RewardMarket, ScreenConfig
 from test_farm_console import A, B, C, ORIGIN, Console, settle_total_rates
+from test_triage import background, envelope, news
 
 # Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
 # sits at the cheapest price covering the favorite bid within the budget (BUDGET), and
@@ -34,9 +36,9 @@ FLOOR_BOOK = Levels(bids=[(0.985, 1000.0), (0.95, 1000.0)], asks=[(0.995, 1000.0
 FALLEN_BOOK = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
 
 
-def assessed_row(cid, slug, book, now, rank, question=None, days=100):
+def assessed_row(cid, slug, book, now, rank, question=None, days=100, **topic):
     market = RewardMarket(cid, slug, question or f"{slug}?", now + timedelta(days=days), False,
-                          0.001, f"tok-{cid}", "No", 50.0, 0.035, 20.0)
+                          0.001, f"tok-{cid}", "No", 50.0, 0.035, 20.0, **topic)
     a = reward_screener.assess(market, book, ScreenConfig(), now, fill_cost.DEFAULT_PRIOR)
     assert not isinstance(a, reward_screener.Skip), a
     return reward_screener.scan_row(a._replace(rank_score=rank))
@@ -58,7 +60,7 @@ class Writes(Console):
             assessed_row("0xfff", "foxtrot", FLOOR_BOOK, self.now, 10.0),
             assessed_row(A, "alpha", FLOOR_BOOK, self.now, 5.0),
         ], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
-        farm_db.reject_market(self.db, C, "not for us")
+        farm_db.reject_market(self.db, C, "not for us", farm_db.RejectReason.OTHER, self.now)
         self.client.app_token = self.app.state.token
 
     def post(self, url, **fields):
@@ -143,6 +145,131 @@ class SecurityTest(Writes):
         other = TestClient(create_app(self.path), base_url=ORIGIN)
         resp = other.post(f"/markets/{A}/paused", data=form(self.client, value="1"))
         self.assertEqual(resp.status_code, 403)
+
+
+FR = "2027-french-presidential-election"
+
+
+class TopicTest(Writes):
+    """D and E are in the FR event; E and F carry the French Election tag."""
+
+    def setUp(self):
+        super().setUp()
+        farm_db.store_scan(self.db, [
+            assessed_row("0xddd", "delta", BUDGET_BOOK, self.now, 30.0, event_slug=FR,
+                         event_title="2027 French presidential election",
+                         tags=("Politics", "France")),
+            assessed_row("0xeee", "echo", FLOOR_BOOK, self.now, 20.0, event_slug=FR,
+                         event_title="2027 French presidential election",
+                         tags=("Politics", "French Election")),
+            assessed_row("0xfff", "foxtrot", FLOOR_BOOK, self.now, 10.0,
+                         tags=("French Election",)),
+        ], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
+        self.seeded = {d.id for d in farm_db.read_decisions(self.db)}
+
+    def decisions(self):
+        """The decisions made since the setup, newest first."""
+        return [(d.condition_id, d.decision, d.reason) for d in farm_db.read_decisions(self.db)
+                if d.id not in self.seeded]
+
+    def discover_ids(self):
+        return re.findall(r'<a href="/review/(0x\w+)">', self.client.get("/discover").text)
+
+    def test_review_shows_the_event_and_tags_each_with_a_mute_button(self):
+        page = self.client.get("/review/0xeee").text
+        self.assertIn('<span class="small">2027 French presidential election</span>', page)
+        self.assertIn(f'name="event" value="{FR}"', page)
+        for tag in ("Politics", "French Election"):
+            self.assertIn(f'<span class="badge t-n">{tag}</span><button class="btn small-btn" '
+                          f'type="submit" name="tag" value="{tag}"', page)
+        self.assertIn("Also mute this event: 2027 French presidential election", page)
+        page = self.client.get("/review/0xfff").text
+        self.assertIn('name="tag" value="French Election"', page)
+        self.assertNotIn('name="event"', page)
+        self.assertNotIn("Also mute this event", page)
+        self.assertNotIn(f'action="/review/{C}/mute"', self.client.get(f"/review/{C}").text)
+
+    def test_reject_refuses_an_unknown_reason_and_logs_the_metrics_it_saw(self):
+        resp = self.post("/review/0xddd/reject", note="meh", reason="bored")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("Pick a reason from the list, or none.", resp.text)
+        self.assertIn('value="meh"', resp.text)
+        self.assertEqual((self.row("0xddd")["status"], self.decisions()), ("candidate", []))
+        metrics = json.loads(self.row("0xddd")["metrics"])
+        resp = self.post("/review/0xddd/reject", reason="unfamiliar_topic", note="")
+        self.assertEqual(resp.headers["location"], "/review/0xeee")
+        d = farm_db.read_decisions(self.db, limit=1)[0]
+        self.assertEqual((d.condition_id, d.decision, d.reason, d.note, d.metrics),
+                         ("0xddd", "rejected", farm_db.RejectReason.UNFAMILIAR_TOPIC, None,
+                          metrics))
+
+    def test_reject_without_a_reason_logs_none(self):
+        for fields in ({}, {"reason": ""}):
+            with self.subTest(fields=fields):
+                farm_db.unreject_market(self.db, "0xddd", utc_now())
+                resp = self.post("/review/0xddd/reject", note="", **fields)
+                self.assertEqual(resp.status_code, 303)
+                self.assertEqual(self.row("0xddd")["status"], "rejected")
+                d = farm_db.read_decisions(self.db, limit=1)[0]
+                self.assertEqual((d.decision, d.reason), ("rejected", None))
+
+    def test_reject_can_mute_the_event_and_goes_past_its_siblings(self):
+        resp = self.post("/review/0xddd/reject", reason="unfamiliar_topic", mute_event="1")
+        self.assertEqual(resp.headers["location"], "/review/0xfff")
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xfff"])
+        self.assertEqual([(m.kind, m.value, m.label) for m in farm_db.read_mutes(self.db)],
+                         [(farm_db.MuteKind.EVENT, FR, "2027 French presidential election")])
+
+    def test_mute_buttons_hide_the_topic_from_the_queue_and_discover(self):
+        self.assertEqual(self.discover_ids(), ["0xddd", "0xeee", "0xfff"])
+        resp = self.post("/review/0xddd/mute", tag="Politics")
+        self.assertEqual(resp.headers["location"], "/review/0xfff")
+        self.assertEqual((farm_db.candidate_queue(self.db), self.discover_ids()),
+                         (["0xfff"], ["0xfff"]))
+        self.assertEqual(self.row("0xddd")["status"], "candidate")
+        resp = self.post("/review/0xfff/mute", tag="French Election", queue_mode="floor")
+        self.assertEqual(resp.headers["location"], "/review?mode=floor")
+        self.assertEqual(self.discover_ids(), [])
+        self.assertEqual(self.decisions(), [])
+
+    def test_mute_takes_only_the_markets_own_event_or_tags(self):
+        for fields in ({"tag": "Sports"}, {"event": "other-event"}, {"tag": ""}, {}):
+            with self.subTest(fields=fields):
+                self.assertEqual(self.post("/review/0xfff/mute", **fields).status_code, 400)
+        self.assertEqual(farm_db.read_mutes(self.db), [])
+
+    def test_unreject_puts_a_rejected_market_back_in_the_queue(self):
+        page = self.client.get(f"/review/{C}").text
+        self.assertIn(f'formaction="/review/{C}/unreject" formnovalidate>'
+                      f'Un-reject (back to the queue)</button>', page)
+        self.assertIn('<button class="btn" type="submit">Approve and start quoting</button>', page)
+        self.assertNotIn("Un-reject", self.client.get("/review/0xddd").text)
+        resp = self.post(f"/review/{C}/unreject", queue_mode="floor")
+        self.assertEqual(resp.headers["location"], f"/review/{C}?mode=floor")
+        self.assertEqual(self.row(C)["status"], "candidate")
+        self.assertIn(C, farm_db.candidate_queue(self.db))
+        self.post("/review/0xddd/unreject")
+        self.assertEqual(self.row("0xddd")["status"], "candidate")
+        self.assertEqual(self.decisions(), [(C, "unrejected", None)])
+
+    def test_settings_lists_mutes_with_what_each_hides_and_unmutes(self):
+        self.assertIn("Nothing is muted.", self.client.get("/settings").text)
+        farm_db.mute(self.db, farm_db.MuteKind.EVENT, FR, "2027 French presidential election",
+                     self.now)
+        farm_db.mute(self.db, farm_db.MuteKind.TAG, "France", "France", self.now)
+        page = self.client.get("/settings").text
+        self.assertRegex(page, r'(?s)2027 French presidential election</td>\s*'
+                               r'<td class="mono">2 candidates</td>')
+        self.assertRegex(page, r'(?s)>France</td>\s*<td class="mono">1 candidate</td>')
+        resp = self.post("/settings/unmute", kind="event", value=FR,
+                         label="2027 French presidential election")
+        self.assertEqual(resp.status_code, 303)
+        self.assertIn("Unmuted 2027 French presidential election. Its candidates are back",
+                      self.client.get(resp.headers["location"]).text)
+        self.assertEqual(farm_db.candidate_queue(self.db), ["0xeee", "0xfff"])
+        self.assertEqual(self.post("/settings/unmute", kind="bogus", value="France").status_code,
+                         400)
+        self.assertEqual([m.value for m in farm_db.read_mutes(self.db)], ["France"])
 
 
 class MarketControlTest(Writes):
@@ -248,7 +375,8 @@ class ReviewTest(Writes):
         self.assertIn('type="number" min="1" max="99" step="1"', page)
         mid = json.loads(self.row("0xddd")["metrics"])["book_mid"]
         self.assertIn(f'data-start="{round(mid * 100)}"', page)
-        for needle in ("BUDGET", "Claude triage (planned)", "Approve and start quoting",
+        for needle in ("BUDGET", 'hx-get="/partials/review/0xddd/triage"',
+                       "Approve and start quoting",
                        "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
                        'hx-include="#d-p_true, #d-naked_budget, #d-capital"'):
@@ -475,9 +603,9 @@ class ReviewTest(Writes):
         self.assertIn('hx-get="/partials/review/0xeee/live?mode=floor"', page)
         self.assertIn("undecided floor candidates · this market is candidate, budget",
                       self.client.get("/review/0xddd?mode=floor").text)
-        resp = self.post("/review/0xeee/reject", note="", queue_mode="floor")
+        resp = self.post("/review/0xeee/reject", reason="other", note="", queue_mode="floor")
         self.assertEqual(resp.headers["location"], "/review/0xfff?mode=floor")
-        resp = self.post("/review/0xfff/reject", note="", queue_mode="floor")
+        resp = self.post("/review/0xfff/reject", reason="other", note="", queue_mode="floor")
         self.assertEqual(resp.headers["location"], "/review?mode=floor")
         self.assertEqual(self.client.get("/review?mode=bogus").status_code, 422)
 
@@ -590,16 +718,16 @@ class ReviewTest(Writes):
                          (1, 0))
 
     def test_last_candidate_decided_goes_to_the_previous_then_the_empty_queue(self):
-        resp = self.post("/review/0xfff/reject", note="")
+        resp = self.post("/review/0xfff/reject", reason="other", note="")
         self.assertEqual(resp.headers["location"], "/review/0xeee")
         for cid in ("0xddd", "0xeee"):
-            self.post(f"/review/{cid}/reject")
+            self.post(f"/review/{cid}/reject", reason="other")
         resp = self.client.get("/review", follow_redirects=False)
         self.assertEqual(resp.status_code, 200)
         self.assertIn("No undecided candidates", resp.text)
 
     def test_editing_an_approved_market_updates_terms_and_goes_to_its_page(self):
-        farm_db.set_approval(self.db, A, 0.99, 25.0, 200.0)
+        farm_db.set_approval(self.db, A, 0.99, 25.0, 200.0, now=self.now)
         page = self.client.get(f"/review/{A}").text
         self.assertIn('value="200"', page)
         self.assertIn('name="p_true" value="99"', page)
@@ -618,7 +746,7 @@ class ReviewTest(Writes):
         self.assertEqual((row["status"], row["capital_usd"]), ("approved", 150.0))
 
     def test_reject_with_note_and_retire_from_review(self):
-        self.post("/review/0xeee/reject", note="  resolution risk ")
+        self.post("/review/0xeee/reject", reason="resolution_risk", note="  resolution risk ")
         self.assertEqual((self.row("0xeee")["status"], self.row("0xeee")["note"]),
                          ("rejected", "resolution risk"))
         resp = self.post(f"/review/{B}/retire")
@@ -767,7 +895,7 @@ class ScanTest(Writes):
         self.fail(f"scan never reached {phase}: {text.text}")
 
     def test_scan_runs_once_at_a_time_and_stores_its_result(self):
-        farm_db.reject_market(self.db, "0xeee", "")
+        farm_db.reject_market(self.db, "0xeee", "", farm_db.RejectReason.OTHER, self.now)
         resp = self.post("/discover/scan", **scan_form(min_fav="0.92", capital="300"))
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/discover"))
         self.wait_for("Scanning: listing reward markets")
@@ -1005,10 +1133,300 @@ class NavAndAlertsTest(Writes):
         self.publish(stopped=self.now)
         alerts = self.client.get("/partials/overview/alerts").text
         self.assertIn('<a href="/settings">Farmer status</a>', alerts)
-        farm_db.set_approval(self.db, A, 0.99, 0.5, None)
+        farm_db.set_approval(self.db, A, 0.99, 0.5, None, now=self.now)
         self.publish()
         alerts = self.client.get("/partials/overview/alerts").text
         self.assertIn(f'<a href="/review/{A}">Edit budget</a>', alerts)
+
+
+
+def settle_triage():
+    for thread in threading.enumerate():
+        if thread.name == "console-triage":
+            thread.join(10)
+
+
+# A background answer that quotes FakeRemote's rules, so every run counts.
+DELTA_PATH = {"path": "delta happens", "rule_quote": "Yes if delta happens", "realistic": False}
+
+
+class FakeClaude:
+    """run_triage: answers each step once gate is set; output, when set,
+    replaces every answer (an exception is raised)."""
+
+    def __init__(self):
+        self.calls = []
+        self.gate = threading.Event()
+        self.gate.set()
+        self.output = None
+        self._lock = threading.Lock()
+
+    def __call__(self, step, prompt):
+        with self._lock:
+            self.calls.append((step.name, prompt))
+        self.gate.wait(5)
+        if isinstance(self.output, Exception):
+            raise self.output
+        return envelope(background(paths=(DELTA_PATH,)) if step is triage.BACKGROUND else news())
+
+    def questions(self):
+        return {re.search(r"Question: (.+)", p).group(1) for _, p in self.calls}
+
+
+def yes_path(quote_ok=True, realistic=False):
+    return triage.YesPath("The President says so", "a statement by the President counts",
+                          realistic, quote_ok)
+
+
+def screen_of(runs, news, days_left=100):
+    return triage.Screen(*triage.decide(triage.background_route(runs, days_left), news), runs,
+                         news)
+
+
+CLEAN = triage.NewsCheck((), False, (), "Nothing new.")
+
+
+def folded(panel):
+    """The triage panel's summary, and what its collapsed details hold."""
+    summary, _, rest = panel.partition("<details>")
+    return summary, rest.partition("</details>")[0]
+# A prompt v3 result: one news check stored as an object, not a list.
+V3_RESULT = {"verdict": "near_impossible", "why": [], "runs": [], "news": {
+    "searches": ["old search"], "found": False, "items": [], "summary": "Old summary."}}
+
+
+class TriageTest(Writes):
+    def app_kwargs(self):
+        self.claude, self.remote = FakeClaude(), FakeRemote()
+        self.addCleanup(settle_triage)
+        market = RewardMarket("0xnew", "novel", "Novel market?", self.now + timedelta(days=100),
+                              False, 0.001, "tok-new", "No", 50.0, 0.035, 20.0)
+        self.scan = FakeScan(self.now, [reward_screener.assess(
+            market, FLOOR_BOOK, ScreenConfig(), self.now, fill_cost.DEFAULT_PRIOR)])
+        self.scan.release.set()
+        return {"run_triage": self.claude, "fetch_rules": self.remote.rules, "scan": self.scan,
+                "fetch_page": lambda url: "Delta happened."}
+
+    def panel(self, cid="0xddd"):
+        return self.client.get(f"/partials/review/{cid}/triage").text
+
+    def store(self, cid, screen=None):
+        run = triage.BackgroundRun("near_impossible", True, (yes_path(),), "Absurd.")
+        screen = screen or screen_of((run,) * 3, (CLEAN,) * 2)
+        farm_db.store_triage(self.db, cid, self.now, triage.PROMPT_VERSION, "sonnet",
+                             result=triage.to_result(screen), book_mid=0.96, duration_s=54.0,
+                             cost_usd=0.16)
+
+    def test_review_page_loads_the_triage_panel(self):
+        page = self.client.get("/review/0xddd").text
+        self.assertIn('hx-get="/partials/review/0xddd/triage" hx-trigger="load"', page)
+        self.assertNotIn("Claude triage (planned)", page)
+        self.assertIn("Not screened yet.", self.panel())
+        self.assertIn(">Ask Claude</button>", self.panel())
+        self.assertEqual(self.claude.calls, [])
+
+    def test_a_near_impossible_row_sums_up_and_folds_the_runs_and_news_checks_away(self):
+        runs = tuple(triage.BackgroundRun("near_impossible", True, (yes_path(),),
+                                          f"Reason {i}.") for i in (1, 2, 3))
+        self.store("0xddd", screen_of(runs, (
+            triage.NewsCheck(("aliens confirmed 2026", "UAP hearing"), False, (),
+                             "No sign of it."),
+            triage.NewsCheck(("disclosure act",), False, (), "Still nothing."))))
+        text = self.panel()
+        summary, details = folded(text)
+        for needle in ('<span class="badge t-q">Near impossible</span> 3/3 runs found no '
+                       "realistic way to YES and 2/2 news checks found nothing.",
+                       "Both news checks found nothing pointing to YES.",
+                       "No run found a realistic way to YES; the ways they listed are in the "
+                       "details.",
+                       "Run agreement: near impossible 3 of 3"):
+            self.assertIn(needle, summary)
+        self.assertEqual(details.count("Nothing found."), 2)
+        for needle in ("Run 1", "Run 3", "Reason 2.", '"a statement by the President counts"',
+                       "News check 1/2", "No sign of it.",
+                       "Searched: aliens confirmed 2026; UAP hearing", "News check 2/2",
+                       "Still nothing.", "Searched: disclosure act"):
+            self.assertIn(needle, details)
+            self.assertNotIn(needle, summary)
+        for needle in (f"sonnet, prompt v{triage.PROMPT_VERSION} ·", "took 54s", "$0.16",
+                       ">Rerun</button>"):
+            self.assertIn(needle, text)
+        for absent in ("Needs human", "not in the rules", "realistic</span>", "Use p_true",
+                       "p_true", 'class="ev', "Stale", "every 3s", "News not checked."):
+            self.assertNotIn(absent, text)
+
+    def test_a_quiet_row_says_why_and_when_the_market_ends(self):
+        runs = (triage.BackgroundRun("possible", True, (yes_path(realistic=True),),
+                                     "Plausible."),
+                triage.BackgroundRun("possible", True, (yes_path(False, realistic=True),),
+                                     "Plausible."),
+                triage.BackgroundRun("possible", True, (
+                    triage.YesPath("A one-run path", "", False, True),), "Plausible."))
+        self.store("0xddd", screen_of(runs, (CLEAN,) * 2, days_left=30))
+        summary, details = folded(self.panel())
+        self.assertIn('<li>The President says so <span class="muted">2 of 3 runs</span> '
+                      '<span class="c-warn">quote not in the rules</span></li>', summary)
+        self.assertNotIn("A one-run path", summary)
+        self.assertIn("A one-run path", details)
+        for needle in ('<span class="badge t-f">Quiet</span> a realistic way to YES exists, 2/2 '
+                       "news checks found nothing pointing to it, ends in 100 days.",
+                       "Both news checks found nothing pointing to YES.",
+                       "Run agreement: possible 3 of 3"):
+            self.assertIn(needle, summary)
+        self.assertEqual(details.count("Nothing found."), 2)
+        for absent in ("Near impossible", "Needs human"):
+            self.assertNotIn(absent, summary + details)
+
+    def test_news_items_need_a_human_and_each_shows_once_with_its_checks_and_links(self):
+        runs = (triage.BackgroundRun("near_impossible", True, (yes_path(),), "r"),) * 3
+
+        def item(text, url, verified, date="2026-05-01"):
+            return triage.NewsItem(text, "q", url, date, verified)
+        self.store("0xddd", screen_of(runs, (
+            triage.NewsCheck(("s",), True, (
+                item("Found one", "https://example.org/a/?utm_source=feed", False),), "One."),
+            triage.NewsCheck(("s",), True, (
+                item("Found it again", "https://Example.org/a#top", True),
+                item("Missed one", "https://example.org/b", False, "2026-06-01"),
+                item("Unread one", "javascript:alert(1)", None, None)), "A hearing."))))
+        text = self.panel()
+        summary, details = folded(text)
+        self.assertIn('<span class="badge t-n">Needs human</span> 3 news developments point '
+                      "toward YES.", summary)
+        self.assertEqual(summary.count("Found one"), 1)
+        self.assertNotIn("Found it again", summary)
+        self.assertEqual(summary.count("both checks"), 1)
+        self.assertEqual(
+            re.findall(r'<li><span class="muted mono">([-\d]+)</span> (\w+ \w+)', summary),
+            [("2026-06-01", "Missed one"), ("2026-05-01", "Found one")])
+        self.assertRegex(summary, r"Found one[^<]*<a href=\"https://example.org/a/\?utm_source="
+                                  r'feed" target="_blank"[^>]*>source ↗</a>\s*<span '
+                                  r'class="c-good">verified on the page</span>\s*<span '
+                                  r'class="muted">both checks</span></li>')
+        self.assertIn("<li>Unread one <span class=\"muted\">couldn't check</span></li>", summary)
+        self.assertIn('<span class="c-warn">not found on the page</span>', summary)
+        for needle in ("Found it again", "quote found on the page", "quote not on the page",
+                       "couldn't check the page"):
+            self.assertIn(needle, details)
+        self.assertNotIn("recent news:", text)
+        self.assertNotIn("javascript:", text)
+
+    def test_a_split_background_shows_why_and_a_quote_not_in_the_rules(self):
+        runs = (triage.BackgroundRun("near_impossible", True, (yes_path(),), "r"),
+                triage.BackgroundRun("near_impossible", True, (yes_path(False),), "r"),
+                triage.BackgroundRun("unsure", False, (yes_path(),), "Can't tell."))
+        self.store("0xddd", screen_of(runs, ()))
+        summary, details = folded(self.panel())
+        for needle in ('<span class="badge t-n">Needs human</span> background 1 of 3 near '
+                       "impossible.", "<li>run 2 quoted words not in the rules</li>",
+                       f"<li>{triage.NEWS_CANT_SETTLE}</li>".replace("'", "&#39;"),
+                       "No run found a realistic way to YES; the ways they listed are in the "
+                       "details.", "News not checked.", "Run agreement: near impossible 2 of 3, unsure 1"):
+            self.assertIn(needle, summary)
+        self.assertNotIn("<li>background 1 of 3", summary)
+        for needle in ('<span class="c-warn">not in the rules</span>', "news can't settle it",
+                       "Can&#39;t tell."):
+            self.assertIn(needle, details)
+
+    def test_blank_rules_need_a_human_with_nothing_to_sum_up(self):
+        self.store("0xddd", triage.RULES_UNAVAILABLE)
+        summary, details = folded(self.panel())
+        self.assertIn('<span class="badge t-n">Needs human</span> rules unavailable.', summary)
+        for absent in ("Ways to YES", "Run agreement", "News not checked", "found nothing"):
+            self.assertNotIn(absent, summary)
+
+    def test_an_older_prompt_versions_row_says_stale_and_nothing_else(self):
+        with self.db:
+            self.db.execute(
+                "INSERT INTO triage (condition_id, at, prompt_version, model, status, p_true, "
+                "p_low, p_high, result) VALUES ('0xddd', ?, 2, 'sonnet', 'ok', 0.99, 0.9, "
+                "0.995, ?)", (self.now.isoformat(), json.dumps({"summary": "Old summary."})))
+        text = self.panel()
+        self.assertIn("Stale: triaged with prompt v2. Rerun.", text)
+        self.assertIn(">Rerun</button>", text)
+        for absent in ("Old summary.", "99.0%", "sonnet", "badge", "Run 1"):
+            self.assertNotIn(absent, text)
+
+    def test_a_prompt_v3_row_with_its_single_news_check_says_stale(self):
+        farm_db.store_triage(self.db, "0xddd", self.now, 3, "sonnet", result=V3_RESULT)
+        resp = self.client.get("/partials/review/0xddd/triage")
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("Stale: triaged with prompt v3. Rerun.", resp.text)
+        for absent in ("Old summary.", "old search", "News check", "badge"):
+            self.assertNotIn(absent, resp.text)
+
+    def test_post_queues_once_polls_until_done_and_stores_the_screen(self):
+        self.claude.gate.clear()
+        first = self.post("/review/0xddd/triage")
+        self.assertEqual(first.status_code, 200)
+        self.assertIn('hx-trigger="every 3s"', first.text)
+        self.post("/review/0xddd/triage")
+        self.assertIn("every 3s", self.panel())
+        self.claude.gate.set()
+        settle_triage()
+        text = self.panel()
+        self.assertNotIn("every 3s", text)
+        self.assertIn("Near impossible", text)
+        self.assertEqual(sorted(step for step, _ in self.claude.calls),
+                         ["background"] * 3 + ["news"] * 2)
+        self.assertIn("Resolves to Yes if delta happens.", self.claude.calls[0][1])
+        row = farm_db.latest_triage(self.db, "0xddd", triage.PROMPT_VERSION)
+        self.assertEqual((row.status, row.verdict, row.book_mid),
+                         ("ok", "near_impossible",
+                          json.loads(self.row("0xddd")["metrics"])["book_mid"]))
+        self.assertEqual(self.post("/review/0xnone/triage").status_code, 404)
+
+    def test_a_failed_screen_shows_the_error_and_a_retry(self):
+        self.claude.output = triage.TriageError("claude (news) did not finish within 420s")
+        self.post("/review/0xddd/triage")
+        settle_triage()
+        text = self.panel()
+        self.assertIn("Claude's screen failed: TriageError: claude (news) did not finish "
+                      "within 420s", text)
+        self.assertIn(">Retry</button>", text)
+        self.assertEqual(farm_db.latest_triage(self.db, "0xddd").status, "error")
+
+    def test_batch_sends_only_queued_candidates_without_a_current_row(self):
+        self.store("0xddd")
+        with self.db:
+            self.db.execute("INSERT INTO triage (condition_id, at, prompt_version, model, "
+                            "status, result) VALUES ('0xeee', ?, 2, 'sonnet', 'ok', '{}')",
+                            (self.now.isoformat(),))
+        farm_db.store_triage(self.db, "0xfff", self.now, triage.PROMPT_VERSION, "sonnet",
+                             error="boom")
+        self.assertEqual(self.post("/triage/batch", n="0").status_code, 422)
+        resp = self.post("/triage/batch", n="5")
+        self.assertEqual((resp.status_code, resp.headers["location"]),
+                         (303, "/discover?triaged=2"))
+        settle_triage()
+        self.assertEqual(self.claude.questions(), {"echo?", "foxtrot?"})
+        page = self.client.get(resp.headers["location"]).text
+        self.assertIn("Sent 2 candidates to Claude.", page)
+        self.assertIn(f"3 of 3 queued candidates screened with prompt v{triage.PROMPT_VERSION}.",
+                      page)
+        self.assertEqual(self.post("/triage/batch").headers["location"], "/discover?triaged=0")
+
+    def scanned(self):
+        for _ in range(200):
+            if "Done" in self.client.get("/partials/discover/scan").text:
+                return
+            time.sleep(0.02)
+        self.fail("the scan never finished")
+
+    def test_a_scan_screens_its_top_new_candidates_only_when_turned_on(self):
+        self.assertIn('name="auto_top_n" value="0"', self.client.get("/settings").text)
+        self.assertEqual(self.post("/settings/triage", auto_top_n="-1").status_code, 422)
+        self.post("/discover/scan", **scan_form())
+        self.scanned()
+        settle_triage()
+        self.assertEqual(self.claude.calls, [])
+        resp = self.post("/settings/triage", auto_top_n="1")
+        self.assertIn("top 1 new candidates", self.client.get(resp.headers["location"]).text)
+        self.assertEqual(farm_db.load_settings(self.db), ({}, {}))
+        self.post("/discover/scan", **scan_form())
+        self.scanned()
+        settle_triage()
+        self.assertEqual(self.claude.questions(), {"Novel market?"})
 
 
 if __name__ == "__main__":

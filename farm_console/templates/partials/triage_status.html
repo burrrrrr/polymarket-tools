@@ -1,0 +1,4 @@
+{%- set busy = triage_running or triage_waiting -%}
+<span id="triage-status" class="small muted" role="status"{% if busy %} hx-get="/partials/discover/triage" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+  {%- if busy %}Claude: {{ triage_running }} running, {{ triage_waiting }} waiting. {% endif -%}
+  {{ triage_done }} of {{ triage_queue }} queued candidates screened with prompt v{{ prompt_version }}.</span>

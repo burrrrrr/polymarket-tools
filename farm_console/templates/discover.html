@@ -37,6 +37,21 @@
   {% include "partials/scan_status.html" %}
 </form>
 
+<form class="panel pad stack" method="post" action="/triage/batch" style="gap: 10px">
+  {{ token_field() }}
+  <div class="page-head">
+    <h2>Claude triage</h2>
+    <div class="input-row">
+      <label class="small muted" for="triage-n">Top</label>
+      <input class="inp mono" id="triage-n" name="n" value="{{ batch_default }}" inputmode="numeric" style="width: 70px">
+      <button class="btn" type="submit">Screen unscreened candidates</button>
+    </div>
+  </div>
+  <span class="hint">Sends the best-ranked queued candidates Claude has not screened to it, two at a time, a minute or two each.</span>
+  {%- if triage_note %}<p class="small" role="status" style="margin: 0">{{ triage_note }}</p>{% endif %}
+  {% include "partials/triage_status.html" %}
+</form>
+
 <section class="panel pad stack" style="gap: 14px">
   <h2>Last scan funnel</h2>
   {%- if funnel %}

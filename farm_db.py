@@ -29,12 +29,24 @@ a busy timeout, and every column has exactly one writer process:
                   in dry run too, kept 7 days, for the console's mid chart.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
-                  config, read every cycle. Keys under the `scan.` prefix
-                  are not farmer config and the farmer skips them:
-                  scan.params (console) holds the last scan parameters,
-                  scan.last (screener) the last scan's funnel.
+                  config, read every cycle. Keys under the `scan.` and
+                  `triage.` prefixes are not farmer config and the farmer
+                  skips them: scan.params (console) holds the last scan
+                  parameters, scan.last (screener) the last scan's funnel,
+                  triage.auto_top_n (console) how many new candidates a
+                  console scan sends to Claude.
   commands        the console inserts rows; the farmer only stamps
                   consumed_at and result.
+  decisions       console or CLI, append-only. One row each time a human
+                  approves, rejects or un-rejects a market, with the
+                  market's metrics as they were then (a rescan overwrites
+                  markets.metrics).
+  mutes           console. Events and tags whose candidates the review
+                  queue and Discover leave out.
+  triage          console or triage_eval.py, append-only. One row per
+                  Claude triage of a market, its result or its error. From
+                  prompt v3 an ok row holds a verdict; p_true, p_low and
+                  p_high are left from v1 and v2 rows.
 
 Controls a human can repeat or a crash can interrupt (pause, resume, retire,
 cancel-all) are level-triggered columns on markets, not commands: the farmer
@@ -160,17 +172,59 @@ CREATE TABLE IF NOT EXISTS rewards_daily (
     fetched_at TEXT NOT NULL,
     PRIMARY KEY (date, condition_id)
 );
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    decision TEXT NOT NULL CHECK (decision IN ('approved', 'rejected', 'unrejected')),
+    reason TEXT,
+    note TEXT,
+    p_true REAL,
+    metrics TEXT
+);
+CREATE INDEX IF NOT EXISTS decisions_market ON decisions (condition_id, at);
+
+CREATE TABLE IF NOT EXISTS mutes (
+    kind TEXT NOT NULL CHECK (kind IN ('event', 'tag')),
+    value TEXT NOT NULL,
+    label TEXT,
+    at TEXT NOT NULL,
+    PRIMARY KEY (kind, value)
+);
+
+CREATE TABLE IF NOT EXISTS triage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    condition_id TEXT NOT NULL,
+    at TEXT NOT NULL,
+    prompt_version INTEGER NOT NULL,
+    model TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
+    p_true REAL,
+    p_low REAL,
+    p_high REAL,
+    book_mid REAL,
+    result TEXT,
+    error TEXT,
+    duration_s REAL,
+    cost_usd REAL,
+    verdict TEXT
+);
+CREATE INDEX IF NOT EXISTS triage_market ON triage (condition_id, prompt_version, at);
 """
 
-# markets columns added after the first release, so open_db can bring an
+# Columns added after their table's first release, so open_db can bring an
 # older database up to date. CREATE TABLE IF NOT EXISTS covers new tables.
-ADDED_MARKET_COLUMNS = (
-    ("baseline_fav", "REAL"),
-    ("baseline_long", "REAL"),
-    ("paused", "INTEGER NOT NULL DEFAULT 0"),
-    ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
-    ("capital_usd", "REAL"),
-)
+ADDED_COLUMNS = {
+    "markets": (
+        ("baseline_fav", "REAL"),
+        ("baseline_long", "REAL"),
+        ("paused", "INTEGER NOT NULL DEFAULT 0"),
+        ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
+        ("capital_usd", "REAL"),
+    ),
+    "triage": (("verdict", "TEXT"),),
+}
 # Settings the farmer no longer has. A row left behind would be reported as
 # an unknown setting on every start.
 RETIRED_SETTINGS = ("fav_target_score", "depth_haircut", "fill_lookback_days",
@@ -188,11 +242,12 @@ def open_db(path):
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_S * 1000}")
     conn.executescript(SCHEMA)
-    present = {row["name"] for row in conn.execute("PRAGMA table_info(markets)")}
     with conn:
-        for name, kind in ADDED_MARKET_COLUMNS:
-            if name not in present:
-                conn.execute(f"ALTER TABLE markets ADD COLUMN {name} {kind}")
+        for table, columns in ADDED_COLUMNS.items():
+            present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         conn.executemany("DELETE FROM settings WHERE key = ?",
                          [(key,) for key in RETIRED_SETTINGS])
     return conn
@@ -317,16 +372,27 @@ CURRENT = ("(status <> 'candidate' "
            "OR (rewards_active = 1 "
            "AND last_scanned = (SELECT MAX(last_scanned) FROM markets)))")
 
+# Whether the mutes row matches the markets row: the market is in the muted
+# event or carries the muted tag, as its latest scan recorded them. Rows
+# scanned before scans recorded events and tags match nothing.
+_MUTE_MATCHES = ("(mutes.kind = 'event' "
+                 "AND mutes.value = json_extract(markets.metrics, '$.market.event_slug') "
+                 "OR mutes.kind = 'tag' AND mutes.value IN "
+                 "(SELECT value FROM json_each(markets.metrics, '$.market.tags')))")
+# A muted candidate is hidden from the queue and Discover until it is unmuted.
+# Muting decides nothing, so decided rows always show.
+MUTED = f"(status = 'candidate' AND EXISTS (SELECT 1 FROM mutes WHERE {_MUTE_MATCHES}))"
+
 
 def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, limit,
                    offset):
     """(markets, total) by rank, filtered; each filter applies only when given.
 
     mode is the planned mode ('floor' or 'budget'). min_days counts from now to
-    the end date less buffer_days, the farmer's cutoff. Stale candidates are
-    always left out (see CURRENT).
+    the end date less buffer_days, the farmer's cutoff. Stale and muted
+    candidates are always left out (see CURRENT and MUTED).
     """
-    where, params = [CURRENT], []
+    where, params = [CURRENT, f"NOT {MUTED}"], []
     if statuses:
         where.append(f"status IN ({', '.join('?' * len(statuses))})")
         params.extend(statuses)
@@ -348,10 +414,10 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
 
 
 def candidate_queue(conn, mode=None, after=None):
-    """Condition ids of the undecided candidates, best rank first; mode ('floor'
-    or 'budget') keeps only that planned mode. after (a condition id) keeps only
-    those the queue orders after that market, which holds its place even when
-    it has left the queue."""
+    """Condition ids of the undecided candidates neither stale nor muted, best
+    rank first; mode ('floor' or 'budget') keeps only that planned mode. after
+    (a condition id) keeps only those the queue orders after that market, which
+    holds its place even when it has left the queue."""
     where, params = "", []
     if mode:
         where += " AND json_extract(metrics, '$.plan.mode') = ?"
@@ -361,7 +427,8 @@ def candidate_queue(conn, mode=None, after=None):
                   "(SELECT rank_score, condition_id FROM markets WHERE condition_id = ?)")
         params.append(after)
     return [r[0] for r in conn.execute(
-        f"SELECT condition_id FROM markets WHERE status = 'candidate' AND {CURRENT}{where} "
+        f"SELECT condition_id FROM markets "
+        f"WHERE status = 'candidate' AND {CURRENT} AND NOT {MUTED}{where} "
         "ORDER BY rank_score DESC, condition_id DESC", params)]
 
 
@@ -384,9 +451,51 @@ def condition_ids(conn, status):
 # Console and CLI: decisions and level-triggered controls
 # ---------------------------------------------------------------------------
 
-def approve_market(conn, condition_id, p_true, budget, capital_usd=None):
+class RejectReason(Enum):
+    UNFAMILIAR_TOPIC = "unfamiliar_topic"
+    ECONOMICS = "economics"
+    RESOLUTION_RISK = "resolution_risk"
+    HORIZON = "horizon"
+    NOT_INTERESTED = "not_interested"
+    OTHER = "other"
+
+    @property
+    def label(self):
+        return REJECT_LABELS[self]
+
+
+REJECT_LABELS = {
+    RejectReason.UNFAMILIAR_TOPIC: "I don't know the topic",
+    RejectReason.ECONOMICS: "The economics don't work",
+    RejectReason.RESOLUTION_RISK: "Resolution risk",
+    RejectReason.HORIZON: "Too long until it ends",
+    RejectReason.NOT_INTERESTED: "Not interested",
+    RejectReason.OTHER: "Other",
+}
+
+
+def _log_decision(conn, condition_id, decision, now, statuses, reason=None, note=None,
+                  p_true=None):
+    """Append a decisions row if the market's status is in statuses, with its
+    metrics as they are now; p_true None records the market's own."""
+    conn.execute(
+        "INSERT INTO decisions (condition_id, at, decision, reason, note, p_true, metrics) "
+        "SELECT condition_id, ?, ?, ?, ?, COALESCE(?, p_true), metrics FROM markets "
+        f"WHERE condition_id = ? AND status IN ({', '.join('?' * len(statuses))})",
+        (stamp(now), decision, reason and reason.value, note, p_true, condition_id,
+         *statuses),
+    )
+
+
+# Approving logs a decision only when the status moves to approved; new terms
+# for an approved market are not a new decision.
+_UNAPPROVED = tuple(s for s in STATUSES if s != "approved")
+
+
+def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, now):
     """Approve with the human's terms; capital_usd None keeps the current one."""
     with conn:
+        _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
             "capital_usd = COALESCE(?, capital_usd) WHERE condition_id = ?",
@@ -394,7 +503,7 @@ def approve_market(conn, condition_id, p_true, budget, capital_usd=None):
         )
 
 
-def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False):
+def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *, now):
     """Approve with exactly these terms; capital_usd None means the farmer's capital.
 
     paused sets the pause flag in the same write, so the farmer previews the
@@ -402,6 +511,7 @@ def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False):
     Re-approving a retired market makes the farmer manage it afresh.
     """
     with conn:
+        _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
             "capital_usd = ?, paused = paused OR ? WHERE condition_id = ?",
@@ -409,13 +519,47 @@ def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False):
         )
 
 
-def reject_market(conn, condition_id, note):
+def reject_market(conn, condition_id, note, reason, now):
+    """Reject for a RejectReason or None; note None keeps the market's note."""
     with conn:
+        _log_decision(conn, condition_id, "rejected", now, STATUSES, reason, note)
         conn.execute(
             "UPDATE markets SET status = 'rejected', note = COALESCE(?, note) "
             "WHERE condition_id = ?",
             (note, condition_id),
         )
+
+
+def unreject_market(conn, condition_id, now):
+    """Put a rejected market back in the queue; whether it was rejected."""
+    with conn:
+        _log_decision(conn, condition_id, "unrejected", now, ("rejected",))
+        return conn.execute(
+            "UPDATE markets SET status = 'candidate' "
+            "WHERE condition_id = ? AND status = 'rejected'",
+            (condition_id,),
+        ).rowcount == 1
+
+
+class MuteKind(Enum):
+    EVENT = "event"
+    TAG = "tag"
+
+
+def mute(conn, kind, value, label, now):
+    """Hide the candidates in this event or with this tag; muting again keeps
+    the first time and takes the new label."""
+    with conn:
+        conn.execute(
+            "INSERT INTO mutes (kind, value, label, at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (kind, value) DO UPDATE SET label = excluded.label",
+            (kind.value, value, label, stamp(now)),
+        )
+
+
+def unmute(conn, kind, value):
+    with conn:
+        conn.execute("DELETE FROM mutes WHERE kind = ? AND value = ?", (kind.value, value))
 
 
 def retire_market(conn, condition_id, note):
@@ -548,16 +692,42 @@ def delete_setting(conn, key):
 def load_settings(conn):
     """({key: value} of the valid rows, {key: error} of the rest).
 
-    Rows under the scan. prefix are the console's and the screener's, not
-    farmer config, so they are neither.
+    Rows under the scan. and triage. prefixes are the console's and the
+    screener's, not farmer config, so they are neither.
     """
     values, errors = {}, {}
-    for row in conn.execute("SELECT key, value FROM settings WHERE key NOT LIKE 'scan.%'"):
+    for row in conn.execute("SELECT key, value FROM settings "
+                            "WHERE key NOT LIKE 'scan.%' AND key NOT LIKE 'triage.%'"):
         try:
             values[row["key"]] = parse_setting(row["key"], row["value"])
         except ValueError as e:
             errors[row["key"]] = str(e)
     return values, errors
+
+
+TRIAGE_AUTO_KEY = "triage.auto_top_n"
+TRIAGE_AUTO = Bound(0, 100)
+
+
+def load_triage_auto(conn):
+    """How many new candidates a console scan sends to Claude; 0, the default, is none."""
+    try:
+        value = _get_json(conn, TRIAGE_AUTO_KEY)
+    except ValueError:
+        return 0
+    return value if _is_count(value) else 0
+
+
+def _is_count(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and TRIAGE_AUTO.admits(value))
+
+
+def put_triage_auto(conn, n, now):
+    if not _is_count(n):
+        raise ValueError(f"{TRIAGE_AUTO_KEY}: {n!r} is out of range")
+    with conn:
+        _put_json(conn, TRIAGE_AUTO_KEY, n, now)
 
 
 def _put_json(conn, key, value, now):
@@ -982,7 +1152,131 @@ def read_rewards(conn, since_date):
     )]
 
 
+class Decision(NamedTuple):
+    """A decisions row; metrics is the market's as it was when decided."""
+
+    id: int
+    condition_id: str
+    at: datetime
+    decision: str
+    reason: Optional[RejectReason]
+    note: Optional[str]
+    p_true: Optional[float]
+    metrics: dict
+
+
+def read_decisions(conn, condition_ids=(), event_slug=None, tags=(), limit=100):
+    """Decisions newest first. Given any filter, only those about one of
+    condition_ids, a market in event_slug, or a market with one of tags."""
+    ids, tags = list(condition_ids), list(tags)
+    where, params = [], []
+    if ids:
+        where.append(f"condition_id IN ({', '.join('?' * len(ids))})")
+        params.extend(ids)
+    if event_slug:
+        where.append("json_extract(metrics, '$.market.event_slug') = ?")
+        params.append(event_slug)
+    if tags:
+        where.append("EXISTS (SELECT 1 FROM json_each(metrics, '$.market.tags') "
+                     f"WHERE value IN ({', '.join('?' * len(tags))}))")
+        params.extend(tags)
+    sql = "SELECT * FROM decisions" + (" WHERE " + " OR ".join(where) if where else "")
+    rows = conn.execute(sql + " ORDER BY at DESC, id DESC LIMIT ?", params + [limit])
+    return [Decision(r["id"], r["condition_id"], _time(r["at"]), r["decision"],
+                     RejectReason(r["reason"]) if r["reason"] else None, r["note"],
+                     r["p_true"], _load(r["metrics"]) or {}) for r in rows]
+
+
+class Mute(NamedTuple):
+    kind: MuteKind
+    value: str
+    label: Optional[str]
+    at: datetime
+    hidden: int  # current candidates it keeps out of the queue
+
+
+def read_mutes(conn):
+    """Every mute, newest first."""
+    rows = conn.execute(
+        "SELECT kind, value, label, at, (SELECT COUNT(*) FROM markets "
+        f"WHERE status = 'candidate' AND {CURRENT} AND {_MUTE_MATCHES}) AS hidden "
+        "FROM mutes ORDER BY at DESC, kind, value")
+    return [Mute(MuteKind(r["kind"]), r["value"], r["label"], _time(r["at"]), r["hidden"])
+            for r in rows]
+
+
 def read_reward_totals(conn):
     """{condition_id: earnings_usd} summed over every recorded day."""
     return dict(conn.execute(
         "SELECT condition_id, SUM(earnings_usd) FROM rewards_daily GROUP BY condition_id"))
+
+
+# ---------------------------------------------------------------------------
+# Claude triage: console or triage_eval.py
+# ---------------------------------------------------------------------------
+
+class TriageRecord(NamedTuple):
+    """A triage row. result is triage.py's JSON of an ok row and verdict the
+    verdict it holds (None before prompt v3); error says why an error row has
+    neither."""
+
+    id: int
+    condition_id: str
+    at: datetime
+    prompt_version: int
+    model: str
+    status: str
+    verdict: Optional[str]
+    book_mid: Optional[float]
+    result: Optional[dict]
+    error: Optional[str]
+    duration_s: Optional[float]
+    cost_usd: Optional[float]
+
+
+def store_triage(conn, condition_id, now, prompt_version, model, *, result=None, error=None,
+                 book_mid=None, duration_s=None, cost_usd=None):
+    """Append an ok row (result, a dict with a verdict) or an error row
+    (error); exactly one of them is given."""
+    if (result is None) == (error is None):
+        raise ValueError("a triage row has a result or an error, not both or neither")
+    with conn:
+        return conn.execute(
+            "INSERT INTO triage (condition_id, at, prompt_version, model, status, verdict, "
+            "book_mid, result, error, duration_s, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (condition_id, stamp(now), prompt_version, model,
+             "ok" if result is not None else "error", result and result["verdict"], book_mid,
+             _json(result), error, duration_s, cost_usd),
+        ).lastrowid
+
+
+def read_triage(conn, condition_ids=(), prompt_version=None, status=None, limit=1000):
+    """Triage rows newest first, each filter applied only when given."""
+    ids, where, params = list(condition_ids), [], []
+    if ids:
+        where.append(f"condition_id IN ({', '.join('?' * len(ids))})")
+        params.extend(ids)
+    for clause, value in (("prompt_version = ?", prompt_version), ("status = ?", status)):
+        if value is not None:
+            where.append(clause)
+            params.append(value)
+    sql = "SELECT * FROM triage" + (" WHERE " + " AND ".join(where) if where else "")
+    rows = conn.execute(sql + " ORDER BY at DESC, id DESC LIMIT ?", params + [limit])
+    return [TriageRecord(r["id"], r["condition_id"], _time(r["at"]), r["prompt_version"],
+                         r["model"], r["status"], r["verdict"], r["book_mid"],
+                         _load(r["result"]), r["error"], r["duration_s"],
+                         r["cost_usd"]) for r in rows]
+
+
+def latest_triage(conn, condition_id, prompt_version=None):
+    """The market's newest triage row, of that prompt version when given, or None."""
+    found = read_triage(conn, (condition_id,), prompt_version, limit=1)
+    return found[0] if found else None
+
+
+def triaged_ids(conn, prompt_version):
+    """The condition ids with an ok triage row of this prompt version."""
+    return frozenset(r[0] for r in conn.execute(
+        "SELECT DISTINCT condition_id FROM triage WHERE status = 'ok' AND prompt_version = ?",
+        (prompt_version,)))

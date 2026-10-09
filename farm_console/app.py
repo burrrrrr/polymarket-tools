@@ -8,6 +8,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlencode
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.encoders import jsonable_encoder
@@ -19,10 +20,12 @@ from fastapi.templating import Jinja2Templates
 import farm_db
 import reward_farmer
 import reward_screener
+import triage
 from farm_db import CommandKind, EventKind
 
 from . import charts, forms, glossary, remote, security, views
 from .scan import ScanPhase, ScanRunner
+from .triage_runner import TriageRunner
 
 HERE = Path(__file__).parent
 KEEPALIVE_S = 15
@@ -60,13 +63,14 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                scan=reward_screener.run_scan, fetch_rules=remote.fetch_rules,
                fetch_position=remote.fetch_position, fetch_info=remote.fetch_info,
                fetch_book=remote.fetch_book, fetch_total_rates=remote.fetch_total_rates,
-               funder=None):
+               run_triage=triage.run_claude, fetch_page=triage.fetch_page, funder=None):
     """The console over db_path, served on 127.0.0.1:port.
 
     max_polls ends /stream after that many polls, so a test can read it to the
     end; None streams until the client leaves. scan and the fetch_ functions
-    reach the network; funder is the wallet address whose holdings the Review
-    page shows.
+    reach the network, run_triage calls Claude and fetch_page reads the pages
+    its news check cites; funder is the wallet address whose holdings the
+    Review page shows.
     """
     app = FastAPI(title="Farm console", docs_url=None, redoc_url=None)
     app.state.token = token = security.new_token()
@@ -84,9 +88,12 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                  polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
                                  review_url=views.review_url, MODES=views.MODES,
                                  glossary=glossary.GLOSSARY,
+                                 REJECT_REASONS=list(farm_db.RejectReason),
                                  static=lambda name: f"/static/{name}?v={versions[name]}")
-    runner = ScanRunner(db_path, clock, scan)
     rules = remote.TtlCache(fetch_rules, remote.RULES_TTL, clock)
+    app.state.triage = triager = TriageRunner(db_path, clock, rules.get, run_triage, fetch_page)
+    runner = ScanRunner(db_path, clock, scan, after_store=lambda conn: triager.enqueue_top(
+        conn, farm_db.load_triage_auto(conn)))
     infos = remote.TtlCache(fetch_info, remote.INFO_TTL, clock)
     books = remote.TtlCache(fetch_book, remote.BOOK_TTL, clock)
 
@@ -524,6 +531,36 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         return templates.TemplateResponse(request, "partials/review_rules.html", {
             "condition_id": condition_id, "rules": found, "error": error})
 
+    def triage_panel(request, condition_id):
+        """The latest screen of this prompt version, else an older row marked
+        stale."""
+        now = clock()
+        with closing(connect()) as conn:
+            market = find(conn, condition_id)
+            row = (farm_db.latest_triage(conn, condition_id, triage.PROMPT_VERSION)
+                   or farm_db.latest_triage(conn, condition_id))
+        stale = row is not None and row.prompt_version != triage.PROMPT_VERSION
+        screen = (triage.from_result(row.result)
+                  if row is not None and row.status == "ok" and not stale else None)
+        end = market.end_date.date() if market.end_date else None
+        days_left = triage.days_until(end, now.date())
+        return templates.TemplateResponse(request, "partials/review_triage.html", {
+            "condition_id": condition_id, "row": row, "stale": stale, "s": screen,
+            "d": screen and triage.digest(screen, days_left), "quiet_days": triage.QUIET_DAYS,
+            "now": now, "running": condition_id in triager.running(),
+            "waiting": condition_id in triager.pending()})
+
+    @app.get("/partials/review/{condition_id}/triage", response_class=HTMLResponse)
+    def review_triage(request: Request, condition_id: str):
+        return triage_panel(request, condition_id)
+
+    @app.post("/review/{condition_id}/triage", response_class=HTMLResponse)
+    def request_triage(request: Request, condition_id: str):
+        with closing(connect()) as conn:
+            find(conn, condition_id)
+        triager.enqueue(condition_id)
+        return triage_panel(request, condition_id)
+
     @app.get("/partials/review/{condition_id}/holdings", response_class=HTMLResponse)
     def review_holdings(request: Request, condition_id: str):
         with closing(connect()) as conn:
@@ -539,9 +576,23 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "long_outcome": views.OTHER_OUTCOME.get(m.get("fav_outcome"), "longshot"),
             "error": error})
 
-    def next_review(ids, condition_id, mode):
-        following = views.after_decision(ids, condition_id)
+    def next_review(conn, ids, condition_id, mode):
+        """Where to go once this market is decided or muted: next to it in the
+        queue as it stood (ids), passing over markets that have left it since."""
+        kept = set(farm_db.candidate_queue(conn, mode))
+        following = views.after_decision([i for i in ids if i in kept or i == condition_id],
+                                         condition_id)
         return views.review_url(following, mode) if following else queue_url(mode)
+
+    def mute_target(market, form):
+        """(MuteKind, value, label) of the event or tag a mute button sent, which
+        must be the market's own."""
+        m = market.metrics.get("market", {})
+        if form.get("event") and form["event"] == m.get("event_slug"):
+            return farm_db.MuteKind.EVENT, form["event"], m.get("event_title")
+        if form.get("tag") and form["tag"] in m.get("tags", ()):
+            return farm_db.MuteKind.TAG, form["tag"], form["tag"]
+        raise HTTPException(400, "mute an event or tag of this market")
 
     @app.post("/review/{condition_id}/approve")
     async def approve(request: Request, condition_id: str):
@@ -556,18 +607,18 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
-                                 decision.capital, decision.start_paused)
-        if market.status == "candidate" and not decision.start_paused:
-            return see_other(next_review(ids, condition_id, mode))
+                                 decision.capital, decision.start_paused, now=clock())
+            if market.status == "candidate" and not decision.start_paused:
+                return see_other(next_review(conn, ids, condition_id, mode))
         return see_other(f"/markets/{condition_id}")
 
     @app.post("/review/{condition_id}/reject")
     async def reject(request: Request, condition_id: str):
         form = await form_of(request)
-        note, errors = forms.parse_note(form)
+        rejection, errors = forms.parse_rejection(form)
         mode = parse_mode(form.get("queue_mode"))
         with closing(connect()) as conn:
-            find(conn, condition_id)
+            market = find(conn, condition_id)
             if errors:
                 return review_page(request, conn, condition_id, 422,
                                    values={**form, "p_true": form.get("p_true", ""),
@@ -575,8 +626,31 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                                            "capital": form.get("capital", "")},
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
-            farm_db.reject_market(conn, condition_id, note)
-        return see_other(next_review(ids, condition_id, mode))
+            now = clock()
+            farm_db.reject_market(conn, condition_id, rejection.note, rejection.reason, now)
+            m = market.metrics.get("market", {})
+            if rejection.mute_event and m.get("event_slug"):
+                farm_db.mute(conn, farm_db.MuteKind.EVENT, m["event_slug"], m.get("event_title"),
+                             now)
+            return see_other(next_review(conn, ids, condition_id, mode))
+
+    @app.post("/review/{condition_id}/unreject")
+    async def unreject(request: Request, condition_id: str):
+        mode = parse_mode((await form_of(request)).get("queue_mode"))
+        with closing(connect()) as conn:
+            find(conn, condition_id)
+            farm_db.unreject_market(conn, condition_id, clock())
+        return see_other(views.review_url(condition_id, mode))
+
+    @app.post("/review/{condition_id}/mute")
+    async def mute(request: Request, condition_id: str):
+        form = await form_of(request)
+        mode = parse_mode(form.get("queue_mode"))
+        with closing(connect()) as conn:
+            target = mute_target(find(conn, condition_id), form)
+            ids = farm_db.candidate_queue(conn, mode)
+            farm_db.mute(conn, *target, clock())
+            return see_other(next_review(conn, ids, condition_id, mode))
 
     @app.post("/review/{condition_id}/retire")
     async def retire_reviewed(request: Request, condition_id: str):
@@ -610,8 +684,16 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         return {**{name: views.number_text(getattr(config, name)) for name in forms.SCAN_FIELDS},
                 **{forms.exclude_field(c): "1" for c in excluded}}
 
+    def triage_status(conn):
+        queue = farm_db.candidate_queue(conn)
+        done = farm_db.triaged_ids(conn, triage.PROMPT_VERSION)
+        return {"triage_running": len(triager.running()),
+                "triage_waiting": len(triager.pending()),
+                "triage_done": sum(c in done for c in queue), "triage_queue": len(queue),
+                "prompt_version": triage.PROMPT_VERSION}
+
     def discover_response(request, conn, filters, status_code=200, values=None, errors=None,
-                          refused=None):
+                          refused=None, triage_note=None):
         now = clock()
         snap = snapshot(conn, now)
         # A stale map refreshes in the background, sweeping ended rewards from the queue.
@@ -629,14 +711,36 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "fields": forms.SCAN_FIELDS, "values": values, "errors": errors or {},
             "categories": {forms.exclude_field(c): c for c in reward_screener.CATEGORIES},
             "refused": refused, "modes": views.MODES, "statuses": views.STATUS_FILTERS,
+            "triage_note": triage_note, "batch_default": forms.TRIAGE_BATCH_DEFAULT,
+            **triage_status(conn),
         }, status_code=status_code)
 
     @app.get("/discover", response_class=HTMLResponse)
     def discover(request: Request, mode: Optional[str] = None, q: str = "",
-                 status: str = "candidate", min_days: Optional[str] = None, page: int = 1):
+                 status: str = "candidate", min_days: Optional[str] = None, page: int = 1,
+                 triaged: Optional[int] = None):
         filters = parse_filters(mode, q, status, min_days, page)
+        note = None
+        if triaged is not None:
+            note = f"Sent {triaged} candidate{'s' if triaged != 1 else ''} to Claude."
         with closing(connect()) as conn:
-            return discover_response(request, conn, filters)
+            return discover_response(request, conn, filters, triage_note=note)
+
+    @app.post("/triage/batch")
+    async def triage_batch(request: Request):
+        n, errors = forms.parse_triage_batch(await form_of(request))
+        with closing(connect()) as conn:
+            if errors:
+                return discover_response(request, conn, views.DiscoverFilters(), 422,
+                                         triage_note=errors["n"])
+            sent = triager.enqueue_top(conn, n)
+        return see_other(f"/discover?triaged={sent}")
+
+    @app.get("/partials/discover/triage", response_class=HTMLResponse)
+    def discover_triage(request: Request):
+        with closing(connect()) as conn:
+            return templates.TemplateResponse(request, "partials/triage_status.html",
+                                              triage_status(conn))
 
     @app.post("/discover/scan")
     async def start_scan(request: Request):
@@ -680,21 +784,28 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         }
 
     def settings_response(request, conn, status_code=200, notice=None, cancel_error=None,
-                          **kw):
+                          triage_error=None, **kw):
         now = clock()
         return templates.TemplateResponse(request, "settings.html", {
             "chrome": views.chrome(snapshot(conn, now), now), "now": now, "page": "settings",
-            "notice": notice, "cancel_error": cancel_error,
+            "notice": notice, "cancel_error": cancel_error, "mutes": farm_db.read_mutes(conn),
+            "triage_auto": farm_db.load_triage_auto(conn), "triage_error": triage_error,
             **settings_context(conn, now, **kw)}, status_code=status_code)
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings(request: Request, saved: Optional[str] = None,
-                 cancelled: Optional[int] = None, reset: Optional[str] = None):
+                 cancelled: Optional[int] = None, reset: Optional[str] = None,
+                 unmuted: Optional[str] = None, auto_triage: Optional[int] = None):
         notice = None
-        if saved:
+        if auto_triage is not None:
+            notice = (f"A console scan now sends its top {auto_triage} new candidates to Claude."
+                      if auto_triage else "A console scan sends nothing to Claude.")
+        elif saved:
             notice = f"Saved {saved}. The farmer applies it on its next cycle."
         elif reset:
             notice = f"Reset {reset} to the farmer's own value."
+        elif unmuted:
+            notice = f"Unmuted {unmuted}. Its candidates are back in the review queue."
         elif cancelled is not None:
             notice = (f"Paused {cancelled} approved market{'s' if cancelled != 1 else ''}. "
                       f"The farmer cancels the orders on its next cycle.")
@@ -719,6 +830,15 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             }, clock())
         return see_other(f"/settings?saved={group}")
 
+    @app.post("/settings/triage")
+    async def save_triage_auto(request: Request):
+        n, errors = forms.parse_triage_auto(await form_of(request))
+        with closing(connect()) as conn:
+            if errors:
+                return settings_response(request, conn, 422, triage_error=errors["auto_top_n"])
+            farm_db.put_triage_auto(conn, n, clock())
+        return see_other(f"/settings?auto_triage={n}")
+
     @app.post("/settings/reset/{key}")
     async def reset_setting(request: Request, key: str):
         if key not in farm_db.SETTINGS:
@@ -726,6 +846,18 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         with closing(connect()) as conn:
             farm_db.delete_setting(conn, key)
         return see_other(f"/settings?reset={key}")
+
+    @app.post("/settings/unmute")
+    async def unmute(request: Request):
+        form = await form_of(request)
+        try:
+            kind = farm_db.MuteKind(form.get("kind"))
+        except ValueError:
+            raise HTTPException(400, "kind must be event or tag") from None
+        value = form.get("value") or ""
+        with closing(connect()) as conn:
+            farm_db.unmute(conn, kind, value)
+        return see_other("/settings?" + urlencode({"unmuted": form.get("label") or value}))
 
     @app.get("/partials/settings/farmer", response_class=HTMLResponse)
     def farmer_partial(request: Request):

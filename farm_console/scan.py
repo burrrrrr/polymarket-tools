@@ -35,12 +35,15 @@ IDLE = ScanJob(ScanPhase.IDLE)
 
 class ScanRunner:
     """scan is reward_screener.run_scan or a stand-in with its signature. It
-    starts from the fill prior the last scan stored."""
+    starts from the fill prior the last scan stored. after_store(conn) runs
+    once a scan is stored."""
 
-    def __init__(self, db_path, clock, scan=reward_screener.run_scan):
+    def __init__(self, db_path, clock, scan=reward_screener.run_scan,
+                 after_store=lambda conn: None):
         self.db_path = db_path
         self.clock = clock
         self.scan = scan
+        self.after_store = after_store
         self.job = IDLE
         self._lock = threading.Lock()
 
@@ -65,6 +68,7 @@ class ScanRunner:
                                    on_stage=self._stage)
                 self._stage(f"storing {len(result.assessments):,} assessments")
                 reward_screener.store(conn, result, started_at)
+                self.after_store(conn)
             self.job = ScanJob(ScanPhase.DONE, "", started_at, self.clock(), result.funnel)
         except Exception as e:
             self.job = ScanJob(ScanPhase.FAILED, self.job.stage, started_at, self.clock(),

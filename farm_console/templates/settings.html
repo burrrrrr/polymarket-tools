@@ -35,6 +35,51 @@
 </form>
 {%- endfor %}
 
+<form class="panel pad stack" method="post" action="/settings/triage" style="gap: 12px">
+  {{ token_field() }}
+  <div class="page-head">
+    <h2>Claude triage</h2>
+    <button class="btn btn-strong" type="submit">Save triage</button>
+  </div>
+  <div class="field">
+    <label class="lbl" for="s-auto_top_n">Screen after a scan (top N new candidates)</label>
+    <input class="inp mono" id="s-auto_top_n" name="auto_top_n" value="{{ triage_auto }}" inputmode="numeric" style="width: 90px" {{ 'aria-invalid="true"' | safe if triage_error }}>
+    {%- if triage_error %}<span class="field-error" role="alert">{{ triage_error }}</span>{% endif %}
+    <span class="hint">0 is off. A scan from the Discover page then sends the best-ranked queued candidates Claude has not screened to it.</span>
+  </div>
+</form>
+
+<section class="panel pad stack" style="gap: 12px">
+  <h2>Muted topics</h2>
+  <span class="hint">Candidates in a muted event or with a muted tag stay out of the review queue and Discover. Mute one from a market's Review page; unmuting brings its candidates back.</span>
+  {%- if mutes %}
+  <table class="tbl">
+    <thead><tr><th>Kind</th><th>Muted</th><th>Hides</th><th>Since</th><th></th></tr></thead>
+    <tbody>
+      {%- for mu in mutes %}
+      <tr>
+        <td><span class="badge t-n">{{ mu.kind.value }}</span></td>
+        <td class="wrap">{{ mu.label or mu.value }}</td>
+        <td class="mono">{{ mu.hidden }} candidate{{ 's' if mu.hidden != 1 }}</td>
+        <td class="mono muted">{{ mu.at | stamp_local }}</td>
+        <td>
+          <form method="post" action="/settings/unmute">
+            {{ token_field() }}
+            <input type="hidden" name="kind" value="{{ mu.kind.value }}">
+            <input type="hidden" name="value" value="{{ mu.value }}">
+            <input type="hidden" name="label" value="{{ mu.label or mu.value }}">
+            <button class="btn small-btn" type="submit">Unmute</button>
+          </form>
+        </td>
+      </tr>
+      {%- endfor %}
+    </tbody>
+  </table>
+  {%- else %}
+  <span class="small muted">Nothing is muted.</span>
+  {%- endif %}
+</section>
+
 <form class="panel pad stack danger-zone" method="post" action="/farmer/cancel-all" style="gap: 12px">
   {{ token_field() }}
   <h2>Danger zone: cancel all managed orders{{ tip('cancel_all') }}</h2>

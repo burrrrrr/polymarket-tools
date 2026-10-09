@@ -62,7 +62,7 @@ Usage:
   python reward_screener.py scan --exclude sports,politics
   python reward_screener.py list --status approved
   python reward_screener.py approve some-market-slug --p-true 0.97
-  python reward_screener.py reject some-market-slug --note "resolution risk"
+  python reward_screener.py reject some-market-slug --reason resolution_risk --note "vague rules"
 """
 
 import argparse
@@ -233,6 +233,9 @@ class RewardMarket(NamedTuple):
     rate_per_day: float
     v: float
     min_size: float
+    tags: tuple = ()
+    event_slug: Optional[str] = None
+    event_title: Optional[str] = None
 
 
 class Levels(NamedTuple):
@@ -375,6 +378,8 @@ class GammaInfo(NamedTuple):
     slug: Optional[str]
     event_closed: Optional[bool] = None
     resolution_statuses: tuple = ()
+    event_slug: Optional[str] = None
+    event_title: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +835,7 @@ def screen_listing(item, total_rates, config, now):
         rate_per_day=rate,
         v=v,
         min_size=_float(rewards.get("min_size")) or 0,
+        tags=tuple(str(t) for t in item.get("tags") or ()),
     )
 
 
@@ -863,6 +869,7 @@ def parse_gamma(entry):
     holding = entry.get("holdingRewardsEnabled")
     neg_risk = entry.get("negRisk")
     events = [e for e in entry.get("events") or [] if isinstance(e, dict)]
+    event = events[0] if events else {}
     return GammaInfo(
         volume24hr=_float(entry.get("volume24hr")),
         holding_rewards=holding if isinstance(holding, bool) else None,
@@ -871,6 +878,8 @@ def parse_gamma(entry):
         slug=entry.get("slug") or None,
         event_closed=any(bool(e.get("closed")) for e in events) if events else None,
         resolution_statuses=_string_list(entry.get("umaResolutionStatuses")),
+        event_slug=event.get("slug") or None,
+        event_title=event.get("title") or None,
     )
 
 
@@ -894,13 +903,16 @@ def resolution_signal(info):
 
 
 def apply_gamma(market, info):
-    """Gamma's end date carries the real resolution time; the CLOB rounds it."""
+    """Gamma's end date carries the real resolution time; the CLOB rounds it.
+    The listing has no event, so Gamma's is the market's."""
     if info is None:
         return market
     return market._replace(
         end_date=info.end_date or market.end_date,
         neg_risk=market.neg_risk if info.neg_risk is None else info.neg_risk,
         slug=info.slug or market.slug,
+        event_slug=info.event_slug or market.event_slug,
+        event_title=info.event_title or market.event_title,
     )
 
 
@@ -1521,7 +1533,8 @@ def cmd_approve(args):
             f"${args.budget:.2f} naked budget"
         )
 
-    farm_db.approve_market(conn, row["condition_id"], args.p_true, args.budget, args.capital)
+    farm_db.approve_market(conn, row["condition_id"], args.p_true, args.budget, args.capital,
+                           now=datetime.now(timezone.utc))
     capital = farm_db.find_market(conn, row["condition_id"])["capital_usd"]
     conn.close()
     capital = f"${capital:.2f}" if capital is not None else "the farmer's --capital"
@@ -1535,7 +1548,9 @@ def cmd_reject(args):
     if row is None:
         print(f"Error: no market {args.market!r} in {args.db}; run a scan first")
         sys.exit(1)
-    farm_db.reject_market(conn, row["condition_id"], args.note)
+    farm_db.reject_market(conn, row["condition_id"], args.note,
+                          args.reason and farm_db.RejectReason(args.reason),
+                          datetime.now(timezone.utc))
     conn.close()
     print(f"Rejected {row['slug']}")
 
@@ -1555,7 +1570,7 @@ Examples:
   python reward_screener.py list --status approved
   python reward_screener.py approve some-market-slug --p-true 0.97 --budget 25
   python reward_screener.py approve some-market-slug --p-true 0.97 --capital 200
-  python reward_screener.py reject some-market-slug --note "resolution risk"
+  python reward_screener.py reject some-market-slug --reason resolution_risk --note "vague rules"
         """,
     )
     db = argparse.ArgumentParser(add_help=False)
@@ -1593,7 +1608,9 @@ Examples:
 
     reject = sub.add_parser("reject", parents=[db], help="Reject a market")
     reject.add_argument("market", help="Slug or condition id")
-    reject.add_argument("--note", help="Why")
+    reject.add_argument("--reason", choices=[r.value for r in farm_db.RejectReason],
+                        help="Why (optional)")
+    reject.add_argument("--note", help="More on why")
     return parser
 
 

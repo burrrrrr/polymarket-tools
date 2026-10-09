@@ -966,7 +966,7 @@ class FarmerHarness(unittest.TestCase):
             CID, "test-market", "Test?", (NOW + timedelta(days=100)).isoformat(), 1.0,
             json.dumps(METRICS),
         )], [CID], NOW, prior=fill_cost.prior_to_json(PRIOR))
-        farm_db.approve_market(self.ui, CID, 0.995, 25.0)
+        farm_db.approve_market(self.ui, CID, 0.995, 25.0, now=NOW)
         self.book_fetches = 0
         self.on_book_fetch = lambda count: None
         self.infos = mock.Mock(return_value={CID: INFO})
@@ -1082,7 +1082,7 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(row["phase"], "QUOTING")
 
     def test_approved_paused_previews_the_orders_and_resume_places_them(self):
-        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, paused=True)
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, paused=True, now=NOW)
         farmer = self.started_farmer()
         farmer.cycle()
         row, slots = self.farm_state()
@@ -1101,7 +1101,7 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(places, {slot: preview[slot][1] for slot in ("FAV_BID", "LONG_BID")})
 
     def test_paused_market_previews_nothing_when_resume_would_not_quote(self):
-        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, paused=True)
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, paused=True, now=NOW)
         farm_db.put_setting(self.ui, "min_fav", 0.995, NOW)
         farmer = self.started_farmer()
         farmer.cycle()
@@ -1189,7 +1189,7 @@ class FarmerCycleTest(FarmerHarness):
         before = self.last_event_id()
         self.assertEqual(self.phase_and_kinds(farmer, before), ("RETIRED", []))
 
-        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None)
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, now=NOW)
         phase, kinds = self.phase_and_kinds(farmer, before)
         self.assertEqual((phase, kinds), ("QUOTING", ["PHASE", "PLACE", "PLACE"]))
         self.assertIn("Managing test-market", self.events(before)[0]["message"])
@@ -1215,7 +1215,7 @@ class FarmerCycleTest(FarmerHarness):
         farm_db.retire_market(self.ui, CID, "console")
         farmer.cycle()
         farm_db.put_setting(self.ui, "expiry_buffer_days", 1000, NOW)
-        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None)
+        farm_db.set_approval(self.ui, CID, 0.995, 25.0, None, now=NOW)
         before = self.last_event_id()
         farmer.cycle()
         row, _ = self.farm_state()
@@ -1407,7 +1407,7 @@ class LiveFarmerTest(FarmerHarness):
             CID2, "other-market", "Other?", (NOW + timedelta(days=100)).isoformat(), 1.0,
             json.dumps(metrics),
         )], [CID, CID2], NOW)
-        farm_db.approve_market(self.ui, CID2, 0.995, 25.0)
+        farm_db.approve_market(self.ui, CID2, 0.995, 25.0, now=NOW)
         self.infos.return_value = {CID: INFO, CID2: INFO2}
         self.market_of = {FAV: CID, LONG: CID, FAV2: CID2, LONG2: CID2}
         self.resting = {}

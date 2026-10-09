@@ -312,7 +312,7 @@ class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
     def scan(self, histories, prior=fill_cost.DEFAULT_PRIOR, tape_markets=2, sample=0,
-             books={}, rejected=frozenset()):
+             books={}, rejected=frozenset(), tags={}, gamma={}):
         asked = []
 
         def fake_histories(http, markets, now, floor):
@@ -321,10 +321,11 @@ class RunScanTest(unittest.TestCase):
 
         with mock.patch.multiple(
                 reward_screener,
-                fetch_paginated=lambda http, path: [listing_item(c, r) for c, r in self.RATES.items()],
+                fetch_paginated=lambda http, path: [{**listing_item(c, r), "tags": tags.get(c)}
+                                                    for c, r in self.RATES.items()],
                 fetch_total_rates=lambda http: dict(self.RATES),
                 fetch_levels=lambda http, ids: {t: books.get(t, DEEP_BOOK) for t in ids},
-                fetch_gamma=lambda http, ids: {},
+                fetch_gamma=lambda http, ids: dict(gamma),
                 fetch_histories=fake_histories,
                 PRIOR_SAMPLE=sample), mock.patch("builtins.print"):
             result = reward_screener.run_scan(CONFIG._replace(tape_markets=tape_markets),
@@ -345,6 +346,22 @@ class RunScanTest(unittest.TestCase):
         self.assertEqual(result.funnel.assess_skips, {"fills cost more than the rewards": 1})
         self.assertEqual(result.funnel.assessed, 2)
         self.assertIsNone(result.prior)
+
+    def test_listing_tags_and_the_gamma_event_land_in_the_stored_market(self):
+        gamma = {"0x1": parse_gamma({"slug": "0x1", "events": [
+                     {"slug": "2027-french-election", "title": "2027 French election",
+                      "closed": False}]}),
+                 "0x2": parse_gamma({"slug": "0x2"})}
+        result, _ = self.scan({}, tags={"0x1": ["Politics", "French Election"]}, gamma=gamma)
+        stored = {a.market.condition_id: json.loads(reward_screener.scan_row(a).metrics)["market"]
+                  for a in result.assessments}
+        topic = {cid: (m["tags"], m["event_slug"], m["event_title"]) for cid, m in stored.items()}
+        self.assertEqual(topic, {
+            "0x1": (["Politics", "French Election"], "2027-french-election",
+                    "2027 French election"),
+            "0x2": ([], None, None),
+            "0x3": ([], None, None),
+        })
 
     def test_a_rejected_market_gives_its_top_slot_to_the_next_but_is_still_assessed(self):
         result, asked = self.scan({}, rejected={"0x1"})

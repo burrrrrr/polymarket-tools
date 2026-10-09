@@ -28,17 +28,19 @@ class Rules(NamedTuple):
 
 
 def fetch_rules(condition_id):
+    """The market's Rules; Gamma lists a closed market only when asked for closed ones."""
     with httpx.Client() as http:
-        resp = http.get(f"{GAMMA_HOST}/markets", params={"condition_ids": condition_id},
-                        timeout=TIMEOUT_S)
-        resp.raise_for_status()
-        entries = resp.json() or []
-    entry = next((e for e in entries
-                  if isinstance(e, dict) and e.get("conditionId") == condition_id), None)
-    if entry is None:
-        raise LookupError("Gamma has no record of this market")
-    return Rules(entry.get("description") or "", entry.get("resolutionSource") or None,
-                 parse_time(entry.get("endDate")))
+        for closed in ({}, {"closed": "true"}):
+            resp = http.get(f"{GAMMA_HOST}/markets",
+                            params={"condition_ids": condition_id, **closed}, timeout=TIMEOUT_S)
+            resp.raise_for_status()
+            entry = next((e for e in resp.json() or []
+                          if isinstance(e, dict) and e.get("conditionId") == condition_id), None)
+            if entry is not None:
+                return Rules(entry.get("description") or "",
+                             entry.get("resolutionSource") or None,
+                             parse_time(entry.get("endDate")))
+    raise LookupError("Gamma has no record of this market")
 
 
 def _market_info(http, condition_id):

@@ -6,7 +6,9 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
+import httpx
 from fastapi.testclient import TestClient
 
 import farm_db
@@ -438,6 +440,38 @@ def settle_total_rates():
             thread.join(10)
 
 
+class FetchRulesTest(unittest.TestCase):
+    def fetch(self, open_entries, closed_entries):
+        """(fetch_rules' Rules or LookupError, whether each Gamma query asked for closed)."""
+        closed = []
+
+        def handle(request):
+            closed.append(request.url.params.get("closed") == "true")
+            return httpx.Response(200, json=closed_entries if closed[-1] else open_entries)
+        client = httpx.Client(transport=httpx.MockTransport(handle))
+        with mock.patch.object(remote.httpx, "Client", return_value=client):
+            try:
+                return remote.fetch_rules("0xa"), closed
+            except LookupError as e:
+                return e, closed
+
+    def entry(self, description):
+        return {"conditionId": "0xa", "description": description,
+                "endDate": "2026-12-01T04:59:00Z"}
+
+    def test_an_open_market_is_read_from_the_plain_query(self):
+        rules, closed = self.fetch([self.entry("Open rules.")], [])
+        self.assertEqual((rules.description, closed), ("Open rules.", [False]))
+
+    def test_a_closed_market_is_read_from_the_closed_query(self):
+        rules, closed = self.fetch([], [self.entry("Closed rules.")])
+        self.assertEqual((rules.description, closed), ("Closed rules.", [False, True]))
+
+    def test_a_market_gamma_never_lists_raises(self):
+        error, _ = self.fetch([], [])
+        self.assertIsInstance(error, LookupError)
+
+
 class Console(unittest.TestCase):
     """The app against a scratch farm.db seeded through farm_db."""
 
@@ -454,7 +488,7 @@ class Console(unittest.TestCase):
             for cid, slug in ((A, "alpha"), (B, "bravo"), (C, "charlie"))
         ], [A, B, C], self.now)
         for cid in (A, B):
-            farm_db.approve_market(self.db, cid, 0.99, 25.0)
+            farm_db.approve_market(self.db, cid, 0.99, 25.0, now=self.now)
         self.publish(events=[
             Event(self.now, EventKind.START, "Reward farmer: DRY RUN"),
             Event(self.now, EventKind.PLACE, "PLACE FAV_BID 98.0c alpha", A, "FAV_BID", 0.98, 100.0, 0.5),
