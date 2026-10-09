@@ -367,8 +367,9 @@ class ScanResult(NamedTuple):
     reward_ids: set
     funnel: farm_db.ScanFunnel
     # The fill prior this scan fit, or None when too few histories were read
-    # and the stored one stands.
+    # and the stored one stands; the exit prior likewise from the tapes.
     prior: Optional[fill_cost.Prior] = None
+    exit_prior: Optional[exit_value.ExitPrior] = None
 
 
 class GammaInfo(NamedTuple):
@@ -1275,6 +1276,13 @@ def load_prior(conn):
     return fill_cost.prior_from_json(stored) or fill_cost.DEFAULT_PRIOR
 
 
+def load_exit_prior(conn):
+    """The exit prior the last scan stored, or exit_value.DEFAULT_EXIT_PRIOR
+    when none is stored or it does not parse."""
+    stored = farm_db.load_scan_json(conn, farm_db.SCAN_EXIT_PRIOR_KEY)
+    return exit_value.exit_prior_from_json(stored) or exit_value.DEFAULT_EXIT_PRIOR
+
+
 # ---------------------------------------------------------------------------
 # Scan
 # ---------------------------------------------------------------------------
@@ -1291,10 +1299,11 @@ def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: No
     their slots to the next markets down the ranking, but a rejected market is
     assessed like any other and may still be sampled. A new prior is fit from
     the sample's histories alone, so it matches the markets it values rather
-    than the busy top; too few leave prior standing. Every market is then
-    assessed again on that prior, each one read on its own history too, and
-    only this second pass's skips count. A market that read no history is
-    valued on the prior alone.
+    than the busy top; too few leave prior standing. An exit prior is fit
+    from the same sample's tapes, and too few leave the stored one standing.
+    Every market is then assessed again on that prior, each one read on its
+    own history too, and only this second pass's skips count. A market that
+    read no history is valued on the prior alone.
     """
     scan_started = time.monotonic()
     with httpx.Client() as http:
@@ -1368,17 +1377,22 @@ def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: No
     on_stage(f"reading fill histories for {len(reads):,} markets")
     started = time.monotonic()
     with httpx.Client() as http:
-        histories = {cid: read.history
-                     for cid, read in fetch_reads(http, reads, now, config.min_fav).items()}
+        fetched = fetch_reads(http, reads, now, config.min_fav)
+    histories = {cid: read.history for cid, read in fetched.items()}
     fitted = fill_cost.fit_prior(
         [histories[m.condition_id] for m in sample if m.condition_id in histories],
         now, config.min_fav)
+    sampled_tapes = [(fetched[m.condition_id].tape, m.end_date) for m in sample
+                     if m.condition_id in fetched and fetched[m.condition_id].tape is not None]
+    fitted_exit = exit_value.fit_exit_prior(sampled_tapes, exit_value.EXIT_PARAMS, now)
     print(f"Histories: {len(histories):,} of {len(reads):,} read, {len(top):,} top "
           f"({passed_over:,} rejected passed over) and "
           f"{len(reads) - len(top):,} more of {len(sample):,} sampled "
           f"({time.monotonic() - started:.1f}s); "
           + (f"fill prior fit from {fitted.markets:,} sampled" if fitted
-             else "too few sampled to fit a fill prior, the stored one stands"))
+             else "too few sampled to fit a fill prior, the stored one stands")
+          + (f"; exit prior fit from {fitted_exit.markets:,} sampled tapes" if fitted_exit
+             else "; too few sampled tapes to fit an exit prior, the stored one stands"))
 
     assessments, assess_skips, _ = assess_all(candidates, config, now, fitted or prior,
                                               histories)
@@ -1390,7 +1404,7 @@ def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: No
         prefilter_skips=prefilter_skips, assess_skips=dict(skipped.most_common()),
     )
     return ScanResult(assessments, {item.get("condition_id") for item in listing}, funnel,
-                      fitted)
+                      fitted, fitted_exit)
 
 
 def assess_all(candidates, config, now, prior, histories):
@@ -1439,10 +1453,12 @@ def scan_row(a):
 
 def store(conn, result, now):
     """Keep a scan in farm.db: its rows, the reward set, its funnel and the
-    fill prior it fit."""
+    fill and exit priors it fit."""
     farm_db.store_scan(conn, [scan_row(a) for a in result.assessments], result.reward_ids,
                        now, result.funnel,
-                       prior=result.prior and fill_cost.prior_to_json(result.prior))
+                       prior=result.prior and fill_cost.prior_to_json(result.prior),
+                       exit_prior=(result.exit_prior
+                                   and exit_value.exit_prior_to_json(result.exit_prior)))
 
 
 FILL_SOURCE_MARK = {"history": "h", "prior": "p", "default": "d"}

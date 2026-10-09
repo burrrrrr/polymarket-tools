@@ -212,6 +212,16 @@ class SettingsTest(ScratchDb):
         self.assertEqual(farm_db.load_scan_json(conn, farm_db.SCAN_FILL_PRIOR_KEY),
                          {"markets": 30})
 
+    def test_the_exit_prior_is_kept_apart_from_the_fill_prior(self):
+        conn = self.open()
+        farm_db.store_scan(conn, [], [], NOW, prior={"markets": 30})
+        farm_db.store_scan(conn, [], [], NOW, exit_prior={"markets": 25})
+        farm_db.store_scan(conn, [], [], NOW, prior={"markets": 31})
+        self.assertEqual([farm_db.load_scan_json(conn, key) for key in
+                          (farm_db.SCAN_FILL_PRIOR_KEY, farm_db.SCAN_EXIT_PRIOR_KEY)],
+                         [{"markets": 31}, {"markets": 25}])
+        self.assertEqual(farm_db.load_settings(conn), ({}, {}))
+
     def test_put_settings_writes_all_or_nothing(self):
         conn = self.open()
         with self.assertRaises(ValueError):

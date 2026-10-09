@@ -6,10 +6,11 @@ from unittest import mock
 
 import httpx
 
+import exit_value
 import farm_db
 import reward_screener
 import fill_cost
-from exit_value import Piece, Sweep
+from exit_value import BuyTape, Piece, Sweep
 from fill_cost import DISTANCES, FillCurve, History, Hit
 from reward_screener import (
     Levels,
@@ -339,12 +340,13 @@ class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
     def scan(self, histories, prior=fill_cost.DEFAULT_PRIOR, tape_markets=2, sample=0,
-             books={}, rejected=frozenset(), tags={}, gamma={}):
+             books={}, rejected=frozenset(), tags={}, gamma={}, tapes={}):
         asked = []
 
         def fake_reads(http, markets, now, floor):
             asked.append([m.condition_id for m in markets])
-            return {cid: Read(h, None) for cid, h in histories.items() if cid in asked[-1]}
+            return {cid: Read(h, tapes.get(cid)) for cid, h in histories.items()
+                    if cid in asked[-1]}
 
         with mock.patch.multiple(
                 reward_screener,
@@ -427,6 +429,21 @@ class RunScanTest(unittest.TestCase):
         self.assertEqual(sorted(asked[0]), ["0x1", "0x2"])
         self.assertEqual(result.prior.markets, 2)
         self.assertEqual([a.market.condition_id for a in result.assessments], ["0x1", "0x2"])
+
+    # A buy an hour before the scan over ten days of tape.
+    TAPE = BuyTape([Sweep(SCAN_NOW.timestamp() - 3600, (Piece(0.97, 50.0),))], SCAN_NOW,
+                   SCAN_NOW.timestamp() - 10 * 86400)
+
+    def test_the_exit_prior_is_fit_from_the_sampled_markets_tapes(self):
+        tapes = {"0x1": self.TAPE, "0x2": self.TAPE}
+        histories = {c: self.QUIET for c in self.RATES}
+        with mock.patch.object(exit_value, "PRIOR_MIN_MARKETS", 2):
+            sampled, _ = self.scan(histories, tape_markets=1, sample=3, tapes=tapes)
+            top, _ = self.scan(histories, tape_markets=3, tapes=tapes)
+        self.assertEqual((sampled.exit_prior.markets, sampled.exit_prior.at), (2, SCAN_NOW))
+        self.assertGreater(sampled.exit_prior.arrival_per_day, 0)
+        self.assertIsNone(top.exit_prior)
+        self.assertIsNone(sampled.prior)
 
     def test_every_market_is_valued_again_on_the_prior_the_sample_fit(self):
         with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
@@ -806,6 +823,48 @@ class FetchTotalRatesTest(unittest.TestCase):
         http, _ = rewards_api(REWARD_ROWS, next_cursor="aWQ6MTI4NDk2OA==")
         with self.assertRaises(ValueError):
             reward_screener.fetch_total_rates(http)
+
+
+class StoreTest(unittest.TestCase):
+    def test_a_scan_stores_the_exit_prior_it_fit_beside_the_stored_fill_prior(self):
+        conn = farm_db.open_db(":memory:")
+        self.addCleanup(conn.close)
+        funnel = farm_db.ScanFunnel(SCAN_NOW, 1.0, 0, 0, 0, {}, {})
+        exit_prior = exit_value.DEFAULT_EXIT_PRIOR._replace(markets=30, at=SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel, PRIOR), SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel, None,
+                                                               exit_prior), SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel), SCAN_NOW)
+        self.assertEqual((reward_screener.load_prior(conn), reward_screener.load_exit_prior(conn)),
+                         (PRIOR, exit_prior))
+
+
+class LoadExitPriorTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = farm_db.open_db(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def store(self, text):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (farm_db.SCAN_EXIT_PRIOR_KEY, text, "2026-10-04T12:00:00+00:00"))
+
+    def test_no_stored_exit_prior_reads_as_the_default(self):
+        self.assertEqual(reward_screener.load_exit_prior(self.conn), exit_value.DEFAULT_EXIT_PRIOR)
+
+    def test_a_stored_exit_prior_is_read_back(self):
+        prior = exit_value.DEFAULT_EXIT_PRIOR._replace(markets=40, at=HISTORY_NOW)
+        self.store(json.dumps(exit_value.exit_prior_to_json(prior)))
+        self.assertEqual(reward_screener.load_exit_prior(self.conn), prior)
+
+    def test_a_malformed_stored_exit_prior_reads_as_the_default(self):
+        for text in ("{not json", json.dumps({"v": 1}), json.dumps([1, 2])):
+            with self.subTest(text=text):
+                self.conn.execute("DELETE FROM settings")
+                self.store(text)
+                self.assertEqual(reward_screener.load_exit_prior(self.conn),
+                                 exit_value.DEFAULT_EXIT_PRIOR)
 
 
 class LoadPriorTest(unittest.TestCase):

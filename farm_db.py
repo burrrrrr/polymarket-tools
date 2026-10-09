@@ -290,16 +290,17 @@ class ScanFunnel(NamedTuple):
 SCAN_PARAMS_KEY = "scan.params"
 SCAN_LAST_KEY = "scan.last"
 SCAN_FILL_PRIOR_KEY = "scan.fill_prior"
+SCAN_EXIT_PRIOR_KEY = "scan.exit_prior"
 
 
-def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None):
+def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None, exit_prior=None):
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
     naked_paused, capital_usd) are never touched, so rescanning is always
     safe. Retiring is the farmer's call. A funnel is kept as the last scan's,
-    and a prior (the JSON-safe dict of a fill prior) as the fill prior every
-    reader values fills with.
+    a prior (the JSON-safe dict of a fill prior) as the fill prior every
+    reader values fills with, and an exit_prior likewise for exits.
     """
     at = stamp(now)
     with conn:
@@ -307,6 +308,8 @@ def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None):
             _put_json(conn, SCAN_LAST_KEY, {**funnel._asdict(), "at": stamp(funnel.at)}, now)
         if prior is not None:
             _put_json(conn, SCAN_FILL_PRIOR_KEY, prior, now)
+        if exit_prior is not None:
+            _put_json(conn, SCAN_EXIT_PRIOR_KEY, exit_prior, now)
         conn.executemany(
             """
             INSERT INTO markets (condition_id, slug, question, end_date,
