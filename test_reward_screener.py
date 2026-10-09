@@ -9,11 +9,13 @@ import httpx
 import farm_db
 import reward_screener
 import fill_cost
+from exit_value import Piece, Sweep
 from fill_cost import DISTANCES, FillCurve, History, Hit
 from reward_screener import (
     Levels,
     Mode,
     Outlook,
+    Read,
     RewardMarket,
     ScreenConfig,
     Skip,
@@ -22,6 +24,7 @@ from reward_screener import (
     fav_bid_candidates,
     fav_ceiling,
     longshot_bid,
+    parse_buys,
     parse_gamma,
     parse_hits,
     plan_at,
@@ -339,9 +342,9 @@ class RunScanTest(unittest.TestCase):
              books={}, rejected=frozenset(), tags={}, gamma={}):
         asked = []
 
-        def fake_histories(http, markets, now, floor):
+        def fake_reads(http, markets, now, floor):
             asked.append([m.condition_id for m in markets])
-            return {cid: h for cid, h in histories.items() if cid in asked[-1]}
+            return {cid: Read(h, None) for cid, h in histories.items() if cid in asked[-1]}
 
         with mock.patch.multiple(
                 reward_screener,
@@ -350,7 +353,7 @@ class RunScanTest(unittest.TestCase):
                 fetch_total_rates=lambda http: dict(self.RATES),
                 fetch_levels=lambda http, ids: {t: books.get(t, DEEP_BOOK) for t in ids},
                 fetch_gamma=lambda http, ids: dict(gamma),
-                fetch_histories=fake_histories,
+                fetch_reads=fake_reads,
                 PRIOR_SAMPLE=sample), mock.patch("builtins.print"):
             result = reward_screener.run_scan(CONFIG._replace(tape_markets=tape_markets),
                                               SCAN_NOW, prior, frozenset(rejected))
@@ -551,6 +554,67 @@ class ParseHitsTest(unittest.TestCase):
         self.assertEqual(hits, [Hit(self.AT, 0.95)])
 
 
+class ParseBuysTest(unittest.TestCase):
+    AT = HISTORY_NOW.timestamp() - 60
+
+    def test_a_buy_is_the_ladder_of_maker_asks_it_took_highest_first(self):
+        # The taker row prints the volume-weighted price, not the top of the ladder.
+        taker = [priced("BUY", FAV_TOKEN, 0.9351, wallet="0xtaker", size=70.0)]
+        makers = [priced("SELL", FAV_TOKEN, 0.935, wallet="0xm1", size=62.28),
+                  priced("SELL", FAV_TOKEN, 0.935, wallet="0xm2", size=5.36),
+                  priced("SELL", FAV_TOKEN, 0.939, wallet="0xm3", size=2.3)]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.at, self.AT)
+        self.assertEqual([p.price for p in buy.pieces], [0.939, 0.935])
+        self.assertEqual([round(p.size, 2) for p in buy.pieces], [2.3, 67.64])
+
+    def test_selling_the_other_outcome_buys_the_favorite_at_one_minus_its_price(self):
+        taker = [priced("SELL", LONG_TOKEN, 0.04, wallet="0xtaker", size=50.0)]
+        makers = [priced("BUY", LONG_TOKEN, 0.04, wallet="0xm1", size=30.0),
+                  priced("SELL", FAV_TOKEN, 0.955, wallet="0xm2", size=20.0)]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.96, 30.0), Piece(0.955, 20.0)))
+
+    def test_only_the_makers_of_its_own_transaction_are_a_buys_pieces(self):
+        taker = [priced("BUY", FAV_TOKEN, 0.95, wallet="0xtaker")]
+        makers = [priced("SELL", FAV_TOKEN, 0.95, wallet="0xm1"),
+                  priced("SELL", FAV_TOKEN, 0.99, tx="0xother", wallet="0xm2")]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.95, 10.0),))
+
+    def test_a_buy_listed_without_its_makers_is_one_piece_at_its_own_price(self):
+        taker = [priced("SELL", LONG_TOKEN, 0.0648685, size=70.0)]
+        [buy] = parse_buys(taker, taker, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.9351315, 70.0),))
+
+    def test_taker_rows_of_one_transaction_are_one_buy(self):
+        taker = [priced("BUY", FAV_TOKEN, 0.95, wallet="0xtaker"),
+                 priced("SELL", LONG_TOKEN, 0.04, wallet="0xtaker", size=5.0),
+                 priced("BUY", FAV_TOKEN, 0.97, tx="0xlater", seconds_ago=30)]
+        buys = parse_buys(taker, taker, FAV_TOKEN)
+        self.assertEqual(buys, [Sweep(self.AT, (Piece(0.96, 5.0), Piece(0.95, 10.0))),
+                                Sweep(self.AT + 30, (Piece(0.97, 10.0),))])
+
+    def test_a_hit_on_favorite_bids_is_not_a_buy_and_hits_are_read_as_before(self):
+        hit = [priced("SELL", FAV_TOKEN, 0.95, tx="0xhit", wallet="0xtaker")]
+        hit_makers = [priced("BUY", FAV_TOKEN, 0.94, tx="0xhit", wallet="0xm1")]
+        buy = [priced("BUY", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xtaker")]
+        buy_makers = [priced("SELL", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xm2")]
+        taker, every = hit + buy, hit + hit_makers + buy + buy_makers
+        self.assertEqual(parse_buys(taker, every, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.97, 10.0),))])
+        self.assertEqual(parse_hits(taker, every, FAV_TOKEN), [Hit(self.AT, 0.94)])
+
+    def test_malformed_rows_are_dropped(self):
+        good = priced("BUY", FAV_TOKEN, 0.95)
+        bad = [{**good, "transactionHash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
+               {**good, "price": 1.0}, {**good, "timestamp": None}, "row", None]
+        self.assertEqual(parse_buys(bad, bad, FAV_TOKEN), [])
+        broken_maker = {**priced("SELL", FAV_TOKEN, 0.99, wallet="0xm"), "size": -5}
+        self.assertEqual(parse_buys([good] + bad, [good, broken_maker] + bad, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.95, 10.0),))])
+
+
 DAY_S = 86400
 
 
@@ -584,12 +648,13 @@ def listed(calls, path):
     return [c.url.params for c in calls if c.url.path == path]
 
 
-class FetchHistoryTest(unittest.TestCase):
-    def test_a_history_reads_all_rows_then_taker_rows_then_mids(self):
+class FetchReadTest(unittest.TestCase):
+    def test_a_read_reads_all_rows_then_taker_rows_then_mids(self):
         taker = [priced("SELL", FAV_TOKEN, 0.95, tx="0xa", wallet="0xt", seconds_ago=DAY_S)]
         maker = [priced("BUY", FAV_TOKEN, 0.93, tx="0xa", wallet="0xm", seconds_ago=DAY_S)]
         http, calls = history_api([taker + maker], [taker], hourly_mids(0.96))
-        history = reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        history = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW,
+                                             0.90).history
         self.assertEqual([p["takerOnly"] for p in listed(calls, "/trades")], ["false", "true"])
         self.assertEqual(calls[-1].url.path, "/prices-history")
         reach = [history.events[fill_cost.DISTANCES.index(d)] for d in (0.02, 0.03)]
@@ -597,9 +662,22 @@ class FetchHistoryTest(unittest.TestCase):
         self.assertAlmostEqual(history.days, 60.0)
         self.assertEqual((history.read_at, history.floor), (HISTORY_NOW, 0.90))
 
+    def test_a_read_takes_its_buys_from_the_same_requests_and_the_same_start(self):
+        hit = [priced("SELL", FAV_TOKEN, 0.95, tx="0xa", wallet="0xt", seconds_ago=DAY_S)]
+        buy = [priced("BUY", FAV_TOKEN, 0.97, tx="0xb", wallet="0xt", seconds_ago=2 * DAY_S)]
+        ask = [priced("SELL", FAV_TOKEN, 0.97, tx="0xb", wallet="0xm", seconds_ago=2 * DAY_S)]
+        old = [priced("BUY", FAV_TOKEN, 0.96, tx="0xc", wallet="0xt", seconds_ago=61 * DAY_S)]
+        http, calls = history_api([hit + buy + ask + old], [hit + buy + old], hourly_mids(0.96))
+        read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        self.assertEqual([c.url.path for c in calls], ["/trades"] * 2 + ["/prices-history"] * 5)
+        start = HISTORY_NOW.timestamp() - 60 * DAY_S
+        self.assertEqual((read.tape.read_at, read.tape.first_at), (HISTORY_NOW, start))
+        self.assertEqual(read.tape.sweeps,
+                         (Sweep(HISTORY_NOW.timestamp() - 2 * DAY_S, (Piece(0.97, 10.0),)),))
+
     def test_mids_are_read_in_chunks_of_at_most_fourteen_days(self):
         http, calls = history_api([[]], [[]], hourly_mids(0.96))
-        reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
         chunks = [(int(p["startTs"]), int(p["endTs"])) for p in listed(calls, "/prices-history")]
         self.assertEqual(len(chunks), 5)
         self.assertTrue(all(0 < hi - lo <= 14 * DAY_S for lo, hi in chunks), chunks)
@@ -621,14 +699,16 @@ class FetchHistoryTest(unittest.TestCase):
         first = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432 * n) for n in range(1000)]
         second = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432000 + 432 * n)
                   for n in range(1, 1001)]
-        taker = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=3600 * n) for n in range(1000)]
+        taker = [priced("BUY", FAV_TOKEN, 0.97, tx=f"0x{n}", seconds_ago=3600 * n)
+                 for n in range(1000)]
         http, calls = history_api([first, second], [taker, taker], hourly_mids(0.96))
-        history = reward_screener.fetch_history(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
         trades = listed(calls, "/trades")
         self.assertEqual([(p["takerOnly"], p["offset"]) for p in trades],
                          [("false", "0"), ("false", "1000"), ("true", "0")])
-        self.assertAlmostEqual(history.days, 10.0)
+        self.assertAlmostEqual(read.history.days, 10.0)
         oldest = HISTORY_NOW.timestamp() - 10 * DAY_S
+        self.assertEqual((read.tape.first_at, len(read.tape.sweeps)), (oldest, 241))
         self.assertEqual(int(listed(calls, "/prices-history")[0]["startTs"]), int(oldest - 60 - 3600))
 
     def test_a_full_page_reaching_past_the_cutoff_is_complete_from_the_cutoff(self):
@@ -653,11 +733,11 @@ class FetchHistoryTest(unittest.TestCase):
         self.assertEqual([c.args for c in sleep.call_args_list], [(2.0,)])
         self.assertEqual(len(rows), 1)
 
-    def test_a_failed_market_is_left_out_of_the_histories(self):
+    def test_a_failed_market_is_left_out_of_the_reads(self):
         http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
         with mock.patch("builtins.print") as printed:
-            histories = reward_screener.fetch_histories(http, [MARKET], HISTORY_NOW, 0.90)
-        self.assertEqual(histories, {})
+            reads = reward_screener.fetch_reads(http, [MARKET], HISTORY_NOW, 0.90)
+        self.assertEqual(reads, {})
         self.assertIn("test-market", printed.call_args.args[0])
 
 

@@ -27,6 +27,9 @@ a busy timeout, and every column has exactly one writer process:
                   transitions, ...), never per-cycle holds.
   farm_mids       farmer. One midpoint sample per managed market per minute,
                   in dry run too, kept 7 days, for the console's mid chart.
+  fav_buys        farmer. Each market's last buy tape read (exit_value),
+                  in dry run too, replaced when a new read lands, so a
+                  restart starts from it.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
                   config, read every cycle. Keys under the `scan.` and
@@ -148,6 +151,12 @@ CREATE TABLE IF NOT EXISTS farm_mids (
     fav_bid REAL,
     long_bid REAL,
     PRIMARY KEY (condition_id, at)
+);
+
+CREATE TABLE IF NOT EXISTS fav_buys (
+    condition_id TEXT PRIMARY KEY,
+    read_at TEXT NOT NULL,
+    tape TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -993,6 +1002,13 @@ def prune_mids(conn, now):
         ).rowcount
 
 
+def save_buys(conn, condition_id, read_at, tape_json):
+    """Keep a market's buy tape, as exit_value.tape_to_json, replacing the last."""
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO fav_buys VALUES (?, ?, ?)",
+                     (condition_id, stamp(read_at), json.dumps(tape_json)))
+
+
 def store_rewards(conn, date, earnings, now):
     """Upsert one day's {condition_id: earnings_usd}."""
     with conn:
@@ -1107,6 +1123,12 @@ def read_farm_states(conn):
         )
         for r in conn.execute("SELECT * FROM farm_state")
     }
+
+
+def read_buys(conn):
+    """{condition_id: the JSON-safe dict of its buy tape} of every saved tape."""
+    return {r["condition_id"]: json.loads(r["tape"])
+            for r in conn.execute("SELECT condition_id, tape FROM fav_buys")}
 
 
 def read_events(conn, *, condition_id=None, kinds=(), since=None, after_id=None,

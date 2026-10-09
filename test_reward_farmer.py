@@ -46,8 +46,9 @@ from reward_farmer import (
     without_backed_off,
 )
 import fill_cost
+from exit_value import TAPE_ROWS_FARMER, BuyTape, Piece, Sweep, tape_to_json
 from fill_cost import DISTANCES, FillCurve, History
-from reward_screener import Levels, round_size_up
+from reward_screener import Levels, Read, round_size_up
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
@@ -139,6 +140,7 @@ SWEPT = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
 # A scan's fill prior, and a market history with no sweeps in 60 days.
 PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=NOW)
 NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90, 0, 0.0)
+NO_BUYS = BuyTape((), NOW, NOW.timestamp() - 60 * 86400)
 
 
 def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET):
@@ -915,9 +917,10 @@ class FetchHoldingsTest(unittest.TestCase):
 
 class HistoriesTest(unittest.TestCase):
     WANT = reward_farmer.Want(FAV, 0.90, "test-market")
+    READ = Read(NO_SWEEPS, NO_BUYS)
 
     def setUp(self):
-        self.fetch = mock.Mock(return_value=NO_SWEEPS)
+        self.fetch = mock.Mock(return_value=self.READ)
         self.histories = reward_farmer.Histories(threading.Event(), self.fetch)
         self.histories.wanted = {"0xc0nd": self.WANT}
         patcher = mock.patch.object(reward_farmer, "log")
@@ -940,14 +943,14 @@ class HistoriesTest(unittest.TestCase):
                                                          NOW + timedelta(seconds=3600), 0.90))
 
     def test_a_failed_first_read_leaves_no_history_and_retries_after_two_minutes(self):
-        self.fetch.side_effect = [httpx.ConnectError("data API down"), NO_SWEEPS]
-        self.assertEqual(self.refresh_at(0, 119, 120), [None, None, NO_SWEEPS])
+        self.fetch.side_effect = [httpx.ConnectError("data API down"), self.READ]
+        self.assertEqual(self.refresh_at(0, 119, 120), [None, None, self.READ])
         self.assertEqual(self.fetch.call_count, 2)
 
     def test_a_failed_reread_keeps_the_last_history(self):
-        later = NO_SWEEPS._replace(events=(1,) * len(DISTANCES))
-        self.fetch.side_effect = [NO_SWEEPS, httpx.ConnectError("data API down"), later]
-        self.assertEqual(self.refresh_at(0, 3600, 3700, 3720), [NO_SWEEPS] * 3 + [later])
+        later = Read(NO_SWEEPS._replace(events=(1,) * len(DISTANCES)), NO_BUYS)
+        self.fetch.side_effect = [self.READ, httpx.ConnectError("data API down"), later]
+        self.assertEqual(self.refresh_at(0, 3600, 3700, 3720), [self.READ] * 3 + [later])
 
     def test_a_market_no_longer_wanted_is_forgotten(self):
         other = reward_farmer.Want("other-fav", 0.90, "other")
@@ -955,7 +958,7 @@ class HistoriesTest(unittest.TestCase):
         self.refresh_at(0)
         self.histories.wanted = {"0xother": other}
         self.refresh_at(5)
-        self.assertEqual(self.histories.read, {"0xother": NO_SWEEPS})
+        self.assertEqual(self.histories.read, {"0xother": self.READ})
         self.histories.wanted = {"0xc0nd": self.WANT}
         self.refresh_at(10)
         self.assertEqual(self.fetch.call_count, 3)
@@ -1116,10 +1119,11 @@ class FarmerHarness(unittest.TestCase):
         self.on_book_fetch = lambda count: None
         self.infos = mock.Mock(return_value={CID: INFO})
         self.history = mock.Mock(return_value=NO_SWEEPS)
+        self.sweeps = ()
         self.book = FLOOR_BOOK
         for name, fake in (
             ("fetch_market_infos", self.infos),
-            ("fetch_history", self.history),
+            ("fetch_read", self.fake_read),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
@@ -1129,6 +1133,11 @@ class FarmerHarness(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.args = build_parser().parse_args(["--db", self.path, "--interval", "0.01"])
+
+    def fake_read(self, http, condition_id, fav_token_id, now, floor):
+        """A read of self.history's History and a new tape of self.sweeps."""
+        history = self.history(http, condition_id, fav_token_id, now, floor)
+        return Read(history, BuyTape(self.sweeps, now, now.timestamp() - 60 * 86400))
 
     def fake_levels(self, http, token_ids):
         self.book_fetches += 1
@@ -1536,6 +1545,65 @@ class FarmerCycleTest(FarmerHarness):
         self.started_farmer()
         self.assertEqual([r["at"] for r in self.query("SELECT at FROM farm_mids")],
                          [farm_db.stamp(now - timedelta(days=6))])
+
+
+class BuyTapeFarmerTest(FarmerHarness):
+    def setUp(self):
+        super().setUp()
+        self.sweeps = (Sweep(NOW.timestamp() - 3600, (Piece(0.995, 40.0), Piece(0.99, 60.0))),)
+        saves = mock.patch.object(farm_db, "save_buys", wraps=farm_db.save_buys)
+        self.save = saves.start()
+        self.addCleanup(saves.stop)
+
+    def test_a_read_tape_is_saved_once_not_every_cycle(self):
+        farmer = self.started_farmer()
+        for _ in range(3):
+            farmer.cycle()
+        self.assertEqual(self.save.call_count, 1)
+        farmer.histories.refresh(farmer.http, NOW + timedelta(seconds=reward_farmer.HISTORY_S))
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(self.save.call_count, 2)
+        tape = farmer.histories.read[CID].tape
+        self.assertEqual(farm_db.read_buys(self.ui),
+                         {CID: tape_to_json(tape, TAPE_ROWS_FARMER)})
+        self.assertEqual(tape.read_at, NOW + timedelta(seconds=reward_farmer.HISTORY_S))
+
+    def restarted(self):
+        """A farmer that read and saved a fresh tape, then a second one started
+        after it, before its reader reads anything."""
+        now = datetime.now(timezone.utc)
+        self.history.return_value = NO_SWEEPS._replace(read_at=now)
+        first = self.started_farmer(read_histories=False)
+        first.histories.refresh(first.http, now)
+        first.cycle()
+        first.shutdown("test", cancel=False)
+        self.history.reset_mock()
+        self.save.reset_mock()
+        return first.histories.read[CID], self.started_farmer(read_histories=False)
+
+    def test_a_restart_seeds_the_history_and_the_tape_it_saved(self):
+        read, farmer = self.restarted()
+        seeded = farmer.histories.read[CID]
+        self.assertEqual(seeded.history, read.history)
+        self.assertEqual((seeded.tape.sweeps, seeded.tape.read_at, seeded.tape.first_at),
+                         (self.sweeps, read.tape.read_at, read.tape.first_at))
+        farmer.cycle()
+        self.history.assert_not_called()
+        self.save.assert_not_called()
+        self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
+
+    def test_a_history_without_a_fresh_tape_still_seeds_and_bids(self):
+        stale = tape_to_json(BuyTape(self.sweeps, datetime.now(timezone.utc) - timedelta(
+            seconds=reward_farmer.HISTORY_S + 60), NOW.timestamp() - 86400), TAPE_ROWS_FARMER)
+        for tape in (None, stale, {"v": 99}):
+            with self.subTest(tape=tape and tape["v"]):
+                with mock.patch.object(farm_db, "read_buys",
+                                       return_value={} if tape is None else {CID: tape}):
+                    read, farmer = self.restarted()
+                self.assertEqual(farmer.histories.read[CID], Read(read.history, None))
+                farmer.cycle()
+                self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
 
 
 CID2, FAV2, LONG2 = "0xc0nd2", "fav-token-2", "long-token-2"

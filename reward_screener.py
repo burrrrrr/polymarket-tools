@@ -81,6 +81,7 @@ from typing import NamedTuple, Optional
 
 import httpx
 
+import exit_value
 import farm_db
 import fill_cost
 
@@ -977,6 +978,44 @@ def parse_hits(taker_rows, all_rows, fav_token_id):
             for t in taker if (t.side == "SELL") == (t.asset == fav_token_id)]
 
 
+def parse_buys(taker_rows, all_rows, fav_token_id):
+    """[exit_value.Sweep] from a market's /trades rows, oldest first, read as
+    parse_hits reads them: one sweep per transaction whose taker bought the
+    favorite, or sold the other outcome at 1 - price.
+
+    A taker row prints the volume-weighted price of its fills, so a sweep's
+    pieces are its transaction's maker fills that sold the favorite, or bought
+    the other outcome at 1 - price, shares summed per price. A transaction
+    listed without such makers is pieced from its taker rows instead.
+    Malformed rows are dropped.
+    """
+    taker = [t for t in map(parse_trade, taker_rows) if t]
+    unmatched = Counter(t[:6] for t in taker)
+    makers = {}
+    for t in filter(None, map(parse_trade, all_rows)):
+        if unmatched[t[:6]]:
+            unmatched[t[:6]] -= 1
+        elif (t.side == "SELL") == (t.asset == fav_token_id):
+            makers.setdefault(t.tx, []).append(t)
+    buys = {}
+    for t in taker:
+        if (t.side == "BUY") == (t.asset == fav_token_id):
+            buys.setdefault(t.tx, []).append(t)
+    return sorted((exit_value.Sweep(min(t.at for t in rows),
+                                    _pieces(makers.get(tx) or rows, fav_token_id))
+                   for tx, rows in buys.items()), key=lambda s: s.at)
+
+
+def _pieces(trades, fav_token_id):
+    """The trades' shares summed per favorite-equivalent price, highest first."""
+    shares = Counter()
+    for t in trades:
+        # 1 - price carries float error; rounding lets equal prices merge.
+        shares[round(_fav_price(t, fav_token_id), 9)] += t.size
+    return tuple(exit_value.Piece(price, size) for price, size in sorted(shares.items(),
+                                                                         reverse=True))
+
+
 def _fav_price(trade, fav_token_id):
     return trade.price if trade.asset == fav_token_id else 1 - trade.price
 
@@ -1186,12 +1225,20 @@ def fetch_mids(http, token_id, start, end, timeout=20):
     return sorted(mids)
 
 
-def fetch_history(http, condition_id, fav_token_id, now, floor, timeout=20):
-    """One market's fill_cost.History; raises on a failed read.
+class Read(NamedTuple):
+    """One market's trades read both ways: the fill history of a favorite bid
+    and the buy tape a favorite ask sells into."""
+
+    history: fill_cost.History
+    tape: Optional[exit_value.BuyTape]
+
+
+def fetch_read(http, condition_id, fav_token_id, now, floor, timeout=20):
+    """One market's Read; raises on a failed read.
 
     All rows come first because they reach the row cap soonest, then taker
     rows only back to where all rows are complete, then mids only from where
-    both are.
+    both are. The tape holds the buys from that same start.
     """
     cutoff = now.timestamp() - fill_cost.HISTORY_DAYS * fill_cost.DAY_S
     every, every_from = fetch_trades(http, condition_id, False, cutoff, timeout)
@@ -1200,15 +1247,17 @@ def fetch_history(http, condition_id, fav_token_id, now, floor, timeout=20):
     mids = fetch_mids(http, fav_token_id, start - fill_cost.PRE_SWEEP_S - MIDS_LEAD_S,
                       now.timestamp(), timeout)
     hits = parse_hits(taker, every, fav_token_id)
-    return fill_cost.make_history(hits, mids, start, now, floor)
+    buys = [s for s in parse_buys(taker, every, fav_token_id) if s.at >= start]
+    return Read(fill_cost.make_history(hits, mids, start, now, floor),
+                exit_value.BuyTape(buys, now, start))
 
 
-def fetch_histories(http, markets, now, floor):
-    """{condition_id: History} over HISTORY_THREADS threads; a failed market is left out."""
+def fetch_reads(http, markets, now, floor):
+    """{condition_id: Read} over HISTORY_THREADS threads; a failed market is left out."""
     def fetch(market):
         try:
-            return market.condition_id, fetch_history(http, market.condition_id,
-                                                      market.fav_token_id, now, floor)
+            return market.condition_id, fetch_read(http, market.condition_id,
+                                                   market.fav_token_id, now, floor)
         except Exception as e:
             print(f"  Warning: fill history of {market.slug or market.condition_id} failed ({e})")
             return market.condition_id, None
@@ -1216,7 +1265,7 @@ def fetch_histories(http, markets, now, floor):
     if not markets:
         return {}
     with ThreadPoolExecutor(min(len(markets), HISTORY_THREADS)) as pool:
-        return {cid: history for cid, history in pool.map(fetch, markets) if history is not None}
+        return {cid: read for cid, read in pool.map(fetch, markets) if read is not None}
 
 
 def load_prior(conn):
@@ -1319,7 +1368,8 @@ def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: No
     on_stage(f"reading fill histories for {len(reads):,} markets")
     started = time.monotonic()
     with httpx.Client() as http:
-        histories = fetch_histories(http, reads, now, config.min_fav)
+        histories = {cid: read.history
+                     for cid, read in fetch_reads(http, reads, now, config.min_fav).items()}
     fitted = fill_cost.fit_prior(
         [histories[m.condition_id] for m in sample if m.condition_id in histories],
         now, config.min_fav)

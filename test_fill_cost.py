@@ -1,3 +1,4 @@
+import json
 import math
 import random
 import unittest
@@ -326,6 +327,16 @@ class StoredHistoryTest(unittest.TestCase):
         self.assertEqual(history_from_json(history_to_json(HISTORY)), HISTORY)
         self.assertEqual(prior_from_json(prior_to_json(PRIOR)), PRIOR)
         self.assertEqual(prior_from_json(prior_to_json(DEFAULT_PRIOR)), DEFAULT_PRIOR)
+
+    def test_a_history_the_live_farmer_stored_reads_and_writes_back_unchanged(self):
+        # A farm_state FAV_BID history from 2026-10-09, as farm.db holds it.
+        stored = ('{"v": 2, "distances": [0.0, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, '
+                  '0.04, 0.05, 0.075, 0.1], "events": [4, 4, 3, 3, 1, 1, 1, 1, 0, 0, 0, 0], '
+                  '"days": 36.77603665377255, "read_at": "2026-10-09T19:59:44.566886+00:00", '
+                  '"floor": 0.9, "exits": 1, "held_days": 3.777974537037037}')
+        history = history_from_json(json.loads(stored))
+        self.assertEqual((history.events[0], history.exits), (4, 1))
+        self.assertEqual(json.dumps(history_to_json(history)), stored)
 
     def test_an_old_stored_tape_reads_as_no_history(self):
         old = {"sweeps": [[T - DAY, 100.0]], "span_days": 5.0, "observed": True,

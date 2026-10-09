@@ -54,7 +54,7 @@ CREATE TABLE triage (
 """
 
 NEW_TABLES = {"farm_state", "farmer_status", "farm_events", "settings", "commands",
-              "rewards_daily", "farm_mids"}
+              "rewards_daily", "farm_mids", "fav_buys"}
 
 
 class ScratchDb(unittest.TestCase):
@@ -419,6 +419,25 @@ class PublishTest(ScratchDb):
         farm_db.publish(conn, self.status(), None, [old, new])
         self.assertEqual(farm_db.prune_events(conn, NOW), 1)
         self.assertEqual([r[0] for r in conn.execute("SELECT message FROM farm_events")], ["new"])
+
+
+class BuysTest(ScratchDb):
+    TAPE = {"v": 1, "read_at": NOW.isoformat(), "first_at": NOW.timestamp() - 86400,
+            "sweeps": [[NOW.timestamp() - 60, [[0.97, 25.0], [0.965, 300.0]]]]}
+
+    def test_a_saved_tape_reads_back_and_a_newer_one_replaces_it(self):
+        conn = self.open()
+        farm_db.save_buys(conn, "0xa", NOW, self.TAPE)
+        farm_db.save_buys(conn, "0xb", NOW, {**self.TAPE, "sweeps": []})
+        newer = {**self.TAPE, "read_at": (NOW + timedelta(hours=1)).isoformat()}
+        farm_db.save_buys(conn, "0xa", NOW + timedelta(hours=1), newer)
+        self.assertEqual(farm_db.read_buys(conn), {"0xa": newer,
+                                                   "0xb": {**self.TAPE, "sweeps": []}})
+        self.assertEqual([r[0] for r in conn.execute("SELECT read_at FROM fav_buys ORDER BY 1")],
+                         [farm_db.stamp(NOW), farm_db.stamp(NOW + timedelta(hours=1))])
+
+    def test_a_database_with_no_tape_saved_reads_as_empty(self):
+        self.assertEqual(farm_db.read_buys(self.open()), {})
 
 
 FR, US = "2027-french-presidential-election", "2028-us-presidential-election"

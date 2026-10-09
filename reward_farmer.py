@@ -147,6 +147,7 @@ from dotenv import load_dotenv
 
 import farm_db
 import fill_cost
+from exit_value import TAPE_ROWS_FARMER, tape_from_json, tape_to_json
 from farm_db import EventKind, stamp
 from py_clob_client_v2.clob_types import (
     AssetType,
@@ -166,6 +167,7 @@ from reward_screener import (
     Levels,
     Outlook,
     QuoteValue,
+    Read,
     Skip,
     _chunks,
     _float,
@@ -175,8 +177,8 @@ from reward_screener import (
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
-    fetch_history,
     fetch_levels,
+    fetch_read,
     fetch_total_rates,
     floor_to_tick,
     get_with_retry,
@@ -1290,7 +1292,7 @@ class TotalRates:
 
 
 class Want(NamedTuple):
-    """A market whose fill history the farmer wants, and the floor to read it at."""
+    """A market whose read the farmer wants, and the floor to read it at."""
 
     fav_token_id: str
     floor: float
@@ -1298,15 +1300,16 @@ class Want(NamedTuple):
 
 
 class Histories:
-    """Each active market's fill history, read on a thread of its own: a read
-    takes up to nine requests, and the main loop must not wait on them.
+    """Each active market's fill history and buy tape, read on a thread of
+    its own: a read takes up to nine requests, and the main loop must not wait
+    on them.
 
     wanted ({condition_id: Want}) is written by the main loop alone, read
-    ({condition_id: fill_cost.History}) by the reader alone once Farmer.start
-    has seeded it; each is replaced whole, never mutated. A market is read
-    once wanted, even if seeded, again every HISTORY_S, and at once when
-    what is wanted of it changes. A failed read keeps the last history and
-    retries after HISTORY_RETRY_S.
+    ({condition_id: Read}) by the reader alone once Farmer.start has seeded
+    it; each is replaced whole, never mutated. A market is read once wanted,
+    even if seeded, again every HISTORY_S, and at once when what is wanted of
+    it changes. A failed read keeps the last one and retries after
+    HISTORY_RETRY_S.
     """
 
     def __init__(self, stop, fetch):
@@ -1329,12 +1332,12 @@ class Histories:
             if now < due and read_for == want:
                 continue
             try:
-                history = self._fetch(http, cid, want.fav_token_id, now, want.floor)
+                read = self._fetch(http, cid, want.fav_token_id, now, want.floor)
             except Exception as e:
                 log(f"Warning: fill history of {want.label} failed ({e})")
                 self._due[cid] = now + timedelta(seconds=HISTORY_RETRY_S), want
                 continue
-            self.read = {**self.read, cid: history}
+            self.read = {**self.read, cid: read}
             self._due[cid] = now + timedelta(seconds=HISTORY_S), want
 
     def run(self):
@@ -1454,7 +1457,8 @@ class Farmer:
         self.keep_orders = False
         self.total_rates = TotalRates(self.stop)
         self.infos = MarketInfos(self.stop, fetch_market_infos)
-        self.histories = Histories(self.stop, fetch_history)
+        self.histories = Histories(self.stop, fetch_read)
+        self.saved_tapes = {}
         self.prior = fill_cost.DEFAULT_PRIOR
         self.user = os.getenv("POLYMARKET_FUNDER_ADDRESS")
 
@@ -1471,10 +1475,12 @@ class Farmer:
         ))
 
     def flush(self, stopped_at=None):
-        """Publish the queued events and the status; farm_state too unless stopping."""
+        """Publish the queued events and the status; farm_state and the buy
+        tapes read since the last flush too unless stopping."""
         states = None
         if stopped_at is None:
             states = [m.snapshot for m in self.markets.values() if m.snapshot]
+            self.save_tapes()
         status = farm_db.FarmerStatus(
             mode="live" if self.live else "dry",
             pid=os.getpid(),
@@ -1488,6 +1494,16 @@ class Farmer:
         )
         farm_db.publish(self.db, status, states, self.events, self.mids)
         self.events, self.mids = [], []
+
+    def save_tapes(self):
+        """Save each tape the reader replaced since the last save; a tape
+        changes only when a read lands, hourly, so most flushes save none."""
+        reads = self.histories.read
+        for cid, read in reads.items():
+            if read.tape is not None and read.tape is not self.saved_tapes.get(cid):
+                farm_db.save_buys(self.db, cid, read.tape.read_at,
+                                  tape_to_json(read.tape, TAPE_ROWS_FARMER))
+        self.saved_tapes = {cid: read.tape for cid, read in reads.items()}
 
     def start(self):
         now = datetime.now(timezone.utc)
@@ -1514,15 +1530,30 @@ class Farmer:
         self.flush()
 
     def seed_histories(self, now):
-        """Take each wanted market's history from its farm_state row while it
-        is fresh, so the first cycle keeps the favorite bids the last run left
-        resting instead of cancelling them until the reader gets round to it."""
-        stored = farm_db.read_farm_states(self.db)
+        """Take each wanted market's history from its farm_state row, and its
+        buy tape from fav_buys, while each is fresh, so the first cycle keeps
+        the favorite bids the last run left resting instead of cancelling them
+        until the reader gets round to it. A history seeds without a tape."""
+
+        def fresh(read):
+            return read is not None and now - read.read_at < timedelta(seconds=HISTORY_S)
+
+        stored, tapes = farm_db.read_farm_states(self.db), farm_db.read_buys(self.db)
         histories = {cid: fill_cost.history_from_json(
                          stored[cid].slots.get(Slot.FAV_BID.name, {}).get("history"))
                      for cid in self.histories.wanted if cid in stored}
-        self.histories.read = {cid: h for cid, h in histories.items()
-                               if h and now - h.read_at < timedelta(seconds=HISTORY_S)}
+        reads = {}
+        for cid, history in histories.items():
+            if fresh(history):
+                tape = tape_from_json(tapes.get(cid))
+                reads[cid] = Read(history, tape if fresh(tape) else None)
+        self.histories.read = reads
+        self.saved_tapes = {cid: read.tape for cid, read in reads.items()}
+
+    def history(self, fm):
+        """The market's last fill history read, or None."""
+        read = self.histories.read.get(fm.condition_id)
+        return read and read.history
 
     def shutdown(self, reason, cancel):
         """Stop the threads and publish the stop, cancelling the live orders if asked."""
@@ -1853,8 +1884,7 @@ class Farmer:
         if managed.state.phase is Phase.QUOTING or previewing:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
-                market_outlook(fm, self.total_rates.rates,
-                               self.histories.read.get(fm.condition_id), self.prior,
+                market_outlook(fm, self.total_rates.rates, self.history(fm), self.prior,
                                self.cfg, now),
                 fill_mid=managed.fill_mid,
             )
@@ -1912,8 +1942,7 @@ class Farmer:
             naked_used_usd=naked_used(managed.position, orders),
             position=position_view(managed.held, managed.baseline, managed.position),
             slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
-                             managed.position, self.cfg,
-                             self.histories.read.get(fm.condition_id)),
+                             managed.position, self.cfg, self.history(fm)),
             book=book_view(levels, orders, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
             backoff={slot.name: {"until": stamp(b.until), "attempts": b.attempts}
