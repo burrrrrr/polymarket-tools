@@ -752,6 +752,48 @@ class BaselineTest(unittest.TestCase):
         self.assertLessEqual(ask.size, held.fav_shares)
 
 
+# OpenSI on 2026-10-09 at 19:08 UTC without our orders, the day after a
+# 2,715-share fill of our 93.9c bid. The mid was 94.8c before the fill.
+OPENSI = market(v=0.065, min_size=20.0, p_true=0.97, naked_budget_usd=40.0, capital=4000.0)
+OPENSI_BOOK = Levels(
+    bids=[(0.912, 21.0), (0.901, 290.0), (0.9, 226.5), (0.896, 1664.79), (0.895, 888.0),
+          (0.891, 40.0), (0.89, 509.54), (0.881, 1000.0), (0.88, 1000.0), (0.871, 10.0)],
+    asks=[(0.938, 100.0), (0.941, 39.0), (0.946, 266.0), (0.947, 280.0), (0.948, 307.0),
+          (0.95, 100.0), (0.951, 100.0), (0.952, 100.0), (0.953, 41.0), (0.959, 257.0),
+          (0.966, 11.14), (0.967, 499.99), (0.968, 883.55), (0.969, 1631.28), (0.978, 5.0),
+          (0.979, 5.85), (0.98, 530.0), (0.982, 766.46), (0.987, 8.59), (0.988, 416.6),
+          (0.989, 1465.62), (0.99, 2280.1)],
+    tick=0.001,
+)
+OPENSI_HELD = Position(fav_shares=2920.63, fav_avg=0.9413)
+
+
+def opensi_ask(book=OPENSI_BOOK, held=OPENSI_HELD, fill_mid=0.948):
+    target = quotes_at(OPENSI, book, held, CFG, True, None, fill_mid=fill_mid)
+    return by_slot(target)[Slot.FAV_ASK].price
+
+
+class ExitPricingTest(unittest.TestCase):
+    """The favorite ask prices off the mid before the fill, when that is
+    higher than the book's, plus the offset."""
+
+    def test_the_ask_prices_off_the_mid_before_the_fill(self):
+        self.assertEqual(opensi_ask(), 0.958)
+
+    def test_without_a_fill_mid_the_ask_keeps_the_mid_rule(self):
+        # 92.5c + 1c is under the exit floor, 94.13c average cost + 0.5c.
+        self.assertEqual(opensi_ask(fill_mid=None), 0.947)
+
+    def test_a_fill_mid_under_the_book_mid_leaves_the_ask_at_the_book_mid(self):
+        book = OPENSI_BOOK._replace(asks=[(0.95, 500.0)])
+        ask = opensi_ask(book=book, held=OPENSI_HELD._replace(fav_avg=0.90), fill_mid=0.90)
+        # (0.912 + 0.95) / 2 = 0.931, plus 1c.
+        self.assertEqual(ask, 0.941)
+
+    def test_the_exit_floor_still_binds(self):
+        self.assertEqual(opensi_ask(held=OPENSI_HELD._replace(fav_avg=0.97)), 0.975)
+
+
 class BackoffTest(unittest.TestCase):
     def test_delay_doubles_to_the_cap(self):
         delays, backoff = [], None
@@ -1498,6 +1540,70 @@ class FarmerCycleTest(FarmerHarness):
 
 CID2, FAV2, LONG2 = "0xc0nd2", "fav-token-2", "long-token-2"
 INFO2 = INFO._replace(token_ids=(FAV2, LONG2))
+
+
+class ExitFarmerTest(FarmerHarness):
+    """The farmer prices a favorite exit from the mid before the fill it saw.
+
+    The book falls to a 96.5c mid after the favorite bid fills; 97.5c was the
+    mid when the positions were read before the fill."""
+
+    FALLEN = Levels(bids=[(0.96, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+
+    def setUp(self):
+        super().setUp()
+        self.holdings = mock.Mock(return_value={})
+        patcher = mock.patch.object(reward_farmer, "fetch_holdings", self.holdings)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.book = self.FALLEN
+
+    def sample_mid(self, book_mid, seconds_ago):
+        at = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+        self.ui.execute("INSERT INTO farm_mids (condition_id, at, mid, book_mid) VALUES (?, ?, ?, ?)",
+                        (CID, farm_db.stamp(at), book_mid, book_mid))
+        self.ui.commit()
+
+    def fill(self, farmer, shares=100.0):
+        self.holdings.return_value = {FAV: (shares, 0.95)}
+        farmer.refresh_positions(datetime.now(timezone.utc))
+
+    def ask_target(self, farmer):
+        farmer.cycle()
+        _, slots = self.farm_state()
+        return slots["FAV_ASK"]["target"]["price"]
+
+    def test_after_a_favorite_fill_the_exit_prices_off_the_mid_before_it(self):
+        self.sample_mid(0.99, seconds_ago=300)
+        self.sample_mid(0.975, seconds_ago=120)
+        self.sample_mid(0.965, seconds_ago=30)
+        farmer = self.started_farmer()
+        self.fill(farmer)
+        # 97.5c + 1c, where the book mid alone would give 97.5c.
+        self.assertEqual(self.ask_target(farmer), 0.985)
+        fills = [json.loads(e["data"]) for e in self.events() if e["kind"] == "FILL"]
+        self.assertEqual(fills[-1]["fill_mid"], 0.975)
+
+    def test_the_fill_mid_stops_pricing_once_the_mid_is_back_at_it(self):
+        self.sample_mid(0.975, seconds_ago=120)
+        farmer = self.started_farmer()
+        self.fill(farmer)
+        self.assertEqual(self.ask_target(farmer), 0.985)
+        self.book = Levels(bids=[(0.975, 1000.0)], asks=[(0.985, 1000.0)], tick=0.001)
+        self.assertEqual(self.ask_target(farmer), 0.99)
+        self.book = self.FALLEN
+        self.assertEqual(self.ask_target(farmer), 0.975)
+
+    def test_a_restart_recovers_the_fill_mid_from_the_last_favorite_fill(self):
+        self.sample_mid(0.975, seconds_ago=300)
+        self.sample_mid(0.965, seconds_ago=170)
+        fill_at = datetime.now(timezone.utc) - timedelta(seconds=180)
+        farm_db.publish(self.ui, farm_db.FarmerStatus(
+            "dry", 1, fill_at, fill_at, 1.0, False, 1, {}, fill_at), events=[farm_db.Event(
+                fill_at, farm_db.EventKind.FILL, "FILL", CID, "FAV_BID", 0.95, 100.0, None, None)])
+        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        self.holdings.return_value = {FAV: (100.0, 0.95)}
+        self.assertEqual(self.ask_target(self.started_farmer()), 0.985)
 
 
 class LiveFarmerTest(FarmerHarness):

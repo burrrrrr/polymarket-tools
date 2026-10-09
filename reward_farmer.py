@@ -232,6 +232,8 @@ RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
 MID_SAMPLE_S = 60
+# farm_mids read back this far for the mid before a fill.
+FILL_MID_LOOKBACK_S = 600
 HEARTBEAT_S = 5
 
 # A rejected place waits this long before the slot tries again, doubling on
@@ -522,11 +524,17 @@ def plan_long_ask_price(fm, levels, fav_price, cfg):
     return None if fav_price is None else mirror(fav_price, fm.tick)
 
 
-def plan_fav_ask_price(fm, levels, book_mid, position, cfg):
-    """Favorite ask above both the midpoint and our cost, or None if it would cross."""
+def plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid=None):
+    """Favorite ask above both the midpoint and our cost, or None if it would cross.
+
+    The midpoint is the one before the fill the inventory came from when that
+    is higher, because the fill_cost exit clock ends a hold when the mid is
+    back there.
+    """
     tick = fm.tick
+    anchor = max(book_mid, fill_mid or 0.0)
     price = max(
-        ceil_to_tick(book_mid + max(cfg.ask_offset, tick), tick),
+        ceil_to_tick(anchor + max(cfg.ask_offset, tick), tick),
         exit_floor(position, fm, cfg),
     )
     best_bid = levels.bids[0][0] if levels.bids else None
@@ -538,9 +546,11 @@ def plan_fav_ask_price(fm, levels, book_mid, position, cfg):
     return price
 
 
-def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None):
+def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None,
+              fill_mid=None):
     """The orders this market would rest with its favorite bid at fav_price, or
     with no favorite bid when fav_price is None, scored against the mid they create.
+    The favorite ask prices off fill_mid per plan_fav_ask_price.
 
     `levels` is the favorite book without our own resting orders. The bid is
     sized from the capital left after favorite inventory at cost, or starts at
@@ -569,7 +579,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     if position.long_shares >= fm.min_size:
         long_ask = plan_long_ask_price(fm, levels, fav_price, cfg)
     if position.fav_shares >= fm.min_size:
-        fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg)
+        fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid)
 
     our_bids = [(fav_bid[0], fav_bid[1])] if fav_bid and fav_bid[1] > 0 else []
     if long_ask is not None:
@@ -647,7 +657,8 @@ def value_of(target, fm, levels, outlook):
                        bid and (bid.price, bid.size), capital, fm.p_true, outlook)
 
 
-def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False):
+def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False,
+                  fill_mid=None):
     """The orders this market should rest, with the favorite bid at the price
     that earns the most net of what its fills cost.
 
@@ -660,7 +671,7 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     alone, unless bid_without_history (a preview of a market the farmer has
     not read yet).
     """
-    base = quotes_at(fm, levels, position, cfg, naked_allowed, None)
+    base = quotes_at(fm, levels, position, cfg, naked_allowed, None, fill_mid=fill_mid)
     if base.mid is None:
         return base._replace(fav=FavChoice(reason="one-sided book"))
     baseline = value_of(base, fm, levels, outlook).net_per_day
@@ -670,7 +681,7 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     plans, curve = {}, {}
     for price in fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
                                     ev_cap(fm, cfg)):
-        plan = quotes_at(fm, levels, position, cfg, naked_allowed, price)
+        plan = quotes_at(fm, levels, position, cfg, naked_allowed, price, fill_mid=fill_mid)
         if any(i.slot is Slot.FAV_BID for i in plan.intents):
             plans[price], curve[price] = plan, value_of(plan, fm, levels, outlook)
     if not curve:
@@ -750,7 +761,7 @@ def keep_failure(order, intent, target, fm, position, cfg):
     return None
 
 
-def around_kept_bid(target, orders, fm, levels, position, cfg, naked_allowed):
+def around_kept_bid(target, orders, fm, levels, position, cfg, naked_allowed, fill_mid=None):
     """The target re-planned around the favorite bid reconcile will keep.
 
     The orders that balance a favorite bid must balance the one resting, not
@@ -769,7 +780,7 @@ def around_kept_bid(target, orders, fm, levels, position, cfg, naked_allowed):
                         and abs(kept.size_remaining - intent.size) < 0.005):
         return target
     around = quotes_at(fm, levels, position, cfg, naked_allowed, kept.price,
-                       kept.size_remaining)
+                       kept.size_remaining, fill_mid)
     if not any(i.slot is Slot.FAV_BID for i in around.intents):
         return target
     return around._replace(fav=target.fav)
@@ -887,6 +898,25 @@ def fill_events(previous, current):
             sell = Slot.FAV_ASK if slot is Slot.FAV_BID else Slot.LONG_ASK
             events.append((sell, -delta))
     return events
+
+
+def pre_fill_mid(samples, seen_at):
+    """The book mid of the last (time, book_mid) sample a positions read or
+    more before seen_at, the read that saw a fill: the fill came after the
+    read before it. None without one."""
+    cutoff = seen_at - timedelta(seconds=POSITIONS_S)
+    before = [mid for at, mid in samples if mid is not None and at <= cutoff]
+    return before[-1] if before else None
+
+
+def held_fill_mid(fill_mid, book_mid, position, fm):
+    """The fill mid while it still prices the exit: None once the farm holds
+    less than a reward minimum of the favorite, or the mid is back at it."""
+    if fill_mid is None or position.fav_shares < fm.min_size:
+        return None
+    if book_mid is not None and book_mid >= fill_mid - 1e-9:
+        return None
+    return fill_mid
 
 
 def ratchet_baseline(baseline, held):
@@ -1380,6 +1410,7 @@ class Managed:
         self.state = State(Phase.QUOTING)
         self.recent_asks = deque()
         self.naked_paused_until = None
+        self.fill_mid = None
         self.held = None
         self.position = None
         self.orders = []
@@ -1618,6 +1649,8 @@ class Farmer:
                     farm_db.save_baseline(self.db, fm.condition_id, baseline.fav, baseline.long)
             current = managed.position = farm_position(held, baseline)
             if previous is None:
+                if current.fav_shares >= fm.min_size:
+                    managed.fill_mid = self.last_fill_mid(fm)
                 if held != Position() or baseline != Baseline(0.0, 0.0):
                     log(f"{fm.label}: holding fav {held.fav_shares:g} @ "
                         f"{cents(held.fav_avg, fm.tick)}, long {held.long_shares:g} @ "
@@ -1626,6 +1659,9 @@ class Farmer:
                         f"{current.fav_shares:g}, long {current.long_shares:g}")
                 continue
             for slot, shares in fill_events(previous, current):
+                if slot is Slot.FAV_BID:
+                    mids = [m for m in (managed.fill_mid, self.fill_mid_seen(fm, now)) if m]
+                    managed.fill_mid = max(mids, default=None)
                 self.record_fill(managed, slot, shares)
                 if slot is Slot.LONG_BID:
                     managed.naked_paused_until = now + timedelta(
@@ -1635,6 +1671,21 @@ class Farmer:
                               f"ALERT {fm.label}: naked longshot fill; LONG_BID paused "
                               f"until {managed.naked_paused_until.astimezone():%H:%M:%S}",
                               fm.condition_id, slot)
+
+    def fill_mid_seen(self, fm, seen_at):
+        """The pre_fill_mid of a fill seen at seen_at, from farm_mids."""
+        since = seen_at - timedelta(seconds=FILL_MID_LOOKBACK_S)
+        samples = farm_db.read_mids(self.db, fm.condition_id, since)
+        return pre_fill_mid([(s.at, s.book_mid) for s in samples], seen_at)
+
+    def last_fill_mid(self, fm):
+        """The mid before the last favorite fill on record, for inventory held
+        when the farmer starts; earlier fills of the same inventory are not
+        weighed."""
+        fills = farm_db.read_events(self.db, condition_id=fm.condition_id,
+                                    kinds=(EventKind.FILL,), limit=100)
+        last = next((e for e in fills if e.slot == Slot.FAV_BID.name), None)
+        return self.fill_mid_seen(fm, last.at) if last else None
 
     def record_fill(self, managed, slot, shares):
         """A fill inferred from a position change, priced at the slot's resting order.
@@ -1646,11 +1697,13 @@ class Farmer:
         resting = next((o for o in managed.orders if o.slot is slot), None)
         price = resting.price if resting else None
         at = f" @ {cents(price, fm.tick)}" if resting else ""
+        data = {"price_source": "resting order at the last cycle" if resting
+                else "unknown: no order rested in the slot",
+                "order_id": resting.id if resting else None}
+        if slot is Slot.FAV_BID:
+            data["fill_mid"] = managed.fill_mid
         self.emit(EventKind.FILL, f"FILL {fm.label} {slot.name} {shares:g} shares{at}",
-                  fm.condition_id, slot, price, shares,
-                  data={"price_source": "resting order at the last cycle" if resting
-                        else "unknown: no order rested in the slot",
-                        "order_id": resting.id if resting else None})
+                  fm.condition_id, slot, price, shares, data=data)
 
     def refresh_rewards(self, now):
         """Live only, best effort: our scoring share per market and today's earnings."""
@@ -1796,18 +1849,20 @@ class Farmer:
         previewing = (managed.state.phase is Phase.PAUSED
                       and step_state(managed.state, obs._replace(paused=False), now,
                                      self.cfg).phase is Phase.QUOTING)
+        managed.fill_mid = held_fill_mid(managed.fill_mid, book_mid, managed.position, fm)
         if managed.state.phase is Phase.QUOTING or previewing:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
                 market_outlook(fm, self.total_rates.rates,
                                self.histories.read.get(fm.condition_id), self.prior,
                                self.cfg, now),
+                fill_mid=managed.fill_mid,
             )
             if previewing:
                 preview = planned
             else:
                 target = around_kept_bid(planned, orders, fm, book, managed.position,
-                                         self.cfg, naked_allowed(obs, now))
+                                         self.cfg, naked_allowed(obs, now), managed.fill_mid)
         actions = without_backed_off(
             reconcile(target, orders, fm, managed.position, self.cfg),
             managed.backoffs,
