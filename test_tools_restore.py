@@ -88,6 +88,24 @@ class PlanTests(unittest.TestCase):
         lines = self.plan([order("0xa", MARKET_A), order("0xb", MARKET_B)], managed={MARKET_B})
         self.assertEqual(actions(lines), [WOULD, FARMER])
 
+    def test_an_order_the_snapshot_records_as_on_a_farmer_market_is_skipped_whatever_is_managed_now(
+            self):
+        farmers = db.SnapshotOrder(1, 1, None, order("0xa", MARKET_A), True)
+        mine = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_B), False)
+        lines = restore.plan([farmers, mine], [], set(), NOW)
+        self.assertEqual(actions(lines), [FARMER, WOULD])
+        self.assertIn("when the snapshot was taken", lines[0].reason)
+
+    def test_an_unrecorded_order_on_a_market_the_farmer_has_retired_is_skipped(self):
+        unrecorded = db.SnapshotOrder(1, 1, None, order("0xa", MARKET_A))
+        placed_since = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_A), False)
+        elsewhere = db.SnapshotOrder(3, 1, None, order("0xc", MARKET_B))
+        lines = restore.plan([unrecorded, placed_since, elsewhere], [], set(), NOW,
+                             retired_markets={MARKET_A})
+        self.assertEqual(actions(lines), [FARMER, WOULD, WOULD],
+                         "only an order with no record is judged by the market's retirement")
+        self.assertIn("retired", lines[0].reason)
+
     def test_an_order_with_an_open_copy_is_skipped(self):
         (line,) = self.plan([order("0xold")], live=[order("0xnew")])
         self.assertEqual(line.action, LIVE)
@@ -192,10 +210,10 @@ class Scratch(unittest.TestCase):
         self.now = NOW
         self.stop = threading.Event()
 
-    def job(self, kind, orders, managed=(), queued_at=NOW):
+    def job(self, kind, orders, managed=(), queued_at=NOW, retired=()):
         snapshot = db.insert_snapshot(self.db, NOW - timedelta(days=1), "", orders, {})
-        db.enqueue_job(self.db, kind, {"snapshot_id": snapshot, "managed_markets": list(managed)},
-                       queued_at)
+        db.enqueue_job(self.db, kind, {"snapshot_id": snapshot, "managed_markets": list(managed),
+                                       "retired_markets": list(retired)}, queued_at)
         return db.claim_job(self.db, queued_at)
 
     def place(self, venue, orders, **job):
@@ -366,7 +384,8 @@ class PlaceTests(Scratch):
         job = self.job(JobKind.RESTORE, [order()])
         with self.assertRaisesRegex(ValueError, "no snapshot 99"):
             restore.place(Venue(), self.db, job._replace(params={"snapshot_id": 99,
-                                                                 "managed_markets": []}),
+                                                                 "managed_markets": [],
+                                                                 "retired_markets": []}),
                           lambda: NOW, self.stop)
 
     def test_the_summary_counts_what_became_of_the_orders(self):

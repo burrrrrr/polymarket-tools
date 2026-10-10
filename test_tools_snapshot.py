@@ -44,6 +44,14 @@ class TakeTests(Scratch):
              ("0xb", f"Q {cid(2)[-4:]}", Side.SELL, False),
              ("0xc", f"Q {cid(1)[-4:]}", Side.BUY, True)])
 
+    def test_a_snapshot_records_the_orders_on_the_markets_the_farmer_managed_then(self):
+        gamma = Gamma(open_ids=[cid(1), cid(2)])
+        listing = [entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]
+        taken = snapshot.take(Clob(listing), client(gamma), self.db, NOW, "",
+                              farmer_markets={cid(2)})
+        self.assertEqual([o.farmer for o in db.read_snapshot_orders(self.db, taken.snapshot_id)],
+                         [False, True])
+
     def test_a_failed_listing_raises_and_stores_no_snapshot(self):
         gamma = Gamma()
         for listing in (ConnectionError("timed out"), None, [entry(), without("price")]):

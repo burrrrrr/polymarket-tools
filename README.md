@@ -1295,7 +1295,10 @@ already queued (job 12).`
 3. Click **Take snapshot**.
 
 The worker lists every open order on the account, the farmer's and your own
-alike, and stores them with their market names. A listing that fails stores
+alike, and stores them with their market names. With each order it stores
+whether the order's market had the status `approved` in `farm.db` at your
+click, so that a later restore leaves the farmer's orders to the farmer
+whatever the farmer manages by then. A listing that fails stores
 nothing, and the job ends `failed` with the error. When Gamma cannot name the
 markets, the orders are stored without names and the page shows each market's
 condition id.
@@ -1347,6 +1350,8 @@ the first rule that fits decides.
 | --- | --- | --- |
 | Nothing of the order was left to fill when the snapshot was taken | **Skipped: nothing left to fill** | There is no size to place. |
 | The order's market has the status `approved` in `farm.db` at your click | **Skipped: the farmer's market** | The farmer cancels the orders on its markets that are not its own, and places its own. |
+| The order's market had the status `approved` when the snapshot was taken | **Skipped: the farmer's market** | The order was the farmer's, or the farmer would have cancelled it. A market the farmer has stopped managing since gets none of its old orders back. |
+| The snapshot has no record of that (an imported file, or a snapshot from before the record was kept), and the market has the status `retired` now | **Skipped: the farmer's market** | The farmer managed the market once, and nothing says whose order this was. An order you placed there by hand is skipped too: place it again by hand. |
 | The order expires within 2 minutes from now, or has expired | **Skipped: expired** | The CLOB refuses an order that expires within a minute. The second minute is for the job to reach the order. |
 | The same order, by its id, is still open | **Skipped: already open** | It never went missing. This holds however much more of it has filled since. |
 | An open order that is not in the snapshot has the same token, side, price, and remaining size | **Skipped: already open** | It was placed again already, by you or by an earlier restore. Each such order covers one snapshot order, so two identical snapshot orders with one copy open give one skip and one place. |

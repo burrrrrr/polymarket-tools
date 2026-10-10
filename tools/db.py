@@ -177,7 +177,8 @@ CREATE TABLE IF NOT EXISTS snapshot_orders (
     price REAL NOT NULL,
     size REAL NOT NULL,
     size_matched REAL NOT NULL,
-    expiration TEXT
+    expiration TEXT,
+    farmer INTEGER
 );
 CREATE INDEX IF NOT EXISTS snapshot_orders_snapshot ON snapshot_orders (snapshot_id);
 
@@ -252,14 +253,24 @@ CREATE INDEX IF NOT EXISTS log_job ON log (job_id);
 CREATE INDEX IF NOT EXISTS log_watch ON log (watch_id);
 """
 
+# Columns added after a tools.db could already exist, as farm_db adds its own.
+ADDED_COLUMNS = {"snapshot_orders": (("farmer", "INTEGER"),)}
+
 
 def open_db(path):
-    """Connect, creating the tables; running it again changes nothing."""
+    """Connect, creating the tables and adding the columns a file from an older
+    version lacks; running it again changes nothing."""
     conn = sqlite3.connect(path, timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_S * 1000}")
     conn.executescript(SCHEMA)
+    with conn:
+        for table, columns in ADDED_COLUMNS.items():
+            present = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+            for name, kind in columns:
+                if name not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
     return conn
 
 
@@ -493,10 +504,14 @@ class Snapshot(NamedTuple):
 
 
 class SnapshotOrder(NamedTuple):
+    """farmer is whether the farmer managed the order's market when the snapshot
+    was taken, and None when the snapshot has no record of it."""
+
     id: int
     snapshot_id: int
     market_name: Optional[str]
     order: OpenOrder
+    farmer: Optional[bool] = None
 
 
 SNAPSHOTS = """
@@ -510,11 +525,14 @@ def _snapshot(row):
                     row["orders"])
 
 
-def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=None):
+def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=None,
+                    farmer_markets=None):
     """Store these OpenOrders as one snapshot and return its id.
 
-    names maps a condition id to its market's name. A source that is already
-    stored raises sqlite3.IntegrityError and stores nothing.
+    names maps a condition id to its market's name. farmer_markets holds the
+    condition ids the farmer managed at taken_at, and None stores no record of
+    it. A source that is already stored raises sqlite3.IntegrityError and
+    stores nothing.
     """
     with conn:
         snapshot_id = conn.execute(
@@ -522,10 +540,11 @@ def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=Non
             (stamp(taken_at), note, source, job_id)).lastrowid
         conn.executemany(
             "INSERT INTO snapshot_orders (snapshot_id, order_id, token_id, market, market_name, "
-            "outcome, side, price, size, size_matched, expiration) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "outcome, side, price, size, size_matched, expiration, farmer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(snapshot_id, o.order_id, o.token_id, o.market, names.get(o.market), o.outcome,
-              o.side.value, o.price, o.size, o.size_matched, stamp(o.expiration))
+              o.side.value, o.price, o.size, o.size_matched, stamp(o.expiration),
+              None if farmer_markets is None else o.market in farmer_markets)
              for o in orders])
     return snapshot_id
 
@@ -549,7 +568,8 @@ def read_snapshot(conn, snapshot_id):
 def _snapshot_order(row):
     return SnapshotOrder(row["id"], row["snapshot_id"], row["market_name"], OpenOrder(
         row["order_id"], row["token_id"], row["market"], row["outcome"], Side(row["side"]),
-        row["price"], row["size"], row["size_matched"], _time(row["expiration"])))
+        row["price"], row["size"], row["size_matched"], _time(row["expiration"])),
+        None if row["farmer"] is None else bool(row["farmer"]))
 
 
 def read_snapshot_orders(conn, snapshot_id):

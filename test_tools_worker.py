@@ -87,8 +87,9 @@ class Scratch(unittest.TestCase):
                    pid=41, **{"sniper": FakeSniper, **kwargs})
 
     def queue(self, kind=JobKind.SNAPSHOT, **params):
-        return db.enqueue_job(self.db, kind, params or {"note": "before the upgrade"},
-                              self.clock())
+        if kind is JobKind.SNAPSHOT and set(params) <= {"note", "managed_markets"}:
+            params = {"note": "before the upgrade", "managed_markets": [], **params}
+        return db.enqueue_job(self.db, kind, params, self.clock())
 
     def messages(self, job_id):
         return [line.message for line in db.read_log(self.db, job_id)]
@@ -119,6 +120,13 @@ class LoopTests(Scratch):
         self.assertEqual((taken.note, taken.orders, taken.job_id), ("before the upgrade", 2, job))
         self.assertEqual(self.messages(job), [
             "started", f"stored snapshot {taken.id} with 2 open orders", "done"])
+
+    def test_a_snapshot_job_records_the_orders_on_the_markets_the_console_named(self):
+        self.queue(managed_markets=[cid(2)])
+        self.run_worker(Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]))
+        (taken,) = db.read_snapshots(self.db)
+        self.assertEqual([o.farmer for o in db.read_snapshot_orders(self.db, taken.id)],
+                         [False, True])
 
     def test_a_job_queued_while_the_worker_runs_is_claimed_on_the_next_beat(self):
         queued = []
@@ -224,8 +232,9 @@ class RestoreJobTests(Scratch):
     def snapshot(self, *orders):
         return db.insert_snapshot(self.db, at(-3600), "", list(orders), {})
 
-    def queue_restore(self, kind, snapshot_id, managed=()):
-        return self.queue(kind, snapshot_id=snapshot_id, managed_markets=list(managed))
+    def queue_restore(self, kind, snapshot_id, managed=(), retired=()):
+        return self.queue(kind, snapshot_id=snapshot_id, managed_markets=list(managed),
+                          retired_markets=list(retired))
 
     def lines(self, job):
         return [(line.action, line.size, line.order_id)
@@ -296,6 +305,13 @@ class RestoreJobTests(Scratch):
         self.assertEqual(self.lines(job), [(RestoreAction.PLACED, 100.0, "0xnew1"),
                                            (RestoreAction.PLACED, 100.0, "0xnew2")])
         self.assertEqual(len(venue.posts), 2)
+
+    def test_a_preview_skips_an_unrecorded_order_on_a_market_the_console_says_is_retired(self):
+        snapshot = self.snapshot(order("0xa", cid(1)), order("0xb", cid(2)))
+        job = self.queue_restore(JobKind.PREVIEW, snapshot, retired=[cid(1)])
+        self.run_worker(Clob([]))
+        self.assertEqual([line.action for line in db.read_restore_lines(self.db, job)],
+                         [RestoreAction.SKIP_FARMER, RestoreAction.WOULD_PLACE])
 
     def test_a_preview_needs_a_key(self):
         job = self.queue_restore(JobKind.PREVIEW, self.snapshot(order("0xa")))

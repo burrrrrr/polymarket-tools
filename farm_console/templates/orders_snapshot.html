@@ -14,13 +14,13 @@
 {% call region("/partials/orders/restore/" ~ snapshot.id, "sse:job, sse:status") %}{% include "partials/orders_restore.html" %}{% endcall %}
 
 <section class="panel pad-table">
-  <div class="head"><h2>Orders in this snapshot</h2></div>
+  <div class="head"><h2>Orders in this snapshot</h2>{% if orders and not orders | rejectattr("farmer", "none") | list %}<span class="hint">This snapshot has no record of which orders were the farmer's.</span>{% endif %}</div>
   <div class="scroll">
     <table class="tbl tight">
       <thead><tr><th>Market</th><th>Outcome</th><th>Side</th><th>Price</th><th>Size</th><th>Matched</th><th>Expiration</th></tr></thead>
       <tbody>
         {%- for o in orders %}
-        <tr>{% if o.market_name %}<td class="wrap">{{ o.market_name }}</td>{% else %}<td class="wrap mono muted">{{ o.order.market }}</td>{% endif %}<td>{{ o.order.outcome }}</td><td class="mono">{{ o.order.side.value }}</td><td class="mono">{{ o.order.price | cents }}</td><td class="mono">{{ o.order.size | shares }}</td><td class="mono">{{ o.order.size_matched | shares }}</td><td class="mono">{{ o.order.expiration | stamp_local if o.order.expiration else 'GTC' }}</td></tr>
+        <tr><td class="wrap{{ '' if o.market_name else ' mono muted' }}">{{ o.market_name or o.order.market }}{% if o.farmer %} <span class="badge t-n">farmer</span>{% endif %}</td><td>{{ o.order.outcome }}</td><td class="mono">{{ o.order.side.value }}</td><td class="mono">{{ o.order.price | cents }}</td><td class="mono">{{ o.order.size | shares }}</td><td class="mono">{{ o.order.size_matched | shares }}</td><td class="mono">{{ o.order.expiration | stamp_local if o.order.expiration else 'GTC' }}</td></tr>
         {%- else %}
         <tr><td colspan="7" class="muted">No orders were open.</td></tr>
         {%- endfor %}

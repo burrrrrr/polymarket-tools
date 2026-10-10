@@ -46,7 +46,8 @@ class Handler(NamedTuple):
 
 def take_snapshot(run):
     taken = snapshot.take(run.client, run.http, run.conn, run.clock(), run.job.params["note"],
-                          job_id=run.job.id)
+                          job_id=run.job.id,
+                          farmer_markets=set(run.job.params["managed_markets"]))
     run.log(f"stored snapshot {taken.snapshot_id} with {taken.orders} open orders"
             + (f", stored without market names ({taken.names_error})" if taken.names_error
                else ""))

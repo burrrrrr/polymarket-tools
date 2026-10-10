@@ -28,8 +28,12 @@ class Imported(NamedTuple):
     skipped: int
 
 
-def take(client, http, conn, now, note, job_id=None):
+def take(client, http, conn, now, note, job_id=None, farmer_markets=None):
     """Store the account's open orders as one snapshot taken at `now`.
+
+    farmer_markets holds the condition ids the farmer manages now, so that a
+    restore can leave the farmer's orders to the farmer whatever it manages by
+    then. None stores no record of it.
 
     Raises when the listing fails or cannot be read, and then stores nothing.
     The market names come from Gamma. They are for display only, so when Gamma
@@ -41,7 +45,8 @@ def take(client, http, conn, now, note, job_id=None):
         names = gamma.market_names(http, [o.market for o in orders])
     except (httpx.HTTPError, ValueError) as e:
         names_error = f"{type(e).__name__}: {e}"
-    snapshot_id = db.insert_snapshot(conn, now, note, orders, names, job_id=job_id)
+    snapshot_id = db.insert_snapshot(conn, now, note, orders, names, job_id=job_id,
+                                     farmer_markets=farmer_markets)
     return Taken(snapshot_id, len(orders), names_error)
 
 

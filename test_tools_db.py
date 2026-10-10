@@ -224,6 +224,27 @@ class SnapshotTests(Scratch):
                           (snapshot_id, None, orders[1])])
         self.assertEqual(len({s.id for s in stored}), 2)
 
+    def test_a_snapshot_records_which_orders_sat_on_a_market_the_farmer_managed(self):
+        orders = [order("0xo1", MARKET_A), order("0xo2", MARKET_B)]
+        recorded = db.insert_snapshot(self.db, NOW, "", orders, {}, farmer_markets={MARKET_B})
+        unrecorded = db.insert_snapshot(self.db, NOW, "", orders, {})
+        self.assertEqual([s.farmer for s in db.read_snapshot_orders(self.db, recorded)],
+                         [False, True])
+        self.assertEqual([s.farmer for s in db.read_snapshot_orders(self.db, unrecorded)],
+                         [None, None], "a snapshot with no record must not read as not the farmer's")
+
+    def test_a_database_from_before_the_record_opens_with_its_orders_unrecorded(self):
+        kept = db.insert_snapshot(self.db, NOW, "", [order()], {})
+        self.db.execute("ALTER TABLE snapshot_orders DROP COLUMN farmer")
+        self.db.commit()
+        self.db.close()
+        self.db = db.open_db(self.path)
+        self.addCleanup(self.db.close)
+        self.assertEqual([(s.order, s.farmer) for s in db.read_snapshot_orders(self.db, kept)],
+                         [(order(), None)])
+        later = db.insert_snapshot(self.db, NOW, "", [order()], {}, farmer_markets={MARKET_A})
+        self.assertEqual([s.farmer for s in db.read_snapshot_orders(self.db, later)], [True])
+
     def test_snapshots_list_newest_first_with_their_order_counts(self):
         old = db.insert_snapshot(self.db, NOW - timedelta(days=30), "", [order()], {},
                                  source="orders_snapshot_old.json")

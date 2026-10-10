@@ -71,6 +71,11 @@ def restore_view(job, log, lines):
     return RestoreView(job, preview, log, groups, len(lines), to_place)
 
 
+def managed_markets(farm):
+    """The condition ids of the markets the farmer manages now, for a job's params."""
+    return sorted(farm_db.condition_ids(farm, "approved"))
+
+
 def placing_refusal(last):
     """Why a snapshot whose newest preview or restore job is `last` cannot be
     placed now, or None when that job is a finished preview."""
@@ -114,10 +119,10 @@ def routes(ctx):
 
     def queue_restore_job(request, conn, snapshot, kind):
         with closing(ctx.connect()) as farm:
-            managed = sorted(farm_db.load_approved(farm))
+            params = {"snapshot_id": snapshot.id, "managed_markets": managed_markets(farm),
+                      "retired_markets": sorted(farm_db.condition_ids(farm, "retired"))}
         try:
-            tools_db.enqueue_job(conn, kind, {"snapshot_id": snapshot.id,
-                                              "managed_markets": managed}, ctx.clock())
+            tools_db.enqueue_job(conn, kind, params, ctx.clock())
         except tools_db.JobOpen as e:
             return snapshot_response(request, conn, snapshot, 409, refused=str(e))
         return see_other(f"/orders/snapshots/{snapshot.id}")
@@ -134,9 +139,11 @@ def routes(ctx):
         note, errors = forms.parse_snapshot_note(form)
         if errors:
             return orders_response(request, 422, errors=errors, note=form.get("note"))
+        with closing(ctx.connect()) as farm:
+            params = {"note": note, "managed_markets": managed_markets(farm)}
         with closing(ctx.connect_tools()) as conn:
             try:
-                tools_db.enqueue_job(conn, JobKind.SNAPSHOT, {"note": note}, ctx.clock())
+                tools_db.enqueue_job(conn, JobKind.SNAPSHOT, params, ctx.clock())
             except tools_db.JobOpen as e:
                 return orders_response(request, 409, refused=str(e), note=note)
         return see_other("/orders")
