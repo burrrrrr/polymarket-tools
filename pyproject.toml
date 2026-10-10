@@ -1,0 +1,30 @@
+[project]
+name = "polymarket-tools"
+version = "0"
+description = "A reward farmer for Polymarket, its web console and its order tools."
+requires-python = ">=3.11"
+dependencies = [
+    "py-clob-client-v2==1.1.0",
+    "python-dotenv",
+    "httpx[http2]",
+    "websockets",
+    "fastapi==0.142.2",
+    "uvicorn==0.54.0",
+    "jinja2==3.1.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+# The code runs from the checkout, so an install brings only the dependencies.
+[tool.setuptools]
+py-modules = []
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+norecursedirs = ["handoff", ".claude", ".venv", "snapshots"]

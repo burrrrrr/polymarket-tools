@@ -7,8 +7,9 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Virtual environment
+# Virtual environment, and what an editable install leaves
 .venv/
+*.egg-info/
 
 # Reward screener database, and SQLite's WAL sidecar files
 farm.db

@@ -15,12 +15,12 @@ This tool allows you to take a snapshot of all your open Polymarket orders and r
 
 ## Installation
 
-1. Ensure you have Python 3.9 or higher installed.
+1. Ensure you have Python 3.11 or higher installed.
 
 2. Install the required dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
 
 ## Setup
@@ -423,7 +423,7 @@ Each market has its own fire thread. When a market's tick changes, its thread
 runs the entry-price guard and places that market's order while the paths keep
 watching the rest.
 
-The WSS path needs the `websockets` package (included in `requirements.txt`).
+The WSS path needs the `websockets` package (listed in `pyproject.toml`).
 Without it the watcher logs a warning and runs poll-only.
 
 **Notes:**
