@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple
 
-from tools import db, snapshot
+from tools import db, restore, snapshot
 from tools.db import JobKind
 
 JOB_THREAD = "tools-job"
@@ -22,13 +22,16 @@ def utc_now():
 @dataclass(frozen=True)
 class JobRun:
     """What a handler works with: the claimed job, the worker's client and HTTP
-    client, and a connection that belongs to the job's thread."""
+    client, a connection that belongs to the job's thread, and stop, an event
+    that is set once the worker is stopping or was replaced. A handler that
+    places orders checks it before each one."""
 
     job: db.Job
     client: Any
     http: Any
     conn: Any
     clock: Callable
+    stop: Any
 
     def log(self, message):
         db.append_log(self.conn, self.clock(), message, job_id=self.job.id)
@@ -50,7 +53,19 @@ def take_snapshot(run):
                else ""))
 
 
-HANDLERS = {JobKind.SNAPSHOT: Handler(take_snapshot, needs_key=True)}
+def preview_restore(run):
+    lines = restore.preview(run.client, run.conn, run.job, run.clock())
+    run.log(f"planned {len(lines)} orders: {restore.summary(lines, preview=True)}")
+
+
+def place_restore(run):
+    lines = restore.place(run.client, run.conn, run.job, run.clock, run.stop)
+    run.log(f"went through {len(lines)} orders: {restore.summary(lines)}")
+
+
+HANDLERS = {JobKind.SNAPSHOT: Handler(take_snapshot, needs_key=True),
+            JobKind.PREVIEW: Handler(preview_restore, needs_key=True),
+            JobKind.RESTORE: Handler(place_restore, needs_key=True)}
 
 
 class JobRefused(Exception):
@@ -68,6 +83,7 @@ class JobThread:
         self.clock = clock
         self.handlers = handlers
         self._thread = None
+        self._stop = threading.Event()
 
     def tick(self, conn):
         """Claim the next job and start it, unless one is still running."""
@@ -83,12 +99,18 @@ class JobThread:
         if self._thread is not None:
             self._thread.join()
 
+    def close(self):
+        """Tell the running job to stop, and wait for it. A job that does not
+        look at its stop signal runs to its end."""
+        self._stop.set()
+        self.join()
+
     def _run(self, job):
         with closing(db.open_db(self.db_path)) as conn:
             try:
                 self._handle(job, conn)
                 error = None
-            except JobRefused as e:
+            except (JobRefused, restore.Stopped) as e:
                 error = str(e)
             except Exception as e:
                 error = f"{type(e).__name__}: {e}"
@@ -101,7 +123,7 @@ class JobThread:
         if handler.needs_key and self.client is None:
             raise JobRefused(f"this worker holds no key, and a {job.kind.value} job needs one: "
                              f"start the worker again without --no-key")
-        handler.run(JobRun(job, self.client, self.http, conn, self.clock))
+        handler.run(JobRun(job, self.client, self.http, conn, self.clock, self._stop))
 
 
 def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=None,
@@ -111,8 +133,9 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
     client is the authenticated CLOB client, or None for a worker with no key,
     which fails every job that needs one. http reads the public APIs. Each
     poll_s the loop beats and starts the next queued job; stop.wait(poll_s) is
-    its only wait. A stopping worker lets its running job finish, then writes
-    when it stopped.
+    its only wait. A stopping worker tells its running job to stop, waits for
+    it, then writes when it stopped: a snapshot runs to its end, and a restore
+    ends before its next order.
 
     Raises db.WorkerRunning, touching nothing, while another worker beats on
     this database, and also when another worker took this one's place. A job
@@ -131,5 +154,5 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
                 if stop.wait(poll_s):
                     break
         finally:
-            jobs.join()
+            jobs.close()
             db.stop_worker(conn, instance, clock())

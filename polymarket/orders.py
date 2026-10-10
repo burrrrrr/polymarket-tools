@@ -1,15 +1,98 @@
-"""The account's open orders, as the CLOB lists them."""
+"""The account's open orders as the CLOB lists them, and the one way to post an
+order and read the CLOB's answer."""
 
+import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import NamedTuple, Optional
 
 from polymarket.parse import as_float
+from polymarket.region import GEOBLOCK_MARKER
+
+# The CLOB's names for an order that rests until it is cancelled and for one
+# that rests until its expiration.
+GTC, GTD = "GTC", "GTD"
+
+# Refusals that no retry can change: the address is blocked, the account cannot
+# fund the order, or a post-only order would take liquidity. Matched in lower
+# case anywhere in a Rejected's reason.
+TERMINAL_REFUSALS = (GEOBLOCK_MARKER, "http 451", "not enough balance", "allowance",
+                     "crosses book")
 
 
 class Side(Enum):
     BUY = "BUY"
     SELL = "SELL"
+
+
+@dataclass(frozen=True)
+class Posted:
+    """The CLOB accepted the order, and this is its id."""
+
+    order_id: str
+
+
+@dataclass(frozen=True)
+class Rejected:
+    """The CLOB refused the order, so nothing rests. reason is its message."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class Unanswered:
+    """The post got no usable answer, so the order may rest. Sending it again
+    could place a second order: a caller never retries one."""
+
+    detail: str
+
+
+def post(client, signed, order_type, post_only=True):
+    """Post one signed order, once, and say what the CLOB answered. Never raises.
+
+    A refusal is Rejected: an answer that says so, or a 4xx status. A timeout,
+    a connection error, a 5xx status or an answer that cannot be read is
+    Unanswered, as is anything else the client raises.
+    """
+    try:
+        answer = client.post_order(signed, order_type, post_only=post_only)
+    except Exception as e:
+        status = getattr(e, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            return Rejected(f"HTTP {status}: {_message(getattr(e, 'error_msg', None))}")
+        return Unanswered(f"{type(e).__name__}: {e}")
+    return read_response(answer)
+
+
+def read_response(answer):
+    """What the CLOB's answer to a post says became of the order.
+
+    An order counts as placed only when the answer has success true, no
+    errorMsg and an order id. Success with no order id is Unanswered, and so is
+    an answer that is not an object.
+    """
+    if not isinstance(answer, dict):
+        return Unanswered(f"the CLOB answered {str(answer)[:200]!r}")
+    if answer.get("errorMsg") or not answer.get("success"):
+        return Rejected(_message(answer))
+    if not answer.get("orderID"):
+        return Unanswered("the CLOB reported success with no order id")
+    return Posted(str(answer["orderID"]))
+
+
+def terminal(rejected):
+    """Whether no retry of this refused order can succeed."""
+    reason = rejected.reason.lower()
+    return any(refusal in reason for refusal in TERMINAL_REFUSALS)
+
+
+def _message(body):
+    """The text of a refusal: the CLOB sends errorMsg in an answer and error in
+    the body of a 4xx."""
+    if isinstance(body, dict):
+        return str(body.get("errorMsg") or body.get("error") or body)
+    return str(body)
 
 
 class OpenOrder(NamedTuple):
@@ -25,6 +108,12 @@ class OpenOrder(NamedTuple):
     size: float
     size_matched: float
     expiration: Optional[datetime]
+
+    @property
+    def remaining(self):
+        """What is left of the order to fill, cut to the whole hundredths of a
+        share an order can be placed for."""
+        return max(0.0, math.floor(round((self.size - self.size_matched) * 100, 4)) / 100)
 
 
 def open_orders(client):

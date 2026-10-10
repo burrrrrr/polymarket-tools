@@ -13,6 +13,7 @@ from reward_screener import CATEGORIES, ScreenConfig
 
 NOTE_MAX = 500
 CANCEL_ALL_WORD = "CANCEL"
+RESTORE_WORD = "PLACE"
 
 
 class Field(NamedTuple):
@@ -171,9 +172,11 @@ def parse_settings(form, group):
     return (None if errors else values), errors
 
 
-def parse_cancel_all(form):
-    if (form.get("confirm") or "").strip() != CANCEL_ALL_WORD:
-        return {"confirm": f"Type {CANCEL_ALL_WORD} to confirm."}
+def parse_typed_word(form, word):
+    """The errors of a form whose confirm field must hold this word, typed out.
+    It guards an action that cannot be taken back, such as placing real orders."""
+    if (form.get("confirm") or "").strip() != word:
+        return {"confirm": f"Type {word} to confirm."}
     return {}
 
 

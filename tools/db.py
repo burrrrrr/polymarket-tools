@@ -11,7 +11,9 @@ is opened in WAL mode with a busy timeout, and every column has one writer:
                    running and then to done or failed.
   snapshots        worker, or the one-time import of the old JSON files.
   snapshot_orders  the same writer as its snapshot.
-  log              worker. What a job did, and every change of a job's state.
+  restore_lines    worker. What a preview would do with each order of a
+                   snapshot, or what a restore did with it.
+  log             worker. What a job did, and every change of a job's state.
 
 The worker never opens farm.db and the farmer never opens this file, so
 neither waits on the other's write lock.
@@ -22,7 +24,7 @@ Times are ISO 8601 UTC strings to the second, as in farm_db.
 import json
 import sqlite3
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import NamedTuple, Optional
 
@@ -48,6 +50,33 @@ class JobState(Enum):
     FAILED = "failed"
 
 
+# A restore places what its own fresh plan finds missing, and the page shows
+# one plan at a time, so one job among these is queued or running.
+RESTORE_KINDS = (JobKind.PREVIEW, JobKind.RESTORE)
+# A restore runs soon after the click that confirmed it, or not at all: the
+# worker fails one that waited longer than this for it.
+RESTORE_MAX_WAIT = timedelta(minutes=5)
+
+
+class RestoreAction(Enum):
+    """What became of one snapshot order. A plan decides PLACE or a skip. In a
+    preview job PLACE means the order would be placed. In a restore job it
+    means the CLOB accepted the order: one it refused is REJECTED, and one that
+    was not sent or got no answer is ERROR."""
+
+    PLACE = "place"
+    SKIP_LIVE = "skip_live"
+    SKIP_EXPIRED = "skip_expired"
+    SKIP_FARMER = "skip_farmer"
+    SKIP_FILLED = "skip_filled"
+    REJECTED = "rejected"
+    ERROR = "error"
+
+
+def _values(members):
+    return ", ".join(f"'{member.value}'" for member in members)
+
+
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS worker_status (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -63,7 +92,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
     params TEXT NOT NULL,
-    state TEXT NOT NULL CHECK (state IN ({", ".join(f"'{s.value}'" for s in JobState)})),
+    state TEXT NOT NULL CHECK (state IN ({_values(JobState)})),
     error TEXT,
     created_at TEXT NOT NULL,
     started_at TEXT,
@@ -71,6 +100,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS jobs_open_kind ON jobs (kind)
     WHERE state IN ('queued', 'running');
+CREATE UNIQUE INDEX IF NOT EXISTS jobs_open_restore ON jobs ((1))
+    WHERE kind IN ({_values(RESTORE_KINDS)}) AND state IN ('queued', 'running');
 
 CREATE TABLE IF NOT EXISTS snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,13 +119,24 @@ CREATE TABLE IF NOT EXISTS snapshot_orders (
     market TEXT NOT NULL,
     market_name TEXT,
     outcome TEXT NOT NULL,
-    side TEXT NOT NULL CHECK (side IN ({", ".join(f"'{s.value}'" for s in Side)})),
+    side TEXT NOT NULL CHECK (side IN ({_values(Side)})),
     price REAL NOT NULL,
     size REAL NOT NULL,
     size_matched REAL NOT NULL,
     expiration TEXT
 );
 CREATE INDEX IF NOT EXISTS snapshot_orders_snapshot ON snapshot_orders (snapshot_id);
+
+CREATE TABLE IF NOT EXISTS restore_lines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL,
+    snapshot_order_id INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ({_values(RestoreAction)})),
+    size REAL NOT NULL,
+    order_id TEXT CHECK (order_id IS NULL OR action = 'place'),
+    detail TEXT NOT NULL,
+    UNIQUE (job_id, snapshot_order_id)
+);
 
 CREATE TABLE IF NOT EXISTS log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -214,8 +256,9 @@ def _job(row):
 def enqueue_job(conn, kind, params, now):
     """Queue a job for the worker and return its id.
 
-    Raises JobOpen when a job of this kind is still queued or running: the
-    jobs_open_kind index allows one.
+    Raises JobOpen when a job of this kind is still queued or running, and for
+    a preview or a restore when either is: the jobs_open_kind and
+    jobs_open_restore indexes allow one.
     """
     try:
         with conn:
@@ -223,10 +266,11 @@ def enqueue_job(conn, kind, params, now):
                 "INSERT INTO jobs (kind, params, state, created_at) VALUES (?, ?, 'queued', ?)",
                 (kind.value, json.dumps(params), stamp(now))).lastrowid
     except sqlite3.IntegrityError:
+        kinds = RESTORE_KINDS if kind in RESTORE_KINDS else (kind,)
         open_job = conn.execute(
-            "SELECT id, state FROM jobs WHERE kind = ? AND state IN ('queued', 'running')",
-            (kind.value,)).fetchone()
-        raise JobOpen(f"A {kind.value} job is already {open_job['state']} "
+            f"SELECT id, kind, state FROM jobs WHERE kind IN ({_values(kinds)}) "
+            "AND state IN ('queued', 'running') ORDER BY id").fetchone()
+        raise JobOpen(f"A {open_job['kind']} job is already {open_job['state']} "
                       f"(job {open_job['id']}).") from None
 
 
@@ -279,11 +323,21 @@ def latest_job(conn, kind):
                              (kind.value,)).fetchone())
 
 
+def latest_restore_job(conn, snapshot_id):
+    """The newest preview or restore job of a snapshot, or None."""
+    return _job(conn.execute(
+        f"SELECT * FROM jobs WHERE kind IN ({_values(RESTORE_KINDS)}) "
+        "AND json_extract(params, '$.snapshot_id') = ? ORDER BY id DESC LIMIT 1",
+        (snapshot_id,)).fetchone())
+
+
 def last_job_change(conn):
-    """A mark that moves whenever a job is queued, changes state or logs a line."""
+    """A mark that moves whenever a job is queued, changes state, logs a line or
+    stores a restore line."""
     return tuple(conn.execute(
         "SELECT (SELECT COALESCE(MAX(id), 0) FROM jobs), "
-        "(SELECT COALESCE(MAX(id), 0) FROM log WHERE job_id IS NOT NULL)").fetchone())
+        "(SELECT COALESCE(MAX(id), 0) FROM log WHERE job_id IS NOT NULL), "
+        "(SELECT COALESCE(MAX(id), 0) FROM restore_lines)").fetchone())
 
 
 class LogLine(NamedTuple):
@@ -378,10 +432,55 @@ def read_snapshot(conn, snapshot_id):
     return _snapshot(row) if row else None
 
 
+def _snapshot_order(row):
+    return SnapshotOrder(row["id"], row["snapshot_id"], row["market_name"], OpenOrder(
+        row["order_id"], row["token_id"], row["market"], row["outcome"], Side(row["side"]),
+        row["price"], row["size"], row["size_matched"], _time(row["expiration"])))
+
+
 def read_snapshot_orders(conn, snapshot_id):
     """A snapshot's orders, in the order the CLOB listed them."""
     rows = conn.execute("SELECT * FROM snapshot_orders WHERE snapshot_id = ? ORDER BY id",
                         (snapshot_id,))
-    return [SnapshotOrder(r["id"], r["snapshot_id"], r["market_name"], OpenOrder(
-        r["order_id"], r["token_id"], r["market"], r["outcome"], Side(r["side"]), r["price"],
-        r["size"], r["size_matched"], _time(r["expiration"]))) for r in rows]
+    return [_snapshot_order(row) for row in rows]
+
+
+class RestoreLine(NamedTuple):
+    """One snapshot order in a preview or a restore job. size is what was left
+    of the order to place. order_id is the new order's id, on a line a restore
+    placed and on no other. detail is the plan's reason or the CLOB's."""
+
+    job_id: int
+    order: SnapshotOrder
+    action: RestoreAction
+    size: float
+    order_id: Optional[str]
+    detail: str
+
+
+def add_restore_lines(conn, lines):
+    """Store these RestoreLines, all or none. A second line for one snapshot
+    order in a job raises sqlite3.IntegrityError."""
+    with conn:
+        conn.executemany(
+            "INSERT INTO restore_lines (job_id, snapshot_order_id, action, size, order_id, "
+            "detail) VALUES (?, ?, ?, ?, ?, ?)",
+            [(line.job_id, line.order.id, line.action.value, line.size, line.order_id,
+              line.detail) for line in lines])
+
+
+def read_restore_lines(conn, job_id):
+    """A job's lines with their snapshot orders, in the order they were stored."""
+    rows = conn.execute(
+        "SELECT o.*, l.job_id, l.action, l.size AS line_size, l.order_id AS new_order_id, "
+        "l.detail FROM restore_lines l JOIN snapshot_orders o ON o.id = l.snapshot_order_id "
+        "WHERE l.job_id = ? ORDER BY l.id", (job_id,))
+    return [RestoreLine(row["job_id"], _snapshot_order(row), RestoreAction(row["action"]),
+                        row["line_size"], row["new_order_id"], row["detail"]) for row in rows]
+
+
+def count_restore_lines(conn, job_id):
+    """{RestoreAction: how many of the job's lines}, without the actions it has none of."""
+    return {RestoreAction(row["action"]): row["n"] for row in conn.execute(
+        "SELECT action, COUNT(*) AS n FROM restore_lines WHERE job_id = ? GROUP BY action",
+        (job_id,))}

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from polymarket.orders import OpenOrder, Side
 from tools import db
-from tools.db import JobKind, JobState
+from tools.db import JobKind, JobState, RestoreAction
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
 MARKET_A, MARKET_B = "0x" + "aa" * 32, "0x" + "bb" * 32
@@ -251,6 +251,96 @@ class SnapshotTests(Scratch):
         db.insert_snapshot(self.db, NOW, "", [], {})
         self.assertEqual(db.imported_sources(self.db), set())
         self.assertEqual(len(db.read_snapshots(self.db)), 2)
+
+
+class RestoreJobTests(Scratch):
+    def test_one_job_among_preview_and_restore_is_open_at_a_time(self):
+        preview = db.enqueue_job(self.db, JobKind.PREVIEW, {"snapshot_id": 1}, NOW)
+        with self.assertRaisesRegex(db.JobOpen, f"A preview job is already queued .job {preview}."):
+            db.enqueue_job(self.db, JobKind.RESTORE, {"snapshot_id": 1}, later(1))
+        db.claim_job(self.db, later(2))
+        db.finish_job(self.db, preview, later(3))
+        restore = db.enqueue_job(self.db, JobKind.RESTORE, {"snapshot_id": 1}, later(4))
+        db.claim_job(self.db, later(5))
+        with self.assertRaisesRegex(db.JobOpen, f"restore job is already running .job {restore}."):
+            db.enqueue_job(self.db, JobKind.PREVIEW, {"snapshot_id": 2}, later(6))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+
+    def test_a_snapshot_job_is_accepted_beside_an_open_restore(self):
+        db.enqueue_job(self.db, JobKind.RESTORE, {"snapshot_id": 1}, NOW)
+        snapshot = db.enqueue_job(self.db, JobKind.SNAPSHOT, {"note": ""}, NOW)
+        self.assertEqual(db.read_job(self.db, snapshot).state, JobState.QUEUED)
+
+    def test_the_latest_restore_job_of_a_snapshot_is_its_newest_preview_or_restore(self):
+        self.assertIsNone(db.latest_restore_job(self.db, 1))
+
+        def run(kind, **params):
+            job = db.enqueue_job(self.db, kind, params, NOW)
+            db.claim_job(self.db, NOW)
+            db.finish_job(self.db, job, NOW)
+            return job
+
+        preview = run(JobKind.PREVIEW, snapshot_id=1, managed_markets=[])
+        self.assertEqual(db.latest_restore_job(self.db, 1).id, preview)
+        restore = run(JobKind.RESTORE, snapshot_id=1, managed_markets=[])
+        run(JobKind.PREVIEW, snapshot_id=2, managed_markets=[])
+        run(JobKind.SNAPSHOT, note="")
+        latest = db.latest_restore_job(self.db, 1)
+        self.assertEqual((latest.id, latest.kind), (restore, JobKind.RESTORE))
+        self.assertIsNone(db.latest_restore_job(self.db, 3))
+
+
+class RestoreLineTests(Scratch):
+    def setUp(self):
+        super().setUp()
+        self.snapshot = db.insert_snapshot(
+            self.db, NOW, "", [order("0xo1", MARKET_A, size=100.0, matched=40.0),
+                               order("0xo2", MARKET_B), order("0xo3", MARKET_B)],
+            {MARKET_A: "Will A happen?"})
+        self.orders = db.read_snapshot_orders(self.db, self.snapshot)
+
+    def line(self, index, action, size=100.0, order_id=None, detail="", job=7):
+        return db.RestoreLine(job, self.orders[index], action, size, order_id, detail)
+
+    def test_a_jobs_lines_read_back_as_written_with_their_snapshot_orders(self):
+        written = [self.line(0, RestoreAction.PLACE, 60.0, "0xnew", "placed"),
+                   self.line(1, RestoreAction.REJECTED, detail="not enough balance / allowance"),
+                   self.line(2, RestoreAction.SKIP_LIVE, detail="already open")]
+        db.add_restore_lines(self.db, written[:1])
+        db.add_restore_lines(self.db, written[1:])
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.SKIP_FARMER, job=8)])
+        self.assertEqual(db.read_restore_lines(self.db, 7), written)
+        self.assertEqual(db.read_restore_lines(self.db, 7)[0].order.market_name, "Will A happen?")
+        self.assertEqual(db.read_restore_lines(self.db, 9), [])
+
+    def test_a_job_holds_one_line_for_a_snapshot_order_and_a_refused_batch_stores_nothing(self):
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.SKIP_EXPIRED)])
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.add_restore_lines(self.db, [self.line(1, RestoreAction.SKIP_LIVE),
+                                           self.line(0, RestoreAction.PLACE)])
+        self.assertEqual([line.action for line in db.read_restore_lines(self.db, 7)],
+                         [RestoreAction.SKIP_EXPIRED])
+
+    def test_only_a_placed_line_carries_an_order_id(self):
+        for action in RestoreAction:
+            if action is not RestoreAction.PLACE:
+                with self.subTest(action=action):
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        db.add_restore_lines(self.db, [self.line(0, action, order_id="0xnew")])
+
+    def test_the_lines_of_a_job_are_counted_by_action(self):
+        self.assertEqual(db.count_restore_lines(self.db, 7), {})
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.PLACE),
+                                       self.line(1, RestoreAction.SKIP_LIVE),
+                                       self.line(2, RestoreAction.PLACE),
+                                       self.line(0, RestoreAction.ERROR, job=8)])
+        self.assertEqual(db.count_restore_lines(self.db, 7),
+                         {RestoreAction.PLACE: 2, RestoreAction.SKIP_LIVE: 1})
+
+    def test_a_restore_line_moves_the_job_change_mark(self):
+        before = db.last_job_change(self.db)
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.PLACE)])
+        self.assertNotEqual(db.last_job_change(self.db), before)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,66 @@
+{%- from "_macros.html" import token_field -%}
+{%- set job = restore.job if restore else none -%}
+<div class="stack" style="gap: 20px">
+<section class="panel pad stack" style="gap: 12px">
+  <div class="page-head">
+    <h2>Restore</h2>
+    <form method="post" action="/orders/snapshots/{{ snapshot.id }}/preview">
+      {{ token_field() }}
+      <button class="btn btn-strong" type="submit">Preview restore</button>
+    </form>
+  </div>
+  <span class="hint">The worker lists the orders open now and decides, for each order of this snapshot, whether it is missing. A preview places nothing.</span>
+  {%- if job %}
+  <div class="page-head">
+    <h2>{{ 'Preview' if restore.preview else 'Restore' }} job {{ job.id }}</h2>
+    <span class="badge {{ JOB_TONE[job.state] }}">{{ job.state.value }}</span>
+  </div>
+  <span class="mono small c-mut">queued {{ job.created_at | stamp_local }}{% if job.started_at %} · started {{ job.started_at | clock }}{% endif %}{% if job.finished_at %} · finished {{ job.finished_at | clock }}{% endif %}{% if job.state.value == 'running' %} · {{ restore.stored }} of {{ snapshot.orders }} orders so far{% endif %}</span>
+  {%- if job.state.value == 'queued' and not chrome.worker.running %}
+  <span class="small c-warn">It waits for the worker, which is not running.{% if not restore.preview %} A restore that waits longer than {{ max_wait.total_seconds() | span }} is not run.{% endif %}</span>
+  {%- endif %}
+  {%- if job.error %}<span class="field-error" role="alert">{{ job.error }}</span>{% endif %}
+  {%- for line in restore.log %}
+  <div class="mono feed"><span class="t">{{ line.at | clock }}</span><span>{{ line.message }}</span></div>
+  {%- endfor %}
+  {%- if restore.groups %}
+  <div class="actions">
+    {%- for group in restore.groups %}
+    <span class="badge {{ group.tone }}">{{ '{:,}'.format(group.lines | length) }} · {{ group.title }}</span>
+    {%- endfor %}
+  </div>
+  {%- endif %}
+  {%- if restore.to_place %}
+  <form class="stack" method="post" action="/orders/snapshots/{{ snapshot.id }}/restore" style="gap: 8px">
+    {{ token_field() }}
+    <div class="actions">
+      <label class="grow-field"><span class="sr">Type {{ confirm_word }} to confirm</span><input class="inp mono" id="restore-confirm" name="confirm" placeholder="Type {{ confirm_word }} to confirm" autocomplete="off" hx-preserve="true" {{ 'aria-invalid="true"' | safe if confirm_error }}></label>
+      <button class="btn btn-danger" type="submit">Place {{ '{:,}'.format(restore.to_place) }} order{{ '' if restore.to_place == 1 else 's' }}</button>
+    </div>
+    {%- if confirm_error %}<span class="field-error" role="alert">{{ confirm_error }}</span>{% endif %}
+    <span class="hint">These are real orders. The worker lists the open orders again and places what is missing then, post-only, so the count can differ from this preview.</span>
+  </form>
+  {%- elif restore.to_place == 0 %}
+  <span class="small muted">Nothing to place: every order of this snapshot is open or was skipped.</span>
+  {%- elif not restore.preview and job.finished_at %}
+  <span class="hint">Preview again to see what is still missing.</span>
+  {%- endif %}
+  {%- endif %}
+</section>
+{%- for group in (restore.groups if restore else []) %}
+<section class="panel pad-table">
+  <div class="head"><h2>{{ group.title }}</h2><span class="badge {{ group.tone }}">{{ '{:,}'.format(group.lines | length) }}</span></div>
+  <div class="scroll">
+    <table class="tbl tight">
+      <thead><tr><th>Market</th><th>Outcome</th><th>Side</th><th>Price</th><th>Size</th><th>Expiration</th>{% if group.placed %}<th>New order</th>{% endif %}<th>Why</th></tr></thead>
+      <tbody>
+        {%- for line in group.lines %}
+        {%- set o = line.order.order %}
+        <tr>{% if line.order.market_name %}<td class="wrap">{{ line.order.market_name }}</td>{% else %}<td class="wrap mono muted">{{ o.market }}</td>{% endif %}<td>{{ o.outcome }}</td><td class="mono">{{ o.side.value }}</td><td class="mono">{{ o.price | cents }}</td><td class="mono">{{ line.size | shares }}</td><td class="mono">{{ o.expiration | stamp_local if o.expiration else 'GTC' }}</td>{% if group.placed %}<td class="mono">{{ line.order_id }}</td>{% endif %}<td class="wrap">{{ line.detail }}</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{%- endfor %}
+</div>

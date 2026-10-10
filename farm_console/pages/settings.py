@@ -125,7 +125,7 @@ def routes(ctx):
 
     @router.post("/farmer/cancel-all")
     async def cancel_all(request: Request):
-        errors = forms.parse_cancel_all(await form_of(request))
+        errors = forms.parse_typed_word(await form_of(request), forms.CANCEL_ALL_WORD)
         with closing(ctx.connect()) as conn:
             if errors:
                 return settings_response(request, conn, 422, cancel_error=errors["confirm"])

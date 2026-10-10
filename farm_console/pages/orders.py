@@ -1,19 +1,77 @@
-"""The Orders page: the snapshots of the account's open orders, and the job that
-asks the worker for a new one."""
+"""The Orders page: the snapshots of the account's open orders, the job that asks
+the worker for a new one, and the restore of a snapshot from its page."""
 
 from contextlib import closing
+from typing import NamedTuple, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+import farm_db
 from tools import db as tools_db
-from tools.db import JobKind
+from tools.db import JobKind, JobState, RestoreAction
 
 from .. import forms
 from ..context import form_of, region_template, see_other
 
 ORDERS_REGIONS = {"job": "partials/orders_job.html",
                   "snapshots": "partials/orders_snapshots.html"}
+# How the lines of a job are grouped, in the order the page shows them: the
+# action, its title and the badge tone. PLACE is titled by the kind of job.
+LINE_GROUPS = (
+    (RestoreAction.ERROR, "Error", "t-r"),
+    (RestoreAction.REJECTED, "Rejected by the exchange", "t-r"),
+    (RestoreAction.PLACE, None, "t-q"),
+    (RestoreAction.SKIP_LIVE, "Skipped: already open", "t-n"),
+    (RestoreAction.SKIP_EXPIRED, "Skipped: expired", "t-n"),
+    (RestoreAction.SKIP_FARMER, "Skipped: the farmer's market", "t-n"),
+    (RestoreAction.SKIP_FILLED, "Skipped: nothing left to fill", "t-n"),
+)
+PREVIEW_FIRST = "Preview the restore first: placing follows a finished preview of this snapshot."
+
+
+class LineGroup(NamedTuple):
+    """The lines of one action. placed is whether they carry a new order's id."""
+
+    title: str
+    tone: str
+    lines: list
+    placed: bool
+
+
+class RestoreView(NamedTuple):
+    """The newest preview or restore job of a snapshot, as its page shows it.
+    to_place is how many orders a finished preview would place, and None for
+    any other job: only then does the page offer to place them."""
+
+    job: tools_db.Job
+    preview: bool
+    log: list
+    groups: list
+    stored: int
+    to_place: Optional[int]
+
+
+def restore_view(job, log, lines):
+    preview = job.kind is JobKind.PREVIEW
+    groups = [LineGroup(title or ("Would place" if preview else "Placed"), tone, found,
+                        action is RestoreAction.PLACE and not preview)
+              for action, title, tone in LINE_GROUPS
+              if (found := [line for line in lines if line.action is action])]
+    to_place = None
+    if preview and job.state is JobState.DONE:
+        to_place = sum(line.action is RestoreAction.PLACE for line in lines)
+    return RestoreView(job, preview, log, groups, len(lines), to_place)
+
+
+def placing_refusal(last):
+    """Why a snapshot whose newest preview or restore job is `last` cannot be
+    placed now, or None when that job is a finished preview."""
+    if last is not None and last.state in (JobState.QUEUED, JobState.RUNNING):
+        return f"{last.kind.value.capitalize()} job {last.id} is still {last.state.value}."
+    if last is None or last.kind is not JobKind.PREVIEW or last.state is not JobState.DONE:
+        return PREVIEW_FIRST
+    return None
 
 
 def routes(ctx):
@@ -35,6 +93,36 @@ def routes(ctx):
     def orders_response(request, status_code=200, **context):
         with closing(ctx.connect_tools()) as conn:
             return render(request, "orders.html", status_code, **orders_context(conn), **context)
+
+    def find_snapshot(conn, snapshot_id):
+        snapshot = tools_db.read_snapshot(conn, snapshot_id)
+        if snapshot is None:
+            raise HTTPException(404, f"no snapshot {snapshot_id} in {ctx.tools_db}")
+        return snapshot
+
+    def restore_context(conn, snapshot):
+        job = tools_db.latest_restore_job(conn, snapshot.id)
+        restore = job and restore_view(job, tools_db.read_log(conn, job.id),
+                                       tools_db.read_restore_lines(conn, job.id))
+        return {"snapshot": snapshot, "restore": restore, "confirm_word": forms.RESTORE_WORD,
+                "max_wait": tools_db.RESTORE_MAX_WAIT}
+
+    def snapshot_response(request, conn, snapshot, status_code=200, **context):
+        return render(request, "orders_snapshot.html", status_code,
+                      orders=tools_db.read_snapshot_orders(conn, snapshot.id),
+                      **restore_context(conn, snapshot), **context)
+
+    def queue_restore_job(request, conn, snapshot, kind):
+        """Queue a preview or a restore of the snapshot with the markets the
+        farmer manages now, and go back to its page."""
+        with closing(ctx.connect()) as farm:
+            managed = sorted(farm_db.load_approved(farm))
+        try:
+            tools_db.enqueue_job(conn, kind, {"snapshot_id": snapshot.id,
+                                              "managed_markets": managed}, ctx.clock())
+        except tools_db.JobOpen as e:
+            return snapshot_response(request, conn, snapshot, 409, refused=str(e))
+        return see_other(f"/orders/snapshots/{snapshot.id}")
 
     @router.get("/orders", response_class=HTMLResponse)
     def orders_page(request: Request):
@@ -58,11 +146,34 @@ def routes(ctx):
     @router.get("/orders/snapshots/{snapshot_id}", response_class=HTMLResponse)
     def snapshot_page(request: Request, snapshot_id: int):
         with closing(ctx.connect_tools()) as conn:
-            snapshot = tools_db.read_snapshot(conn, snapshot_id)
-            if snapshot is None:
-                raise HTTPException(404, f"no snapshot {snapshot_id} in {ctx.tools_db}")
-            orders = tools_db.read_snapshot_orders(conn, snapshot_id)
-        return render(request, "orders_snapshot.html", snapshot=snapshot, orders=orders)
+            return snapshot_response(request, conn, find_snapshot(conn, snapshot_id))
+
+    @router.post("/orders/snapshots/{snapshot_id}/preview")
+    async def preview_restore(request: Request, snapshot_id: int):
+        with closing(ctx.connect_tools()) as conn:
+            return queue_restore_job(request, conn, find_snapshot(conn, snapshot_id),
+                                     JobKind.PREVIEW)
+
+    @router.post("/orders/snapshots/{snapshot_id}/restore")
+    async def place_restore(request: Request, snapshot_id: int):
+        """Queue the job that places real orders. It follows a finished preview
+        of this snapshot and the typed word, both checked here."""
+        errors = forms.parse_typed_word(await form_of(request), forms.RESTORE_WORD)
+        with closing(ctx.connect_tools()) as conn:
+            snapshot = find_snapshot(conn, snapshot_id)
+            refusal = placing_refusal(tools_db.latest_restore_job(conn, snapshot_id))
+            if refusal:
+                return snapshot_response(request, conn, snapshot, 409, refused=refusal)
+            if errors:
+                return snapshot_response(request, conn, snapshot, 422,
+                                         confirm_error=errors["confirm"])
+            return queue_restore_job(request, conn, snapshot, JobKind.RESTORE)
+
+    @router.get("/partials/orders/restore/{snapshot_id}", response_class=HTMLResponse)
+    def restore_partial(request: Request, snapshot_id: int):
+        with closing(ctx.connect_tools()) as conn:
+            return render(request, "partials/orders_restore.html",
+                          **restore_context(conn, find_snapshot(conn, snapshot_id)))
 
     @router.get("/partials/orders/{region}", response_class=HTMLResponse)
     def orders_partial(request: Request, region: str):

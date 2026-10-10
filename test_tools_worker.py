@@ -10,8 +10,9 @@ from datetime import datetime, timedelta, timezone
 
 from test_polymarket_gamma import Gamma, cid, client
 from test_polymarket_orders import Clob, entry
+from test_tools_restore import ACCEPT, MARKET_B, MARKET_C, Venue, order
 from tools import db, worker
-from tools.db import JobKind, JobState
+from tools.db import JobKind, JobState, RestoreAction
 from tools.worker import Handler
 
 START = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
@@ -141,7 +142,8 @@ class LoopTests(Scratch):
     def test_a_job_the_worker_has_no_handler_for_fails_and_the_next_one_runs(self):
         unknown = self.queue(JobKind.PREVIEW, snapshot_id=1)
         snapshot = self.queue()
-        self.run_worker(Clob([entry()]), beats=2)
+        self.run_worker(Clob([entry()]), beats=2,
+                        handlers={JobKind.SNAPSHOT: worker.HANDLERS[JobKind.SNAPSHOT]})
         failed = db.read_job(self.db, unknown)
         self.assertEqual((failed.state, failed.error),
                          (JobState.FAILED, "this worker cannot run a preview job"))
@@ -184,6 +186,109 @@ class LoopTests(Scratch):
         self.assertEqual(order, [None])
         self.assertEqual(db.read_job(self.db, job).state, JobState.DONE)
         self.assertEqual(db.read_worker_status(self.db).stopped_at, at(1))
+
+    def test_a_stopping_worker_tells_its_running_job_to_stop(self):
+        told = []
+
+        def handler(run):
+            told.append(run.stop.wait(GUARD_S))
+
+        self.queue()
+        self.run_worker(Clob([]), stop=Stop(self.clock, 1, settle_jobs=False),
+                        handlers={JobKind.SNAPSHOT: Handler(handler, True)})
+        self.assertEqual(told, [True])
+
+    def test_a_job_is_not_told_to_stop_while_the_worker_runs(self):
+        told = []
+        self.queue()
+        self.run_worker(Clob([]), beats=2, handlers={
+            JobKind.SNAPSHOT: Handler(lambda run: told.append(run.stop.is_set()), True)})
+        self.assertEqual(told, [False])
+
+
+class RestoreJobTests(Scratch):
+    def snapshot(self, *orders):
+        return db.insert_snapshot(self.db, at(-3600), "", list(orders), {})
+
+    def queue_restore(self, kind, snapshot_id, managed=()):
+        return self.queue(kind, snapshot_id=snapshot_id, managed_markets=list(managed))
+
+    def lines(self, job):
+        return [(line.action, line.size, line.order_id)
+                for line in db.read_restore_lines(self.db, job)]
+
+    def test_a_preview_job_stores_the_plan_and_never_posts(self):
+        venue = Venue(listing=[order("0xlive")])
+        job = self.queue_restore(JobKind.PREVIEW, self.snapshot(
+            order("0xa"), order("0xb"), order("0xc", MARKET_B)), managed=[MARKET_B])
+        self.run_worker(venue)
+        self.assertEqual((db.read_job(self.db, job).state, db.read_job(self.db, job).error),
+                         (JobState.DONE, None))
+        self.assertEqual(self.lines(job), [(RestoreAction.SKIP_LIVE, 100.0, None),
+                                           (RestoreAction.PLACE, 100.0, None),
+                                           (RestoreAction.SKIP_FARMER, 100.0, None)])
+        self.assertEqual((venue.signed, venue.posts), ([], []), "a preview signed or posted")
+        self.assertEqual(self.messages(job),
+                         ["started", "planned 3 orders: 1 to place, 2 skipped", "done"])
+
+    def test_a_restore_job_places_what_is_missing_and_stores_what_became_of_each_order(self):
+        venue = Venue(listing=[order("0xlive")],
+                      answer=lambda signed: "not enough balance / allowance"
+                      if signed.price == 0.5 else ACCEPT)
+        job = self.queue_restore(JobKind.RESTORE, self.snapshot(
+            order("0xa"), order("0xb"), order("0xc", MARKET_B, price=0.5)))
+        self.run_worker(venue)
+        self.assertEqual(db.read_job(self.db, job).state, JobState.DONE)
+        self.assertEqual(self.lines(job), [(RestoreAction.SKIP_LIVE, 100.0, None),
+                                           (RestoreAction.PLACE, 100.0, "0xnew1"),
+                                           (RestoreAction.REJECTED, 100.0, None)])
+        self.assertEqual([post_only for *_, post_only in venue.posts], [True, True])
+        self.assertEqual(self.messages(job), [
+            "started", "went through 3 orders: 1 placed, 1 rejected, 1 skipped", "done"])
+
+    def test_a_restore_whose_listing_fails_fails_the_job_and_places_nothing(self):
+        venue = Venue(listing=ConnectionError("timed out"))
+        job = self.queue_restore(JobKind.RESTORE, self.snapshot(order("0xa"), order("0xb")))
+        self.run_worker(venue, beats=2)
+        failed = db.read_job(self.db, job)
+        self.assertEqual((failed.state, failed.error),
+                         (JobState.FAILED, "ConnectionError: timed out"))
+        self.assertEqual((venue.posts, self.lines(job)), ([], []))
+
+    def test_a_stopping_worker_ends_a_restore_between_orders_and_keeps_its_lines(self):
+        venue, runs, posted_two = Venue(), [], threading.Event()
+
+        def hold_the_second_post():
+            # It returns only once the job has been told to stop, so the third
+            # order is reached with the stop set.
+            if len(venue.posts) == 2:
+                posted_two.set()
+                runs[0].stop.wait(GUARD_S)
+
+        def handler(run):
+            runs.append(run)
+            worker.HANDLERS[JobKind.RESTORE].run(run)
+
+        def loop_waits(n):
+            if not posted_two.wait(GUARD_S):
+                raise TimeoutError("the restore never reached its second order")
+
+        venue.after_post = hold_the_second_post
+        job = self.queue_restore(JobKind.RESTORE, self.snapshot(
+            order("0xa"), order("0xb", MARKET_B), order("0xc", MARKET_C), order("0xd", price=0.4)))
+        self.run_worker(venue, stop=Stop(self.clock, 1, settle_jobs=False, on_wait=loop_waits),
+                        handlers={JobKind.RESTORE: Handler(handler, True)})
+        failed = db.read_job(self.db, job)
+        self.assertEqual(failed.state, JobState.FAILED)
+        self.assertIn("the worker stopped after 2 of 4 orders", failed.error)
+        self.assertEqual(self.lines(job), [(RestoreAction.PLACE, 100.0, "0xnew1"),
+                                           (RestoreAction.PLACE, 100.0, "0xnew2")])
+        self.assertEqual(len(venue.posts), 2)
+
+    def test_a_preview_needs_a_key(self):
+        job = self.queue_restore(JobKind.PREVIEW, self.snapshot(order("0xa")))
+        self.run_worker(None)
+        self.assertIn("no key", db.read_job(self.db, job).error)
 
 
 class RecoveryTests(Scratch):
