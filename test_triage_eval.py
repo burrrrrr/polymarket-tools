@@ -8,11 +8,15 @@ import tempfile
 import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+import httpx
 
 import farm_db
 import triage
 import triage_eval
 from farm_console.remote import Rules
+from polymarket.hosts import GAMMA_HOST
 from test_farm_console_writes import BUDGET_BOOK, FLOOR_BOOK, V3_RESULT, assessed_row
 from test_triage import background, envelope, news
 from triage_eval import Resolution
@@ -263,6 +267,50 @@ class RetroTest(EvalTest):
         self.assertEqual([(r["verdict"], r["reconsider"]) for r in rows],
                          [("needs_human", "False")])
         self.assertNotIn("reconsider (", printed)
+
+
+class FetchResolutionTest(unittest.TestCase):
+    """fetch_resolution against a Gamma that records what it was asked."""
+
+    def fetch(self, answer, condition_id="0xabc"):
+        """What fetch_resolution returns when Gamma answers every request with
+        answer, an httpx.Response. self.asked is each request it sent."""
+        self.asked = []
+
+        def gamma(request):
+            self.asked.append((request.method, str(request.url),
+                               request.extensions["timeout"]["read"]))
+            return answer
+
+        client = httpx.Client(transport=httpx.MockTransport(gamma))
+        with mock.patch("httpx.Client", return_value=client):
+            return triage_eval.fetch_resolution(condition_id)
+
+    def closed(self, prices, condition_id="0xabc"):
+        return httpx.Response(200, json=[{
+            "conditionId": condition_id, "outcomes": json.dumps(["Yes", "No"]),
+            "outcomePrices": json.dumps(prices)}])
+
+    def test_it_asks_gamma_once_for_the_closed_market_and_names_the_winner(self):
+        self.assertEqual(self.fetch(self.closed(["0.0005", "0.9995"])), Resolution(True, "No"))
+        self.assertEqual(self.asked, [
+            ("GET", f"{GAMMA_HOST}/markets?condition_ids=0xabc&closed=true", 15)])
+
+    def test_a_closed_market_with_no_outcome_at_99c_has_no_winner_yet(self):
+        self.assertEqual(self.fetch(self.closed(["0.5", "0.5"])), Resolution(True, None))
+
+    def test_a_market_gamma_does_not_list_as_closed_is_open(self):
+        for answer in (httpx.Response(200, json=[]), httpx.Response(200, content=b"null"),
+                       self.closed(["0", "1"], condition_id="0xother")):
+            with self.subTest(body=answer.text):
+                self.assertEqual(self.fetch(answer), Resolution(False, None))
+
+    def test_a_refused_read_raises_after_one_request(self):
+        for status in (429, 500):
+            with self.subTest(status=status):
+                with self.assertRaises(httpx.HTTPStatusError):
+                    self.fetch(httpx.Response(status, headers={"retry-after": "0"}))
+                self.assertEqual(len(self.asked), 1)
 
 
 if __name__ == "__main__":

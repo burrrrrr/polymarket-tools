@@ -34,7 +34,7 @@ import httpx
 import farm_db
 import triage
 from farm_console import remote
-from polymarket.hosts import GAMMA_HOST
+from polymarket.gamma import request_markets
 
 WORKERS = 4
 NEAR = triage.Verdict.NEAR_IMPOSSIBLE.value
@@ -61,11 +61,8 @@ def fetch_resolution(condition_id):
     """The market's Resolution. Gamma lists a closed market only when asked
     for closed ones, and then only closed ones."""
     with httpx.Client() as http:
-        resp = http.get(f"{GAMMA_HOST}/markets",
-                        params={"condition_ids": condition_id, "closed": "true"},
-                        timeout=remote.TIMEOUT_S)
-        resp.raise_for_status()
-        entries = resp.json() or []
+        entries = request_markets(http, [condition_id], True, remote.TIMEOUT_S, limit=False,
+                                  retries=0)
     entry = next((e for e in entries if e.get("conditionId") == condition_id), None)
     if entry is None:
         return Resolution(False, None)
