@@ -512,7 +512,7 @@ class StreamTest(Orders):
 
 
 class ImportTest(unittest.TestCase):
-    def test_the_console_loads_no_key_loader_no_client_and_no_worker(self):
+    def test_the_console_loads_no_keys_no_client_and_no_worker(self):
         # reward_farmer, which the console imports for the farmer's defaults,
         # loads py_clob_client_v2, so the SDK itself cannot be ruled out here.
         loaded = loaded_by(["farm_console.app"])

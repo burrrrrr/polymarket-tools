@@ -1,8 +1,8 @@
 """Where Polymarket's services live.
 
 Each host is read from the process environment once, when this module is
-imported. The farmer and the console import it before they load .env, so a host
-override belongs in the real environment and not in .env.
+imported. Every entry point imports it before it loads .env, so a host override
+belongs in the real environment and not in .env.
 """
 
 import os

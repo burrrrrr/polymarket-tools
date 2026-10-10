@@ -23,8 +23,7 @@ KEYLESS = ["polymarket.books", "polymarket.gamma", "polymarket.feed", "polymarke
            "polymarket.hosts", "polymarket.http", "polymarket.parse", "polymarket.orders"]
 KEYED = ("polymarket.keys", "polymarket.client", "py_clob_client_v2")
 OUTSIDE_PREFIXES = ("reward_", "farm_")
-OUTSIDE = {"tools", "config", "key_loader", "bitwarden_loader", "dotenv", "tick_watch", "restore",
-           "snapshot"}
+OUTSIDE = {"tools", "data_dir", "dotenv"}
 TERMINAL_CALLS = {"print", "input", "getpass", "exit", "quit", "load_dotenv"}
 
 
@@ -48,12 +47,12 @@ def called_names(path):
 
 
 class ImportTests(unittest.TestCase):
-    def test_the_read_modules_load_no_key_loader_no_client_and_no_sdk(self):
+    def test_the_read_modules_load_no_keys_no_client_and_no_sdk(self):
         loaded = loaded_by(KEYLESS)
         self.assertTrue(set(KEYLESS) <= set(loaded))
         self.assertEqual([name for name in loaded if name.startswith(KEYED)], [])
 
-    def test_no_module_loads_the_farmer_the_console_the_old_scripts_or_dotenv(self):
+    def test_no_module_loads_the_farmer_the_console_the_worker_or_dotenv(self):
         self.assertGreaterEqual(len(MODULES), 9)
         top_level = {name.split(".")[0] for name in loaded_by(MODULES)}
         self.assertEqual(sorted(name for name in top_level

@@ -21,12 +21,12 @@ LIBRARY = sorted(path for path in glob(os.path.join(ROOT, "tools", "*.py"))
 
 
 class ImportTests(unittest.TestCase):
-    def test_the_rows_the_console_reads_load_no_key_loader_no_client_and_no_sdk(self):
+    def test_the_rows_the_console_reads_load_no_keys_no_client_and_no_sdk(self):
         loaded = loaded_by(["tools.db"])
         self.assertEqual([name for name in loaded
                           if name.startswith(KEYED) or name in KEYED_BY_THIS_BUILD], [])
 
-    def test_the_worker_is_handed_its_client_and_loads_no_key_loader(self):
+    def test_the_worker_is_handed_its_client_and_loads_no_keys(self):
         loaded = loaded_by(["tools.worker", "tools.snapshot", "tools.restore"])
         self.assertEqual([name for name in loaded if name in KEY_LOADERS], [])
 

@@ -1,6 +1,6 @@
-"""Tests for python -m tools: the worker's entry point. The region check, the key
-loader, the CLOB connection and the worker loop are fakes, so no key is read
-and nothing is sent."""
+"""Tests for python -m tools: the worker's entry point and the tools.db it opens.
+The region check, the key loader, the CLOB connection and the worker loop are
+fakes, so no key is read and nothing is sent."""
 
 import contextlib
 import io
@@ -9,6 +9,7 @@ import os
 import signal
 import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -22,6 +23,14 @@ from tools import db
 KEY = "0x" + "ab" * 32
 ALLOWED = Verdict(True, "CH: new orders permitted")
 BLOCKED = Verdict(False, "US: the API rejects new orders from here")
+OPEN_DB = db.open_db
+
+
+def open_scratch(path):
+    """open_db for a main under test, which never opens the repo's own tools.db."""
+    if Path(path).resolve().parent == entry_point.REPO.resolve():
+        raise AssertionError(f"main opened {path}, the repo's own database")
+    return OPEN_DB(path)
 
 
 class Fakes:
@@ -81,10 +90,14 @@ class Main(unittest.TestCase):
         self.dir = tmp.name
         self.db_path = os.path.join(tmp.name, "tools.db")
 
-    def main(self, argv, fakes=None, stdin=""):
+    def main(self, argv, fakes=None, stdin="", dotenv=None):
+        """main's exit code, what it printed and the fakes it reached. dotenv is
+        what the .env file sets when main loads it."""
         fakes = fakes or Fakes()
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ))
+            os.environ.pop("POLYMARKET_DATA_DIR", None)
             for target, fake in (
                     ("polymarket.http.persistent_client", fakes.persistent_client),
                     ("polymarket.http.use_for_sdk", fakes.use_for_sdk),
@@ -92,12 +105,15 @@ class Main(unittest.TestCase):
                     ("polymarket.keys.load_private_key", fakes.load_private_key),
                     ("polymarket.client.connect", fakes.connect),
                     ("tools.worker.run", fakes.run),
+                    ("tools.db.open_db", open_scratch),
                     ("signal.signal", fakes.handle),
                     ("sys.setswitchinterval", fakes.set_switch_interval),
                     ("getpass.getpass", lambda prompt: "master password"),
                     ("sys.stdin", io.StringIO(stdin))):
                 stack.enter_context(mock.patch(target, fake))
-            self.load_dotenv = stack.enter_context(mock.patch.object(entry_point, "load_dotenv"))
+            self.load_dotenv = stack.enter_context(mock.patch.object(
+                entry_point, "load_dotenv", side_effect=lambda path: os.environ.update(
+                    dotenv or {})))
             stack.enter_context(contextlib.redirect_stdout(out))
             stack.enter_context(contextlib.redirect_stderr(out))
             code = entry_point.main(argv)
@@ -181,6 +197,33 @@ class WorkerTests(Main):
                 self.assertTrue(fakes.stop.is_set())
 
 
+class DataDirTests(Main):
+    def test_with_no_flag_and_no_variable_the_worker_opens_the_repos_tools_db(self):
+        _, out, fakes = self.main(["--no-key"])
+        self.assertEqual(Path(fakes.run_args[0]), entry_point.REPO / "tools.db")
+        self.assertIn(str(entry_point.REPO / "tools.db"), out)
+
+    def test_the_data_directory_that_env_names_holds_the_tools_db(self):
+        code, _, fakes = self.main(["--no-key"], dotenv={"POLYMARKET_DATA_DIR": self.dir})
+        self.assertEqual(code, 0)
+        self.assertEqual(Path(fakes.run_args[0]), Path(self.db_path))
+
+    def test_a_db_flag_wins_over_the_data_directory(self):
+        _, _, fakes = self.main(["--no-key", "--db", "scratch.db"], dotenv={
+            "POLYMARKET_DATA_DIR": os.path.join(self.dir, "missing")})
+        self.assertEqual(fakes.run_args[0], "scratch.db")
+
+    def test_a_data_directory_that_does_not_exist_ends_the_run_before_anything_is_read(self):
+        missing = os.path.join(self.dir, "missing")
+        for argv in ([], ["import-snapshots", self.dir]):
+            with self.subTest(argv=argv):
+                code, out, fakes = self.main(argv, dotenv={"POLYMARKET_DATA_DIR": missing})
+                self.assertEqual(code, 1)
+                self.assertEqual(fakes.calls, [])
+                self.assertIn(f"POLYMARKET_DATA_DIR is not a directory: {missing}", out)
+        self.assertFalse(os.path.exists(missing))
+
+
 class ImportTests(Main):
     def setUp(self):
         super().setUp()
@@ -212,12 +255,16 @@ class ImportTests(Main):
         self.assertEqual(code, 1)
         self.assertIn("nowhere", out)
 
-    def test_the_defaults_are_the_repos_tools_db_and_its_snapshots_directory(self):
+    def test_the_import_stores_in_the_data_directory_that_env_names(self):
+        code, out, _ = self.main(["import-snapshots", self.files],
+                                 dotenv={"POLYMARKET_DATA_DIR": self.dir})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.stored(), [("orders_snapshot_20260718_221655.json", 2)])
+        self.assertIn(self.db_path, out)
+
+    def test_the_files_are_looked_for_in_the_repos_snapshots_directory(self):
         args = entry_point.build_parser().parse_args(["import-snapshots"])
-        self.assertEqual((args.db, args.directory),
-                         (str(entry_point.REPO / "tools.db"), str(entry_point.REPO / "snapshots")))
-        self.assertEqual(entry_point.build_parser().parse_args([]).db,
-                         str(entry_point.REPO / "tools.db"))
+        self.assertEqual(args.directory, str(entry_point.REPO / "snapshots"))
 
 
 if __name__ == "__main__":

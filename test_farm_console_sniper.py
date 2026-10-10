@@ -355,7 +355,7 @@ class StreamTest(Sniper):
 
 
 class ImportTest(unittest.TestCase):
-    def test_the_console_loads_the_picker_and_no_sniper_worker_key_loader_or_client(self):
+    def test_the_console_loads_the_picker_and_no_sniper_worker_keys_or_client(self):
         loaded = loaded_by(["farm_console.app"])
         self.assertIn("tools.picker", loaded)
         self.assertEqual([name for name in loaded if name in KEYED_BY_THIS_BUILD], [])

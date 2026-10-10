@@ -145,16 +145,21 @@ Planning, reconciling, and the lifecycle are pure functions; the daemon around
 them only fetches, executes, and logs.
 
 Usage:
-  python reward_farmer.py                      # dry run on farm.db, forever
+  python reward_farmer.py                      # dry run, forever
   python reward_farmer.py --db scratch.db --once
   python reward_farmer.py --live               # sign and post real orders
   python reward_farmer.py --live --keep-orders # Ctrl+C leaves orders resting
   python reward_farmer.py --live --key-stdin   # the wallet key is piped in
 
-A live run reads the wallet key from the environment or the Bitwarden vault,
-as polymarket.keys describes, and asks for the vault's master password when
-the vault is locked. --key-stdin reads the key itself from one line of
+A live run first checks where it connects from, as polymarket.region
+describes, and does not start from a place whose new orders Polymarket
+rejects. It then reads the wallet key from the environment or the Bitwarden
+vault, as polymarket.keys describes, and asks for the vault's master password
+when the vault is locked. --key-stdin reads the key itself from one line of
 standard input instead, for a machine with no vault.
+
+--db defaults to farm.db in the data directory (see data_dir.py): the
+directory POLYMARKET_DATA_DIR names, or the repo directory.
 """
 
 import argparse
@@ -177,6 +182,7 @@ from typing import NamedTuple, Optional
 import httpx
 from dotenv import load_dotenv
 
+import data_dir
 import farm_books
 import farm_db
 import fill_cost
@@ -192,6 +198,7 @@ from py_clob_client_v2.clob_types import (
     PostOrdersV2Args,
 )
 
+from polymarket import region
 from polymarket.books import Levels
 from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
 from polymarket.hosts import DATA_API_HOST
@@ -2544,7 +2551,7 @@ Examples:
   python reward_farmer.py --live --capital 300     # real orders
         """,
     )
-    parser.add_argument("--db", default="farm.db", help="SQLite file (default: farm.db)")
+    parser.add_argument("--db", help=f"SQLite file (default: farm.db {data_dir.WHERE})")
     parser.add_argument("--live", action="store_true",
                         help="Sign and post real orders (default: dry run)")
     parser.add_argument("--key-stdin", action="store_true",
@@ -2611,6 +2618,13 @@ def connect(args):
     from polymarket import client as polymarket_client
     from polymarket import keys
 
+    with httpx.Client() as http:
+        verdict = region.check(http)
+    log(f"Region: {verdict.message}.")
+    if not verdict.allowed:
+        log("Not started: a live farmer would place orders from here. "
+            "Start it without --live for a dry run.")
+        return None
     try:
         return polymarket_client.connect(read_key(args.key_stdin))
     except (keys.KeyUnavailable, polymarket_client.ConfigError) as e:
@@ -2633,6 +2647,11 @@ def main(argv=None):
     load_dotenv(Path(__file__).parent / ".env")
     _make_output_safe()
     args = build_parser().parse_args(argv)
+    try:
+        args.db = data_dir.farm_db_path(args.db)
+    except data_dir.NoDataDir as e:
+        log(f"Not started: {e}.")
+        return 1
     client = None
     if args.live:
         client = connect(args)

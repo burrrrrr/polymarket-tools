@@ -13,7 +13,8 @@ locked. --key-stdin reads the key itself from one line of standard input
 instead, for a machine with no vault: unlock the vault elsewhere and pipe the
 key in over SSH. --no-key starts a worker that fails every job that needs one.
 
---db defaults to tools.db beside the repo's farm.db.
+--db defaults to tools.db in the data directory (see data_dir.py): the
+directory POLYMARKET_DATA_DIR names, or the repo directory.
 """
 
 import argparse
@@ -26,8 +27,13 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+import data_dir
+from polymarket import client as polymarket_client
+from polymarket import http as polymarket_http
+from polymarket import keys, region
+from tools import db, snapshot, sniper, worker
+
 REPO = Path(__file__).parent.parent
-DEFAULT_DB = REPO / "tools.db"
 DEFAULT_SNAPSHOTS = REPO / "snapshots"
 STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGBREAK")
 
@@ -37,8 +43,8 @@ def build_parser():
         prog="python -m tools",
         description="The keyed worker behind the console's order tools. With no command it "
                     "runs until Ctrl+C.")
-    parser.add_argument("--db", default=str(DEFAULT_DB),
-                        help=f"SQLite file shared with the console (default: {DEFAULT_DB})")
+    parser.add_argument("--db", help="SQLite file shared with the console (default: tools.db "
+                                     f"{data_dir.WHERE})")
     key = parser.add_mutually_exclusive_group()
     key.add_argument("--key-stdin", action="store_true",
                      help="read the wallet key from one line of standard input, not from the "
@@ -61,14 +67,16 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     load_dotenv(REPO / ".env")
+    try:
+        args.db = data_dir.tools_db_path(args.db)
+    except data_dir.NoDataDir as e:
+        return fail(f"Not started: {e}.")
     if args.command == "import-snapshots":
         return import_snapshots(args)
     return run_worker(args)
 
 
 def import_snapshots(args):
-    from tools import db, snapshot
-
     try:
         with closing(db.open_db(args.db)) as conn:
             done = snapshot.import_files(conn, args.directory)
@@ -80,10 +88,6 @@ def import_snapshots(args):
 
 
 def run_worker(args):
-    # Imported after .env is loaded: polymarket.hosts reads the environment once.
-    from polymarket import http as polymarket_http
-    from tools import db, sniper, worker
-
     sys.setswitchinterval(sniper.SWITCH_INTERVAL_S)
     http = polymarket_http.persistent_client()
     try:
@@ -113,10 +117,6 @@ def connect(args, http):
     """(the jobs' client, the sniper's client), both authenticated, or None
     after saying why there is none. The sniper's client presigns orders at a
     tick its market has not reached, so the jobs never sign through it."""
-    from polymarket import client as polymarket_client
-    from polymarket import http as polymarket_http
-    from polymarket import keys, region
-
     verdict = region.check(http)
     print(f"Region: {verdict.message}.", flush=True)
     if not verdict.allowed:
@@ -133,8 +133,6 @@ def connect(args, http):
 
 
 def read_key(from_stdin):
-    from polymarket import keys
-
     if not from_stdin:
         return keys.load_private_key(lambda: getpass.getpass("Bitwarden master password: "))
     key = sys.stdin.readline().strip()
