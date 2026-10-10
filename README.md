@@ -1,459 +1,401 @@
-# Polymarket Order Snapshot and Restore
+# Polymarket tools
 
-This tool allows you to take a snapshot of all your open Polymarket orders and restore them later if they get automatically cancelled (e.g., due to balance drops).
+A reward farmer for Polymarket, the web console that controls it, and a keyed
+worker that runs two order tools from that console.
 
-## Features
+- `reward_screener.py` ranks the markets that pay liquidity rewards and stores
+  them in `farm.db` for you to approve or reject.
+- `reward_farmer.py` rests post-only orders on the approved markets to earn
+  those rewards. It is a dry run unless you pass `--live`.
+- `python -m farm_console` serves a local web console. It shows what the
+  farmer does, and it is where you run scans, approve markets, and control
+  the farmer. It holds no wallet key.
+- `python -m tools` runs the worker. It holds the wallet key and does what the
+  console's **Orders** and **Sniper** pages ask for. It takes snapshots of
+  your open orders, places the ones that went missing, and fires tick-change
+  watches.
 
-- **Snapshot**: Save all open orders to a timestamped JSON file
-- **Restore**: Recreate orders from a snapshot file
-- **Dry-Run Mode**: Validate orders without submitting them to test restoration
-- **Smart Filtering**: Automatically skips orders that already exist on Polymarket
-- **Expiration Preservation**: Restores orders with their original expiration times (GTC/GTD)
-- **Error Handling**: Gracefully handles API errors and continues processing
-- **Summary Reports**: Detailed output showing successful and failed operations
-- **Tick Watch**: Fuzzy-search for a market, then place a limit order the instant its minimum tick size shrinks (0.01 -> 0.001), guarded by a check that the market really was pinned at 99c
+A live farmer, a restore, and a live watch place real orders with real money.
+Read [Safety](#safety) before you start anything that holds a key.
 
-## Installation
+Contents:
 
-1. Ensure you have Python 3.11 or higher installed.
+- [How the pieces fit](#how-the-pieces-fit)
+- [Install](#install)
+- [Set up the environment](#set-up-the-environment)
+- [Run the processes](#run-the-processes)
+- [Safety](#safety)
+- [Reward screener](#reward-screener)
+- [Reward farmer](#reward-farmer)
+- [Farm console](#farm-console)
+- [Orders page](#orders-page)
+- [Sniper page](#sniper-page)
+- [Tests](#tests)
+- [Troubleshooting](#troubleshooting)
+- [References](#references)
 
-2. Install the required dependencies:
+## How the pieces fit
+
+### Processes
+
+Four programs run as separate processes. The browser talks to the console
+over HTTP. The processes talk to each other only through rows in two SQLite
+files.
+
+```text
+browser --HTTP--> console (no key) --rows--> tools.db <--rows-- worker (key)
+                     |                                            |- job thread: snapshot, preview, restore
+                     |                                            +- sniper threads: control, feed, poll, slow
+                     |
+                     +--rows--> farm.db <--rows-- farmer (key only with --live)
+                                   ^
+                                   +--rows-- screener (no key)
+```
+
+| Process | Command | Wallet key | What it reads and writes |
+| --- | --- | --- | --- |
+| Screener | `python reward_screener.py` | Never | Reads Polymarket's public APIs. Writes its scan to `farm.db`. |
+| Farmer | `python reward_farmer.py` | Only with `--live` | Reads your decisions, settings, and commands from `farm.db` every cycle and writes what it does there. Records books to `farm_books.db`. With `--live` it posts and cancels orders. |
+| Console | `python -m farm_console` | Never | Serves HTTP on `127.0.0.1`. Reads and writes `farm.db` and `tools.db`. Reads the public APIs for a scan, the Review page, and the Sniper search. |
+| Worker | `python -m tools` | Yes, unless `--no-key` | Reads the jobs and the watches the console wrote to `tools.db` and writes the results there. Posts the orders of a restore and of a watch. |
+
+The console steers the farmer and the worker only by writing rows. The farmer
+reads `farm.db` again every cycle, and the worker reads `tools.db` again at
+least every second, so neither needs the console to keep running.
+
+The worker is a process of its own for three reasons:
+
+- A console restart does not stop an armed watch or a restore in progress.
+- The wallet key stays out of the process that parses HTTP.
+  `test_farm_console_orders.py` and `test_farm_console_sniper.py` fail if
+  importing the console loads `polymarket.keys`, `polymarket.client`, or the
+  worker.
+- The sniper does not share Python's interpreter lock with scans and the
+  console's event stream.
+
+The worker never opens `farm.db`, and the farmer never opens `tools.db`, so
+neither waits on the other's write lock. When a restore needs to know which
+markets the farmer manages, the console reads them from `farm.db` at your
+click and puts them in the job.
+
+Both databases run in WAL mode with a 5-second busy timeout, and every column
+has one writer process. `farm_db.py` owns the schema of `farm.db` and every
+statement run against it. `tools/db.py` does the same for `tools.db`.
+
+### Files
+
+The farmer, the screener, and their analysis modules are single files at the
+repository root. The code that talks to Polymarket, the worker, and the
+console are packages.
+
+```text
+reward_screener.py   the screener: scan, list, approve, reject
+reward_farmer.py     the farmer
+farm_db.py           farm.db: the schema and every statement
+farm_books.py        farm_books.db: the favorite books the farmer records
+fill_cost.py         how often a favorite bid fills, and what a fill costs
+exit_value.py        what a favorite exit is worth
+fill_backtest.py     backtest of the fill forecast
+exit_backtest.py     backtest of the exit model
+triage.py            a screen of candidate markets that runs the claude CLI
+triage_eval.py       the evaluation of that screen
+scoring_probe.py     read-only: how long an order rests before it scores
+
+polymarket/          talks to Polymarket and holds no strategy
+  hosts.py           where the services live
+  http.py            the rate-limit retry, chunked requests, the order connection
+  parse.py           numbers and times as the APIs send them
+  books.py           order books from the CLOB
+  gamma.py           markets by condition id, and the market search
+  feed.py            the market websocket channel
+  region.py          whether Polymarket takes new orders from this address
+  orders.py          open orders, and the one way to post an order
+  ticks.py           signing an order at a market's tick
+  client.py          an authenticated CLOB client
+  keys.py            the wallet key, from the environment or Bitwarden
+
+tools/               the keyed worker
+  __main__.py        the entry point: python -m tools
+  worker.py          the loop: the liveness record, the jobs, the sniper
+  db.py              tools.db: the schema and every statement
+  snapshot.py        take a snapshot, import the old JSON files
+  restore.py         plan a restore, place it
+  sniper.py          fire each armed watch once
+  picker.py          rank a market search for the Sniper page
+
+farm_console/        the web console
+  __main__.py        the entry point: python -m farm_console
+  app.py             wires the pages together
+  context.py         what every page shares
+  security.py        the request guard
+  pages/             one module for each page
+  templates/         the pages' HTML
+  static/            CSS, htmx, and the console's scripts
+
+test_*.py            the tests, at the repository root
+run_tests.py         runs every test module
+pyproject.toml       the dependencies and the pytest settings
+.env.example         the settings each process reads at start
+```
+
+`git ls-files` lists every tracked file. Git ignores the data: `.env`,
+`farm.db`, `farm_books.db`, `tools.db`, and the old snapshot files in
+`snapshots/`.
+
+## Install
+
+You need Python 3.11 or later.
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
 ```
 
-## Setup
+The code runs from the checkout, and the install brings only the
+dependencies. Run every command in this file from the repository root, so
+that Python finds the `polymarket`, `tools`, and `farm_console` packages.
 
-1. Copy the example environment file:
+Two outside programs are optional. The Bitwarden CLI (`bw`) is needed only
+when the wallet key comes from a Bitwarden vault. The `claude` CLI is needed
+only for the screen in `triage.py`.
 
-```bash
-cp .env.example .env
-```
+## Set up the environment
 
-2. Edit `.env` and fill in your credentials:
+1. Copy the example file.
 
-```env
-POLYMARKET_PRIVATE_KEY=your-private-key-here
-POLYMARKET_FUNDER_ADDRESS=your-funder-address-here
-POLYMARKET_SIGNATURE_TYPE=1
-```
-
-**Note:** The private key doesn't have to be in the `.env` file. You can load it from a secure store like Bitwarden instead. See the [Bitwarden Configuration](#bitwarden-configuration) section below.
-
-### Configuration Options
-
-- **POLYMARKET_PRIVATE_KEY** (optional if using Bitwarden): Your wallet's private key. Can be set in `.env` or loaded from Bitwarden.
-- **POLYMARKET_FUNDER_ADDRESS** (required): The address that holds your funds
-- **POLYMARKET_SIGNATURE_TYPE** (optional): Signature type
-  - `0`: EOA/MetaMask (standard wallet)
-  - `1`: Email/Magic wallet (default)
-  - `2`: Browser wallet proxy
-- **POLYMARKET_HOST** (optional): CLOB API endpoint (default: `https://clob.polymarket.com`)
-- **POLYMARKET_CHAIN_ID** (optional): Chain ID (default: `137` for Polygon)
-- **POLYMARKET_KEY_SOURCE** (optional): Force a specific key source
-  - `env`: Only use environment variable (POLYMARKET_PRIVATE_KEY)
-  - `bitwarden`: Only use Bitwarden
-  - (default): Try environment variable first, then Bitwarden if not found
-
-### Bitwarden Configuration
-
-Instead of storing your private key in the `.env` file, you can securely load it from Bitwarden:
-
-1. **Install Bitwarden CLI**: Follow the [Bitwarden CLI installation guide](https://bitwarden.com/help/cli/)
-
-2. **Store your private key in Bitwarden**:
-   - Create a Secure Note item in Bitwarden
-   - Store your private key in the notes field
-   - Note the item name or ID
-
-3. **Configure the tool** to use Bitwarden by setting one of these in your `.env`:
-   ```env
-   BW_POLYMARKET_ITEM_NAME=your-item-name
-   # OR
-   BW_POLYMARKET_ITEM_ID=your-item-id
+   ```bash
+   cp .env.example .env
    ```
 
-4. **Authentication**: The tool will prompt you to log in or unlock your Bitwarden vault when needed. The vault will be automatically locked after operations complete.
+2. Set `POLYMARKET_FUNDER_ADDRESS` in `.env` to the address that holds your
+   funds and positions.
+3. Decide where the wallet key comes from. See
+   [Where the wallet key comes from](#where-the-wallet-key-comes-from).
 
-## Usage
+The farmer, the console, the worker, and the scoring probe each load `.env`
+from the repository root when they start. A variable already set in the real
+environment wins over its line in `.env`. The screener reads no `.env`.
 
-### Taking a Snapshot
-
-To save all your current open orders to a file:
-
-```bash
-python snapshot.py
-```
-
-This will create a file named `orders_snapshot_YYYYMMDD_HHMMSS.json` containing all your open orders.
-
-Example output:
-```
-Polymarket Order Snapshot Tool
-========================================
-Connected to Polymarket CLOB
-Fetching open orders...
-Found 5 open order(s)
-Snapshot saved to: orders_snapshot_20250124_143022.json
-
-Snapshot complete! Use the following command to restore:
-  python restore.py orders_snapshot_20250124_143022.json
-```
-
-### Restoring Orders
-
-To restore orders from a snapshot file:
-
-```bash
-python restore.py orders_snapshot_20250124_143022.json
-```
-
-The script will:
-1. Load the snapshot file
-2. Fetch your current open orders from Polymarket
-3. Filter out orders that already exist (by token ID, side, price, and size)
-4. Restore only the orders that don't already exist
-5. Preserve original expiration times (GTC or GTD)
-6. Display a summary of successful and failed restorations
-
-#### Dry-Run Mode
-
-You can test the restoration process without actually submitting orders:
-
-```bash
-python restore.py orders_snapshot_20250124_143022.json --dry-run
-```
-
-Dry-run mode will:
-- Validate all orders in the snapshot
-- Check which orders already exist
-- Show what would be restored without actually creating orders
-- Still requires API connection to check existing orders
-
-Example output:
-```
-Polymarket Order Restore Tool
-============================================================
-Connected to Polymarket CLOB
-Loaded snapshot from: orders_snapshot_20250124_143022.json
-Snapshot taken: 2025-01-24T14:30:22.123456
-Total orders in snapshot: 5
-Fetching existing open orders...
-Found 1 existing open order(s)
-
-Skipping 1 order(s) that already exist on Polymarket
-
-Restoring 4 order(s)...
-------------------------------------------------------------
-[1/4] Processing order (GTC (no expiration))... ✓ Success (Order ID: 12345)
-[2/4] Processing order (GTD (expires: 2025-12-31 23:59:59))... ✓ Success (Order ID: 12346)
-[3/4] Processing order (GTC (no expiration))... ✗ Failed: Insufficient balance
-[4/4] Processing order (GTC (no expiration))... ✓ Success (Order ID: 12347)
-
-============================================================
-RESTORATION SUMMARY
-============================================================
-Total orders in snapshot: 5
-Skipped (already exist): 1
-Total orders processed: 4
-Successfully restored: 3
-Failed: 1
-
-Skipped orders (already exist on Polymarket):
-  - BUY 10.0 @ $0.4500 (Token: 0x1234...)
-
-Successfully restored orders:
-  - BUY 10.0 @ $0.4500 (Token: 0x5678..., ID: 12345, GTC (no expiration))
-  - SELL 5.0 @ $0.5500 (Token: 0x9abc..., ID: 12346, GTD (expires: 2025-12-31 23:59:59))
-  - BUY 20.0 @ $0.3000 (Token: 0xdef0..., ID: 12347, GTC (no expiration))
-
-Failed orders:
-  - Order #3 (Token: 0x1111...): Insufficient balance
-```
-
-#### Dry-Run Example
-
-```bash
-python restore.py orders_snapshot_20250124_143022.json --dry-run
-```
-
-Example output:
-```
-Polymarket Order Restore Tool
-(DRY RUN MODE)
-============================================================
-Connected to Polymarket CLOB
-Loaded snapshot from: orders_snapshot_20250124_143022.json
-Snapshot taken: 2025-01-24T14:30:22.123456
-Total orders in snapshot: 5
-Fetching existing open orders...
-Found 1 existing open order(s)
-
-Skipping 1 order(s) that already exist on Polymarket
-
-Validating 4 order(s)...
-(DRY RUN - No orders will be submitted)
-------------------------------------------------------------
-[1/4] Processing order (GTC (no expiration))... ✓ Valid (would restore)
-[2/4] Processing order (GTD (expires: 2025-12-31 23:59:59))... ✓ Valid (would restore)
-[3/4] Processing order (GTC (no expiration))... ✓ Valid (would restore)
-[4/4] Processing order (GTC (no expiration))... ✓ Valid (would restore)
-
-============================================================
-DRY RUN SUMMARY
-============================================================
-Total orders in snapshot: 5
-Skipped (already exist): 1
-Total orders processed: 4
-Valid orders (would restore): 4
-Failed: 0
-```
-
-### Watching for a Tick Size Change
-
-`tick_watch.py` watches one or more markets and places a limit order on each
-the moment its own minimum tick size shrinks. Polymarket caps prices at
-`1 - tick`, so a market on a 0.01 tick cannot trade above $0.99. When it moves
-to a 0.001 tick, $0.999 (99.9c) becomes legal for the first time - and the
-point of this tool is to be first in the queue at that price.
-
-The markets you watch together form a batch. Each market in a batch fires
-independently: when one market's tick shrinks, its order goes out at once and
-the others keep watching.
-
-Run it with no arguments and it walks you through everything:
-
-```bash
-python tick_watch.py
-```
-
-```
-Search markets (or 'q' to quit): fed interest rate
-  Searching for 'fed interest rate'...
-  40 outcome(s) matched; 1 at 99.0c and not yet on a 0.001 tick.
-
-  #      Bid    Tick   24h Vol  Status              Market -> Outcome
-  ------------------------------------------------------------------------
-   1    99.0c    0.01   $199.0K  READY               Will there be no change... -> No
-
-Pick a number, or several like 1,3 ('s' to search again, 'q' to quit): 1
-Order size in shares (market minimum 5): 100
-
-Add another market? [y/N]: y
-
-1 market(s) in this batch so far.
-
-Search markets (or 'q' to finish adding): ...
-```
-
-The picker fuzzy-searches open markets, expands each one into its individual
-outcomes, and prices every hit off the real order book. Only valid setups are
-listed: at the required price (99c by default) and not yet on the target tick.
-With `--no-price-check` every open outcome is listed instead, with a `Status`
-column saying why a row is or isn't a valid setup. Anything typed at a prompt
-is re-asked rather than guessed at.
-
-Pick several rows at once by separating their numbers with commas, e.g. `1,3,5`.
-Each one is validated and sized in turn, and the size prompt offers the last
-size as its default. If any number is not on the list, nothing is added and
-the prompt asks again.
-
-After each pick is validated and sized, the watcher asks whether to add
-another. Answer `y` to go back to the picker, or press Enter to see the plan
-for the whole batch and confirm it once. While a batch has markets in it, `q`
-at the picker finishes adding instead of quitting. A market that fails
-validation (wrong price, already at the target tick) prints why and returns to
-the picker without losing the batch. Picking a market that is already in the
-batch prints a note and asks again.
-
-An interactive session keeps going until you quit. When a batch ends - every
-order placed or rejected, or the batch timed out - the picker comes back for
-the next batch, with your last order size offered as the default. Ctrl+C while
-watching drops the markets still waiting and returns to the picker; an order
-already in flight is allowed to finish. `q` (or Ctrl+C) at the picker with an
-empty batch ends the session and lists every order it placed. Credentials are
-loaded once, on the first batch, and reused for the rest. Pass `--once` to stop
-after a single batch. Runs that name markets with `--slug`, `--condition-id`,
-or `--token-id` always stop after one batch.
-
-When a batch ends, a summary lists each market that fired (tick change,
-detection path, entry-price check, order, result) and then each market that
-never saw its tick change.
-
-Every prompt has a flag, so unattended runs skip the interaction entirely:
-
-```bash
-# Fully specified - no prompts at all
-python tick_watch.py --slug will-x-happen --outcome YES --size 100 --yes
-
-# Two markets in one batch; each fires on its own tick change
-python tick_watch.py --slug will-x-happen --slug will-y-happen --size 100 --yes
-
-# Jump straight to the pick list for a query
-python tick_watch.py --search "fed interest rate"
-
-# Rehearse without sending anything
-python tick_watch.py --slug will-x-happen --size 250 --dry-run
-```
-
-Name markets with `--token-id`, `--condition-id`, and `--slug`. Each flag can be
-repeated, and the three can be mixed in one run. `--outcome` (an outcome name
-such as `YES`, or a zero-based index) applies to every `--condition-id` and
-`--slug`. `--size` is the size of each market's order, not a total. `--search`
-seeds the interactive picker and cannot be combined with the other three. Omit
-them all for the interactive picker.
-
-A named run resolves every market before it watches anything, and a market
-that cannot be resolved stops the run with exit code 1, since that is almost
-always a typo. A market that resolves but fails validation is skipped with its
-reason, and the rest are still watched. A skip for a real problem (price guard,
-size, unreadable book) makes the run exit non-zero, so an unattended caller can
-see it.
-
-#### The entry-price guard
-
-The strategy only makes sense on a market pinned at the top of its 0.01 tick,
-so the price is checked twice and the order is refused if it does not hold:
-
-- **At startup**, against the live order book. A market that is not at 99c is
-  rejected before anything else happens - including before credentials are
-  loaded, so a bad pick never triggers a vault unlock.
-- **At the tick change**, against the last price observed *before* the change.
-
-That second point is deliberate. The instant a tick opens up, competing orders
-reprice the book, so a fresh read at that moment would reject a setup that was
-perfectly valid a millisecond earlier. Both detection paths therefore track the
-best bid/ask continuously while watching, and the guard inspects the newest
-reading taken before the change - refusing to fire if that reading is older
-than `--price-max-age` rather than guessing.
-
-The side determines which price is checked: `BUY` looks at the best bid, `SELL`
-at the best ask.
-
-#### Key options
-
-| Option | Default | Purpose |
+| Variable | Needed | Meaning |
 | --- | --- | --- |
-| `--size` | *prompted* | Order size in shares, for each market |
-| `--price` | `0.999` | Limit price in dollars (99.9c) |
-| `--side` | `BUY` | `BUY` or `SELL` |
-| `--require-price` | `0.99` | Price the market must be at before the change |
-| `--price-tolerance` | `0.005` | Allowed deviation from `--require-price` |
-| `--price-max-age` | `5` | Reject if the pre-change price is older than this |
-| `--no-price-check` | off | Skip the entry-price guard entirely |
-| `--target-tick` | `0.001` | Tick size to wait for |
-| `--from-tick` | `0.01` | Tick size expected at startup |
-| `--poll-interval` | `0.5` | Seconds between `/books` polls |
-| `--post-only` | off | Reject rather than cross the spread |
-| `--expiration-seconds` | `0` | Place a GTD order instead of GTC |
-| `--retry-window` | `10` | Seconds to retry an order the venue rejects |
-| `--timeout` | `0` | Give up on markets still waiting after N seconds, for the whole batch (0 = watch forever) |
-| `--dry-run` | off | Watch and report, never submit |
-| `--fire-if-already` | off | Order even if already at the target tick |
-| `--no-wss` | off | Detect by polling only |
-| `--once` | off | Exit after one batch instead of returning to the picker |
-| `-y`, `--yes` | off | Skip the confirmation prompt |
-| `--skip-region-check` | off | Do not look up the egress region at startup |
-| `--allow-blocked-region` | off | Arm the watch even from a blocked region |
+| `POLYMARKET_FUNDER_ADDRESS` | Always | The address that holds the funds and the positions. The farmer reads your positions for it, and the console shows your holdings on the Review page. |
+| `POLYMARKET_SIGNATURE_TYPE` | No | How orders are signed. The default is `1`, a Polymarket proxy wallet. `0` is an EOA wallet. |
+| `POLYMARKET_CHAIN_ID` | No | The chain id. The default is `137`, Polygon. |
+| `POLY_BUILDER_CODE` | No | A builder code to attach to every order. |
+| `POLYMARKET_KEY_SOURCE` | No | `env` or `bitwarden` reads the key from that source alone. |
+| `POLYMARKET_PRIVATE_KEY` | No | The wallet's private key, when you keep it in the environment. |
+| `BW_POLYMARKET_ITEM_ID` | No | The id of the Bitwarden item whose note is the key. |
+| `BW_POLYMARKET_ITEM_NAME` | No | A name to search the vault for, when you set no id. The first item found is used. |
+| `POLYMARKET_DATA_DIR` | No | The directory where the farmer, the console, and the worker keep their databases. See [Where the databases live](#where-the-databases-live). |
 
-Exit codes: `0` success or cancelled, `1` order failed, `2` bad usage, `3`
-rejected by the entry-price guard. A batch exits with the highest code among
-its markets. In a named run, a market skipped at setup also counts: `3` for a
-price-guard rejection, `2` for a size problem, `1` for an unreadable book, and
-`0` for a market already at the target tick. A looping session reports each failure
-as it happens and exits `0` when you quit.
+An EOA wallet (`POLYMARKET_SIGNATURE_TYPE=0`) must approve Polymarket's
+exchange contracts to spend its collateral and its conditional tokens before
+it can trade. The installed SDK lists the contract addresses in
+the `py_clob_client_v2.config` module.
 
-#### The region preflight
+### Where the wallet key comes from
 
-The CLOB geoblock is enforced on the IP that submits the order, and it is
-checked at submission time - so a VPN that is not carrying this process turns
-the tick change you have been waiting for into a 403. Before any credential
-load, the watcher reads its own egress region and refuses to arm when new
-orders are blocked from there:
+Three programs read the key: a farmer started with `--live`, the worker
+unless you start it with `--no-key`, and `scoring_probe.py`. A dry-run farmer,
+the screener, and the console read no key.
 
+Each of the three reads `POLYMARKET_PRIVATE_KEY` when it is set. Otherwise it
+reads the note of a Bitwarden item. `POLYMARKET_KEY_SOURCE=env` or
+`POLYMARKET_KEY_SOURCE=bitwarden` reads that source alone.
+
+To keep the key in Bitwarden:
+
+1. Install the [Bitwarden CLI](https://bitwarden.com/help/cli/).
+2. Run `bw login` once, by hand. The programs have no login step, and a CLI
+   that is not logged in stops the start with an error that says so.
+3. Create a Secure Note item in the vault and put the private key in its
+   notes field. An item of any other type is refused.
+4. Set `BW_POLYMARKET_ITEM_ID` or `BW_POLYMARKET_ITEM_NAME` in `.env`.
+
+When the vault is locked, the program asks for `Bitwarden master password:`
+in its terminal, unlocks the vault, reads the note, and locks the vault again
+before it does anything else. If the vault does not lock, the program throws
+the key away and does not start. A vault you had unlocked yourself, with your
+own `BW_SESSION`, is read and left unlocked. The master password and the
+session token go only to the `bw` child process. The program never writes
+either one to its own environment.
+
+On a machine with no vault, `--key-stdin` makes the farmer or the worker read
+the key from one line of standard input and skip both sources:
+
+```bash
+python -m tools --key-stdin
+python reward_farmer.py --live --key-stdin
 ```
-[17:32:12.284] Region check: JP-13 via 198.51.100.24 - new orders permitted (website-blocked, API permitted)
-[17:32:13.186] Region check: GB-ENG via 203.0.113.7 - API REJECTS NEW ORDERS from here
+
+That lets you unlock the vault on your own machine and send only the key to
+a server over SSH. Nobody has run the next command against a server yet, so
+treat it as a sketch:
+
+```bash
+bw get notes <item-id> | ssh user@203.0.113.10 'cd polymarket-tools && python -m tools --key-stdin'
 ```
 
-It uses two independent signals, because either alone clears runs that then
-fail:
+### Host overrides
 
-- **A live probe of the hosts.** A blocked request is answered by the edge
-  with `451` before it reaches the API, and that happens for exit addresses
-  the venue distrusts - a shared VPN IP in a country on no published list
-  still gets a 451. Only probing catches this. The market lookup host is
-  probed separately and a 451 there is a warning, not a stop: it costs the
-  picker and `--slug` but `--token-id` still resolves.
-- **The published country and region lists**, which catch the close-only
-  jurisdictions. Reads succeed from those, and only order submission is
-  rejected, so probing alone would clear them.
+`POLYMARKET_HOST`, `POLYMARKET_GAMMA_HOST`, `POLYMARKET_DATA_API_HOST`, and
+`POLYMARKET_WSS_HOST` replace the default hosts in `polymarket/hosts.py`.
+Set them in the real environment, not in `.env`. Every program reads the
+hosts before it loads `.env`, so a host that only `.env` names changes
+nothing.
 
-Region is read from `polymarket.com/api/geoblock`, falling back to the CDN
-edge's country when that endpoint is unreachable. Only the country and region
-it reports are used - **not** its `blocked` flag, which encodes the website's
-rules and reads `true` for several jurisdictions whose API access is
-unrestricted (Ireland, Japan, Malta, the Netherlands). An unrecognised region
-is reported and allowed, so a change to the published list cannot silently
-stop a run; unreachable endpoints likewise fail open with a warning.
+### Where the databases live
 
-A geoblock rejection at order time is also treated as non-retryable, since it
-is not the venue lagging behind a tick change and retrying it only burns
-`--retry-window`.
+The farmer, the console, and the worker look for `farm.db` and `tools.db` in
+one data directory. It is the directory `POLYMARKET_DATA_DIR` names, and the
+repository root when the variable is not set. The three processes therefore
+agree wherever you start each one.
 
-#### How detection works
+- You can set `POLYMARKET_DATA_DIR` in `.env` or in the real environment. A
+  relative value is taken from the repository root.
+- The directory must exist. No program creates it, because a mistyped
+  directory would start every process on empty databases. A program that
+  cannot find it prints `Not started: POLYMARKET_DATA_DIR is not a directory`
+  with the path, and exits.
+- `--db` on the farmer and the worker, and `--db` and `--tools-db` on the
+  console, each name one file outright. A relative path there is read from
+  the current directory.
+- The farmer writes `farm_books.db` in the directory of its `farm.db`.
+- The screener is the exception. It reads neither `.env` nor
+  `POLYMARKET_DATA_DIR`, and its `--db` defaults to `farm.db` in the current
+  directory. When you set a data directory, run the screener with `--db` and
+  the path of the `farm.db` in it, or scan from the console's Discover page,
+  which writes to the console's `farm.db`.
 
-Two paths run at once and, for each market, the first to see its new tick
-wins. Each path is one connection for the whole batch, however many markets it
-holds:
+## Run the processes
 
-1. The WSS market channel
-   (`wss://ws-subscriptions-clob.polymarket.com/ws/market`), subscribed once
-   for every market in the batch. It pushes `tick_size_change` events and
-   carries the tick and top of book on every `book` and `price_change`
-   message. This is the fast path; it reconnects on its own if dropped.
-2. A REST poll of `/books`, which returns the live tick size *and* the top of
-   book for every market still waiting, in one request. This is the honest
-   cross-check - a socket that is connected but silently stale is
-   indistinguishable from a quiet market - and it bounds how old the guard's
-   price reading can be.
+A usual session has three terminals, each in the repository root:
 
-Each market has its own fire thread. When a market's tick changes, its thread
-runs the entry-price guard and places that market's order while the paths keep
-watching the rest.
+```bash
+python reward_farmer.py      # the farmer, a dry run
+python -m farm_console       # the console, on http://127.0.0.1:8787
+python -m tools              # the worker, with the key
+```
 
-The WSS path needs the `websockets` package (listed in `pyproject.toml`).
-Without it the watcher logs a warning and runs poll-only.
+No process needs another one to be running. The console shows the last state
+the farmer and the worker published, with a banner when one of them is down.
 
-**Notes:**
+With no flags, the three share the `farm.db` and the `tools.db` of the data
+directory (see [Where the databases live](#where-the-databases-live)).
 
-- Every network lookup the order path would otherwise make (tick size, neg
-  risk, exchange version) is pre-warmed at startup, so when the change lands
-  signing is purely local and only the order POST hits the network.
-- Orders are pre-signed, but never once and held: a v2 signed order embeds its
-  signing timestamp, so one background thread re-signs every waiting market's
-  order on a short interval, and a stale payload is signed again at fire time.
-  `--no-presign` turns this off.
-- The process shortens Python's thread switch interval to 0.5ms. At the
-  default 5ms, a fire thread woken by the tick change waited a median 31ms
-  (217ms worst case) for another busy thread to give up the interpreter lock.
-- The order endpoint can briefly lag the tick change, so an early rejection is
-  expected rather than fatal - `--retry-window` keeps retrying through it.
-- Gamma's `outcomePrices` is a mid/last price and disagrees with the order book
-  often enough to matter (0.99 against a real best bid of 0.98 was observed
-  while building this), so every price that gates a decision comes from the
-  book, never from Gamma.
-- Every update is routed to its market by asset id. A market's `price_change`
-  messages cover both complementary outcomes, and the other side of a 99c
-  market sits at 1c, so an update for a token outside the batch is dropped.
-- If a market is already at the target tick on startup, it is not watched (in
-  a named run it is skipped and the rest are still watched). Override with
-  `--fire-if-already`, which fires that market's order straight away.
-- A `--price` that is already legal at `--from-tick` is rejected up front: no
-  tick change is needed to place it.
+### Screener
 
-### Reward Screener
+`python reward_screener.py` runs one scan and exits. It needs no key. See
+[Reward screener](#reward-screener). The console's Discover page runs the
+same scan.
+
+### Farmer
+
+`python reward_farmer.py` is a dry run that reads live public data and sends
+nothing. `python reward_farmer.py --live` signs and posts real orders.
+
+A live start first checks the region this machine connects from and prints
+the result, as the worker does. From a place where Polymarket rejects new
+orders it prints `Not started: a live farmer would place orders from here.
+Start it without --live for a dry run.` and exits with status 1, before it
+reads any key. A dry run checks no region.
+
+See [Reward farmer](#reward-farmer), and [Going live](#going-live) before the
+first live run.
+
+### Console
+
+```bash
+python -m farm_console                          # port 8787
+python -m farm_console --port 8788              # another port
+python -m farm_console --db scratch.db --tools-db scratch-tools.db
+```
+
+It prints `Farm console on http://127.0.0.1:8787 reading <farm.db> and
+<tools.db>` and serves until Ctrl+C. See [Farm console](#farm-console).
+
+### Worker
+
+```bash
+python -m tools                 # keyed: the environment or Bitwarden
+python -m tools --key-stdin     # keyed: the key arrives on standard input
+python -m tools --no-key        # no key
+python -m tools --db scratch-tools.db
+```
+
+A keyed start goes in this order:
+
+1. It checks the region this machine connects from and prints the result, for
+   example `Region: IE: new orders permitted (blocked on the website only).`
+   From a place where Polymarket rejects new orders it prints
+   `Not started: a keyed worker would place orders from here. Start it with
+   --no-key to run without one.` and exits with status 1. It has read no key
+   at that point.
+2. It reads the key and signs in.
+3. It prints `Worker on <tools.db>, keyed. Ctrl+C stops it.` and runs.
+
+While it runs, the worker records in `tools.db` every second that it is
+alive. The console counts it as running until 10 seconds pass without that
+record. This is not the farmer's `--heartbeat`, and Polymarket never sees it.
+Every second the worker also starts the oldest queued job, one job at a time,
+on a thread of its own. The sniper runs beside the jobs from the start.
+
+Ctrl+C or a terminate signal stops the worker. A snapshot in progress runs to
+its end, and a restore ends before its next order. Then the worker prints
+`Worker stopped.` A job that a killed worker left running is closed as failed
+when the next worker starts, with the error `the worker stopped while this
+job was running`.
+
+One worker runs on a `tools.db` at a time. A second one prints `Not started:
+a worker is already running on this database (pid <pid>, last beat <time>).`
+and changes nothing.
+
+`--no-key` starts a worker that holds no key. Every snapshot, preview, and
+restore job fails with `this worker holds no key`, and the sniper adopts only
+dry-run watches. Use it to rehearse a watch with no key in the process.
+
+### Scoring probe
+
+`python scoring_probe.py` measures how long an order rests before Polymarket
+counts it for rewards. It reads the live key, lists your open orders, and
+places and cancels nothing. Its module docstring has the details.
+
+## Safety
+
+- **The console has no login.** It binds `127.0.0.1` only, and anyone who
+  can reach its port can pause markets, stop the farmer, place a restore, and
+  arm a watch. Never change the bind address. To use the console from another
+  machine, forward the port over SSH and open `http://localhost:8787`:
+
+  ```bash
+  ssh -L 8787:127.0.0.1:8787 user@203.0.113.10
+  ```
+
+  Forward the same port number on both ends. The console answers 400 to any
+  request whose `Host` header is not `127.0.0.1:<port>` or `localhost:<port>`
+  with its own port. This tunnel follows from that rule, and nobody has run
+  the console through one yet. [Security](#security) lists every check.
+- **Leave `--heartbeat` off.** If the farmer's heartbeats stop, Polymarket
+  cancels open orders, and it is not confirmed whether that means the
+  farmer's orders or every order on the account.
+  [The heartbeat warning](#the-heartbeat-warning) has the open risk.
+- **Two console actions place real orders.** Placing a restore needs the
+  typed word `PLACE`, and arming a live watch needs the typed word `ARM`.
+  The server checks each word. Both tools post post-only orders, so an order
+  rests or is refused and never takes liquidity.
+- **A post that gets no answer may have placed an order.** The worker never
+  sends such a post again. The page then says that an order may rest, and you
+  check your open orders. See
+  [When a line says the order may rest](#when-a-line-says-the-order-may-rest)
+  and [How a watch ends](#how-a-watch-ends).
+- **Polymarket blocks new orders by the address that sends them.** A keyed
+  worker and a live farmer each check their region before they read a key,
+  and neither starts from a place where new orders are rejected. The check
+  runs once, at the start. It does not notice a VPN that drops later.
+- **Keep `.env` out of Git.** `.gitignore` already lists it.
+
+## Reward screener
 
 `reward_screener.py` ranks the markets that pay Polymarket liquidity rewards
 for one farming strategy, and stores them in `farm.db` (SQLite) for you to
@@ -614,7 +556,7 @@ lose money. It also warns when a planned longshot leg outside the free zone
 costs more than the budget. The zone is the one the leg's price falls in today:
 a leg planned in the free zone leaves it as the end date nears.
 
-#### Decided markets
+### Decided markets
 
 Polymarket closes a market only after its on-chain resolution settles, so a
 market whose outcome is already known can stay active and accept orders for
@@ -634,7 +576,7 @@ once, and it returns if they come back. Approved, rejected and retired markets
 always show. Some decided markets show neither signal until Polymarket updates
 them. Read the resolution rules before you approve.
 
-#### Approximations
+### Approximations
 
 - The midpoint drops whole price levels smaller than the reward minimum size.
   Polymarket's adjusted midpoint applies the cutoff per order, so a level of
@@ -652,7 +594,7 @@ them. Read the resolution rules before you approve.
   farmer reacts to your orders. Thin books show very high APRs that will not
   survive competition, so read them as a ranking, not a forecast.
 
-#### The fill-cost model
+### The fill-cost model
 
 A favorite share bought by a fill ties up capital that could earn the hurdle
 rate r (`--hurdle-rate`) elsewhere, until it leaves. The farmer offers it back
@@ -763,7 +705,7 @@ rank, end date, and `rewards_active` flag. It never touches your decisions:
 `capital_usd`. A market that leaves the reward set gets `rewards_active = 0`
 and keeps its status. Retiring markets is the farmer's job.
 
-### Reward Farmer
+## Reward farmer
 
 `reward_farmer.py` farms the liquidity rewards on the markets you approved
 with the screener. It runs as a daemon. Every cycle it reads each market's
@@ -785,8 +727,13 @@ python reward_farmer.py                       # dry run on farm.db, forever
 python reward_farmer.py --once                # one dry-run cycle, then exit
 python reward_farmer.py --db scratch.db       # dry run on another database
 python reward_farmer.py --live                # real orders
-python reward_farmer.py --live --heartbeat    # real orders with the dead-man switch
+python reward_farmer.py --live --keep-orders  # Ctrl+C leaves the orders resting
+python reward_farmer.py --live --key-stdin    # the wallet key is piped in
 ```
+
+The farmer also records each quoting market's favorite book to
+`farm_books.db`, beside `farm.db`, every five minutes. `farm_books.py` owns
+that file, and no other process writes it.
 
 A cycle prints a market's summary line only when it differs from the last
 one printed for that market, then one line per action. A market resting
@@ -814,7 +761,7 @@ only the exits rest. A read that found no midpoints counts as no history. The
 farmer values fills on the fill prior the last scan stored, read again every
 cycle.
 
-#### The four slots
+### The four slots
 
 Above a 0.90 midpoint Polymarket pays only for two-sided liquidity:
 min(Q_one, Q_two). Q_one sums favorite bids and longshot asks. Q_two sums
@@ -867,7 +814,7 @@ because it would carry risk without scoring.
 The farmer never buys at market. All inventory comes from passive fills of
 these orders.
 
-#### Market lifecycle
+### Market lifecycle
 
 Each market is in one of six states:
 
@@ -910,7 +857,7 @@ reads positions every 60 seconds and every market's Gamma record (reward terms,
 tick, trading status) every 5 minutes, in batched requests on a thread of its
 own, and a newly approved market's at once.
 
-#### Pausing, settings, and stopping
+### Pausing, settings, and stopping
 
 The console (or any process with write access to `farm.db`) controls a
 running farmer through the database. Per-market controls are columns on
@@ -949,7 +896,7 @@ on its next cycle, stamps `consumed_at` and `result`, and shuts down the same
 way as on Ctrl+C. A stop sent while no farmer runs is marked expired when the
 next farmer starts, so it does not stop that farmer.
 
-#### Safety mechanisms
+### Safety mechanisms
 
 - Every order is post-only, so a fill is always a maker fill.
 - Every order is good-till-date. It expires at the market's end date minus
@@ -986,11 +933,16 @@ next farmer starts, so it does not stop that farmer.
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
   logged once per rejection.
-- In live mode, Ctrl+C, SIGTERM, or a `stop` command cancels every order on
-  the managed markets before the farmer exits. A normal `--once` exit leaves
-  the orders resting.
+- In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels every
+  order on the managed markets before the farmer exits. A normal `--once`
+  exit leaves the orders resting. So do Ctrl+C and SIGTERM under
+  `--keep-orders`, and a `stop` command that asks to keep the orders. Orders
+  left that way rest unmanaged until the farmer starts again: no cooldowns,
+  retirement, or fill handling, and they expire only at their good-till-date.
+  The next start adopts the ones still close to their targets and replaces
+  the rest.
 
-#### Positions and existing orders
+### Positions and existing orders
 
 The farmer reads your positions from the public data API for
 `POLYMARKET_FUNDER_ADDRESS` in `.env`. It never sells shares that were in your
@@ -1021,13 +973,15 @@ keeps the ones that match a slot target and cancels the rest, including
 orders you placed there by hand. It never reads or touches orders on markets
 it does not manage.
 
-#### Key options
+### Key options
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--db` | `farm.db` | SQLite file written by the screener |
+| `--db` | `farm.db` in the data directory | SQLite file written by the screener. See [Where the databases live](#where-the-databases-live) |
 | `--live` | off | Sign and post real orders |
+| `--key-stdin` | off | Live only. Read the wallet key from one line of standard input, not from the environment or Bitwarden |
 | `--once` | off | Run one cycle and exit |
+| `--keep-orders` | off | Live only. Ctrl+C and SIGTERM leave the managed orders resting instead of cancelling them. A crash still cancels them. Not with `--heartbeat` |
 | `--interval` | 5 | Seconds between cycles |
 | `--capital` | 500 | Most USD a market's favorite bid may be, held favorite shares included at cost. The farmer rests the size at or under it that nets the most |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
@@ -1045,7 +999,7 @@ it does not manage.
 | `--expiry-buffer-days` | 7 | Retire this many days before the end date |
 | `--heartbeat` | off | Live only. See the warning below |
 
-#### The heartbeat warning
+### The heartbeat warning
 
 `--heartbeat` posts a heartbeat to Polymarket every 5 seconds. If the
 heartbeats then stop for 10 seconds, because the farmer crashed, the network
@@ -1055,7 +1009,27 @@ Polymarket does not document whether the scope is the API key or the whole
 account. Without `--heartbeat`, a dead farmer leaves its orders resting until
 their good-till-date expiry.
 
-#### Going live
+This is an open risk, not a settled fact. Leave `--heartbeat` off until the
+scope is confirmed:
+
+- Polymarket's own pages describe the scope two ways. The "Manage Orders"
+  page says a lapse cancels all open orders "owned by those CLOB API
+  credentials". The "Send heartbeat" reference page says "for the user".
+- Every process here signs in with the same API key. `connect` in
+  `polymarket/client.py` derives it from the wallet key, for the farmer, the
+  worker, and the scoring probe alike. So a lapse could cancel the orders a
+  restore or a watch placed, and orders you placed by hand, along with the
+  farmer's.
+- Before anyone turns `--heartbeat` on, the farmer needs an API key of its
+  own, and the scope needs a test on a second, throwaway account. The code
+  has no option for a separate key yet.
+- Do not test the scope on the main account. If the scope is the whole
+  account, the test itself cancels every open order.
+
+`--heartbeat` and `--keep-orders` cannot be combined, because Polymarket
+cancels the orders 10 seconds after the heartbeats stop.
+
+### Going live
 
 1. Run a scan and approve the markets you want, with your `--p-true` and
    `--budget` for each.
@@ -1064,13 +1038,16 @@ their good-till-date expiry.
 3. Make sure the wallet holds enough USDC. At startup the live farmer compares
    your collateral balance with the favorite bids it plans and warns if the
    balance is short.
-4. Start `python reward_farmer.py --live`. It loads the private key the same
-   way the other tools do (environment or Bitwarden) and locks Bitwarden again
-   on exit.
+4. Start `python reward_farmer.py --live`. It checks the region it connects
+   from and does not start from a place where Polymarket rejects new orders.
+   It then reads the wallet key from the environment or from Bitwarden, and
+   locks the vault again as soon as the key is read (see
+   [Where the wallet key comes from](#where-the-wallet-key-comes-from)).
+   Leave `--heartbeat` off.
 5. Stop it with Ctrl+C or a `stop` command, which cancel the orders on the
    managed markets.
 
-#### The farm.db contract
+### The farm.db contract
 
 `farm_db.py` owns the schema and every SQL statement the tools run against
 `farm.db`. Opening the file migrates an older one in place: missing columns
@@ -1091,6 +1068,10 @@ Each column has exactly one writer process:
 | `rewards_daily` | Farmer, live only | Your reward earnings per market per day, fetched every 10 minutes |
 | `farm_mids` | Farmer | At most one row per managed market per minute, in dry run too: the midpoint, the book midpoint, and the prices the `FAV_BID` and `LONG_BID` rest at after that cycle (NULL when the slot rests nothing). Rows older than 7 days are deleted at startup. The console draws its midpoint chart from it |
 
+This table leaves out four tables: `fav_buys`, `decisions`, `mutes`, and
+`triage`. The module docstring of `farm_db.py` lists every table with its
+writer.
+
 The one exception to one writer per column: the live farmer retires a market
 by changing `status` from `approved` to `retired` and writing a `note`, in a
 single conditional `UPDATE`. A status you already changed is never
@@ -1105,28 +1086,34 @@ whose response fields Polymarket does not document. The farmer reads them
 defensively, logs a warning when the shape does not match, and keeps
 farming.
 
-### Farm Console
+## Farm console
 
-`farm_console` is a local web console for the reward farmer. It shows what
-the farmer is doing, live, and it is where you run scans, approve markets, and
-control the farmer. Every change it makes goes through `farm_db` into
-`farm.db`, and the farmer picks it up on its next cycle.
+`farm_console` is a local web console for the reward farmer and the order
+tools. It shows what the farmer is doing, live, and it is where you run scans,
+approve markets, and control the farmer. Every change it makes to the farm
+goes through `farm_db` into `farm.db`, and the farmer picks it up on its next
+cycle. Its **Orders** and **Sniper** pages queue work for the worker through
+`tools.db` (see [Orders page](#orders-page) and [Sniper page](#sniper-page)).
 
 ```bash
-python -m farm_console                    # production farm.db on port 8787
-python -m farm_console --db scratch.db    # another database
-python -m farm_console --port 8788        # another port
+python -m farm_console                        # port 8787
+python -m farm_console --db scratch.db        # another farm database
+python -m farm_console --tools-db scratch-tools.db   # another worker database
+python -m farm_console --port 8788            # another port
 ```
 
 Then open http://127.0.0.1:8787. Run it from the repository root (or with
 the repository on `PYTHONPATH`) so Python can find the `farm_console`
-package. `--db` defaults to the repository's `farm.db`, the production
-database, wherever you start the console from. A relative `--db` path is
-read from the current directory.
+package. `--db` defaults to `farm.db`, the production database, and
+`--tools-db` to `tools.db`, both in the data directory (see
+[Where the databases live](#where-the-databases-live)). A relative `--db` or
+`--tools-db` path is read from the current directory.
 
-Run it next to the farmer on the same database, in its own terminal. Neither
-process needs the other: the console shows the last state the farmer
-published, with a banner when the farmer is not running. The console reads
+Run it next to the farmer on the same `farm.db` and next to the worker on the
+same `tools.db`, each in its own terminal. No process needs another: the
+console shows the last state the farmer and the worker published. The sidebar
+lists both processes. A farm page shows a banner when the farmer is not
+running, and a tool page shows one when the worker is not. The console reads
 `POLYMARKET_FUNDER_ADDRESS` from `.env` to show your holdings on the Review
 page. It never reads or handles a private key.
 
@@ -1141,8 +1128,10 @@ Pages:
 | Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
 | Activity (`/activity?tab=`) | `rewards`: earnings per day and market against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
 | Settings (`/settings`) | The farmer process (mode, pid, start, last cycle, interval, heartbeat) and every setting with its effective value and where it comes from: your override, the farmer's own value, or the built-in default | Stop the farmer, save or reset settings, cancel all managed orders |
+| Orders (`/orders`) | The snapshot job in progress and every stored snapshot. A snapshot's page (`/orders/snapshots/<id>`) shows its orders and its newest preview or restore | Take a snapshot, preview a restore, place it |
+| Sniper (`/sniper`) | A search over the open markets and every watch with the quote the worker last saw, its outcome, and its log. `/sniper/arm` is the form that arms one outcome | Arm a watch, disarm it |
 
-#### Running a scan from the console
+### Running a scan from the console
 
 The Discover page runs the same scan as `python reward_screener.py scan`, in a
 background thread of the console. It takes two to three minutes. The page shows
@@ -1152,7 +1141,7 @@ error. Only one scan runs at a time: a second request while one runs gets
 last scan run from the console, or the screener's defaults. A scan stores its
 rows and its funnel in one transaction and never changes your decisions.
 
-#### Decisions and controls
+### Decisions and controls
 
 - **Approve** sets `status` to `approved` with the p_true, naked budget, and
   capital you entered. You enter p_true as a whole percent from 1 to 99, with
@@ -1185,23 +1174,25 @@ rows and its funnel in one transaction and never changes your decisions.
 - **Cancel all** pauses every approved market. You must type `CANCEL`, and
   the server checks it.
 - **Stop farmer** asks first, then inserts a `stop` command. The Settings
-  page shows when the farmer consumed it.
+  page shows when the farmer consumed it. **Stop, keep orders** inserts a
+  `stop` command that asks the farmer to leave its orders resting, as
+  `--keep-orders` does.
 - **Settings** forms check each value with the same rules the farmer uses
   and write only the fields you changed, all in one transaction. A value
   that fails shows its error next to the field and nothing is saved.
   **Reset** deletes the override, so the farmer's own value applies again.
 
 There is no live switch. Live mode needs the private key, which the farmer
-unlocks from Bitwarden in its own terminal, so you start it there:
-`python reward_farmer.py --live --db farm.db`.
+reads in its own terminal, so you start it there:
+`python reward_farmer.py --live`.
 
-#### Security
+### Security
 
 The console has no login and controls real orders, so it must only be
 reachable from your own machine, and only by its own pages:
 
 - It binds `127.0.0.1` only. To reach it from another machine, use an SSH
-  tunnel. Never change the bind address.
+  tunnel, as [Safety](#safety) shows. Never change the bind address.
 - Every request must carry `Host: 127.0.0.1:<port>` or `localhost:<port>`.
   Anything else gets 400. This blocks DNS rebinding, where a hostile site
   points its own domain at 127.0.0.1.
@@ -1213,6 +1204,9 @@ reachable from your own machine, and only by its own pages:
   forge a request.
 - A request other than GET or HEAD whose `Origin` header names another origin
   gets 403, even with the token.
+- A request that makes real orders move carries a typed word, which the
+  server checks: `CANCEL` to cancel all managed orders, `PLACE` to place a
+  restore, and `ARM` to arm a live watch.
 - Every decision and control is a POST. Two GET requests write, the Review
   page's live check and its skip to the next quotable candidate, and they
   only record a candidate's `rewards_active` as Polymarket reports it. No
@@ -1221,12 +1215,15 @@ reachable from your own machine, and only by its own pages:
 `farm_console/security.py` holds all of these checks, as a middleware in
 front of every route.
 
-#### Live updates
+### Live updates
 
 The pages update without a reload. `GET /stream` is a server-sent event
-stream that polls `farm.db` once a second and sends three signals with no
-HTML: `cycle` when the farmer finishes a cycle, `farm-event` when a new event
-appears, and `status` when the farmer starts or stops running. Each live region
+stream that polls `farm.db` and `tools.db` once a second and sends five
+signals with no HTML: `cycle` when the farmer finishes a cycle, `farm-event`
+when a new event appears, `status` when the farmer or the worker starts or
+stops running, `job` when a worker job is queued, changes state, or logs a
+line, and `watch` when a watch is armed, changes, is sampled, or logs a line.
+Each live region
 of a page requests its own HTML fragment from `/partials/...` when its signal
 arrives, using htmx and its SSE extension. After a market control, the regions
 that show that market reload at once. There is no client-side state and no
@@ -1261,7 +1258,7 @@ system fonts, and the Review page's rules and holdings. To upgrade, download
 `dist/htmx.min.js` from the `htmx.org` package and `dist/sse.min.js` from the
 `htmx-ext-sse` package, and update the versions here.
 
-#### What the terms mean
+### What the terms mean
 
 Each term on the console that is not self-explanatory, such as naked budget,
 Q1 / Q2, a phase or a slot name, has an info button after it. Hover over it or
@@ -1275,126 +1272,492 @@ no dependencies, shows one tooltip on the page body, so a scrolling table never
 clips it. `test_farm_console_tips.py` fails when a template uses a key the
 glossary lacks, or when the glossary has an entry no page uses.
 
-## Important Notes
 
-### Token Allowances
+## Orders page
 
-If you're using an EOA (Externally Owned Account) or MetaMask wallet, you must set token allowances before trading. This is not required for email/Magic wallets.
+The **Orders** page (`/orders`) stores snapshots of every open order on the
+account. From a snapshot's page you place again the orders that are no longer
+open, for example after Polymarket cancelled them when your balance dropped.
 
-**Required approvals:**
+The console holds no key, so it only queues a job in `tools.db`. The worker
+runs the job. While no worker runs, the page shows a banner with the command
+that starts one, and a queued job says `It waits for the worker, which is not
+running.` Every job on this page needs a keyed worker.
 
-1. **USDC** (`0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`)
-   - Approve for: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
-   - Approve for: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
-   - Approve for: `0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`
+One job of a kind is queued or running at a time. A preview and a restore
+count as one kind. A second request gets a notice such as `A snapshot job is
+already queued (job 12).`
 
-2. **Conditional Tokens** (`0x4D97DCd97eC945f40cF65F87097ACe5EA0476045`)
-   - Approve for the same three contracts above
+### Take a snapshot
 
-See the [Polymarket documentation](https://docs.polymarket.com/developers/CLOB/authentication) for more details on setting allowances.
+1. Open **Orders**.
+2. Type a note of at most 200 characters, or leave it empty.
+3. Click **Take snapshot**.
 
-### Error Handling
+The worker lists every open order on the account, the farmer's and your own
+alike, and stores them with their market names. A listing that fails stores
+nothing, and the job ends `failed` with the error. When Gamma cannot name the
+markets, the orders are stored without names and the page shows each market's
+condition id.
 
-- The restore script will continue processing even if some orders fail
-- Each failure is logged with details about what went wrong
-- Common failure reasons:
-  - Insufficient balance
-  - Market no longer available
-  - Invalid token ID
-  - Network/API errors
+The job panel shows the job's state (`queued`, `running`, `done`, or
+`failed`), its log, and a link to the snapshot once it is stored.
 
-### Snapshot File Format
+### Import the old snapshot files
 
-The snapshot file is a JSON file with the following structure:
+The snapshot script this page replaces saved each snapshot as an
+`orders_snapshot_*.json` file. To store those files as snapshots, run:
 
-```json
-{
-  "metadata": {
-    "timestamp": "2025-01-24T14:30:22.123456",
-    "total_orders": 5,
-    "snapshot_version": "1.0"
-  },
-  "orders": [
-    {
-      "asset_id": "0x1234...",
-      "price": "0.45",
-      "original_size": "10.0",
-      "side": "BUY",
-      "expiration": "0",
-      "order_type": "GTC",
-      ...
-    },
-    {
-      "asset_id": "0x5678...",
-      "price": "0.55",
-      "original_size": "5.0",
-      "side": "SELL",
-      "expiration": "1767225599",
-      "order_type": "GTD",
-      ...
-    },
-    ...
-  ]
-}
+```bash
+python -m tools import-snapshots                   # the files in snapshots/
+python -m tools import-snapshots path/to/files     # the files somewhere else
 ```
 
-**Key fields:**
-- `expiration`: Unix timestamp in seconds. `0` means GTC (Good-Til-Cancelled), any positive value means GTD (Good-Til-Date)
-- The restore script preserves the original expiration when recreating orders
+The import needs no key and no running worker. It takes the same `--db` as
+the worker, before or after the command. It prints one line, in this form:
+
+```text
+Stored <n> snapshot files with <n> orders in <tools.db>; <n> already stored.
+```
+
+A file that was stored before, by name, is skipped, so you can run the import
+again. A file that is not a snapshot stops the import with `Import failed:
+<file> is not an order snapshot`. The files before it stay stored.
+
+The old files hold local times with no time zone. The import reads them in
+the time zone of the machine it runs on and stores them as UTC. Run it on the
+machine that took the snapshots.
+
+### Preview a restore
+
+1. On **Orders**, click a snapshot's time in the **Snapshots** table.
+2. Click **Preview restore**.
+
+The worker lists the orders that are open now and decides what a restore
+would do with each order of the snapshot. A preview places nothing. The page
+groups the orders under **Would place** and the four skips below, and each
+row says why.
+
+### What a restore places and what it skips
+
+The worker goes through the snapshot's orders in their order. For each one,
+the first rule that fits decides.
+
+| Rule | Group on the page | Why |
+| --- | --- | --- |
+| Nothing of the order was left to fill when the snapshot was taken | **Skipped: nothing left to fill** | There is no size to place. |
+| The order's market has the status `approved` in `farm.db` at your click | **Skipped: the farmer's market** | The farmer cancels the orders on its markets that are not its own, and places its own. |
+| The order expires within 2 minutes from now, or has expired | **Skipped: expired** | The CLOB refuses an order that expires within a minute. The second minute is for the job to reach the order. |
+| The same order, by its id, is still open | **Skipped: already open** | It never went missing. This holds however much more of it has filled since. |
+| An open order that is not in the snapshot has the same token, side, price, and remaining size | **Skipped: already open** | It was placed again already, by you or by an earlier restore. Each such order covers one snapshot order, so two identical snapshot orders with one copy open give one skip and one place. |
+| None of the above | **Would place**, then **Placed** | The order is missing. |
+
+What it places:
+
+- **The remaining size.** A restore places the order's size less what had
+  filled when the snapshot was taken, cut to whole hundredths of a share. It
+  never places the original size of a partly filled order.
+- **The same token, side, and price.** The worker reads each market's tick
+  once for the job. An order whose price is not a multiple of that tick is
+  not sent.
+- **The same expiration.** An order with an expiration goes out
+  good-til-date with that expiration. An order with none goes out
+  good-til-cancelled.
+- **Post-only.** Every order of a restore is post-only. An order that would
+  cross the book is refused by the exchange and shows under **Rejected by
+  the exchange**. It is never filled as a taker.
+
+### Place a restore
+
+Placing follows a finished preview. The **Place** button shows only under a
+finished preview that would place at least one order, and the server refuses
+a placing request unless the snapshot's newest preview or restore job is a
+finished preview. So every restore follows a preview you could read, and
+after a restore you preview again before you place again.
+
+1. Read the preview.
+2. Type `PLACE` in the field beside the button. The server checks the word
+   and answers `Type PLACE to confirm.` without it.
+3. Click **Place N orders**.
+
+These are real orders. What happens next:
+
+- The worker lists the open orders again and makes a new plan. It places
+  what is missing then, so the count can differ from the preview.
+- A finished preview has no time limit of its own. The limit is on the
+  restore job, which a worker must start within 5 minutes of your click. A
+  restore that waited longer fails with `preview it again`, so a restore
+  queued while the worker was down does not run hours later.
+- If the worker cannot list the open orders, the job fails and places
+  nothing.
+- The worker stores one line for each order as it goes. A placed order shows
+  under **Placed** with its new order id. An order the exchange refused shows
+  under **Rejected by the exchange** with the exchange's reason. An order
+  that was not sent, or whose post got no answer, shows under **Error**.
+- A restore ends early when the worker stops, and after 3 posts in a row get
+  no answer. The lines stored by then stay, and the job's error says how far
+  it got.
+
+A restore is safe to run again while the orders it placed still rest
+unfilled. Preview again. Each of those orders is open now, so the new plan
+skips it.
+
+A restore cannot tell an order that was cancelled from an order that filled
+after the snapshot was taken. Both are missing from your open orders, so
+both show under **Would place**. The same holds for an order that an earlier
+restore placed and that has filled since, in whole or in part. Read the
+preview before you place.
+
+### When a line says the order may rest
+
+An **Error** line is one of two kinds.
+
+`not sent: ...` means the order never left the worker, because the market's
+tick could not be read or the order could not be signed. Nothing rests.
+
+`no answer (...): the order may rest: check your open orders` means the post
+went out and no usable answer came back: a timeout, a dropped connection, a
+5xx status, or an answer the worker could not read. The exchange may have
+placed the order or not. The worker does not send it again, because a second
+post could place a second order.
+
+To settle it, look at your open orders on Polymarket. A new preview also
+shows it. Click **Preview restore** again, and the worker lists your open
+orders afresh. An order that rests unfilled is skipped as already open. An
+order that does not rest is listed under **Would place**.
+
+## Sniper page
+
+The **Sniper** page (`/sniper`) arms tick-change watches. This page places
+real orders, unattended, at a moment you do not choose. Read this whole
+section before you arm a live watch.
+
+### What a tick-change watch is
+
+A Polymarket market trades on a price grid, and prices run from one tick to
+one minus a tick. On a 0.01 tick the highest legal price is $0.99. When
+Polymarket shrinks the market's tick to 0.001, $0.999 becomes legal. Orders
+at one price fill in the order they arrived, so the first resting order at
+the new best price is first in the queue there.
+
+A watch waits for one outcome token's tick to reach a target tick, and then
+posts one limit order, once. It exists to be first in that queue. The watch
+is a row in `tools.db`, and the worker holds it, so it outlives a console
+restart. One token has at most one open watch.
+
+Every sniper order is post-only. It rests or the exchange refuses it, and it
+never takes liquidity. The build chose that default, and the owner has not
+confirmed it. The form has no option for an order that takes.
+
+### Find a market and arm a watch
+
+1. Open **Sniper**, type a few words under **Find a market**, and click
+   **Search**.
+2. Read the results. They are Gamma's search, ranked again. Outcomes that
+   are ready for the default setup come first, then the best matches, then
+   the highest volume. The page shows at most 25 outcomes. **Bid**, **Ask**,
+   and **Tick** come from the live book.
+3. Click **Arm** on the outcome you want. The status does not block you. It
+   only says whether the outcome fits the default setup.
+4. Fill in the **Arm a watch** form, which shows the live book above it.
+5. For a live watch, type `ARM` and click **Arm watch**. For a rehearsal,
+   tick **Dry run** and click **Arm watch** with no word.
+
+The **Status** column judges each outcome for a BUY under the default guard:
+
+| Status | Meaning |
+| --- | --- |
+| `ready` | Open, accepting orders, on a tick coarser than 0.001, with a best bid within 0.5c of 99.0c |
+| `closed` | The market is closed |
+| `not accepting orders` | The market takes no orders |
+| `tick 0.001 already` | The tick has reached the target, so a watch would be missed |
+| `no book` | The book could not be read |
+| `no bid` | The book has no bid |
+| `bid at 98.0c` | The best bid is outside the guard's range. The status shows the bid |
+
+The form's fields:
+
+| Field | Default | Rule |
+| --- | --- | --- |
+| **Side** | `BUY` | `BUY` or `SELL` |
+| **Price (dollars)** | `0.999` | A multiple of the target tick, from one tick to one minus a tick |
+| **Size (shares)** | empty | A positive number |
+| **Target tick** | `0.001` | One of `0.1`, `0.01`, `0.001`, `0.0001` |
+| **Expires after (s)** | `0` | `0` for good-til-cancelled, or at least 60 seconds, counted from the signing |
+| **Guard the entry price** | ticked | See [The guard](#the-guard) |
+| **Required price** | `0.99` | A price between 0 and 1 |
+| **Tolerance** | `0.005` | From 0 to 1 |
+| **Max quote age (s)** | `5` | A positive number of seconds |
+| **Dry run** | not ticked | See [Dry runs and the keyless worker](#dry-runs-and-the-keyless-worker) |
+
+A token that already has an open watch is refused with `This token already
+has an open watch.`
+
+### What the worker does with an armed watch
+
+The worker reads the open watches four times a second. It adopts a new one
+in these steps:
+
+1. It reads the token's book. If the tick is already at the target or finer,
+   the watch closes as `missed` and never fires.
+2. It keeps that book's best bid and ask as the first quote.
+3. It reads what signing needs from the exchange, and signs the order for
+   the target tick ahead of time. It signs again every half second, because
+   a signed order carries its signing time, and it never sends a signature
+   older than 2 seconds.
+
+If the book or the exchange cannot be read, the watch stays `armed`, its log
+says why, and the worker tries again 2 seconds later.
+
+Two threads then look for the tick change: the market websocket, and a read
+of the books every half second. The thread that first sees the tick at the
+target judges the guard and posts the order itself. A watch fires once.
+
+While the watch is armed, its card shows the tick, the bid, and the ask the
+worker last saw, refreshed every second.
+
+### The guard
+
+The guard stops the order when the market is not where you expected it at
+the moment the tick changes. With **Guard the entry price** ticked, all of
+these must hold or the watch closes as `rejected` and nothing is sent:
+
+- The worker saw a quote before the tick change, with a price on your side
+  of the book.
+- That quote is no older than **Max quote age (s)**. The default is 5
+  seconds.
+- The side's own best price in that quote is within **Tolerance** of
+  **Required price**. The side's own best price is the best bid for a BUY and
+  the best ask for a SELL. The defaults ask for 99.0c within 0.5c.
+
+The guard reads the last quote from before the change on purpose. Once the
+finer tick opens, other orders reprice the book, and a quote from after the
+change would refuse a setup that was valid a moment earlier. The worker never
+takes a quote from an observation that already shows the target tick.
+
+With the box not ticked, the watch has no guard, and the order goes out at
+the tick change whatever the price is.
+
+### Dry runs and the keyless worker
+
+A dry run rehearses everything up to the post and sends nothing. Tick **Dry
+run: rehearse everything up to the post, send nothing** on the form. A dry
+run needs no typed word.
+
+- On a keyed worker a dry run signs the order, as a live watch does, and
+  then stops. It ends `rehearsed` with `signed, not sent`.
+- On a worker started with `--no-key` it signs nothing. It ends `rehearsed`
+  with `not signed (no key), not sent`.
+- A dry run can also end `missed`, `rejected`, `disarmed`, or `failed`
+  because the order could not be signed. It can never end `fired`. SQLite
+  refuses that row.
+
+The closed card of a dry run shows the quote the guard judged, which thread
+saw the tick, and the time from the tick to the post. So a dry run on a real
+tick change tests your guard settings with no money at risk.
+
+A worker with no key adopts dry-run watches only. A live watch then stays
+`armed`, and its card says `Armed. Waiting for a keyed worker: the running
+worker holds no key.`
+
+### How a watch ends
+
+A watch is open while it is `armed` or `firing`. Every other state is final.
+SQLite refuses any change to the state of a closed watch, so to try again
+you arm a new one.
+
+| State | What happened | Is an order on the book? |
+| --- | --- | --- |
+| `armed` | The watch waits for the tick change, for a worker, or for a keyed worker | No |
+| `firing` | The guard passed and the first post has left. The worker waits for the answer or retries | Possibly |
+| `fired` | The exchange accepted the order. The card shows its order id | Yes. A real post-only order rests, and the worker does nothing more with it. Cancel it on Polymarket if you do not want it |
+| `rehearsed` | A dry run reached the post | No |
+| `rejected` | Your guard refused. The card says which check failed | No. Nothing was sent |
+| `missed` | The tick was already at the target when the worker adopted the watch | No, with one exception below |
+| `disarmed` | You disarmed it before it fired, or while it was retrying after refusals | No |
+| `failed` | See the next table | It depends on the reason |
+
+A `failed` watch gives its reason in the sentence on its card:
+
+| The card says | What happened | Is an order on the book? |
+| --- | --- | --- |
+| `The exchange refused the order: ...` | Every post was refused, and the retry window closed or the refusal was one no retry can change | No |
+| `The order could not be signed: ...` | The worker could not sign at the tick | No |
+| `The worker stopped inside the retry window after N refusals: ... No order rests.` | You stopped the worker while it was retrying | No |
+| `The post got no answer (...). An order may rest: check your open orders.` | A post went out and no usable answer came back | Unknown. Check your open orders on Polymarket |
+| `The worker stopped while the order was leaving. An order may rest: check your open orders.` | The worker died between the post and its answer, and the next worker found the watch `firing` | Unknown. Check your open orders on Polymarket |
+
+The card prints the two unknown cases in the warning color. In both, look at
+your open orders on Polymarket and cancel the order there if you do not want
+it. The worker never sends that order again, and it never resumes a fire
+after a restart.
+
+How the worker retries:
+
+- The exchange's order endpoint can lag the tick event, so a refusal of the
+  first post is expected. The worker posts again every 0.25 seconds until 10
+  seconds have passed since the tick change.
+- It stops at once on a refusal that no retry can change: the address is
+  blocked, the account cannot fund the order, or the post-only order would
+  cross the book.
+- It never retries a post that got no answer, because the order may rest and
+  a second post could place a second order.
+- Every refusal goes into the watch's log with the exchange's message.
+
+The exception for `missed` is a crash at the moment of the post. The worker
+records `firing` in `tools.db` up to about 50 milliseconds after the post
+starts, and never before it, so that no database write delays the post. If
+the worker process dies in that gap, the row is still `armed` although an
+order may rest. The next worker then finds the tick at the target and closes
+the watch as `missed`. After a worker crash near a tick change, check your
+open orders even when the watch says `missed`.
+
+Stopping the worker with Ctrl+C leaves each armed watch `armed`, and the next
+worker adopts it again. No watch fires while no worker runs. A tick that
+changes in that time is found at the next start, and the watch closes as
+`missed`.
+
+### Disarm a watch
+
+Click **Disarm** on an open watch. The console writes the request to
+`tools.db`, and the worker answers within a second.
+
+A disarm cannot stop a post that has already left:
+
+- The worker reads the request up to a quarter of a second after your click.
+  A tick change inside that time still fires the watch.
+- Once the first post has left, a disarm only stops the retries. If the
+  exchange accepted the first post, the watch ends `fired` and the order
+  rests. If the exchange refused it and the worker was retrying, the watch
+  ends `disarmed` and no order rests.
+
+So read the watch's final state after a disarm. `disarmed` means no order.
+`fired` means the order went out first.
+
+With no worker running, the card says `Disarm requested. Waiting for the
+worker to answer.` The next worker to start, keyed or not, disarms the watch.
+
+### What is not confirmed against the live exchange
+
+As of 2026-10-11 the restore and the sniper have posted only to fake
+clients, in the tests and in the build's own checks. The feed's subscribe
+message was checked on Polymarket's live market channel, which is read-only.
+These points wait for the first live use:
+
+- **The order of the feed's messages.** The guard assumes that the tick
+  change arrives before any price at the new tick. If a price at the new
+  tick arrives first, the guard judges that price, and it can refuse a valid
+  setup or pass one it should refuse. A dry-run watch on a real tick change
+  answers this with no money at risk, because the closed card records the
+  quote the guard judged.
+- **The shape of the exchange's answer to a post.** The worker counts an
+  order as placed only when the answer has `success` true, no `errorMsg`,
+  and an `orderID`. If the real answer differs, an accepted order shows as a
+  refusal or as an order that may rest. Check your open orders after the
+  first live restore and the first live fire.
+- **The text of the refusals.** The worker recognizes a refusal that no retry
+  can change by words in the exchange's message, listed in
+  `TERMINAL_REFUSALS` in `polymarket/orders.py`. If the exchange words one
+  differently, the worker retries it for the whole 10 seconds instead of
+  stopping at once. The exact text of the refusal during the tick race is
+  also unknown.
+- **The delay under load.** The worker shortens Python's thread switch
+  interval to 0.5 ms so that a busy thread cannot hold up the thread that
+  sees the tick. A comment in `tools/sniper.py` records the measurement
+  behind that, taken on 2026-10-11 with a CPU-bound thread standing in for a
+  restore. A parked thread woke after a median 15.5 ms and a worst 110 ms at
+  Python's default 5 ms, against 0.08 ms and 0.35 ms at 0.5 ms. Nobody has
+  measured it with a real restore running, and a restore's posts share the
+  sniper's HTTP connection. Until someone measures it, avoid running a
+  restore while a live watch is armed.
+
+[Safety](#safety) has two more open points: the SSH tunnel and the scope of
+the farmer's heartbeat.
+
+## Tests
+
+```bash
+python run_tests.py                  # every test_*.py, one process a module
+python run_tests.py test_farm_db     # only the modules you name
+pytest                               # the same tests under pytest
+```
+
+`run_tests.py` runs the modules side by side, prints one line for each with
+its test count and time, and exits with status 1 when a module fails. Bare
+`pytest` works because `pyproject.toml` keeps it out of `handoff/`,
+`.claude/`, `.venv/`, and `snapshots/`.
+
+The tests never touch the network and never hold a real key. Each one works
+in its own temporary directory, with fake clients where the code would talk
+to Polymarket.
 
 ## Troubleshooting
 
-### "Missing required environment variables"
-- Make sure you've created a `.env` file from `.env.example`
-- Verify that `POLYMARKET_FUNDER_ADDRESS` is set
-- For the private key, either:
-  - Set `POLYMARKET_PRIVATE_KEY` in your `.env` file, OR
-  - Configure Bitwarden by setting `BW_POLYMARKET_ITEM_NAME` or `BW_POLYMARKET_ITEM_ID` in your `.env` file
+### The farmer or the worker does not start
 
-### "Error connecting to Polymarket"
-- Check your internet connection
-- Verify your credentials are correct
-- Ensure the API endpoint is accessible
+Each program prints why. The common lines:
+
+| Message | What to do |
+| --- | --- |
+| `POLYMARKET_FUNDER_ADDRESS is not set` | Copy `.env.example` to `.env` and set the address |
+| `POLYMARKET_PRIVATE_KEY is not set, and no Bitwarden item is named in BW_POLYMARKET_ITEM_ID or BW_POLYMARKET_ITEM_NAME` | Set one of the three, or start with `--key-stdin` |
+| `the Bitwarden CLI (bw) is not installed` | Install it, or keep the key in the environment |
+| ``the Bitwarden CLI is not logged in: run `bw login` once`` | Run `bw login` in a terminal |
+| `` the Bitwarden vault did not lock again: run `bw lock` `` | Run `bw lock`, then start again |
+| `a worker is already running on this database` | Stop the other worker, or wait 10 seconds after it died |
+| `the API rejects new orders from here` | See the next two sections |
 
 ### "Trading restricted in your region" (403)
-- The submitting IP is in a blocked jurisdiction; the check is IP-based and
-  happens at order submission
-- Confirm the VPN is carrying **this process**: per-app split tunnelling
-  matches the interpreter's exact path, so a venv or a second install needs
-  its own rule, and a process already running when the rule changed keeps
-  its old routing
-- Verify with `python -c "import httpx; print(httpx.get('https://clob.polymarket.com/cdn-cgi/trace').text)"` - run it
-  with the *same* interpreter and check the `loc=` line
-- Exits whose API access is unrestricted: Ireland, Japan, Malta, the
-  Netherlands. Most obvious alternatives (UK, France, Germany, Italy, Poland,
-  Singapore, New Zealand, Canada, US) are close-only on the API too
 
-### 451 Unavailable For Legal Reasons
-- Distinct from the 403 above: this is the edge refusing the request before
-  the API sees it, and it can hit an exit address in a country that appears
-  on no published restriction list - shared VPN IPs get flagged on their own
-- Reconnecting to a different server, even in the same country, usually
-  clears it; the block follows the address, not the jurisdiction
-- Hosts can disagree: `gamma-api` returning 451 while `clob` is fine breaks
-  the picker and `--slug` but leaves `--token-id` working
-- Full list: https://docs.polymarket.com/developers/CLOB/geoblock
+- The address that sends the order is in a blocked place. The check is by IP
+  address, and it happens when the order is sent.
+- Confirm that the VPN carries this process. Split tunnelling by application
+  matches the interpreter's exact path, so a virtual environment or a second
+  install needs its own rule, and a process that was already running when
+  the rule changed keeps its old route.
+- To see where the exchange places you, run this with the same interpreter
+  and read the `loc=` line:
 
-### "Insufficient balance" errors during restore
-- Make sure you have enough USDC and conditional tokens
-- Check that token allowances are set (for EOA/MetaMask wallets)
+  ```bash
+  python -c "import httpx; print(httpx.get('https://clob.polymarket.com/cdn-cgi/trace').text)"
+  ```
 
-### Orders fail to restore
-- Some orders may fail if market conditions have changed
-- Check the error messages in the summary for specific reasons
-- You can manually review and recreate failed orders if needed
+- `polymarket/region.py` holds the tables the start-up check uses, copied
+  from [Polymarket's geoblock page](https://docs.polymarket.com/developers/CLOB/geoblock).
+  Ireland, Japan, Malta, and the Netherlands are blocked on the website only,
+  and the API takes orders from them. A place the tables cannot classify is
+  allowed, with a message that says it was not checked.
 
-### Using dry-run mode
-- Use `--dry-run` to test restoration without submitting orders
-- Dry-run still requires API connection to check existing orders
-- Useful for validating snapshot files before actual restoration
+### "451 Unavailable For Legal Reasons"
+
+- A 451 is not the 403 above. The exchange's edge refuses the request before
+  the API sees it, and it can refuse an address in a country that is on no
+  published list. Shared VPN addresses get flagged on their own.
+- A different server, even in the same country, usually clears it. The block
+  follows the address, not the country.
+- The start-up check probes the exchange and reports `the CLOB refuses this
+  address (451)`.
+- The hosts can disagree. When Gamma answers 451 and the exchange does not,
+  every read of Gamma fails. The Sniper page's search then shows the error.
+  Armed watches read only the exchange, and they keep working.
+
+### The console answers 400 or 403
+
+- `Unknown Host header.` with status 400 means the browser did not address
+  the console as `127.0.0.1:<port>` or `localhost:<port>`. Through an SSH
+  tunnel, forward the console's own port number.
+- `Missing or wrong console token.` with status 403 usually means the page
+  is older than the console process. Reload the page. The token changes each
+  time the console starts.
+
+### A tool page says the worker is not running
+
+Start it with `python -m tools`. A page also says so when the worker runs on
+another `tools.db` than the console reads. Give both the same file.
 
 ## References
 
-- [py-clob-client GitHub](https://github.com/Polymarket/py-clob-client)
-- [Polymarket CLOB Documentation](https://docs.polymarket.com/developers/CLOB)
-
+- [py-clob-client-v2](https://github.com/Polymarket/py-clob-client-v2), the
+  SDK that signs and posts the orders
+- [Polymarket's geoblock page](https://docs.polymarket.com/developers/CLOB/geoblock)
+- [The Bitwarden CLI](https://bitwarden.com/help/cli/)
