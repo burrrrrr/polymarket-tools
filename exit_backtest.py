@@ -1,9 +1,12 @@
 """
 Backtest the favorite exit model against the buys that came after.
 
-  fetch    read each sampled market's trades and mids once into --cache
-  search   replay the parameter grid and every arm offline, choose the
-           parameters, refit the prior and write the report
+  fetch      read each sampled market's trades and mids once into --cache
+  search     replay the parameter grid and every arm offline, choose the
+             parameters, refit the prior and write the report
+  calibrate  print the hillclimb metric at fixed parameters: the model's
+             predicted over realised sales by cell, the same forecast at
+             the floor's and the anchor's asks, and its gain guards
 
 A case is a market at a past time t holding a hypothetical inventory bought
 a cent under the mid, as a swept favorite bid buys it. Each arm prices one
@@ -11,7 +14,8 @@ favorite ask for it from what was known at t: the production ExitModel on
 the tape as of t, with a prior fit as of t on the markets of the other
 folds, beside fixed-rule and alternative arms. The ask then rests for a
 horizon against the buys that came after. Queue ahead at the ask's price
-is not modelled, for every arm alike.
+is not modelled, for every arm alike: by default every buy at or over the
+ask fills it, and the strictly-above fill rule bounds the queue's cost.
 """
 
 import argparse
@@ -182,18 +186,29 @@ def with_prior(found, markets):
     return [c for c in found if exposed(c.fold, c.t) >= PRIOR_MIN_MARKETS]
 
 
-def simulate(price, case, horizon_days):
+# Which of a later buy's pieces fill a resting ask: at-or-above assumes the ask
+# is first in its queue, strictly-above counts only the shares a buy took past
+# it, which it would have taken from the ask whatever the queue.
+FILLS = {
+    "at-or-above": lambda piece, ask: piece >= ask - 1e-9,
+    "strictly-above": lambda piece, ask: piece > ask + 1e-9,
+}
+DEFAULT_FILL = "at-or-above"
+
+
+def simulate(price, case, horizon_days, fill=DEFAULT_FILL):
     """The ask at price rested horizon_days from case.t for case.size: each
-    later buy sells the shares it took at or over price, at price, until none
-    are left; the rest are marked at the mid the horizon ends at."""
+    later buy sells the shares it took that FILLS[fill] says take the ask, at
+    price, until none are left; the rest are marked at the mid the horizon
+    ends at."""
     m, t = case.market, case.t
     end, delta = t + horizon_days * DAY_S, math.log1p(POLICY.hurdle_rate)
-    sweeps = m.tape.sweeps
+    sweeps, fills = m.tape.sweeps, FILLS[fill]
     left, pv = case.size, 0.0
     for s in sweeps[bisect.bisect_right(sweeps, t, key=lambda s: s.at):]:
         if s.at > end or left <= 0:
             break
-        took = sum(p.size for p in s.pieces if p.price >= price - 1e-9)
+        took = sum(p.size for p in s.pieces if fills(p.price, price))
         if took:
             sold = min(left, took)
             pv += sold * price * math.exp(-delta * (s.at - t) / DAY_S / YEAR_DAYS)
@@ -383,17 +398,19 @@ def picks(markets, found, half_life_days, points, arm):
 
 
 class Book:
-    """Outcomes of asks on the cases over one horizon, each simulated once."""
+    """Outcomes of asks on the cases over one horizon under one fill rule,
+    each simulated once."""
 
-    def __init__(self, found, horizon_days):
+    def __init__(self, found, horizon_days, fill=DEFAULT_FILL):
         self.cases = found
         self.horizon_days = horizon_days
+        self.fill = fill
         self._memo = {}
 
     def outcome(self, i, price):
         key = i, price
         if key not in self._memo:
-            self._memo[key] = simulate(price, self.cases[i], self.horizon_days)
+            self._memo[key] = simulate(price, self.cases[i], self.horizon_days, self.fill)
         return self._memo[key]
 
     def outcomes(self, picked, among):
@@ -671,6 +688,242 @@ def evaluate(markets, found, chosen, horizons=HORIZONS):
     return report
 
 
+# ---------------------------------------------------------------------------
+# Calibration: the hillclimb metric at fixed parameters
+# ---------------------------------------------------------------------------
+
+# A cell is an inventory and a time to resolution; its label names both.
+CELLS = tuple((size, part) for size in SIZES for part in ("under 60d", "60d+"))
+CALIBRATION_ARMS = ("floor", "anchor", "model")
+
+
+def cell_label(size, part):
+    return f"{size:g}/{part}"
+
+
+def predicted_sold(pick, horizon_days):
+    """The share of the inventory a model's pick expects to sell over the horizon."""
+    return 1 - math.exp(-pick.rate * horizon_days / YEAR_DAYS)
+
+
+class Totals(NamedTuple):
+    """Sums over some cases: how many, the model's predicted and realised sold
+    fraction, each arm's realised sold fraction and gain in cents a share
+    over the floor ask, the model's gain over the anchor, and the model's
+    predicted sold fraction at the floor's and the anchor's asks."""
+
+    n: float
+    predicted: float
+    realised: float
+    sold_floor: float
+    sold_anchor: float
+    sold_model: float
+    gain_anchor: float
+    gain_model: float
+    model_over_anchor: float
+    predicted_floor: float
+    predicted_anchor: float
+
+    @staticmethod
+    def of(rows):
+        return Totals(*map(sum, zip(*rows)))
+
+    def stats(self):
+        """The means, and the ratio of predicted to realised, None when nothing
+        was realised: the model's at its own ask, and at each arm's ask."""
+        mean = lambda x: x / self.n
+        ratio = lambda predicted, realised: predicted / realised if realised > 0 else None
+        return {"predicted": mean(self.predicted), "realised": mean(self.realised),
+                "ratio": ratio(self.predicted, self.realised),
+                "sold floor": mean(self.sold_floor), "sold anchor": mean(self.sold_anchor),
+                "sold model": mean(self.sold_model), "gain floor": 0.0,
+                "gain anchor": mean(self.gain_anchor), "gain model": mean(self.gain_model),
+                "model over anchor": mean(self.model_over_anchor),
+                "predicted floor": mean(self.predicted_floor),
+                "ratio floor": ratio(self.predicted_floor, self.sold_floor),
+                "predicted anchor": mean(self.predicted_anchor),
+                "ratio anchor": ratio(self.predicted_anchor, self.sold_anchor),
+                "predicted model": mean(self.predicted),
+                "ratio model": ratio(self.predicted, self.realised)}
+
+
+def _totals(i, picked, out, horizon_days):
+    pv = lambda arm: out[arm][i].pv_per_share
+    sold = lambda arm: out[arm][i].sold_fraction
+    predicted = lambda arm: predicted_sold(picked[arm][i], horizon_days)
+    return Totals(1.0, predicted("model"), sold("model"),
+                  sold("floor"), sold("anchor"), sold("model"),
+                  100 * (pv("anchor") - pv("floor")), 100 * (pv("model") - pv("floor")),
+                  100 * (pv("model") - pv("anchor")), predicted("floor"), predicted("anchor"))
+
+
+def forecast_picks(markets, found, params):
+    """{arm: [Pick per case]} of the calibration arms at params: the model's
+    own choice, and each fixed arm's ask carrying the model's sales rate
+    there, read off the same curve."""
+    replay = Replay(markets, params.half_life_days)
+    out = {arm: [None] * len(found) for arm in CALIBRATION_ARMS}
+    for i in sorted(range(len(found)), key=lambda i: found[i].t):
+        case = found[i]
+        model = _exit_model(case, replay.tape(case.market, case.t), replay.prior(case), params)
+        out["model"][i] = _chosen(model, case)
+        curve = model.curve(case.size)
+        for arm in ("floor", "anchor"):
+            v = curve.value_at(ARMS[arm](case, replay, params).price)
+            out[arm][i] = Pick(v.price, v.sold_per_year / v.size)
+    return out
+
+
+def _by_market(found, among, row):
+    """{condition_id: Totals} over the cases among, row(i) their Totals."""
+    by = {}
+    for i in among:
+        by.setdefault(found[i].market.condition_id, []).append(row(i))
+    return {cid: Totals.of(rows) for cid, rows in by.items()}
+
+
+def _percentile_interval(values):
+    """The 2.5th and 97.5th percentiles, None without values."""
+    if not values:
+        return None
+    values = sorted(values)
+    return values[int(0.025 * len(values))], values[max(int(0.975 * len(values)) - 1, 0)]
+
+
+def _metric(stats_by_cell):
+    """(M, cell): the largest |ln ratio| over the cells with a ratio."""
+    found = [(abs(math.log(s["ratio"])), label) for label, s in stats_by_cell.items()
+             if s["ratio"]]
+    return max(found) if found else (None, None)
+
+
+def calibrate(markets, found, params, horizon_days, fill, reps=BOOTSTRAP_REPS, seed=0):
+    """The hillclimb metric of the model at params on the cases: per cell the
+    mean predicted and realised sold fraction of its asks and their ratio; M,
+    the largest |ln ratio| over the cells; the guards, the pooled gain in
+    cents a share of the model over the floor ask and over the anchor; and
+    per cell and arm the model's predicted sold fraction at that arm's ask
+    over what the ask realised. Each carries a 95% bootstrap interval from
+    one resample of the markets per replicate, so the cells, M, the guards
+    and the arms vary together."""
+    picked = forecast_picks(markets, found, params)
+    book, among = Book(found, horizon_days, fill), range(len(found))
+    out = {arm: book.outcomes(picked[arm], among) for arm in CALIBRATION_ARMS}
+    row = lambda i: _totals(i, picked, out, horizon_days)
+    pooled = _by_market(found, among, row)
+    by_cell = {cell_label(size, part): _by_market(found, idx, row)
+               for (size, part), idx in slices(found, among).items() if (size, part) in CELLS}
+    point = {label: Totals.of(by.values()).stats() for label, by in by_cell.items()}
+    point_pooled = Totals.of(pooled.values()).stats()
+
+    rng, ids = random.Random(seed), sorted(pooled)
+    reps_cells = {label: {key: [] for key in point[label]} for label in by_cell}
+    reps_pooled = {key: [] for key in point_pooled}
+    reps_m = []
+    for _ in range(reps):
+        draw = rng.choices(ids, k=len(ids))
+        stats = {}
+        for label, by in by_cell.items():
+            rows = [by[cid] for cid in draw if cid in by]
+            if rows:
+                stats[label] = Totals.of(rows).stats()
+                for key, value in stats[label].items():
+                    if value is not None:
+                        reps_cells[label][key].append(value)
+        for key, value in Totals.of([pooled[cid] for cid in draw]).stats().items():
+            reps_pooled[key].append(value)
+        m, _ = _metric(stats)
+        if m is not None:
+            reps_m.append(m)
+
+    cells = {}
+    for label, by in by_cell.items():
+        s, r = point[label], reps_cells[label]
+        cells[label] = {
+            "cases": int(sum(t.n for t in by.values())), "markets": len(by),
+            "predicted": s["predicted"], "realised": s["realised"], "ratio": s["ratio"],
+            "ratio_interval": _percentile_interval(r["ratio"]),
+            "arms": {arm: {"sold": s[f"sold {arm}"], "gain": s[f"gain {arm}"],
+                           "gain_interval": _percentile_interval(r[f"gain {arm}"]),
+                           "predicted": s[f"predicted {arm}"], "ratio": s[f"ratio {arm}"],
+                           "ratio_interval": _percentile_interval(r[f"ratio {arm}"])}
+                     for arm in CALIBRATION_ARMS},
+            "model over anchor": {"mean": s["model over anchor"],
+                                  "interval": _percentile_interval(r["model over anchor"])}}
+    m, cell = _metric(point)
+    guard = lambda key, g: {"mean": point_pooled[key], "se": score(g, found).se,
+                            "interval": _percentile_interval(reps_pooled[key])}
+    return {
+        "params": params._asdict(), "fill": fill, "horizon_days": horizon_days,
+        "markets": len(markets), "cases": len(found), "markets_with_cases": len(pooled),
+        "cells": cells,
+        "M": {"value": m, "cell": cell, "interval": _percentile_interval(reps_m)},
+        "guards": {"model over floor": guard("gain model", gains(out["model"], out["floor"])),
+                   "anchor over floor": guard("gain anchor", gains(out["anchor"], out["floor"])),
+                   "model over anchor": guard("model over anchor",
+                                              gains(out["model"], out["anchor"]))},
+        "bootstrap": {"reps": reps, "seed": seed},
+    }
+
+
+def _fmt_interval(interval, spec):
+    return "[none]" if interval is None else f"[{interval[0]:{spec}}, {interval[1]:{spec}}]"
+
+
+def render_calibration(r):
+    p = r["params"]
+    lines = [f"calibrate at half_life_days={p['half_life_days']:g} arrival_days="
+             f"{p['arrival_days']:g} mark_buys={p['mark_buys']:g}, fill {r['fill']}, "
+             f"horizon {r['horizon_days']:g}d: {r['markets']} markets, {r['cases']} cases on "
+             f"{r['markets_with_cases']} of them", "",
+             f"{'cell':<16}{'cases':>6}{'mkts':>6}{'predicted':>11}{'realised':>10}"
+             f"{'ratio':>7}  [95%]"]
+    for label, c in r["cells"].items():
+        ratio = "none" if c["ratio"] is None else f"{c['ratio']:.3f}"
+        lines.append(f"{label:<16}{c['cases']:>6}{c['markets']:>6}{c['predicted']:>11.3f}"
+                     f"{c['realised']:>10.3f}{ratio:>7}  {_fmt_interval(c['ratio_interval'], '.3f')}")
+    m = r["M"]
+    value = "none" if m["value"] is None else f"{m['value']:.3f}"
+    lines += ["", f"M = max |ln ratio| = {value} {_fmt_interval(m['interval'], '.3f')}"
+              f" at {m['cell']}", "", "guards, pooled, cents a share:"]
+    for key, g in r["guards"].items():
+        lines.append(f"  {key:<18}{g['mean']:+.3f} {_fmt_interval(g['interval'], '+.3f')} "
+                     f"se {g['se']:.3f}")
+    lines += ["", f"{'cell':<16}{'arm':<8}{'sold':>7}{'gain over floor':>17}  [95%]"]
+    for label, c in r["cells"].items():
+        for arm, a in c["arms"].items():
+            lines.append(f"{label:<16}{arm:<8}{a['sold']:>7.3f}{a['gain']:>+17.3f}  "
+                         f"{_fmt_interval(a['gain_interval'], '+.3f')}")
+    lines += ["", "the model's forecast at each arm's ask:",
+              f"{'cell':<16}{'arm':<8}{'predicted':>11}{'realised':>10}{'ratio':>7}  [95%]"]
+    for label, c in r["cells"].items():
+        for arm, a in c["arms"].items():
+            ratio = "none" if a["ratio"] is None else f"{a['ratio']:.3f}"
+            lines.append(f"{label:<16}{arm:<8}{a['predicted']:>11.3f}{a['sold']:>10.3f}"
+                         f"{ratio:>7}  {_fmt_interval(a['ratio_interval'], '.3f')}")
+    if "seconds" in r:
+        lines += ["", f"took {r['seconds']:.0f} s"]
+    return "\n".join(lines) + "\n"
+
+
+def run_calibrate(args):
+    started = time.perf_counter()
+    markets = load(args.cache)
+    found = with_prior(cases(markets, HORIZONS[0]), markets)
+    result = calibrate(markets, found, ExitParams(*args.params), HORIZONS[0], args.fill)
+    result["seconds"] = time.perf_counter() - started
+    result["cache"] = str(args.cache)
+    print(render_calibration(result), end="")
+    if args.json:
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(json.dumps(result, indent=1))
+        print(f"wrote {args.json}")
+
+
+def _floats(s):
+    return [float(x) for x in s.split(",")]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
@@ -682,17 +935,26 @@ def main():
     p.add_argument("--cache", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--workers", type=int, default=8)
-    p.add_argument("--yield-grid", type=lambda s: [float(x) for x in s.split(",")],
+    p.add_argument("--yield-grid", type=_floats,
                    help="price the prior on these yields instead of YIELD_GRID")
-    p.add_argument("--params", type=lambda s: [float(x) for x in s.split(",")],
+    p.add_argument("--params", type=_floats,
                    help="half_life_days,arrival_days,mark_buys for both estimators: "
                         "skip the search and report at these")
+    p = sub.add_parser("calibrate", help="print the hillclimb metric at fixed parameters")
+    p.add_argument("--cache", required=True)
+    p.add_argument("--params", required=True, type=_floats,
+                   help="half_life_days,arrival_days,mark_buys")
+    p.add_argument("--fill", choices=tuple(FILLS), default=DEFAULT_FILL,
+                   help="which later buys fill an ask (default at-or-above)")
+    p.add_argument("--json", help="also write the result to this file")
     args = parser.parse_args()
     if args.command == "fetch":
         with closing(sqlite3.connect(f"file:{args.db}?mode=ro", uri=True)) as conn:
             markets = sample(conn, args.limit)
         with httpx.Client() as http:
             fetch(markets, args.cache, datetime.now(timezone.utc), http)
+    elif args.command == "calibrate":
+        run_calibrate(args)
     else:
         run_search(args)
 

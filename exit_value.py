@@ -170,8 +170,11 @@ class ExitParams(NamedTuple):
     mark_buys: float
 
 
-# Placeholders until exit_backtest.py chooses them.
-EXIT_PARAMS = ExitParams(half_life_days=14.0, arrival_days=3.0, mark_buys=5.0)
+# A market's own buys of the last days, with no weight on the prior: the
+# setting whose forecasts match realised sales in exit_backtest.py calibrate
+# on markets 60+ days from resolution. The prior, pooled by yield, reads far
+# markets' cheap buys as demand that is not there. Unproven under 60 days.
+EXIT_PARAMS = ExitParams(half_life_days=5.0, arrival_days=0.0, mark_buys=0.0)
 
 
 class ExitPrior(NamedTuple):

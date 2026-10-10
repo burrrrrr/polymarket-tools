@@ -60,6 +60,16 @@ class SimulateTest(unittest.TestCase):
         out = simulate(0.96, self.case(1000.0), 14.0)
         self.assertAlmostEqual(out.sold_fraction, (80 + 60 + 20) / 1000)
 
+    def test_under_strictly_above_only_the_shares_a_buy_took_past_the_ask_fill_it(self):
+        out = simulate(0.965, self.case(), 14.0, fill="strictly-above")
+        disc = lambda days: math.exp(-DELTA * days / YEAR_DAYS)
+        pv = (30 * 0.965 * disc(1) + 20 * 0.965 * disc(2) + 20 * 0.965 * disc(5)
+              + 30 * 0.97 * disc(14)) / 100
+        self.assertAlmostEqual(out.pv_per_share, pv, places=12)
+        self.assertAlmostEqual(out.sold_fraction, 0.70)
+        self.assertEqual(simulate(0.965, self.case(), 14.0, fill="at-or-above"),
+                         simulate(0.965, self.case(), 14.0))
+
 
 class CasesTest(unittest.TestCase):
     def test_cases_run_every_two_days_after_a_week_of_buys_until_the_horizon_ends_the_tape(self):
@@ -123,6 +133,106 @@ class FitTest(unittest.TestCase):
         for row in prior.marks:
             for mark, size in zip(row, SIZE_GRID):
                 self.assertAlmostEqual(mark, min(size, 50.0))
+
+
+class CalibrateTest(unittest.TestCase):
+    """Twenty identical far markets and five identical near ones, each day's
+    buy walking every tick from the lowest ask to 0.999, so any ask prints
+    exactly every day and never sells out: the metric is the model's
+    predicted sold fraction over the realised, by cell."""
+
+    @classmethod
+    def setUpClass(cls):
+        ladder = tuple((round(0.945 + 0.001 * k, 3), 0.1) for k in range(55))
+        far = [buy(T - (40 - d - 0.5) * DAY, *ladder) for d in range(40)]
+        near = [buy(T - (26 - d - 0.5) * DAY, *ladder) for d in range(26)]
+        cls.markets = ([market(f"far{i:02}", far) for i in range(20)]
+                       + [market(f"near{i}", near, end_days=40.0) for i in range(5)])
+        cls.found = cases(cls.markets, 14.0)
+        cls.picked = exit_backtest.picks(cls.markets, cls.found, PARAMS.half_life_days,
+                                         [PARAMS], "model")[PARAMS]
+
+    def expected(self, cell, fill):
+        size, part = cell
+        among = [i for i, c in enumerate(self.found)
+                 if c.size == size and exit_backtest.PARTS[part](c)]
+        predicted = [1 - math.exp(-self.picked[i].rate * 14 / YEAR_DAYS) for i in among]
+        realised = [simulate(self.picked[i].price, self.found[i], 14.0, fill).sold_fraction
+                    for i in among]
+        return len(among), sum(predicted) / len(among), sum(realised) / len(among)
+
+    def test_each_cell_holds_the_models_predicted_and_realised_sold_fraction(self):
+        got = exit_backtest.calibrate(self.markets, self.found, PARAMS, 14.0, "at-or-above",
+                                      reps=100)
+        self.assertEqual(set(got["cells"]), {"100/under 60d", "100/60d+", "1000/under 60d",
+                                             "1000/60d+"})
+        ratios = []
+        for cell in exit_backtest.CELLS:
+            with self.subTest(cell=cell):
+                n, predicted, realised = self.expected(cell, "at-or-above")
+                r = got["cells"][f"{cell[0]:g}/{cell[1]}"]
+                self.assertEqual((r["cases"], r["markets"]), (n, 5 if "under" in cell[1] else 20))
+                self.assertAlmostEqual(r["predicted"], predicted)
+                self.assertAlmostEqual(r["realised"], realised)
+                self.assertAlmostEqual(r["ratio"], predicted / realised)
+                low, high = r["ratio_interval"]
+                self.assertAlmostEqual(low, r["ratio"])
+                self.assertAlmostEqual(high, r["ratio"])
+                ratios.append(r["ratio"])
+        self.assertAlmostEqual(got["M"]["value"], max(abs(math.log(r)) for r in ratios))
+        self.assertAlmostEqual(got["M"]["interval"][0], got["M"]["value"])
+        self.assertAlmostEqual(got["M"]["interval"][1], got["M"]["value"])
+        self.assertAlmostEqual(got["guards"]["model over anchor"]["mean"],
+                               got["guards"]["model over floor"]["mean"]
+                               - got["guards"]["anchor over floor"]["mean"])
+
+    def forecast_at(self, i, price):
+        """The model's predicted sold fraction at price for case i, through
+        exit_value alone: the tape as of t, the prior fit on the other folds."""
+        c, m = self.found[i], self.found[i].market
+        fold = exit_backtest.folds(self.markets)
+        prior = fit([k for k in self.markets if fold[k.condition_id] != c.fold], PARAMS, c.t)
+        model = exit_value.ExitModel(m.tape.as_of(c.t), prior, PARAMS, exit_backtest.POLICY,
+                                     c.mid, m.end_date, m.expires_at,
+                                     datetime.fromtimestamp(c.t, timezone.utc), m.tick,
+                                     exit_value.Holding(c.size, c.cost))
+        v = model.curve(c.size).value_at(price)
+        return 1 - math.exp(-v.sold_per_year / v.size * 14 / YEAR_DAYS)
+
+    def test_each_arm_carries_the_models_forecast_at_its_own_ask(self):
+        got = exit_backtest.calibrate(self.markets, self.found, PARAMS, 14.0, "at-or-above",
+                                      reps=100)
+        for cell in exit_backtest.CELLS:
+            r = got["cells"][f"{cell[0]:g}/{cell[1]}"]
+            among = [i for i, c in enumerate(self.found)
+                     if c.size == cell[0] and exit_backtest.PARTS[cell[1]](c)]
+            for arm in ("floor", "anchor"):
+                with self.subTest(cell=cell, arm=arm):
+                    price = {ARMS[arm](self.found[i], None, None).price for i in among}
+                    self.assertEqual(len(price), 1)
+                    [price] = price
+                    predicted = sum(self.forecast_at(i, price) for i in among) / len(among)
+                    a = r["arms"][arm]
+                    self.assertAlmostEqual(a["predicted"], predicted)
+                    self.assertAlmostEqual(a["ratio"], predicted / a["sold"])
+                    self.assertAlmostEqual(a["ratio_interval"][0], a["ratio"])
+                    self.assertAlmostEqual(a["ratio_interval"][1], a["ratio"])
+            with self.subTest(cell=cell, arm="model"):
+                self.assertEqual((r["arms"]["model"]["predicted"], r["arms"]["model"]["ratio"]),
+                                 (r["predicted"], r["ratio"]))
+            self.assertNotAlmostEqual(r["arms"]["anchor"]["predicted"], r["predicted"])
+            self.assertNotAlmostEqual(r["arms"]["floor"]["predicted"],
+                                      r["arms"]["anchor"]["predicted"])
+
+    def test_the_strict_fill_rule_lowers_the_realised_sales_of_the_same_asks(self):
+        strict = exit_backtest.calibrate(self.markets, self.found, PARAMS, 14.0,
+                                         "strictly-above", reps=100)
+        for cell in exit_backtest.CELLS:
+            with self.subTest(cell=cell):
+                r = strict["cells"][f"{cell[0]:g}/{cell[1]}"]
+                n, predicted, realised = self.expected(cell, "strictly-above")
+                self.assertAlmostEqual(r["realised"], realised)
+                self.assertLess(realised, self.expected(cell, "at-or-above")[2])
 
 
 class NoLookAheadTest(unittest.TestCase):
