@@ -42,7 +42,11 @@ farmer rests on both sides, in four slots per market:
             less longshot shares held, and never one above the cheapest price
             scoring --min-low-score. Once a longshot bid has filled, the
             budget less the shares held limits every price, the floor too,
-            until LONG_ASK has sold them.
+            until LONG_ASK has sold them. And the floor is free of the
+            budget only once a share there has scored FLOOR_MIN_SCORE on
+            every cycle for FLOOR_DWELL_S: a score that flickers across the
+            bound would flip the plan, and the favorite bid's size with it,
+            as often as it crossed.
 
 Q_two comes from the covered FAV_ASK first and only the remainder from the
 naked LONG_BID. When the budget leaves the LONG_BID short of Q_one, the
@@ -186,6 +190,8 @@ from reward_screener import (
     _float,
     _make_output_safe,
     adjust_levels,
+    FLOOR_MIN_SCORE,
+    FLOOR_PRICE,
     adjusted_mid,
     at_floor,
     fav_bid_candidates,
@@ -226,6 +232,19 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 # stays: at 0.1c the extra cover costs cents, and on a 1c tick one tick of
 # mid moves the cover by more than this multiple.
 LONG_COVER_MAX = 2.0
+
+# How long a floor share must have scored FLOOR_MIN_SCORE, on every cycle,
+# before the floor is free of the naked budget. One cycle under the bound
+# puts the market back under its budget at once. Live, a 107-share bid coming
+# and going moved one market's floor score between 0.0008 and 0.0053 every
+# few cycles, and its favorite bid flipped between all and a quarter of its
+# capital 17 times in seven minutes.
+FLOOR_DWELL_S = 600
+
+# farm_mids samples further apart than this, or a last one older than this at
+# start, do not vouch for the floor's score in between. They are due every
+# MID_SAMPLE_S.
+FLOOR_SEED_GAP_S = 180
 
 # A longshot bid priced over target stays while it is within this many ticks
 # of the cheapest price scoring min_low_score, which moves a tick with each
@@ -345,6 +364,10 @@ class FarmMarket(NamedTuple):
     capital: float
     paused: bool = False
     naked_paused: bool = False
+    # Whether the floor's score has held at FLOOR_MIN_SCORE for FLOOR_DWELL_S,
+    # as the farmer's tracker saw it this cycle (Managed.floor_since). Not a
+    # term of the market: without that evidence it is False.
+    floor_steady: bool = False
 
     def token(self, role):
         return self.fav_token_id if role is Role.FAV else self.long_token_id
@@ -543,8 +566,58 @@ def capital_room(fm, position):
 def naked_room(fm, position):
     """USD of longshot bid the budget still allows after longshot shares held,
     at cost. It does not limit a floor bid while the floor is free of the
-    budget (floor_free)."""
+    budget (floor_is_free)."""
     return max(0.0, fm.naked_budget_usd - position.long_shares * position.long_avg)
+
+
+def floor_score(fm, book_mid):
+    """What a longshot share at the floor scores against the favorite midpoint
+    of the book without our orders; nothing on a one-sided book. A favorite
+    bid of ours only lifts the midpoint a plan scores against, so the floor
+    scores no less in the plan than here. A favorite ask of ours under the
+    book's can lower it, and the plan's own test of the bound
+    (sized_without_budget) then holds the floor to the budget."""
+    if book_mid is None:
+        return 0.0
+    return order_score(Slot.LONG_BID, FLOOR_PRICE, book_mid, fm.v)
+
+
+def steady_since(since, share_score, at):
+    """Since when the floor's score has held at FLOOR_MIN_SCORE, given that
+    it held since `since` (None if it did not) and scores share_score at
+    `at`. None while it scores less."""
+    if share_score < FLOOR_MIN_SCORE - 1e-9:
+        return None
+    return at if since is None else since
+
+
+def dwelt(since, now):
+    """Whether a floor score steady since `since` has held for FLOOR_DWELL_S."""
+    return since is not None and (now - since).total_seconds() >= FLOOR_DWELL_S
+
+
+def seeded_steady_since(samples, fm, now):
+    """steady_since at start, from the market's farm_mids samples: (time, book
+    midpoint), oldest first. A gap over FLOOR_SEED_GAP_S between samples
+    starts the count again, and a last sample older than that is no evidence
+    at all, so a market the farmer has not watched starts with its floor
+    under the budget."""
+    since = last = None
+    for at, book_mid in samples:
+        if last is not None and (at - last).total_seconds() > FLOOR_SEED_GAP_S:
+            since = None
+        since, last = steady_since(since, floor_score(fm, book_mid), at), at
+    if last is None or (now - last).total_seconds() > FLOOR_SEED_GAP_S:
+        return None
+    return since
+
+
+def floor_is_free(fm, position):
+    """Whether the naked budget leaves this market's floor bid alone: its
+    floor score has held steady (fm.floor_steady) and it holds no longshot
+    shares that rest an exit (floor_free). The one test the plan, the keep
+    rule and the console's figures share."""
+    return fm.floor_steady and floor_free(position.long_shares, fm.min_size)
 
 
 def mirror(price, tick):
@@ -654,7 +727,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
             return None
         return longshot_bid(levels, mid, v, tick, fm.min_size, q_one - q_two_covered,
                             naked_room(fm, position), cfg.min_low_score,
-                            floor_free(position.long_shares, fm.min_size))
+                            floor_is_free(fm, position))
 
     low = long_bid(q_one_exits + fav_score * fav_size)
     q_two = q_two_covered + (low.score * low.size if low else 0.0)
@@ -813,9 +886,10 @@ def keep_failure(order, intent, target, fm, position, cfg):
     priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
     price scoring min_low_score, the fill-risk bound the plan prices under.
     The naked budget does not hold a floor bid while the floor is free of it
-    (floor_free). That bid stays whatever it costs, even once its share
-    scores too little for the plan to size a new one without the budget:
-    replacing it only to shrink it would cost 30 seconds of score.
+    (floor_is_free). That bid stays whatever it costs. Once the floor is no
+    longer free, because its score dipped under the bound or longshot shares
+    rest an exit, a floor bid over the budget is replaced by the budgeted
+    one, once, and FLOOR_DWELL_S keeps the plan there.
     A favorite ask is judged by score too, but one more than
     ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
     """
@@ -863,7 +937,7 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "over the capital"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
         return "below the exit floor"
-    free = at_floor(order.price) and floor_free(position.long_shares, fm.min_size)
+    free = at_floor(order.price) and floor_is_free(fm, position)
     if order.slot is Slot.LONG_BID and not free and (
             order.price * order.size_remaining > naked_room(fm, position) + 1e-9):
         return "over the naked budget"
@@ -1156,6 +1230,7 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
     views[Slot.FAV_BID.name].update(
         economics=economics_view(fav), fav_reason=fav.reason,
         history=fill_cost.history_to_json(history) if history else None)
+    views[Slot.LONG_BID.name].update(floor_free=floor_is_free(fm, position))
     return views
 
 
@@ -1519,6 +1594,8 @@ class Managed:
         self.approved = True
         self.state = State(Phase.QUOTING)
         self.recent_asks = deque()
+        # Since when the floor's score has held at FLOOR_MIN_SCORE (steady_since).
+        self.floor_since = None
         self.naked_paused_until = None
         self.fill_mid = None
         self.held = None
@@ -1633,6 +1710,7 @@ class Farmer:
         self.infos.refresh(self.http, now)
         self.reload(now)
         self.seed_histories(now)
+        self.seed_floors(now)
         self.refresh_positions(now)
         self.positions_at = time.monotonic() + POSITIONS_S
         if not self.markets:
@@ -1640,6 +1718,17 @@ class Farmer:
         if self.live:
             self.check_collateral()
         self.flush()
+
+    def seed_floors(self, now):
+        """Take each market's floor steadiness from its farm_mids samples of the
+        last run, so a restart keeps the floor bids that run sized without the
+        budget where the score held, and puts back under the budget the ones
+        where it did not."""
+        since = now - timedelta(seconds=FLOOR_DWELL_S + FLOOR_SEED_GAP_S)
+        for managed in self.markets.values():
+            samples = farm_db.read_mids(self.db, managed.fm.condition_id, since)
+            managed.floor_since = seeded_steady_since(
+                [(s.at, s.book_mid) for s in samples], managed.fm, now)
 
     def seed_histories(self, now):
         """Take each wanted market's history from its farm_state row, and its
@@ -1961,6 +2050,8 @@ class Farmer:
         book = strip_own(levels, orders, fm) if self.live else levels
         book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
         book_ask = drop_ask(book.asks, fm.min_size)
+        managed.floor_since = steady_since(managed.floor_since, floor_score(fm, book_mid), now)
+        fm = managed.fm = fm._replace(floor_steady=dwelt(managed.floor_since, now))
         obs = Observation(
             mid=book_mid,
             ask=book_ask,

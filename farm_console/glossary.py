@@ -24,7 +24,9 @@ GLOSSARY = {
     "floor": Term("Floor", "The longshot bid sits at 0.1c, where it almost never fills. "
                            "Where a share there scores at least 0.002 the bid is sized to "
                            "balance the favorite bid whatever that costs: the naked budget "
-                           "does not limit it."),
+                           "does not limit it. The score must have held there for ten "
+                           "minutes: after one dip under it the budget limits the bid "
+                           "again."),
     "budget": Term("Budget", "At 0.1c the longshot bid scores nothing, or too little to "
                              "balance the favorite bid, so it sits higher. That bid is real "
                              "risk, capped by the market's naked budget, and the favorite "

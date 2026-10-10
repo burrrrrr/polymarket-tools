@@ -817,7 +817,13 @@ bound is on the arithmetic, not the dollars: the size that covers is Q_one
 divided by the score, and at the band edge the score runs to zero. At the
 bound a floor bid costs $0.50 for each unit of score it covers, so at most
 half its score times its size, in dollars, for the favorite bid it balances. Under it
-the budget limits the floor like any other price. Once a longshot
+the budget limits the floor like any other price. The floor is free of the
+budget only once its score has held at the bound on every cycle for ten
+minutes (`FLOOR_DWELL_S` in `reward_farmer.py`), and one cycle under it puts
+the market back under its budget at once. A score that flickers across the
+bound therefore rests the budgeted plan, steadily. At start the farmer takes
+that history from `farm_mids`, and a market with none starts under its
+budget. A scan and the Review preview assume the score has held. Once a longshot
 bid has filled, the budget, less the shares held at cost, limits every price,
 the floor too, until `LONG_ASK` has sold them: the exit adds to Q_one, and a
 floor bid sized to balance it would grow with every fill. When no price up to

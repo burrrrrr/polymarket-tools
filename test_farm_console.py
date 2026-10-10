@@ -142,6 +142,24 @@ class AlertRuleTest(unittest.TestCase):
         over = state(A, naked_used=30.0, slots=quoting_slots(long=(0.001, 30000.0)))
         self.assertEqual(kinds(snap([over], [market(A, "a", budget=25.0)])), [])
 
+    def test_the_floor_is_free_when_the_farmer_says_so(self):
+        # The farmer publishes whether the budget leaves the floor bid alone:
+        # the score must have held for ten minutes. A $30 floor bid on a $25
+        # budget counts against it when the farmer says the floor is not free.
+        slots = quoting_slots(long=(0.001, 30000.0))
+        slots["LONG_BID"]["floor_free"] = False
+        held_back = snap([state(A, slots=slots)], [market(A, "a", budget=25.0)])
+        self.assertEqual(kinds(held_back), ["Budget bound"])
+        self.assertIn("uses $30.00 of its $25.00 budget", views.alerts(held_back, NOW)[0].text)
+        c = views.card(market(A, "a", budget=25.0), state(A, slots=slots), status(), NOW)
+        self.assertEqual((c.budget_used_usd, c.floor_bid_usd, c.naked_pct), (30.0, 0.0, 100.0))
+        slots["LONG_BID"]["floor_free"] = True
+        self.assertEqual(kinds(snap([state(A, slots=slots)], [market(A, "a", budget=25.0)])),
+                         [])
+        # The farmer's word also stands where longshot shares rest an exit.
+        with_exit = state(A, slots=slots, position=holding_long(60.0, 0.01))
+        self.assertEqual(kinds(snap([with_exit], [market(A, "a", budget=25.0)])), [])
+
     def test_a_floor_bid_scoring_under_the_bound_counts_against_the_budget(self):
         # A floor share scoring 0.0015 is under the 0.002 the farmer needs to
         # size a floor bid without the budget, so this $25 bid is one the

@@ -196,9 +196,14 @@ def resting(state, slot):
 
 
 def floor_is_free(market, state):
-    """Whether the naked budget leaves this market's floor bid alone
-    (reward_screener.floor_free): it holds no longshot shares that rest an
+    """Whether the naked budget leaves this market's floor bid alone, as the
+    farmer judged it this cycle (reward_farmer.floor_is_free, published on
+    the LONG_BID slot). A row from before the farmer published it falls back
+    to that farmer's rule: the market holds no longshot shares that rest an
     exit. With no reward minimum on record, any share held counts."""
+    published = (state.slots.get("LONG_BID") or {}).get("floor_free")
+    if published is not None:
+        return bool(published)
     held = ((state.position or {}).get("farm") or {}).get("long", 0.0)
     min_size = ((market.metrics.get("market") or {}).get("min_size") if market else None)
     return floor_free(held, min_size or 1e-9)
@@ -1154,6 +1159,10 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     if row["p_true"] is None:
         row = {**dict(row), "p_true": book_mid}
     fm = reward_farmer.farm_market(row, info, cfg)
+    if not isinstance(fm, Skip):
+        # A preview has no cycles behind it. It shows the plan the farmer
+        # settles on once the floor's score has held for FLOOR_DWELL_S.
+        fm = fm._replace(floor_steady=True)
     if managed:
         note = "The farmer manages this market. Its live orders are on the market page."
     elif isinstance(fm, Skip):
