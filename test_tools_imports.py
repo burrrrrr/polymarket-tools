@@ -1,11 +1,3 @@
-"""Tests for what the tools package is allowed to load and call.
-
-The console, which holds no key, reads tools.db, so tools.db must not bring in
-the key loader, the client or the SDK. The worker signs orders, so it loads the
-SDK, and is handed its client: in tools/ only the entry point reads a key or
-talks to a terminal.
-"""
-
 import ast
 import os
 import unittest

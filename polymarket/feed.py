@@ -1,6 +1,3 @@
-"""The CLOB's market websocket channel: a pure parser from one frame to typed
-Updates, and MarketFeed, the loop that holds the connection."""
-
 import json
 import time
 from enum import Enum
@@ -131,7 +128,7 @@ class MarketFeed:
     on_update and on_error run on the thread that calls run. on_update gets
     only Updates for tokens in the set, although one price_change message lists
     both tokens of a market. connect(url) opens the socket and clock() gives
-    monotonic seconds; tests replace both.
+    monotonic seconds.
     """
 
     def __init__(self, token_ids, on_update, *, on_error, connect=open_socket,
@@ -161,7 +158,6 @@ class MarketFeed:
                 stop.wait(RECONNECT_S)
 
     def _listen(self, stop, tokens):
-        """One connection, until stop is set or the token set is emptied."""
         with self._connect(WSS_MARKET_URL) as socket:
             socket.send(json.dumps({"assets_ids": sorted(tokens), "type": "market"}))
             pinged = self._clock()

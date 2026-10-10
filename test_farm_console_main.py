@@ -1,10 +1,7 @@
-"""Tests for python -m farm_console: which farm.db and tools.db the console
-serves. The app and the server are fakes, so no database is opened and no port
-is bound."""
-
 import contextlib
 import io
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -14,6 +11,13 @@ from unittest import mock
 from farm_console import __main__ as entry_point
 
 ROOT = Path(__file__).resolve().parent
+
+
+def printed_paths(out):
+    """The two database paths the start line names, as paths, since the drive
+    letter the console prints has the case of the working directory."""
+    farm, tools = re.search(r" reading (.+) and (.+)$", out.strip()).groups()
+    return Path(farm), Path(tools)
 
 
 class Fakes:
@@ -35,8 +39,6 @@ class StartTests(unittest.TestCase):
         self.dir = Path(tmp.name)
 
     def main(self, argv, dotenv=None):
-        """main's exit code, what it printed and the fakes it reached. dotenv is
-        what the .env file sets when main loads it."""
         fakes = Fakes()
         out = io.StringIO()
         with contextlib.ExitStack() as stack:
@@ -59,13 +61,13 @@ class StartTests(unittest.TestCase):
                          (ROOT / "farm.db", ROOT / "tools.db"))
         self.assertEqual(fakes.served, ("the app", "127.0.0.1", 8799))
         self.load_dotenv.assert_called_once_with(ROOT / ".env")
-        self.assertIn(str(ROOT / "farm.db"), out)
+        self.assertEqual(printed_paths(out), (ROOT / "farm.db", ROOT / "tools.db"))
 
     def test_the_data_directory_that_env_names_holds_both_databases(self):
         _, out, fakes = self.main([], dotenv={"POLYMARKET_DATA_DIR": str(self.dir)})
         self.assertEqual((Path(fakes.farm_db), Path(fakes.tools_db)),
                          (self.dir / "farm.db", self.dir / "tools.db"))
-        self.assertIn(str(self.dir / "tools.db"), out)
+        self.assertEqual(printed_paths(out), (self.dir / "farm.db", self.dir / "tools.db"))
 
     def test_each_flag_wins_over_the_data_directory_for_its_own_database(self):
         dotenv = {"POLYMARKET_DATA_DIR": str(self.dir)}

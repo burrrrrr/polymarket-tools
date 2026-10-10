@@ -1,8 +1,3 @@
-"""Tests for what the farmer, the console and the worker agree on when they
-start: each reads the hosts before it loads .env, so a host that only .env
-names moves none of them. Each starts in a fresh interpreter with a fake .env
-and a fake loop, on scratch files."""
-
 import os
 import subprocess
 import sys

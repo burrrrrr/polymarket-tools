@@ -1,5 +1,3 @@
-"""Tests for polymarket.parse: the loosely typed values the APIs send."""
-
 import unittest
 from datetime import datetime, timedelta, timezone
 

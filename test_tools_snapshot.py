@@ -1,6 +1,3 @@
-"""Tests for tools.snapshot: taking a snapshot of the open orders, and importing
-the old snapshot files. The client is a fake and no request leaves the process."""
-
 import json
 import os
 import tempfile
@@ -73,8 +70,6 @@ class TakeTests(Scratch):
 
 
 def old_file(directory, name, taken, orders):
-    """A snapshot as snapshot.py saved it: the CLOB's order dicts with a
-    market_name on each, under a naive local timestamp."""
     with open(os.path.join(directory, name), "w", encoding="utf-8") as f:
         json.dump({"metadata": {"timestamp": taken, "total_orders": len(orders),
                                 "snapshot_version": "1.0"}, "orders": orders}, f)

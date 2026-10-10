@@ -1,5 +1,3 @@
-"""The Activity page's tabs (rewards, fills, inventory, log) and the events API."""
-
 from contextlib import closing
 from typing import Optional
 

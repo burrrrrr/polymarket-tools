@@ -1,6 +1,3 @@
-"""The Settings page: the farmer's settings, the mutes, the scan's triage count, and
-the controls that stop the farmer or pause every market."""
-
 from contextlib import closing
 from typing import Optional
 from urllib.parse import urlencode

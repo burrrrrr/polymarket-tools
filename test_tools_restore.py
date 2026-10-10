@@ -1,7 +1,3 @@
-"""Tests for tools.restore: the plan of a restore and the placing of it. The
-client is a fake that records what it was asked to sign and post, so nothing
-is sent."""
-
 import os
 import tempfile
 import threading
@@ -18,10 +14,10 @@ MARKET_A, MARKET_B, MARKET_C = ("0x" + pair * 32 for pair in ("aa", "bb", "cc"))
 ACCEPT = "accept"
 NO_FUNDS = "not enough balance / allowance"
 
-PLACE, LIVE, EXPIRED, FARMER, FILLED, REJECTED, ERROR = (
-    RestoreAction.PLACE, RestoreAction.SKIP_LIVE, RestoreAction.SKIP_EXPIRED,
-    RestoreAction.SKIP_FARMER, RestoreAction.SKIP_FILLED, RestoreAction.REJECTED,
-    RestoreAction.ERROR)
+WOULD, PLACED, LIVE, EXPIRED, FARMER, FILLED, REJECTED, ERROR = (
+    RestoreAction.WOULD_PLACE, RestoreAction.PLACED, RestoreAction.SKIP_LIVE,
+    RestoreAction.SKIP_EXPIRED, RestoreAction.SKIP_FARMER, RestoreAction.SKIP_FILLED,
+    RestoreAction.REJECTED, RestoreAction.ERROR)
 
 
 def order(order_id="0xo1", market=MARKET_A, side=Side.BUY, price=0.98, size=100.0, matched=0.0,
@@ -31,7 +27,6 @@ def order(order_id="0xo1", market=MARKET_A, side=Side.BUY, price=0.98, size=100.
 
 
 def stored(*orders):
-    """These orders as the rows of snapshot 1."""
     return [db.SnapshotOrder(n, 1, None, o) for n, o in enumerate(orders, 1)]
 
 
@@ -45,7 +40,7 @@ class PlanTests(unittest.TestCase):
 
     def test_an_order_that_is_gone_is_placed_whole(self):
         (line,) = self.plan([order(size=100.0)])
-        self.assertEqual((line.action, line.size), (PLACE, 100.0))
+        self.assertEqual((line.action, line.size), (WOULD, 100.0))
 
     def test_there_is_one_line_for_each_snapshot_order_in_the_snapshots_order(self):
         snapshot = stored(
@@ -53,12 +48,12 @@ class PlanTests(unittest.TestCase):
             order("0xd", size=50.0, matched=50.0), order("0xe"), order("0xf", MARKET_C))
         lines = restore.plan(snapshot, [order("0xlive")], {MARKET_B}, NOW)
         self.assertEqual([line.order for line in lines], snapshot)
-        self.assertEqual(actions(lines), [LIVE, FARMER, EXPIRED, FILLED, PLACE, PLACE])
+        self.assertEqual(actions(lines), [LIVE, FARMER, EXPIRED, FILLED, WOULD, WOULD])
         self.assertEqual(restore.plan([], [order()], set(), NOW), [])
 
     def test_a_partly_filled_order_is_placed_for_what_was_left(self):
         (line,) = self.plan([order(size=100.0, matched=40.0)])
-        self.assertEqual((line.action, line.size), (PLACE, 60.0),
+        self.assertEqual((line.action, line.size), (WOULD, 60.0),
                          "a partly filled order was planned at the size it was first placed with")
         self.assertIn("40", line.reason)
 
@@ -82,16 +77,16 @@ class PlanTests(unittest.TestCase):
         (soon,) = self.plan([order(expiration=NOW + restore.EXPIRY_MARGIN)])
         (later,) = self.plan([order(expiration=NOW + restore.EXPIRY_MARGIN
                                     + timedelta(seconds=1))])
-        self.assertEqual((soon.action, later.action), (EXPIRED, PLACE))
+        self.assertEqual((soon.action, later.action), (EXPIRED, WOULD))
         self.assertGreater(restore.EXPIRY_MARGIN, timedelta(minutes=1))
 
     def test_an_order_with_no_expiration_never_expires(self):
         (line,) = self.plan([order(expiration=None)], now=NOW + timedelta(days=4000))
-        self.assertEqual(line.action, PLACE)
+        self.assertEqual(line.action, WOULD)
 
     def test_an_order_on_a_market_the_farmer_manages_is_skipped(self):
         lines = self.plan([order("0xa", MARKET_A), order("0xb", MARKET_B)], managed={MARKET_B})
-        self.assertEqual(actions(lines), [PLACE, FARMER])
+        self.assertEqual(actions(lines), [WOULD, FARMER])
 
     def test_an_order_with_an_open_copy_is_skipped(self):
         (line,) = self.plan([order("0xold")], live=[order("0xnew")])
@@ -99,12 +94,12 @@ class PlanTests(unittest.TestCase):
 
     def test_two_identical_orders_with_one_open_copy_are_one_skip_and_one_place(self):
         twins = [order("0xa"), order("0xb")]
-        self.assertEqual(actions(self.plan(twins, live=[order("0xlive")])), [LIVE, PLACE],
+        self.assertEqual(actions(self.plan(twins, live=[order("0xlive")])), [LIVE, WOULD],
                          "one open copy hid both of two identical orders")
         self.assertEqual(actions(self.plan(twins, live=[order("0xl1"), order("0xl2")])),
                          [LIVE, LIVE])
         self.assertEqual(actions(self.plan(twins + [order("0xc")], live=[order("0xlive")])),
-                         [LIVE, PLACE, PLACE])
+                         [LIVE, WOULD, WOULD])
 
     def test_a_copy_is_an_open_order_of_the_same_token_side_price_and_size_left(self):
         base = order("0xold", size=100.0, matched=40.0)
@@ -113,7 +108,7 @@ class PlanTests(unittest.TestCase):
                       order("0xnew", size=60.0, side=Side.SELL),
                       order("0xnew", size=60.0, token="token-zz")):
             with self.subTest(other=other):
-                self.assertEqual(self.plan([base], live=[other])[0].action, PLACE)
+                self.assertEqual(self.plan([base], live=[other])[0].action, WOULD)
 
     def test_an_order_that_still_rests_is_skipped_however_much_more_of_it_filled(self):
         (line,) = self.plan([order("0xsame", size=100.0)],
@@ -122,7 +117,7 @@ class PlanTests(unittest.TestCase):
 
     def test_an_order_that_still_rests_is_not_taken_for_the_copy_of_its_twin(self):
         lines = self.plan([order("0xgone"), order("0xrests")], live=[order("0xrests")])
-        self.assertEqual(actions(lines), [PLACE, LIVE])
+        self.assertEqual(actions(lines), [WOULD, LIVE])
 
     def test_an_expired_or_managed_order_uses_up_no_open_copy(self):
         lines = self.plan([order("0xa", expiration=NOW - timedelta(hours=1)), order("0xb")],
@@ -142,10 +137,6 @@ class PlanTests(unittest.TestCase):
 
 
 class Venue:
-    """A client over made-up open orders. It records every signature and every
-    post, and answers a post with what `answer(signed)` returns: ACCEPT, the
-    text of a refusal, or an exception to raise."""
-
     def __init__(self, listing=(), answer=lambda signed: ACCEPT, tick="0.001"):
         self.listing = listing
         self.answer = answer
@@ -202,7 +193,6 @@ class Scratch(unittest.TestCase):
         self.stop = threading.Event()
 
     def job(self, kind, orders, managed=(), queued_at=NOW):
-        """A claimed job over a snapshot of these orders."""
         snapshot = db.insert_snapshot(self.db, NOW - timedelta(days=1), "", orders, {})
         db.enqueue_job(self.db, kind, {"snapshot_id": snapshot, "managed_markets": list(managed)},
                        queued_at)
@@ -226,7 +216,7 @@ class PlaceTests(Scratch):
         self.place(venue, [order(side=Side.SELL, price=0.985, size=250.0, expiration=FAR)])
         self.assertEqual(venue.posts, [("token-aa", "SELL", 0.985, 250.0, int(FAR.timestamp()),
                                         "GTD", True)])
-        self.assertEqual(self.results(), [(PLACE, 250.0, "0xnew1")])
+        self.assertEqual(self.results(), [(PLACED, 250.0, "0xnew1")])
 
     def test_an_order_with_no_expiration_is_posted_good_til_cancelled(self):
         venue = Venue()
@@ -246,7 +236,7 @@ class PlaceTests(Scratch):
         self.place(venue, [order(size=3000.0, matched=204.137143)])
         self.assertEqual([size for _, _, _, size, *_ in venue.posts], [2795.86],
                          "a partly filled order was posted at the size it was first placed with")
-        self.assertEqual(self.results(), [(PLACE, 2795.86, "0xnew1")])
+        self.assertEqual(self.results(), [(PLACED, 2795.86, "0xnew1")])
 
     def test_a_failed_listing_places_nothing_and_stores_no_line(self):
         venue = Venue(listing=ConnectionError("timed out"))
@@ -276,14 +266,14 @@ class PlaceTests(Scratch):
     def test_two_identical_orders_with_one_open_copy_place_one(self):
         venue = Venue(listing=[order("0xlive")])
         self.place(venue, [order("0xa"), order("0xb")])
-        self.assertEqual(self.results(), [(LIVE, 100.0, None), (PLACE, 100.0, "0xnew1")])
+        self.assertEqual(self.results(), [(LIVE, 100.0, None), (PLACED, 100.0, "0xnew1")])
         self.assertEqual(len(venue.posts), 1)
 
     def test_an_order_the_venue_refuses_is_rejected_with_its_reason_and_no_order_id(self):
         venue = Venue(answer=lambda signed: NO_FUNDS if signed.price == 0.5 else ACCEPT)
         self.place(venue, [order("0xa"), order("0xb", MARKET_B, price=0.5), order("0xc", MARKET_C)])
-        self.assertEqual(self.results(), [(PLACE, 100.0, "0xnew1"), (REJECTED, 100.0, None),
-                                          (PLACE, 100.0, "0xnew3")],
+        self.assertEqual(self.results(), [(PLACED, 100.0, "0xnew1"), (REJECTED, 100.0, None),
+                                          (PLACED, 100.0, "0xnew3")],
                          "an order the venue refused was recorded as placed")
         self.assertEqual(self.lines[1].detail, NO_FUNDS)
 
@@ -291,7 +281,7 @@ class PlaceTests(Scratch):
         venue = Venue(answer=lambda signed: (TimeoutError("timed out") if signed.price == 0.5
                                              else ACCEPT))
         self.place(venue, [order("0xa", price=0.5), order("0xb", MARKET_B)])
-        self.assertEqual(self.results(), [(ERROR, 100.0, None), (PLACE, 100.0, "0xnew2")])
+        self.assertEqual(self.results(), [(ERROR, 100.0, None), (PLACED, 100.0, "0xnew2")])
         self.assertIn("may rest", self.lines[0].detail)
         self.assertIn("timed out", self.lines[0].detail)
         self.assertEqual([price for _, _, price, *_ in venue.posts], [0.5, 0.98],
@@ -302,15 +292,15 @@ class PlaceTests(Scratch):
         orders = [order(f"0x{n}", price=n / 100) for n in range(1, 9)]
         with self.assertRaisesRegex(restore.Stopped, "no answer"):
             self.place(venue, orders)
-        self.assertEqual(len(venue.posts), restore.MAX_UNANSWERED)
-        self.assertEqual(actions(self.lines), [ERROR] * restore.MAX_UNANSWERED)
+        self.assertEqual(len(venue.posts), restore.MAX_UNANSWERED_IN_A_ROW)
+        self.assertEqual(actions(self.lines), [ERROR] * restore.MAX_UNANSWERED_IN_A_ROW)
 
     def test_answers_between_lost_posts_keep_the_restore_going(self):
         lost = {0.01, 0.02, 0.04, 0.05}
         venue = Venue(answer=lambda signed: (TimeoutError("timed out") if signed.price in lost
                                              else ACCEPT))
         self.place(venue, [order(f"0x{n}", price=n / 100) for n in range(1, 7)])
-        self.assertEqual(actions(self.lines), [ERROR, ERROR, PLACE, ERROR, ERROR, PLACE])
+        self.assertEqual(actions(self.lines), [ERROR, ERROR, PLACED, ERROR, ERROR, PLACED])
 
     def test_an_order_that_was_not_sent_does_not_break_a_run_of_lost_posts(self):
         venue = Venue(tick="0.01", answer=lambda signed: TimeoutError("timed out"))
@@ -326,7 +316,7 @@ class PlaceTests(Scratch):
                   order("0xd", price=0.4)]
         with self.assertRaisesRegex(restore.Stopped, "2 of 4"):
             self.place(venue, orders)
-        self.assertEqual(self.results(), [(PLACE, 100.0, "0xnew1"), (PLACE, 100.0, "0xnew2")])
+        self.assertEqual(self.results(), [(PLACED, 100.0, "0xnew1"), (PLACED, 100.0, "0xnew2")])
         self.assertEqual(len(venue.posts), 2)
 
     def test_a_restore_that_was_stopped_before_it_began_places_nothing(self):
@@ -347,19 +337,19 @@ class PlaceTests(Scratch):
         venue = Venue()
         self.now = NOW + db.RESTORE_MAX_WAIT
         self.place(venue, [order()])
-        self.assertEqual(actions(self.lines), [PLACE])
+        self.assertEqual(actions(self.lines), [PLACED])
 
     def test_the_market_is_read_once_and_its_tick_signed_with(self):
         venue = Venue(tick="0.001")
         self.place(venue, [order("0xa", price=0.985), order("0xb", price=0.986),
                            order("0xc", MARKET_B, price=0.5)])
         self.assertEqual(venue.markets_read, [MARKET_A, MARKET_B])
-        self.assertEqual(actions(self.lines), [PLACE, PLACE, PLACE])
+        self.assertEqual(actions(self.lines), [PLACED, PLACED, PLACED])
 
     def test_a_price_the_markets_tick_cannot_hold_is_not_sent(self):
         venue = Venue(tick="0.01")
         self.place(venue, [order("0xa", price=0.985), order("0xb", price=0.98)])
-        self.assertEqual(self.results(), [(ERROR, 100.0, None), (PLACE, 100.0, "0xnew1")])
+        self.assertEqual(self.results(), [(ERROR, 100.0, None), (PLACED, 100.0, "0xnew1")])
         self.assertIn("not sent", self.lines[0].detail)
         self.assertNotIn("may rest", self.lines[0].detail)
         self.assertEqual([price for _, _, price, *_ in venue.posts], [0.98])
@@ -402,8 +392,8 @@ class PreviewTests(Scratch):
         self.preview(venue, [order("0xa"), order("0xb"), order("0xc", MARKET_B),
                              order("0xd", size=100.0, matched=40.0, price=0.5)],
                      managed=[MARKET_B])
-        self.assertEqual(self.results(), [(LIVE, 100.0, None), (PLACE, 100.0, None),
-                                          (FARMER, 100.0, None), (PLACE, 60.0, None)])
+        self.assertEqual(self.results(), [(LIVE, 100.0, None), (WOULD, 100.0, None),
+                                          (FARMER, 100.0, None), (WOULD, 60.0, None)])
         self.assertEqual((venue.signed, venue.posts, venue.markets_read), ([], [], []))
 
     def test_a_failed_listing_stores_no_plan(self):

@@ -1,7 +1,3 @@
-"""Tests for the console's Sniper page: the search, the arm form, the watch
-list and the disarm. The search and the books are fakes injected through
-create_app, and the worker's rows are written straight through tools.db."""
-
 import asyncio
 import os
 import unittest
@@ -41,8 +37,6 @@ def levels(bid, ask, tick=0.01):
 
 
 class Sniper(Console):
-    """The console over a scratch farm.db and tools.db, with a fake search and fake books."""
-
     def setUp(self):
         self.markets = []
         self.books = {}
@@ -53,7 +47,6 @@ class Sniper(Console):
         self.addCleanup(self.tools.close)
 
     def app_kwargs(self):
-        # A fixed clock, so an age the page shows is exact.
         self.tools_path = os.path.join(os.path.dirname(self.path), "tools.db")
         return {"tools_db": self.tools_path, "search_markets": self.search,
                 "fetch_books": self.fetch_books, "clock": lambda: self.now}
@@ -83,7 +76,6 @@ class Sniper(Console):
         return fields
 
     def arm(self, **changes):
-        """A watch as the console would insert it, straight through tools.db."""
         parsed, errors = db.parse_watch(self.arm_form(**changes))
         assert not errors, errors
         return db.arm_watch(self.tools, parsed, self.now)

@@ -51,7 +51,7 @@ def load_private_key(ask_password, bw=run_bw):
     the vault is locked, and a vault this call unlocks is locked again before
     the call returns or raises. A vault the user had unlocked is left as it was.
 
-    Raises KeyUnavailable with the reason. bw runs the CLI; tests replace it.
+    Raises KeyUnavailable with the reason. bw runs the CLI.
     """
     source = os.getenv("POLYMARKET_KEY_SOURCE", "").lower()
     if source != "bitwarden":
@@ -77,12 +77,16 @@ def load_private_key(ask_password, bw=run_bw):
 
     session = _unlock(bw, ask_password())
     try:
-        return _read_key(bw, session, item_id, item_name)
+        key = _read_key(bw, session, item_id, item_name)
     finally:
-        # Raising here discards the key on purpose: a process that could not
-        # lock the vault again does not go on to trade.
-        if not bw(["lock"]).ok:
-            raise KeyUnavailable("the Bitwarden vault did not lock again: run `bw lock`")
+        _lock(bw)
+    return key
+
+
+def _lock(bw):
+    """A process that could not lock the vault again does not go on to trade."""
+    if not bw(["lock"]).ok:
+        raise KeyUnavailable("the Bitwarden vault did not lock again: run `bw lock`")
 
 
 def _vault_status(bw):

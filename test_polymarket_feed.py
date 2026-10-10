@@ -1,7 +1,3 @@
-"""Tests for polymarket.feed: the market-channel parser and the MarketFeed
-loop, driven by a scripted socket, a clock the socket advances and a stop that
-records its waits. No socket opens and nothing sleeps."""
-
 import json
 import unittest
 
@@ -53,7 +49,6 @@ class ParseFrameTests(unittest.TestCase):
                          [Update(YES, 0.01, None, None, None, Kind.BOOK)])
 
     def test_each_price_change_entry_goes_to_its_own_token(self):
-        # One message covers both tokens of a market: 99c on one side is 1c on the other.
         raw = price_change((YES, "0.99", "1"), (NO, "0", "0.01"))
         self.assertEqual(parse_frame(raw), [
             Update(YES, None, None, 0.99, 1.0, Kind.PRICE_CHANGE),
@@ -126,10 +121,6 @@ class Clock:
 
 
 class Stop:
-    """threading.Event's is_set and wait. A wait is recorded, not slept. A feed
-    that spins without stopping is stopped after CHECKS_MAX checks, so a defect
-    fails an assertion instead of hanging the suite."""
-
     CHECKS_MAX = 5000
 
     def __init__(self, set_after_waits=None):
@@ -153,11 +144,6 @@ class Stop:
 
 
 class Socket:
-    """One scripted connection. Each recv plays the next step: a string is a
-    frame, an exception is raised, QUIET times out after advancing the clock,
-    and a callable runs first and its result is then played. The end of the
-    script sets stop."""
-
     def __init__(self, harness, script):
         self.harness = harness
         self.script = list(script)
@@ -195,9 +181,6 @@ class Socket:
 
 
 class Harness:
-    """A MarketFeed over scripted connections, one script each. An exception
-    in place of a script makes that connection fail to open."""
-
     def __init__(self, tokens, *scripts, stop=None, on_update=None):
         self.clock, self.stop = Clock(), stop or Stop()
         self.pending = list(scripts)
@@ -242,9 +225,6 @@ class MarketFeedTests(unittest.TestCase):
         self.assertEqual(h.updates, [Update(YES, None, None, 0.99, 1.0, Kind.PRICE_CHANGE)])
 
     def test_a_consumer_sees_the_tick_change_before_the_prices_of_the_same_message(self):
-        # The sniper's guard reads the last price seen before the tick changed.
-        # This consumer stores the price first, which is the order that would
-        # lose that price if one update carried both.
         seen = {}
 
         def on_update(update):

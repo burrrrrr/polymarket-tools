@@ -1,5 +1,3 @@
-"""The Live markets page, one market's detail page, and the controls on their cards."""
-
 from contextlib import closing
 from datetime import timedelta
 from typing import Optional
@@ -29,6 +27,17 @@ def parse_phase(phase):
 
 def chart_of(vm, now):
     return charts.mid_chart(vm.mids, vm.v, vm.markers, now)
+
+
+def changed():
+    return Response(headers={"HX-Trigger": CONTROLS_EVENT})
+
+
+def level(form):
+    value = form.get("value")
+    if value not in ("0", "1"):
+        raise HTTPException(400, "value must be 0 or 1")
+    return value == "1"
 
 
 def routes(ctx):
@@ -92,26 +101,6 @@ def routes(ctx):
         with closing(ctx.connect()) as conn:
             _, vm = market_vm(conn, now, condition_id)
         return as_json(vm)
-
-    return router
-
-
-def changed():
-    """Empty reply to an htmx control; the regions showing it re-render."""
-    return Response(headers={"HX-Trigger": CONTROLS_EVENT})
-
-
-def level(form):
-    value = form.get("value")
-    if value not in ("0", "1"):
-        raise HTTPException(400, "value must be 0 or 1")
-    return value == "1"
-
-
-def controls(ctx):
-    """The pause, naked-pause and retire buttons. They have a router of their own
-    so that the app registers them after the Activity page, as it always has."""
-    router = APIRouter()
 
     @router.post("/markets/{condition_id}/paused")
     async def set_paused(request: Request, condition_id: str):

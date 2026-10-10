@@ -1,6 +1,3 @@
-"""The Review page: one candidate's plan against the live book, its rules, triage and
-holdings, and the decision to approve, reject or mute it."""
-
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -17,8 +14,6 @@ import triage
 from .. import forms, views
 from ..context import FARMER_DEFAULTS, form_of, see_other
 
-# Skipping to the next quotable candidate reads at most QUOTABLE_SCAN books,
-# QUOTABLE_BATCH at a time.
 QUOTABLE_SCAN = 40
 QUOTABLE_BATCH = 8
 
@@ -103,7 +98,6 @@ def routes(ctx):
     def review_first(request: Request, mode: Optional[str] = None):
         now = ctx.clock()
         mode = parse_mode(mode)
-        # A stale map refreshes in the background, sweeping ended rewards from the queue.
         ctx.total_rates.get()
         with closing(ctx.connect()) as conn:
             ids = farm_db.candidate_queue(conn, mode)

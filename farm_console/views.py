@@ -185,7 +185,6 @@ NO_WORKER = WorkerLiveness(False, False, None, None, "not configured",
 
 
 def worker_liveness(status, now):
-    """The WorkerLiveness of a tools.db worker_status row, or of none."""
     if status is None:
         return WorkerLiveness(True, False, None, None, "never ran",
                               "The worker has never run against this database.")

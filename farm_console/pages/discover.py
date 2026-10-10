@@ -1,6 +1,3 @@
-"""The Discover page: the candidate table and its filters, the scan form and its
-progress, and the batch that sends candidates to Claude."""
-
 from contextlib import closing
 from typing import Optional
 
@@ -32,8 +29,6 @@ def parse_filters(mode, q, status, min_days, page):
 def scan_values(conn):
     """The scan form's {name: text}: the last parameters run, else the screener's defaults."""
     stored = farm_db.load_scan_params(conn)
-    # Parameters a scan no longer takes stay in old rows; drop them, and
-    # categories the screener no longer offers.
     config = reward_screener.ScreenConfig()._replace(
         **{k: v for k, v in stored.items() if k in reward_screener.ScreenConfig._fields})
     excluded = [c for c in config.excluded_categories if c in reward_screener.CATEGORIES]
@@ -56,7 +51,6 @@ def routes(ctx):
                           refused=None, triage_note=None):
         now = ctx.clock()
         snap = ctx.snapshot(conn, now)
-        # A stale map refreshes in the background, sweeping ended rewards from the queue.
         ctx.total_rates.get()
         markets, total = farm_db.search_markets(
             conn, statuses=() if filters.status == "all" else (filters.status,),
@@ -125,7 +119,6 @@ def routes(ctx):
         response = ctx.templates.TemplateResponse(request, "partials/scan_status.html",
                                                   {"job": job, "now": ctx.clock()})
         if job.phase is not ScanPhase.RUNNING:
-            # Only a running scan polls this; reload so the table shows the result.
             response.headers["HX-Refresh"] = "true"
         return response
 

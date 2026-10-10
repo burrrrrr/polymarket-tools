@@ -1,6 +1,3 @@
-"""Tests for polymarket.region: where the API takes new orders from. No request
-leaves the process."""
-
 import unittest
 
 import httpx
@@ -12,9 +9,6 @@ TRACE = "fl=1f1\nh=clob.polymarket.com\nip=203.0.113.9\nloc=pt\ncolo=LIS\n"
 
 
 def edge(geoblock=None, trace=None, time=200):
-    """A client over the three hosts the check reads. geoblock is the JSON the
-    geo lookup answers, trace the CDN trace text, time the CLOB's status. None
-    makes that host unreachable."""
     def handler(request):
         url = str(request.url)
         if url == region.GEOBLOCK_URL and geoblock is not None:
@@ -92,7 +86,6 @@ class CheckTests(unittest.TestCase):
         self.assertIn("PT-11", result.message)
 
     def test_the_websites_own_blocked_flag_is_ignored(self):
-        # The geo lookup reports blocked=true for places whose API access is open.
         result = check(edge(geoblock={"blocked": True, "country": "NL", "region": "NH"}))
         self.assertTrue(result.allowed)
 

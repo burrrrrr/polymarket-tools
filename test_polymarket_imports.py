@@ -1,10 +1,3 @@
-"""Tests for what the polymarket package is allowed to load and to call.
-
-A keyless process, the console, imports the read modules, so they must not
-bring in the key loader, the client or the SDK. No module of the package may
-reach back into the farmer, load .env, or talk to a terminal.
-"""
-
 import ast
 import json
 import os
@@ -28,7 +21,6 @@ TERMINAL_CALLS = {"print", "input", "getpass", "exit", "quit", "load_dotenv"}
 
 
 def loaded_by(modules):
-    """The names in sys.modules after a fresh interpreter imports these modules."""
     code = (f"import sys, json, {', '.join(modules)}\n"
             "print(json.dumps(sorted(sys.modules)))")
     done = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
@@ -37,7 +29,6 @@ def loaded_by(modules):
 
 
 def called_names(path):
-    """The name of every function a source file calls: f for f(...) and for x.f(...)."""
     with open(path, encoding="utf-8") as source:
         tree = ast.parse(source.read(), path)
     for node in ast.walk(tree):

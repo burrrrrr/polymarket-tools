@@ -1,6 +1,3 @@
-"""Tests for polymarket.books: parsing a book and reading books from the CLOB.
-No request leaves the process."""
-
 import json
 import unittest
 
@@ -117,7 +114,6 @@ class ParseBooksTests(unittest.TestCase):
 
 class FetchBooksTests(unittest.TestCase):
     def recording(self, fail_when=lambda tokens: False):
-        """A /books endpoint that answers each request, and the token lists it was sent."""
         requests = []
 
         def handler(request):

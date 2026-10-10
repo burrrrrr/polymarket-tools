@@ -174,8 +174,7 @@ def parse_settings(form, group):
 
 
 def parse_typed_word(form, word):
-    """The errors of a form whose confirm field must hold this word, typed out.
-    It guards an action that cannot be taken back, such as placing real orders."""
+    """The errors of a form whose confirm field must hold this word, typed out."""
     if (form.get("confirm") or "").strip() != word:
         return {"confirm": f"Type {word} to confirm."}
     return {}

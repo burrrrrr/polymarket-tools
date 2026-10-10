@@ -1,5 +1,3 @@
-"""Tests for tools.db: the rows the console and the worker pass each other."""
-
 import os
 import sqlite3
 import tempfile
@@ -303,7 +301,7 @@ class RestoreLineTests(Scratch):
         return db.RestoreLine(job, self.orders[index], action, size, order_id, detail)
 
     def test_a_jobs_lines_read_back_as_written_with_their_snapshot_orders(self):
-        written = [self.line(0, RestoreAction.PLACE, 60.0, "0xnew", "placed"),
+        written = [self.line(0, RestoreAction.PLACED, 60.0, "0xnew", "placed"),
                    self.line(1, RestoreAction.REJECTED, detail="not enough balance / allowance"),
                    self.line(2, RestoreAction.SKIP_LIVE, detail="already open")]
         db.add_restore_lines(self.db, written[:1])
@@ -317,29 +315,31 @@ class RestoreLineTests(Scratch):
         db.add_restore_lines(self.db, [self.line(0, RestoreAction.SKIP_EXPIRED)])
         with self.assertRaises(sqlite3.IntegrityError):
             db.add_restore_lines(self.db, [self.line(1, RestoreAction.SKIP_LIVE),
-                                           self.line(0, RestoreAction.PLACE)])
+                                           self.line(0, RestoreAction.WOULD_PLACE)])
         self.assertEqual([line.action for line in db.read_restore_lines(self.db, 7)],
                          [RestoreAction.SKIP_EXPIRED])
 
-    def test_only_a_placed_line_carries_an_order_id(self):
+    def test_a_placed_line_carries_an_order_id_and_no_other_line_does(self):
         for action in RestoreAction:
-            if action is not RestoreAction.PLACE:
+            if action is not RestoreAction.PLACED:
                 with self.subTest(action=action):
                     with self.assertRaises(sqlite3.IntegrityError):
                         db.add_restore_lines(self.db, [self.line(0, action, order_id="0xnew")])
+        with self.assertRaises(sqlite3.IntegrityError):
+            db.add_restore_lines(self.db, [self.line(0, RestoreAction.PLACED)])
 
     def test_the_lines_of_a_job_are_counted_by_action(self):
         self.assertEqual(db.count_restore_lines(self.db, 7), {})
-        db.add_restore_lines(self.db, [self.line(0, RestoreAction.PLACE),
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.WOULD_PLACE),
                                        self.line(1, RestoreAction.SKIP_LIVE),
-                                       self.line(2, RestoreAction.PLACE),
+                                       self.line(2, RestoreAction.WOULD_PLACE),
                                        self.line(0, RestoreAction.ERROR, job=8)])
         self.assertEqual(db.count_restore_lines(self.db, 7),
-                         {RestoreAction.PLACE: 2, RestoreAction.SKIP_LIVE: 1})
+                         {RestoreAction.WOULD_PLACE: 2, RestoreAction.SKIP_LIVE: 1})
 
     def test_a_restore_line_moves_the_job_change_mark(self):
         before = db.last_job_change(self.db)
-        db.add_restore_lines(self.db, [self.line(0, RestoreAction.PLACE)])
+        db.add_restore_lines(self.db, [self.line(0, RestoreAction.WOULD_PLACE)])
         self.assertNotEqual(db.last_job_change(self.db), before)
 
 

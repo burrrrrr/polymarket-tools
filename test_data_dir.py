@@ -1,6 +1,3 @@
-"""Tests for the data directory: where the farmer, the console and the worker
-find farm.db and tools.db."""
-
 import os
 import tempfile
 import unittest

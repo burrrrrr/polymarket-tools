@@ -24,21 +24,17 @@ from polymarket.hosts import CLOB_HOST, GEOBLOCK_URL
 TRACE_URL = f"{CLOB_HOST}/cdn-cgi/trace"
 TIMEOUT_S = 6.0
 
-# Where the API rejects new orders: the docs' close-only list and the fully
-# blocked places.
 API_BLOCKED_COUNTRIES = frozenset({
     "AU", "BE", "BI", "BR", "BY", "CD", "CF", "CU", "DE", "ET", "FR", "GB",
     "IQ", "IR", "IT", "KP", "LB", "LY", "MM", "NI", "NZ", "PL", "RU", "SD",
     "SG", "SK", "SO", "SS", "SY", "TH", "TW", "UM", "US", "VE", "YE", "ZW",
 })
 
-# Countries blocked in part, with the subdivisions that are blocked.
 API_BLOCKED_REGIONS = {
     "CA": frozenset({"AB", "BC", "ON", "QC"}),
     "UA": frozenset({"09", "14", "43"}),  # Luhansk, Donetsk, Crimea
 }
 
-# Blocked on the website and not on the API.
 FRONTEND_ONLY_COUNTRIES = frozenset({"IE", "JP", "MT", "NL"})
 
 GEOBLOCK_MARKER = "restricted in your region"

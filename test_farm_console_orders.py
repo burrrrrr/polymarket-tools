@@ -1,6 +1,3 @@
-"""Tests for the console's Orders page and the worker's place in the layout. The
-worker's rows are written straight through tools.db: no worker runs here."""
-
 import asyncio
 import os
 import unittest
@@ -57,8 +54,6 @@ class WorkerLivenessTest(unittest.TestCase):
 
 
 class Orders(Console):
-    """The console over a scratch farm.db and a scratch tools.db beside it."""
-
     def setUp(self):
         super().setUp()
         self.tools = db.open_db(self.tools_path)
@@ -76,7 +71,6 @@ class Orders(Console):
         return db.start_worker(self.tools, self.now, pid=41, keyed=keyed)
 
     def take(self, note="before the upgrade"):
-        """What the worker writes for one snapshot job: two orders, one of them named."""
         job = db.enqueue_job(self.tools, JobKind.SNAPSHOT, {"note": note}, self.now)
         db.claim_job(self.tools, self.now)
         orders = [
@@ -247,9 +241,6 @@ class SnapshotsTest(Orders):
 
 
 class RestoreTest(Orders):
-    """The restore of a snapshot, from its page. What the worker would write for
-    a preview or a restore job is written here through tools.db."""
-
     def setUp(self):
         super().setUp()
         _, self.snapshot, _ = self.take()
@@ -257,8 +248,6 @@ class RestoreTest(Orders):
         self.stored = db.read_snapshot_orders(self.tools, self.snapshot)
 
     def ran(self, kind, lines, state=JobState.DONE, error=None):
-        """A job of this kind with these (order index, action, order id, detail)
-        lines, in the state the worker left it."""
         job = db.enqueue_job(self.tools, kind, {"snapshot_id": self.snapshot,
                                                 "managed_markets": []}, self.now)
         if state is not JobState.QUEUED:
@@ -273,7 +262,7 @@ class RestoreTest(Orders):
 
     def previewed(self):
         return self.ran(JobKind.PREVIEW, [
-            (0, RestoreAction.PLACE, None, "150.5 of 2000 had filled"),
+            (0, RestoreAction.WOULD_PLACE, None, "150.5 of 2000 had filled"),
             (1, RestoreAction.SKIP_LIVE, None, "still open")])
 
     def restore_jobs(self):
@@ -387,7 +376,7 @@ class RestoreTest(Orders):
         self.ran(JobKind.PREVIEW, [], state=JobState.FAILED, error="ConnectionError: timed out")
         refused("the preview failed")
         self.previewed()
-        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACE, "0xnew", "not open")])
+        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACED, "0xnew", "not open")])
         refused("the preview was already placed")
         self.assertEqual(len(self.restore_jobs()), 1)
 
@@ -401,7 +390,7 @@ class RestoreTest(Orders):
     def test_a_restore_shows_what_became_of_each_order(self):
         self.previewed()
         job = self.ran(JobKind.RESTORE, [
-            (0, RestoreAction.PLACE, "0xnew1", "150.5 of 2000 had filled"),
+            (0, RestoreAction.PLACED, "0xnew1", "150.5 of 2000 had filled"),
             (1, RestoreAction.REJECTED, None, "not enough balance / allowance")])
         text = self.client.get(self.url).text
         for needle in (f"Restore job {job}", "<h2>Placed</h2>", '<td class="mono">0xnew1</td>',
@@ -423,7 +412,7 @@ class RestoreTest(Orders):
         self.assertNotIn("<h2>Placed</h2>", text)
 
     def test_a_running_restore_shows_how_far_it_is(self):
-        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACE, "0xnew1", "not open")],
+        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACED, "0xnew1", "not open")],
                  state=JobState.RUNNING)
         text = self.client.get(f"/partials/orders/restore/{self.snapshot}").text
         self.assertIn('<span class="badge t-c">running</span>', text)
@@ -431,7 +420,7 @@ class RestoreTest(Orders):
 
     def test_a_stopped_restore_shows_its_error_and_the_lines_it_stored(self):
         error = "the worker stopped after 1 of 2 orders (1 placed)"
-        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACE, "0xnew1", "not open")],
+        self.ran(JobKind.RESTORE, [(0, RestoreAction.PLACED, "0xnew1", "not open")],
                  state=JobState.FAILED, error=error)
         text = self.client.get(self.url).text
         for needle in ('<span class="badge t-r">failed</span>', f'role="alert">{error}<',
@@ -448,8 +437,6 @@ class RestoreTest(Orders):
 
 
 class NotConfiguredTest(Console):
-    """A console started with no tools.db, as the farm console's own tests start it."""
-
     def test_the_orders_page_says_so_and_offers_no_form(self):
         text = self.client.get("/orders").text
         self.assertIn("The worker database is not configured", text)
@@ -476,9 +463,6 @@ class NotConfiguredTest(Console):
 
 class StreamTest(Orders):
     def read_stream(self, during=lambda conn: None):
-        """The stream's text over three polls. `during` writes to tools.db in the
-        first wait between polls, after the stream has read where it starts
-        from. The waits take no time."""
         waits = []
 
         async def wait(seconds):
@@ -513,8 +497,6 @@ class StreamTest(Orders):
 
 class ImportTest(unittest.TestCase):
     def test_the_console_loads_no_keys_no_client_and_no_worker(self):
-        # reward_farmer, which the console imports for the farmer's defaults,
-        # loads py_clob_client_v2, so the SDK itself cannot be ruled out here.
         loaded = loaded_by(["farm_console.app"])
         self.assertIn("tools.db", loaded)
         self.assertEqual([name for name in loaded if name in KEYED_BY_THIS_BUILD], [])

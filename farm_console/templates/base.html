@@ -36,7 +36,6 @@
     </div>
   </nav>
   <main>
-    {#- A tool page depends on the worker, so its banner is the worker's. #}
     {%- if process == 'worker' %}
     {% call region("/partials/chrome/worker-banner", "sse:status, every 15s") %}{% include "partials/worker_banner.html" %}{% endcall %}
     {%- else %}

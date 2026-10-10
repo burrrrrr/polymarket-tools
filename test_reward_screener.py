@@ -684,6 +684,17 @@ class ExcludedCategoryTest(unittest.TestCase):
             parse("--exclude", "sports,golf")
 
 
+class ScanHelpTest(unittest.TestCase):
+    def test_the_scan_help_renders_the_naked_budget_entry_whole(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            reward_screener.build_parser().parse_args(["scan", "--help"])
+        self.assertIn("--naked-budget NAKED_BUDGET USD a longshot bid may cost where a fill gives "
+                      "the favorite buyer 5% a year or more. Each market's longshot bid is priced "
+                      "with it, as the farmer would with this budget approved (default: 10.0) "
+                      "--min-rate", " ".join(out.getvalue().split()))
+
+
 class RunScanTest(unittest.TestCase):
     RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
 
@@ -1107,8 +1118,6 @@ class FetchReadTest(unittest.TestCase):
 
 
 def books_api(fail_when=lambda tokens: False, gate=None):
-    """An httpx client whose /books answers with a book for each token asked for,
-    or a 502 when fail_when(tokens), once gate lets it; and its requests."""
     calls = []
 
     def handle(request):
@@ -1160,8 +1169,6 @@ class FetchLevelsTest(unittest.TestCase):
 
 
 def gamma_markets_api(fail_when=lambda ids: False, status=500, gate=None):
-    """An httpx client whose Gamma /markets answers with a record for each id
-    asked for, or status when fail_when(ids), once gate lets it; and its requests."""
     calls = []
 
     def handle(request):

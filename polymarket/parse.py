@@ -1,6 +1,3 @@
-"""Reading the loosely typed values Polymarket's APIs send: numbers as strings,
-times with and without a zone."""
-
 from datetime import datetime, timezone
 
 

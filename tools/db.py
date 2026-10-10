@@ -28,15 +28,16 @@ Times are ISO 8601 UTC strings to the second, as in farm_db.
 import json
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import NamedTuple, Optional
 
 from farm_db import stamp
-from polymarket.orders import TICKS, LimitOrder, OpenOrder, Side, on_grid
+from polymarket.orders import (MIN_EXPIRES_AFTER_S, TICKS, LimitOrder, OpenOrder, Side,
+                               on_grid)
 
 BUSY_TIMEOUT_S = 5
-# How often the worker beats, and how long after its last beat it counts as gone.
 BEAT_S = 1.0
 STALE_AFTER_S = 10.0
 
@@ -54,21 +55,18 @@ class JobState(Enum):
     FAILED = "failed"
 
 
-# A restore places what its own fresh plan finds missing, and the page shows
-# one plan at a time, so one job among these is queued or running.
 RESTORE_KINDS = (JobKind.PREVIEW, JobKind.RESTORE)
-# A restore runs soon after the click that confirmed it, or not at all: the
-# worker fails one that waited longer than this for it.
 RESTORE_MAX_WAIT = timedelta(minutes=5)
 
 
 class RestoreAction(Enum):
-    """What became of one snapshot order. A plan decides PLACE or a skip. In a
-    preview job PLACE means the order would be placed. In a restore job it
-    means the CLOB accepted the order: one it refused is REJECTED, and one that
-    was not sent or got no answer is ERROR."""
+    """What became of one snapshot order. A plan decides WOULD_PLACE or a skip,
+    and a preview stores the plan. A restore places each WOULD_PLACE: the CLOB
+    accepted it (PLACED, with its order id), refused it (REJECTED), or it was
+    not sent or got no answer (ERROR)."""
 
-    PLACE = "place"
+    WOULD_PLACE = "would_place"
+    PLACED = "placed"
     SKIP_LIVE = "skip_live"
     SKIP_EXPIRED = "skip_expired"
     SKIP_FARMER = "skip_farmer"
@@ -78,8 +76,6 @@ class RestoreAction(Enum):
 
 
 class WatchState(Enum):
-    """Where a watch is. ARMED and FIRING are open; the rest are final."""
-
     ARMED = "armed"
     FIRING = "firing"
     FIRED = "fired"
@@ -120,11 +116,14 @@ class Guard(NamedTuple):
     tolerance: float
     max_age_s: float
 
+    def admits(self, quoted):
+        """Whether a quoted price is within tolerance of the guard's. The slack
+        keeps 0.985 inside 0.99 less 0.005, whatever the floats say."""
+        return abs(quoted - self.price) <= self.tolerance + 1e-9
+
 
 GUARD_DEFAULT = Guard(0.99, 0.005, 5.0)
 TARGET_TICK_DEFAULT = "0.001"
-# The CLOB refuses an order that expires within a minute.
-EXPIRES_MIN_S = 60
 INTERRUPTED_LINE = "found firing when the worker started: the order may rest"
 
 
@@ -188,7 +187,7 @@ CREATE TABLE IF NOT EXISTS restore_lines (
     snapshot_order_id INTEGER NOT NULL,
     action TEXT NOT NULL CHECK (action IN ({_values(RestoreAction)})),
     size REAL NOT NULL,
-    order_id TEXT CHECK (order_id IS NULL OR action = 'place'),
+    order_id TEXT CHECK ((order_id IS NOT NULL) = (action = 'placed')),
     detail TEXT NOT NULL,
     UNIQUE (job_id, snapshot_order_id)
 );
@@ -268,6 +267,15 @@ def _time(text):
     return datetime.fromisoformat(text) if text else None
 
 
+@contextmanager
+def _write_lock_first(conn):
+    """A transaction that takes the write lock before its first read, so what
+    it reads is what it writes over: two workers cannot both find a row free."""
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        yield
+
+
 class WorkerStatus(NamedTuple):
     """instance names one run of the worker; keyed is whether it holds a key."""
 
@@ -284,7 +292,6 @@ class WorkerRunning(Exception):
 
 
 def is_running(status, now):
-    """Whether the worker behind this row is alive: not stopped, and beating."""
     return (status is not None and status.stopped_at is None
             and (now - status.last_beat_at).total_seconds() < STALE_AFTER_S)
 
@@ -304,10 +311,7 @@ def start_worker(conn, now, pid, keyed):
     stopped, or whose beats stopped STALE_AFTER_S ago, is replaced.
     """
     instance = uuid.uuid4().hex
-    with conn:
-        # The write lock comes first, so two workers starting together cannot
-        # both find the row free.
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_lock_first(conn):
         running = read_worker_status(conn)
         if is_running(running, now):
             raise WorkerRunning(
@@ -381,8 +385,7 @@ def enqueue_job(conn, kind, params, now):
 
 def claim_job(conn, now):
     """Move the oldest queued job to running and return it, or None."""
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_lock_first(conn):
         row = conn.execute(
             "SELECT id FROM jobs WHERE state = 'queued' ORDER BY id LIMIT 1").fetchone()
         if row is None:
@@ -408,8 +411,7 @@ def finish_job(conn, job_id, now, error=None):
 def fail_running_jobs(conn, now, reason):
     """Close every running job as failed and return how many there were. A
     starting worker calls it: no job survives the worker that ran it."""
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
+    with _write_lock_first(conn):
         left = [row["id"] for row in conn.execute("SELECT id FROM jobs WHERE state = 'running'")]
         for job_id in left:
             conn.execute(
@@ -529,7 +531,6 @@ def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=Non
 
 
 def imported_sources(conn):
-    """The file names of the snapshots that came from a file."""
     return {row["source"] for row in
             conn.execute("SELECT source FROM snapshots WHERE source IS NOT NULL")}
 
@@ -560,8 +561,8 @@ def read_snapshot_orders(conn, snapshot_id):
 
 class RestoreLine(NamedTuple):
     """One snapshot order in a preview or a restore job. size is what was left
-    of the order to place. order_id is the new order's id, on a line a restore
-    placed and on no other. detail is the plan's reason or the CLOB's."""
+    of the order to place. order_id is the new order's id, on a PLACED line
+    and on no other. detail is the plan's reason or the CLOB's."""
 
     job_id: int
     order: SnapshotOrder
@@ -600,8 +601,6 @@ def count_restore_lines(conn, job_id):
 
 
 class NewWatch(NamedTuple):
-    """A watch the console may arm. parse_watch is the one way to build it."""
-
     order: LimitOrder
     market: str
     label: str
@@ -646,8 +645,6 @@ class WatchRow(NamedTuple):
 
 
 class Settlement(NamedTuple):
-    """The closing write of a watch: its final state, why, and what was sent."""
-
     state: WatchState
     reason: Optional[Reason]
     detail: str
@@ -656,8 +653,6 @@ class Settlement(NamedTuple):
 
 
 class Sample(NamedTuple):
-    """The quote the worker last saw for an open watch."""
-
     watch_id: int
     tick: Optional[str]
     bid: Optional[float]
@@ -713,9 +708,10 @@ def parse_watch(form):
         if guard.max_age_s is None or guard.max_age_s <= 0:
             errors["guard_max_age_s"] = "A positive number of seconds."
     expires = _number(form.get("expires_after_s"))
-    if expires is None or expires != int(expires) or not (expires == 0 or expires >= EXPIRES_MIN_S):
-        errors["expires_after_s"] = (f"0 for good-til-cancelled, or at least {EXPIRES_MIN_S} "
-                                     "seconds.")
+    if (expires is None or expires != int(expires)
+            or not (expires == 0 or expires >= MIN_EXPIRES_AFTER_S)):
+        errors["expires_after_s"] = (f"0 for good-til-cancelled, or at least "
+                                     f"{MIN_EXPIRES_AFTER_S} seconds.")
     if errors:
         return None, errors
     return NewWatch(LimitOrder(token_id, side, price, size, int(expires)), market, label,
@@ -812,17 +808,15 @@ def close_watch(conn, watch_id, settlement, now, send_ms=None, post_ms=None):
         return _close(conn, watch_id, settlement, now, send_ms, post_ms)
 
 
-def fail_interrupted(conn, now):
-    """Every watch found firing is closed as failed, interrupted, and logged.
-    A starting worker calls it: a fire is never resumed and never repeated.
-    Returns the ids."""
-    with conn:
-        conn.execute("BEGIN IMMEDIATE")
+def close_firing(conn, settlement, line, now):
+    """Close every watch found firing with this Settlement and log the line
+    for each, in one transaction. A starting worker calls it: a fire is never
+    resumed and never repeated. Returns the ids."""
+    with _write_lock_first(conn):
         left = [row["id"] for row in conn.execute("SELECT id FROM watches WHERE state = 'firing'")]
         for watch_id in left:
-            _close(conn, watch_id, Settlement(WatchState.FAILED, Reason.INTERRUPTED, ""), now,
-                   None, None)
-            _log(conn, now, INTERRUPTED_LINE, watch_id=watch_id)
+            _close(conn, watch_id, settlement, now, None, None)
+            _log(conn, now, line, watch_id=watch_id)
     return left
 
 

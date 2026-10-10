@@ -188,7 +188,7 @@ SCAN_HELP = {
                      "share. Outside the free zone it takes the cheapest price that covers "
                      "the favorite bid within the naked budget, or else the price where the "
                      "budget buys the most score",
-    "naked_budget": "USD a longshot bid may cost where a fill gives the favorite buyer 5% "
+    "naked_budget": "USD a longshot bid may cost where a fill gives the favorite buyer 5%% "
                     "a year or more. Each market's longshot bid is priced with it, as the "
                     "farmer would with this budget approved",
     "min_rate": "Minimum daily reward pool in USD",

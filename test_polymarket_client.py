@@ -1,6 +1,3 @@
-"""Tests for polymarket.client: an authenticated client from a key and the
-environment. The client class is a fake, so nothing is signed or sent."""
-
 import os
 import unittest
 from unittest import mock

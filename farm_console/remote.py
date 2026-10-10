@@ -73,7 +73,6 @@ def fetch_info(condition_id):
 
 
 def fetch_book(token_id):
-    """The token's live book as polymarket.books.Levels."""
     with httpx.Client() as http:
         return books.fetch_book(http, token_id, timeout=TIMEOUT_S)
 

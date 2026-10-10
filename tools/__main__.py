@@ -44,7 +44,7 @@ def build_parser():
         description="The keyed worker behind the console's order tools. With no command it "
                     "runs until Ctrl+C.")
     parser.add_argument("--db", help="SQLite file shared with the console (default: tools.db "
-                                     f"{data_dir.WHERE})")
+                                     f"{data_dir.LOCATION_HELP})")
     key = parser.add_mutually_exclusive_group()
     key.add_argument("--key-stdin", action="store_true",
                      help="read the wallet key from one line of standard input, not from the "

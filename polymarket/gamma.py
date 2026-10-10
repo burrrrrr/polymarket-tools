@@ -1,6 +1,3 @@
-"""Gamma, Polymarket's read-only market metadata API: markets by condition id
-and the market search."""
-
 import json
 from datetime import datetime
 from typing import NamedTuple, Optional
@@ -49,8 +46,7 @@ def request_markets(http, condition_ids, closed=None, timeout=20, *, limit=True,
     fails.
 
     closed is as in fetch_markets. limit=False sends no limit, for a request
-    that names one market. A 429 is waited out up to retries times. A caller
-    that carries on without a failed request catches around this.
+    that names one market. A 429 is waited out up to retries times.
     """
     params = [("condition_ids", c) for c in condition_ids]
     if closed is not None:

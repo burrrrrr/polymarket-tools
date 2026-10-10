@@ -1,6 +1,3 @@
-"""Tests for polymarket.gamma: market lookups by condition id and the search.
-No request leaves the process."""
-
 import unittest
 from datetime import datetime, timezone
 from unittest import mock
@@ -27,10 +24,6 @@ def cid(n):
 
 
 class Gamma:
-    """A /markets endpoint over a set of open and closed markets. Like the real
-    one it returns closed markets only when asked for them, and at most `limit`
-    entries, 20 when no limit is sent."""
-
     def __init__(self, open_ids=(), closed_ids=(), fail_when=lambda ids: False):
         self.open_ids, self.closed_ids = set(open_ids), set(closed_ids)
         self.fail_when = fail_when
@@ -193,7 +186,6 @@ class SearchTests(unittest.TestCase):
         self.assertEqual(seen[0].params.get("q"), "fed rates")
 
     def test_it_asks_for_active_events_only(self):
-        # Without events_status the search returns markets that resolved years ago.
         seen = []
 
         def handler(request):

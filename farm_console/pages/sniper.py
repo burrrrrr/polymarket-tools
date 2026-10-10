@@ -1,9 +1,5 @@
-"""The Sniper page: a search over the open markets, the form that arms a watch
-on one outcome, the watches with what the worker published for each, and the
-disarm. The console holds no key: it arms and disarms rows in tools.db, and
-the worker fires them."""
-
 from contextlib import closing
+from functools import partial
 from typing import NamedTuple, Optional
 
 import httpx
@@ -33,21 +29,16 @@ FORM_DEFAULTS = {"side": "BUY", "price": "0.999", "size": "", "target_tick":
 
 
 def search_markets(query):
-    """The open markets matching the query, from Gamma."""
     with httpx.Client() as http:
         return gamma.search(http, query, timeout=TIMEOUT_S)
 
 
 def fetch_books(token_ids):
-    """{token_id: Levels} of these tokens' live books."""
     with httpx.Client() as http:
         return books.fetch_books(http, token_ids, timeout=TIMEOUT_S)
 
 
 class WatchView(NamedTuple):
-    """One watch as the page shows it: the row, the sentence for its state, the
-    age of the quote it shows, and its log lines."""
-
     row: tools_db.WatchRow
     tone: str
     sentence: str
@@ -64,14 +55,8 @@ def watch_view(row, keyed, log, now):
 
 def routes(ctx):
     router = APIRouter()
-
-    def render(request, template, status_code=200, **context):
-        """A tool page: its banner is the worker's, not the farmer's."""
-        now = ctx.clock()
-        with closing(ctx.connect()) as conn:
-            snap = ctx.snapshot(conn, now)
-        return ctx.render(request, template, now, snap, status_code, page="sniper",
-                          process="worker", ticks=TICKS, confirm_word=forms.ARM_WORD, **context)
+    render = partial(ctx.render_tool_page, page="sniper", ticks=TICKS,
+                     confirm_word=forms.ARM_WORD)
 
     def watches_context(conn):
         now = ctx.clock()
@@ -106,7 +91,6 @@ def routes(ctx):
                           **watches_context(conn), **context)
 
     def pick_of(params):
-        """The outcome an arm form is for, from its query or form fields."""
         pick = {name: (params.get(name) or "").strip() for name in ("token_id", "market", "label")}
         if not all(pick.values()):
             raise HTTPException(422, "an arm form needs a token id, a market and a label")

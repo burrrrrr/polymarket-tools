@@ -1,6 +1,3 @@
-"""What every page of the console shares. Reads go through farm_db and tools.db,
-derivation through views."""
-
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
@@ -20,11 +17,8 @@ from .scan import ScanRunner
 from .triage_runner import TriageRunner
 
 HERE = Path(__file__).parent
-# The farmer's built-in config, for settings with no override and no farmer run.
 FARMER_DEFAULTS = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))._asdict()
-# htmx refreshes the regions listening for this event after a market control.
 CONTROLS_EVENT = "controls"
-# How often an open Review page re-reads the live book and re-plans the orders.
 LIVE_POLL_S = 5
 
 
@@ -110,6 +104,15 @@ class Context:
     def render(self, request, template, now, snap, status_code=200, **context):
         return self.templates.TemplateResponse(request, template, {
             "chrome": self.chrome(snap, now), "now": now, **context}, status_code=status_code)
+
+    def render_tool_page(self, request, template, status_code=200, *, page, **context):
+        """A page of the worker's tools, at the clock's now and over a fresh
+        snapshot: its banner is the worker's, not the farmer's."""
+        now = self.clock()
+        with closing(self.connect()) as conn:
+            snap = self.snapshot(conn, now)
+        return self.render(request, template, now, snap, status_code, page=page,
+                           process="worker", **context)
 
     def find(self, conn, condition_id):
         found = farm_db.read_markets(conn, (condition_id,))

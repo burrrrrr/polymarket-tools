@@ -1,5 +1,3 @@
-"""The farm console's app: one Context that the pages share, and each page's routes."""
-
 import mimetypes
 from datetime import datetime, timezone
 
@@ -56,7 +54,6 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     app.include_router(overview.routes(ctx))
     app.include_router(markets.routes(ctx))
     app.include_router(activity.routes(ctx))
-    app.include_router(markets.controls(ctx))
     app.include_router(review.routes(ctx))
     app.include_router(discover.routes(ctx))
     app.include_router(orders.routes(ctx))

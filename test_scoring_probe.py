@@ -1,7 +1,3 @@
-"""Tests for the scoring probe's start: where its key and its client come from.
-The key loader and the CLOB connection are fakes, so no key is read and
-nothing is sent."""
-
 import contextlib
 import io
 import os
@@ -20,8 +16,6 @@ KEY = "0x" + "ab" * 32
 
 
 class Fakes:
-    """What main reaches for, replaced: each call is noted in `calls`."""
-
     def __init__(self, key=KEY, connect_raises=None):
         self.calls = []
         self.key, self.connect_raises = key, connect_raises

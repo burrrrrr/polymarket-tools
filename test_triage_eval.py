@@ -270,11 +270,7 @@ class RetroTest(EvalTest):
 
 
 class FetchResolutionTest(unittest.TestCase):
-    """fetch_resolution against a Gamma that records what it was asked."""
-
     def fetch(self, answer, condition_id="0xabc"):
-        """What fetch_resolution returns when Gamma answers every request with
-        answer, an httpx.Response. self.asked is each request it sent."""
         self.asked = []
 
         def gamma(request):

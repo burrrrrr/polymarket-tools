@@ -1,7 +1,5 @@
-"""The Orders page: the snapshots of the account's open orders, the job that asks
-the worker for a new one, and the restore of a snapshot from its page."""
-
 from contextlib import closing
+from functools import partial
 from typing import NamedTuple, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -16,18 +14,27 @@ from ..context import form_of, region_template, see_other
 
 ORDERS_REGIONS = {"job": "partials/orders_job.html",
                   "snapshots": "partials/orders_snapshots.html"}
-# How the lines of a job are grouped, in the order the page shows them: the
-# action, its title and the badge tone. PLACE is titled by the kind of job.
-LINE_GROUPS = (
-    (RestoreAction.ERROR, "Error", "t-r"),
-    (RestoreAction.REJECTED, "Rejected by the exchange", "t-r"),
-    (RestoreAction.PLACE, None, "t-q"),
-    (RestoreAction.SKIP_LIVE, "Skipped: already open", "t-n"),
-    (RestoreAction.SKIP_EXPIRED, "Skipped: expired", "t-n"),
-    (RestoreAction.SKIP_FARMER, "Skipped: the farmer's market", "t-n"),
-    (RestoreAction.SKIP_FILLED, "Skipped: nothing left to fill", "t-n"),
-)
 PREVIEW_FIRST = "Preview the restore first: placing follows a finished preview of this snapshot."
+
+
+class LineHeading(NamedTuple):
+    """How the page heads the lines of one action: its title and badge tone."""
+
+    action: RestoreAction
+    title: str
+    tone: str
+
+
+LINE_HEADINGS = (
+    LineHeading(RestoreAction.ERROR, "Error", "t-r"),
+    LineHeading(RestoreAction.REJECTED, "Rejected by the exchange", "t-r"),
+    LineHeading(RestoreAction.PLACED, "Placed", "t-q"),
+    LineHeading(RestoreAction.WOULD_PLACE, "Would place", "t-q"),
+    LineHeading(RestoreAction.SKIP_LIVE, "Skipped: already open", "t-n"),
+    LineHeading(RestoreAction.SKIP_EXPIRED, "Skipped: expired", "t-n"),
+    LineHeading(RestoreAction.SKIP_FARMER, "Skipped: the farmer's market", "t-n"),
+    LineHeading(RestoreAction.SKIP_FILLED, "Skipped: nothing left to fill", "t-n"),
+)
 
 
 class LineGroup(NamedTuple):
@@ -54,13 +61,13 @@ class RestoreView(NamedTuple):
 
 def restore_view(job, log, lines):
     preview = job.kind is JobKind.PREVIEW
-    groups = [LineGroup(title or ("Would place" if preview else "Placed"), tone, found,
-                        action is RestoreAction.PLACE and not preview)
-              for action, title, tone in LINE_GROUPS
-              if (found := [line for line in lines if line.action is action])]
+    groups = [LineGroup(heading.title, heading.tone, found,
+                        heading.action is RestoreAction.PLACED)
+              for heading in LINE_HEADINGS
+              if (found := [line for line in lines if line.action is heading.action])]
     to_place = None
     if preview and job.state is JobState.DONE:
-        to_place = sum(line.action is RestoreAction.PLACE for line in lines)
+        to_place = sum(line.action is RestoreAction.WOULD_PLACE for line in lines)
     return RestoreView(job, preview, log, groups, len(lines), to_place)
 
 
@@ -76,14 +83,7 @@ def placing_refusal(last):
 
 def routes(ctx):
     router = APIRouter()
-
-    def render(request, template, status_code=200, **context):
-        """A tool page: its banner is the worker's, not the farmer's."""
-        now = ctx.clock()
-        with closing(ctx.connect()) as conn:
-            snap = ctx.snapshot(conn, now)
-        return ctx.render(request, template, now, snap, status_code, page="orders",
-                          process="worker", **context)
+    render = partial(ctx.render_tool_page, page="orders")
 
     def orders_context(conn):
         job = tools_db.latest_job(conn, JobKind.SNAPSHOT)
@@ -113,8 +113,6 @@ def routes(ctx):
                       **restore_context(conn, snapshot), **context)
 
     def queue_restore_job(request, conn, snapshot, kind):
-        """Queue a preview or a restore of the snapshot with the markets the
-        farmer manages now, and go back to its page."""
         with closing(ctx.connect()) as farm:
             managed = sorted(farm_db.load_approved(farm))
         try:

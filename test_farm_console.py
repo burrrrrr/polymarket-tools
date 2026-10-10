@@ -525,7 +525,6 @@ def settle_total_rates():
 
 @contextlib.contextmanager
 def remote_api(respond):
-    """Answer the requests of remote's own client with respond(request); the requests."""
     requests = []
 
     def handle(request):

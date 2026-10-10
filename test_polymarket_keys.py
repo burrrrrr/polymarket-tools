@@ -1,7 +1,3 @@
-"""Tests for polymarket.keys: the private key from the environment or the
-Bitwarden vault. The CLI is a fake that keeps the vault's state, so the tests
-read whether the vault ends locked. The real bw never runs."""
-
 import json
 import os
 import unittest
@@ -18,10 +14,6 @@ LOGIN = {"id": "item-2", "name": "Polymarket login", "type": 1, "notes": "not th
 
 
 class FakeBw:
-    """The bw CLI over one vault. Reading an item needs the vault unlocked and
-    the session the unlock printed, or no session when the vault was unlocked
-    before the call, as with the user's own BW_SESSION."""
-
     def __init__(self, status="locked", items=(NOTE,), broken=(), garbage=()):
         self.status = status
         self.items = list(items)
@@ -65,7 +57,6 @@ def never_asked():
 
 
 def chain(exc):
-    """The exception and every exception chained to it."""
     while exc is not None:
         yield exc
         exc = exc.__cause__ or exc.__context__

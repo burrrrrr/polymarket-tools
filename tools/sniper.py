@@ -39,9 +39,9 @@ from tools.db import Guard, Reason, Sample, Settlement, WatchRow, WatchState
 # 15.5 ms and a worst 110 ms at the default 5 ms, against 0.08 ms and 0.35 ms at 0.5 ms.
 # The leg from the callback to the POST needs no hand-off and measured 0.03 ms either way.
 SWITCH_INTERVAL_S = 0.0005
-CONTROL_TICK_S = 0.05     # the control lane drains the outbox this often
-RECONCILE_S = 0.25        # and reads the open rows this often: the delay of a disarm
-PUBLISH_S = 1.0           # and samples tick, bid, ask into the rows this often
+CONTROL_TICK_S = 0.05
+RECONCILE_S = 0.25
+PUBLISH_S = 1.0
 POLL_S = 0.5
 SLOW_TICK_S = 0.05
 PRESIGN_S = 0.5
@@ -49,7 +49,7 @@ PRESIGN_MAX_AGE_S = 2.0   # a v2 signed order embeds its signing time
 RETRY_WINDOW_S = 10.0     # the tick event can arrive before the order endpoint takes the price
 RETRY_DELAY_S = 0.25
 BOOK_TIMEOUT_S = 5.0
-JOIN_RETRY_S = 2.0        # a watch whose book or prewarm failed waits this long for another go
+JOIN_RETRY_S = 2.0
 
 
 class Source(Enum):
@@ -117,9 +117,18 @@ class Cut(NamedTuple):
     last_reason: str
 
 
-# How a watch ends. settle() maps only a Posted to `fired`, and a Posted comes only
-# from orders.read_response.
-Outcome = Union[Missed, GuardRefused, Posted, Rehearsed, Rejected, Unanswered, Unsigned, Cut]
+class Disarmed(NamedTuple):
+    """A disarm request won the claim, so nothing was sent. The control lane
+    closes it directly, off the outbox."""
+
+
+class Interrupted(NamedTuple):
+    """Found firing when the worker started, so the order may rest. The
+    control lane closes it at open(), off the outbox."""
+
+
+Outcome = Union[Missed, GuardRefused, Posted, Rehearsed, Rejected, Unanswered, Unsigned, Cut,
+                Disarmed, Interrupted]
 
 
 class Prepared(NamedTuple):
@@ -167,24 +176,20 @@ def cents(price):
 
 
 def reached(tick, target):
-    """Whether `tick` is at or finer than the target."""
     return tick <= target
 
 
 def newest(*quotes):
-    """The latest of the per-lane quotes: the merge at the read boundary."""
     seen = [quote for quote in quotes if quote is not None]
     return max(seen, key=lambda quote: quote.at) if seen else None
 
 
 def last_tick(*quotes):
-    """The tick of the latest quote that carried one."""
     ticked = [quote for quote in quotes if quote is not None and quote.tick is not None]
     return max(ticked, key=lambda quote: quote.at).tick if ticked else None
 
 
 def fresh(presigned, tick, now):
-    """The presigned order, if it was signed for this tick under PRESIGN_MAX_AGE_S ago."""
     if presigned is None or presigned.tick != tick or now - presigned.at > PRESIGN_MAX_AGE_S:
         return None
     return presigned.order
@@ -205,8 +210,7 @@ def judge(guard, side, quote, now):
     if reference is None:
         return GuardRefused(Reason.GUARD_NO_QUOTE,
                             f"no {side_name} was seen before the tick change")
-    # A tolerance of 0.005 at 0.99 admits 0.985, whatever the floats say.
-    if abs(reference - guard.price) > guard.tolerance + 1e-9:
+    if not guard.admits(reference):
         return GuardRefused(Reason.GUARD_PRICE, f"the {side_name} was {cents(reference)}, not "
                                                 f"{cents(guard.price)} within "
                                                 f"{cents(guard.tolerance)}")
@@ -219,7 +223,6 @@ def retryable(attempt):
 
 
 def settle(outcome, attempts):
-    """Outcome to row: pure, total, and the only place a closing state is chosen."""
     if isinstance(outcome, Missed):
         return Settlement(WatchState.MISSED, Reason.AT_TARGET, outcome.tick, attempts=attempts)
     if isinstance(outcome, GuardRefused):
@@ -241,6 +244,10 @@ def settle(outcome, attempts):
             return Settlement(WatchState.DISARMED, None, outcome.last_reason, attempts=attempts)
         return Settlement(WatchState.FAILED, Reason.STOPPED, outcome.last_reason,
                           attempts=attempts)
+    if isinstance(outcome, Disarmed):
+        return Settlement(WatchState.DISARMED, None, "", attempts=attempts)
+    if isinstance(outcome, Interrupted):
+        return Settlement(WatchState.FAILED, Reason.INTERRUPTED, "", attempts=attempts)
     raise TypeError(f"not an Outcome: {outcome!r}")
 
 
@@ -293,8 +300,6 @@ def describe(event, watch):
 
 
 class LivePoster:
-    """Signs with the Signer and posts through `post`: the only caller of it."""
-
     def __init__(self, client, signer, post):
         self._client, self._signer, self._post = client, signer, post
 
@@ -338,11 +343,15 @@ class DryPoster:
 
 
 class Watch:
-    """One adopted row in memory. Every mutable field has one writing lane."""
+    """One adopted row in memory. Each mutable field is in the tuple of the one
+    lane that writes it; every other lane only reads it."""
 
+    CONTROL_WRITES = ("abort",)
+    SLOW_WRITES = ("not_before", "base_quote", "presigned", "presign_error")
+    FEED_WRITES = ("feed_quote",)
+    POLL_WRITES = ("poll_quote",)
     __slots__ = ("id", "token_id", "order", "target", "target_text", "guard", "dry_run", "poster",
-                 "_claim", "abort", "not_before", "base_quote", "feed_quote", "poll_quote",
-                 "presigned", "presign_error")
+                 "_claim", *CONTROL_WRITES, *SLOW_WRITES, *FEED_WRITES, *POLL_WRITES)
 
     def __init__(self, row, poster):
         self.id = row.id
@@ -354,13 +363,13 @@ class Watch:
         self.dry_run = row.dry_run
         self.poster = poster
         self._claim = threading.Lock()
-        self.abort = False                      # control lane, on a disarm; read by the slow lane
-        self.not_before = 0.0                   # slow lane: when to try adoption again
-        self.base_quote = None                  # slow lane, before the watch is routed
-        self.feed_quote = None                  # feed lane
-        self.poll_quote = None                  # poll lane
-        self.presigned = None                   # slow lane
-        self.presign_error = None               # slow lane
+        self.abort = False
+        self.not_before = 0.0
+        self.base_quote = None
+        self.feed_quote = None
+        self.poll_quote = None
+        self.presigned = None
+        self.presign_error = None
 
     def claim(self):
         """True for exactly one caller, ever. The winner decides the watch's end: a hot
@@ -395,8 +404,8 @@ class Sniper:
     UTC time the rows record; monotonic the seconds the lanes measure with.
     """
 
-    def __init__(self, db_path, http, stop, client=None, *, signer=None, post=post, feed=None,
-                 clock=utc_now, monotonic=time.monotonic):
+    def __init__(self, db_path, http, stop, client=None, *, signer=None, post=post,
+                 feed=MarketFeed, clock=utc_now, monotonic=time.monotonic):
         self._db_path = db_path
         self._http = http
         self._stop = stop
@@ -407,15 +416,15 @@ class Sniper:
         if signer is None and client is not None:
             signer = ticks.Signer(client, clock)
         self._signer = signer
-        self._feed = (feed or MarketFeed)([], self.on_update, on_error=self._feed_error)
+        self._feed = feed([], self.on_update, on_error=self._feed_error)
         self._conn = None
         self._failure = None
-        self._adopted = {}        # control writes: watch id -> Watch
-        self._armed = {}          # control writes: token id -> routed Watch; the lanes read
-        self._outbox = deque()    # any lane appends; control pops
-        self._joining = deque()   # control appends; slow pops
-        self._retries = deque()   # feed and poll append; slow pops
-        self._fires = []          # slow lane only
+        self._adopted: dict[int, Watch] = {}
+        self._armed: dict[str, Watch] = {}
+        self._control_inbox: deque[Event] = deque()
+        self._slow_adoptions: deque[Watch] = deque()
+        self._slow_retries: deque[Fire] = deque()
+        self._slow_fires: list[Fire] = []
         self._reconciled = self._published = float("-inf")
 
     def run(self):
@@ -452,19 +461,16 @@ class Sniper:
             self._failure = e
             self._stop.set()
 
-    # The lanes' steps. run() calls each from exactly one thread. A test calls them in
-    # the order that stages the interleaving it wants.
-
     def open(self):
         """Control. Open the connection and close every `firing` row a dead
-        worker left as failed, interrupted. Armed rows need nothing here: the
-        first tick() adopts them as it adopts any new row."""
+        worker left as failed, interrupted."""
         self._conn = db.open_db(self._db_path)
-        db.fail_interrupted(self._conn, self._clock())
+        db.close_firing(self._conn, settle(Interrupted(), None), db.INTERRUPTED_LINE,
+                        self._clock())
 
     def tick(self):
         """Control. Drain the outbox, and when due reconcile with the rows and
-        publish the quotes. The only SQLite in the sniper."""
+        publish the quotes."""
         self._drain()
         now = self._monotonic()
         if now - self._reconciled >= RECONCILE_S:
@@ -489,7 +495,7 @@ class Sniper:
         try:
             found = books.fetch_books(self._http, tokens, timeout=BOOK_TIMEOUT_S)
         except Exception as e:
-            self._outbox.append(Note(self._monotonic(), None, f"poll failed: {e}"))
+            self._control_inbox.append(Note(self._monotonic(), None, f"poll failed: {e}"))
             return
         for token_id, levels in found.items():
             watch = self._armed.get(token_id)
@@ -501,17 +507,19 @@ class Sniper:
         """Slow. In this order, so nothing delays a retry that is due: the
         retries, then one adoption, then the presigns that aged."""
         now = self._monotonic()
-        while self._retries:
-            self._fires.append(self._retries.popleft())
-        for fire in list(self._fires):
-            if now >= fire.next_at and self._retry(fire, now):
-                self._fires.remove(fire)
+        while self._slow_retries:
+            self._slow_fires.append(self._slow_retries.popleft())
+        for fire in list(self._slow_fires):
+            if now >= fire.next_at:
+                over = self._retry(fire, now)
+                if over:
+                    self._slow_fires.remove(fire)
         if self._stop.is_set():
             return
-        if not self._fires and self._joining:
-            watch = self._joining.popleft()
+        if not self._slow_fires and self._slow_adoptions:
+            watch = self._slow_adoptions.popleft()
             if now < watch.not_before:
-                self._joining.append(watch)
+                self._slow_adoptions.append(watch)
             else:
                 self._prepare(watch, now)
         for watch in list(self._armed.values()):
@@ -535,12 +543,7 @@ class Sniper:
         self._conn.close()
         self._conn = None
 
-    # The hot path.
-
     def _observe(self, watch, tick, bid, ask, source):
-        """One observation of a routed token. A tick at the target is the
-        trigger and its prices are never a quote, which keeps the guard's
-        quote from before the change."""
         if tick is not None and reached(tick, watch.target):
             self._trigger(watch, tick, source)
         elif bid is not None or ask is not None:
@@ -561,48 +564,43 @@ class Sniper:
                           newest(watch.base_quote, watch.feed_quote, watch.poll_quote))
         refused = judge(watch.guard, watch.order.side, trigger.quote, now)
         if refused is not None:
-            self._outbox.append(Resolved(watch.id, refused, trigger))
+            self._control_inbox.append(Resolved(watch.id, refused, trigger))
             return
-        self._outbox.append(Claimed(watch.id, trigger))
+        self._control_inbox.append(Claimed(watch.id, trigger))
         sent = self._monotonic()
         attempt = watch.poster.attempt(watch.order, trigger.tick,
                                        fresh(watch.presigned, trigger.tick, now))
         answered = self._monotonic()
         fire = Fire(watch, trigger, (sent - now) * 1000)
-        if not self._answer(fire, attempt, (answered - sent) * 1000, answered):
-            self._retries.append(fire)
+        over = self._answer(fire, attempt, (answered - sent) * 1000, answered)
+        if not over:
+            self._slow_retries.append(fire)
 
     def _answer(self, fire, attempt, post_ms, now):
-        """What one attempt's answer means. True when it ended the watch; a
-        plain refusal keeps the Fire for a retry instead, and _retry closes it
-        once the window has passed."""
         fire.attempts += 1
         if retryable(attempt):
             fire.last = attempt
             fire.next_at = now + RETRY_DELAY_S
-            self._outbox.append(Note(now, fire.watch.id,
+            self._control_inbox.append(Note(now, fire.watch.id,
                                      f"attempt {fire.attempts} refused: {attempt.reason}; retrying"))
             return False
-        self._outbox.append(Resolved(fire.watch.id, attempt, fire.trigger, fire.attempts,
+        self._control_inbox.append(Resolved(fire.watch.id, attempt, fire.trigger, fire.attempts,
                                      fire.send_ms, post_ms))
         return True
 
     def _retry(self, fire, now):
-        """Slow. One due retry; True when the Fire is over."""
         watch = fire.watch
         if watch.abort or self._stop.is_set():
             cut = Cut(CutBy.DISARM if watch.abort else CutBy.STOP, fire.last.reason)
-            self._outbox.append(Resolved(watch.id, cut, fire.trigger, fire.attempts, fire.send_ms))
+            self._control_inbox.append(Resolved(watch.id, cut, fire.trigger, fire.attempts, fire.send_ms))
             return True
         if now >= fire.deadline:
-            self._outbox.append(Resolved(watch.id, fire.last, fire.trigger, fire.attempts,
+            self._control_inbox.append(Resolved(watch.id, fire.last, fire.trigger, fire.attempts,
                                          fire.send_ms))
             return True
         attempt = watch.poster.attempt(watch.order, fire.trigger.tick, None)
         answered = self._monotonic()
         return self._answer(fire, attempt, (answered - now) * 1000, answered)
-
-    # The slow lane's adoption.
 
     def _prepare(self, watch, now):
         if watch.claimed:
@@ -617,7 +615,7 @@ class Sniper:
         tick = levels.tick
         if tick is not None and reached(tick, watch.target):
             if watch.claim():
-                self._outbox.append(Resolved(watch.id, Missed(text(tick))))
+                self._control_inbox.append(Resolved(watch.id, Missed(text(tick))))
             return
         watch.base_quote = Quote(books.best_bid(levels), books.best_ask(levels),
                                  text(tick) if tick is not None else None, Source.BASELINE, now)
@@ -627,12 +625,12 @@ class Sniper:
             self._later(watch, now, f"prewarm failed: {e}")
             return
         self._presign(watch, now)
-        self._outbox.append(Prepared(watch))
+        self._control_inbox.append(Prepared(watch))
 
     def _later(self, watch, now, message):
-        self._outbox.append(Note(now, watch.id, f"{message}; trying again in {JOIN_RETRY_S:g} s"))
+        self._control_inbox.append(Note(now, watch.id, f"{message}; trying again in {JOIN_RETRY_S:g} s"))
         watch.not_before = now + JOIN_RETRY_S
-        self._joining.append(watch)
+        self._slow_adoptions.append(watch)
 
     def _presign(self, watch, now):
         try:
@@ -641,22 +639,20 @@ class Sniper:
             message = f"{type(e).__name__}: {e}"
             if message != watch.presign_error:
                 watch.presign_error = message
-                self._outbox.append(Note(now, watch.id,
+                self._control_inbox.append(Note(now, watch.id,
                                          f"presign failed, signing at fire time: {message}"))
             return
         watch.presign_error = None
         watch.presigned = Presigned(signed, watch.target_text, now) if signed is not None else None
 
-    # The control lane's SQLite.
-
     def _feed_error(self, error):
-        self._outbox.append(Note(self._monotonic(), None,
+        self._control_inbox.append(Note(self._monotonic(), None,
                                  f"feed: {type(error).__name__}: {error}; reconnecting"))
 
     def _drain(self):
         routed = set(self._armed)
-        while self._outbox:
-            event = self._outbox.popleft()
+        while self._control_inbox:
+            event = self._control_inbox.popleft()
             now = self._clock()
             if isinstance(event, Note):
                 targets = [event.watch_id] if event.watch_id else [w.id for w in self._armed.values()]
@@ -673,10 +669,10 @@ class Sniper:
                     self._log(now, watch, event)
             elif isinstance(event, Claimed):
                 trigger, quote = event.trigger, event.trigger.quote
-                db.mark_firing(self._conn, watch.id, self._wall(now, trigger.at),
+                db.mark_firing(self._conn, watch.id, self._wall_of(trigger.at, now),
                                trigger.source.value, trigger.tick,
                                quote.bid if quote else None, quote.ask if quote else None,
-                               self._wall(now, quote.at) if quote else None)
+                               self._wall_of(quote.at, now) if quote else None)
                 self._log(now, watch, event)
             else:
                 closed = db.close_watch(self._conn, watch.id, settle(event.outcome, event.attempts),
@@ -690,9 +686,8 @@ class Sniper:
         for line in describe(event, watch):
             db.append_log(self._conn, now, line, watch_id=watch.id)
 
-    def _wall(self, now, at):
-        """The wall-clock time of a monotonic instant, as of now."""
-        return now - timedelta(seconds=self._monotonic() - at)
+    def _wall_of(self, monotonic_at, wall_now):
+        return wall_now - timedelta(seconds=self._monotonic() - monotonic_at)
 
     def _forget(self, watch):
         self._adopted.pop(watch.id, None)
@@ -718,7 +713,7 @@ class Sniper:
                   and (row.dry_run or self._client is not None)):
                 watch = Watch(row, self._poster(row))
                 self._adopted[row.id] = watch
-                self._joining.append(watch)
+                self._slow_adoptions.append(watch)
         for watch in list(self._adopted.values()):
             if watch.id not in open_ids:
                 watch.claim()
@@ -726,12 +721,11 @@ class Sniper:
         self._route(routed)
 
     def _route(self, before):
-        """Tell the feed the routed tokens, when they changed since `before`."""
         if set(self._armed) != before:
             self._feed.set_tokens(list(self._armed))
 
     def _disarm(self, watch_id, now):
-        db.close_watch(self._conn, watch_id, Settlement(WatchState.DISARMED, None, ""), now)
+        db.close_watch(self._conn, watch_id, settle(Disarmed(), None), now)
         db.append_log(self._conn, now, "disarmed", watch_id=watch_id)
 
     def _poster(self, row):

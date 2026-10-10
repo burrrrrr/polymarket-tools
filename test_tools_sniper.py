@@ -1,8 +1,3 @@
-"""Tests for tools.sniper: the pure rules (the guard, the settlement, the log
-lines) and the four lanes as steps a test calls in the order that stages each
-race. No thread runs, nothing sleeps, no clock ticks on its own, and the book,
-the feed, the signer and the post are fakes, so nothing is sent."""
-
 import json
 import os
 import sqlite3
@@ -34,8 +29,6 @@ def quote(bid=0.99, ask=0.995, tick="0.01", source=Source.POLL, at=0.0):
 
 
 class Signed:
-    """What the fake signer hands back: the order, the tick and a serial."""
-
     def __init__(self, order, tick, serial):
         self.order, self.tick, self.serial = order, tick, serial
 
@@ -60,9 +53,6 @@ class FakeSigner:
 
 
 class FakePost:
-    """orders.post as a fake: answers come from `answers`, a list consumed in
-    order or a callable of the signed order; the last one repeats."""
-
     def __init__(self, *answers):
         self.answers = list(answers) or [Posted("0xnew")]
         self.calls = []
@@ -78,8 +68,6 @@ class FakePost:
 
 
 class FakeFeed:
-    """The feed as the Sniper builds it: it records every token set."""
-
     built = []
 
     def __init__(self, token_ids, on_update, *, on_error):
@@ -103,8 +91,6 @@ class Monotonic:
 
 
 class Harness(unittest.TestCase):
-    """A Sniper over a scratch tools.db, with every lane a step to call."""
-
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -157,12 +143,10 @@ class Harness(unittest.TestCase):
         return db.arm_watch(self.db, new, self.clock_now)
 
     def tick(self, seconds=1.0):
-        """One control tick, due for reconcile and publish."""
         self.mono.now += seconds
         self.snipe.tick()
 
     def adopt(self, *tokens, book=("0.01", 0.99, 0.995)):
-        """Arm and route these tokens: the book is read, the order presigned."""
         ids = []
         for token in tokens:
             self.books[token] = book
@@ -399,9 +383,6 @@ class FireTests(Harness):
                          (WatchState.FIRED, "poll"))
 
     def test_the_frame_that_carries_the_new_tick_cannot_change_the_book_the_guard_reads(self):
-        # A book message at the new tick gives its tick first and then its
-        # prices, which sit far from the guard's price. The guard judged the
-        # last quote before the change.
         watch_id = self.adopt(T)
         self.snipe.on_update(Update(T, None, None, 0.99, 0.995, Kind.PRICE_CHANGE))
         self.snipe.on_update(Update(T, 0.001, None, None, None, Kind.BOOK))
@@ -543,7 +524,6 @@ class AnswerTests(Harness):
             self.snipe.tick()
             steps += 1
         self.assert_closed(watch_id, WatchState.FAILED, Reason.VENUE, TICK_RULE)
-        # The first attempt, then one every RETRY_DELAY_S until the window closes.
         self.assertEqual(len(self.post.calls), int(RETRY_WINDOW_S / RETRY_DELAY_S))
         self.assertEqual(self.row(watch_id).attempts, len(self.post.calls))
         self.assertIn("the retry window closed", self.lines(watch_id)[-1])
@@ -799,8 +779,6 @@ class PublishTests(Harness):
 
 
 class RunTests(Harness):
-    """run() on its own threads, stopped at once: the one test that starts them."""
-
     def test_run_opens_starts_the_lanes_and_closes_them_when_stopped(self):
         self.build()
         self.snipe.close()

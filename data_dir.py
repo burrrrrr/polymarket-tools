@@ -17,8 +17,7 @@ from pathlib import Path
 
 VARIABLE = "POLYMARKET_DATA_DIR"
 REPO = Path(__file__).parent
-# For a --help, which is printed before .env is read.
-WHERE = f"in {VARIABLE}, or in the repo directory when that is not set"
+LOCATION_HELP = f"in {VARIABLE}, or in the repo directory when that is not set"
 
 
 class NoDataDir(Exception):

@@ -1,6 +1,3 @@
-"""HTTP plumbing every read of Polymarket shares: the rate-limit retry, requests
-sent in chunks, and the one connection the order path keeps open."""
-
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -55,7 +52,6 @@ def persistent_client():
 
 def use_for_sdk(http):
     """Send every py_clob_client_v2 request through http, for the whole process:
-    the SDK keeps one module-level client. Only a keyed entry point calls this."""
-    # Imported here so a keyless process can import this module without loading the SDK.
+    the SDK keeps one module-level client."""
     import py_clob_client_v2.http_helpers.helpers as sdk_http
     sdk_http._http_client = http

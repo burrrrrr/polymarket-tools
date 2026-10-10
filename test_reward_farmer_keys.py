@@ -1,8 +1,3 @@
-"""Tests for the farmer's start: the farm.db it opens, the region a live run is
-checked against and where its key and client come from. The region check, the
-key loader, the CLOB connection and the farmer's loop are fakes, so no key is
-read, nothing is sent and no database is opened."""
-
 import contextlib
 import io
 import os
@@ -25,8 +20,6 @@ BLOCKED = Verdict(False, "US: the API rejects new orders from here")
 
 
 class Fakes:
-    """What main reaches for, replaced: each call is noted in `calls`."""
-
     def __init__(self, verdict=ALLOWED, key=KEY, connect_raises=None):
         self.calls = []
         self.verdict, self.key, self.connect_raises = verdict, key, connect_raises
@@ -63,8 +56,6 @@ class Fakes:
 
 class Start(unittest.TestCase):
     def main(self, argv, fakes=None, stdin="", dotenv=None):
-        """main's exit code, what it printed and the fakes it reached. dotenv is
-        what the .env file sets when main loads it."""
         fakes = fakes or Fakes()
         out = io.StringIO()
         self.stdin = io.StringIO(stdin)

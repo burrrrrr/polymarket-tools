@@ -1,8 +1,3 @@
-"""Tests for the watches half of tools.db: the rows the console arms and the
-worker fires, their constraints run against real SQLite, the two console
-writes, the worker's writes, the reads the Sniper page needs, and the sentence
-it shows for a row."""
-
 import os
 import sqlite3
 import tempfile
@@ -23,7 +18,6 @@ def later(seconds):
 
 
 def form(**changes):
-    """The arm form as the page posts it, for a guarded live watch."""
     fields = {"token_id": TOKEN, "market": MARKET, "label": "Will it? -> Yes", "side": "BUY",
               "price": "0.999", "size": "100", "target_tick": "0.001", "guard": "1",
               "guard_price": "0.99", "guard_tolerance": "0.005", "guard_max_age_s": "5",
@@ -201,12 +195,14 @@ class WorkerWriteTests(Scratch):
         self.assertEqual((row.state, row.reason, row.detail), (WatchState.REJECTED,
                                                                Reason.GUARD_PRICE, "bid was 97.0c"))
 
-    def test_a_watch_found_firing_when_a_worker_starts_is_failed_as_interrupted(self):
+    def test_a_watch_found_firing_when_a_worker_starts_is_closed_with_the_settlement_given(self):
         left, armed, done = self.arm(), self.arm(token_id=OTHER), self.arm(token_id="73" * 38)
         self.fire(left)
         self.fire(done)
         db.close_watch(self.db, done, fired(), later(1))
-        self.assertEqual(db.fail_interrupted(self.db, later(60)), [left])
+        interrupted = Settlement(WatchState.FAILED, Reason.INTERRUPTED, "")
+        self.assertEqual(db.close_firing(self.db, interrupted, db.INTERRUPTED_LINE, later(60)),
+                         [left])
         row = self.row(left)
         self.assertEqual((row.state, row.reason, row.resolved_at),
                          (WatchState.FAILED, Reason.INTERRUPTED, later(60)))
@@ -215,7 +211,8 @@ class WorkerWriteTests(Scratch):
         self.assertEqual(self.row(done).state, WatchState.FIRED)
         self.assertEqual([line.message for line in db.read_watch_log(self.db, left)],
                          [db.INTERRUPTED_LINE])
-        self.assertEqual(db.fail_interrupted(self.db, later(61)), [])
+        self.assertEqual(db.close_firing(self.db, interrupted, db.INTERRUPTED_LINE, later(61)),
+                         [])
 
     def test_samples_land_on_armed_watches_only(self):
         armed, firing = self.arm(), self.arm(token_id=OTHER)
@@ -230,8 +227,6 @@ class WorkerWriteTests(Scratch):
 
 
 class ConstraintTests(Scratch):
-    """Every illegal write, run against SQLite itself, so no process can store one."""
-
     def refused(self, sql, *params):
         with self.assertRaises(sqlite3.IntegrityError):
             self.raw(sql, *params)
@@ -318,9 +313,6 @@ class LogTests(Scratch):
 
 
 class DescribeTests(Scratch):
-    """The sentence the page shows for a row. keyed is the running worker's key
-    flag, or None when no worker runs."""
-
     def said(self, watch_id, keyed=True, now=later(10)):
         return db.describe(self.row(watch_id), keyed, now)
 

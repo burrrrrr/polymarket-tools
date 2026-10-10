@@ -1,6 +1,3 @@
-"""The account's open orders as the CLOB lists them, and the one way to post an
-order and read the CLOB's answer."""
-
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,13 +7,11 @@ from typing import NamedTuple, Optional
 from polymarket.parse import as_float
 from polymarket.region import GEOBLOCK_MARKER
 
-# The CLOB's names for an order that rests until it is cancelled and for one
-# that rests until its expiration.
 GTC, GTD = "GTC", "GTD"
 
-# Refusals that no retry can change: the address is blocked, the account cannot
-# fund the order, or a post-only order would take liquidity. Matched in lower
-# case anywhere in a Rejected's reason.
+# The CLOB refuses an order that expires within a minute.
+MIN_EXPIRES_AFTER_S = 60
+
 TERMINAL_REFUSALS = (GEOBLOCK_MARKER, "http 451", "not enough balance", "allowance",
                      "crosses book")
 
@@ -114,7 +109,7 @@ def read_response(answer):
 def terminal(rejected):
     """Whether no retry of this refused order can succeed."""
     reason = rejected.reason.lower()
-    return any(refusal in reason for refusal in TERMINAL_REFUSALS)
+    return any(refusal.lower() in reason for refusal in TERMINAL_REFUSALS)
 
 
 def _message(body):

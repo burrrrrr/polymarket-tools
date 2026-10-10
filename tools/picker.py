@@ -1,7 +1,3 @@
-"""The sniper's picker: which outcomes of a market search are a setup worth
-watching, and in what order to show them. Pure: the page fetches the search
-and the books and hands them here."""
-
 import difflib
 import re
 from typing import NamedTuple, Optional
@@ -10,6 +6,9 @@ from polymarket import books
 from polymarket.orders import Side
 
 RESULT_LIMIT = 25
+# A text that contains the whole query scores at least the floor, and up to the
+# coverage more as the query covers more of the text.
+SUBSTRING_FLOOR, SUBSTRING_COVERAGE = 0.9, 0.1
 
 
 class Candidate(NamedTuple):
@@ -27,8 +26,6 @@ class Candidate(NamedTuple):
 
 
 class Verdict(NamedTuple):
-    """Whether an outcome is a setup to watch, and the note the page shows."""
-
     ready: bool
     note: str
 
@@ -44,16 +41,12 @@ def _words(text):
 
 
 def score(query, text):
-    """How well text matches the query, from 0 to 1. Gamma's search decides
-    which markets come back; this only reranks them, so a blend of a substring
-    hit, sequence similarity and word overlap is enough. Word overlap is what
-    makes an out-of-order query match."""
+    """How well text matches the query, from 0 to 1."""
     query, text = (query or "").strip().lower(), (text or "").lower()
     if not query or not text:
         return 0.0
     if query in text:
-        # The shortest title holding the whole query comes first.
-        similarity = 0.9 + 0.1 * (len(query) / len(text))
+        similarity = SUBSTRING_FLOOR + SUBSTRING_COVERAGE * (len(query) / len(text))
     else:
         similarity = difflib.SequenceMatcher(None, query, text).ratio()
     words = _words(query)
@@ -95,7 +88,7 @@ def status(candidate, book, side, guard, target_tick):
     price = books.best_bid(book) if side is Side.BUY else books.best_ask(book)
     if price is None:
         return Verdict(False, f"no {name}")
-    if abs(price - guard.price) > guard.tolerance + 1e-9:
+    if not guard.admits(price):
         return Verdict(False, f"{name} at {price * 100:.1f}c")
     return Verdict(True, "ready")
 

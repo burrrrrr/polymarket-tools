@@ -1,5 +1,3 @@
-"""Order books from the CLOB: one token's bid and ask levels and its tick."""
-
 from typing import NamedTuple, Optional
 
 from polymarket.hosts import CLOB_HOST
@@ -53,11 +51,7 @@ def fetch_book(http, token_id, timeout=20):
 def request_books(http, token_ids, timeout=20):
     """The entries of one /books request for these tokens, at most
     BOOKS_REQUEST_LIMIT of them, as the CLOB sent them. Raises when the request
-    fails.
-
-    A caller that carries on without a failed request catches around this and
-    reads the entries with parse_books.
-    """
+    fails."""
     resp = http.post(f"{CLOB_HOST}/books", json=[{"token_id": t} for t in token_ids],
                      timeout=timeout)
     resp.raise_for_status()
@@ -73,9 +67,8 @@ def parse_books(entries):
 def fetch_books(http, token_ids, timeout=20):
     """{token_id: Levels}, from one /books request for each BOOKS_REQUEST_LIMIT tokens.
 
-    The tick comes with the levels, so this never reads the SDK's tick cache,
-    which does not expire. A token the CLOB does not know is absent from the
-    result. Raises when any request fails.
+    A token the CLOB does not know is absent from the result. Raises when any
+    request fails.
     """
     books = {}
     for entries in in_chunks(lambda chunk: request_books(http, chunk, timeout), token_ids,

@@ -1,5 +1,3 @@
-"""Tests for polymarket.hosts: the defaults and the environment overrides."""
-
 import importlib
 import os
 import unittest

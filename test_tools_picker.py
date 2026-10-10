@@ -1,7 +1,3 @@
-"""Tests for tools.picker: the Sniper page's search ranking and the check that
-says whether an outcome is a setup worth watching. Pure functions over Gamma's
-markets and the CLOB's books, nothing fetched."""
-
 import unittest
 from datetime import datetime, timezone
 
@@ -101,8 +97,6 @@ class RankTests(unittest.TestCase):
         ranked = picker.rank(found, books, Side.BUY, GUARD, "0.001")
         self.assertEqual([(r.candidate.token_id, r.verdict.ready) for r in ranked][:3],
                          [("555", True), ("111", True), ("333", False)])
-        # Among the rest, the shorter title holding the query outranks the
-        # longer one, and relevance comes before volume.
         self.assertEqual([r.candidate.token_id for r in ranked][3:], ["444", "666", "222"])
 
 

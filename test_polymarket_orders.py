@@ -1,6 +1,3 @@
-"""Tests for polymarket.orders: the open-order listing, and posting an order and
-reading the CLOB's answer. The client is a fake, so nothing is signed or sent."""
-
 import unittest
 from datetime import datetime, timezone
 
@@ -16,7 +13,6 @@ MARKET = "0x" + "08" * 32
 
 
 def entry(**changes):
-    """An open order as the CLOB lists it: numbers and the expiration are strings."""
     return {"id": "0xorder1", "status": "LIVE", "market": MARKET, "asset_id": TOKEN,
             "side": "BUY", "original_size": "2000", "size_matched": "150.5", "price": "0.986",
             "outcome": "No", "expiration": "1791157113", "order_type": "GTD",
@@ -110,14 +106,10 @@ GEOBLOCKED = ("Trading restricted in your region, please refer to available regi
 
 
 def refused(status, body):
-    """What the SDK raises when the CLOB answers with this status and JSON body."""
     return PolyApiException(httpx.Response(status, json=body))
 
 
 class Venue:
-    """A client that answers each post with the next of `answers`, raising the
-    ones that are exceptions, and records what it was asked to post."""
-
     def __init__(self, *answers):
         self.answers = list(answers)
         self.posts = []

@@ -1,10 +1,3 @@
-"""Tests for polymarket.ticks: signing an order at the tick its market has now.
-
-The client is the installed SDK's, with a throwaway key and its GET replaced by
-canned answers, so the signing and the SDK's tick cache are the real ones and
-nothing is sent.
-"""
-
 import unittest
 from datetime import datetime, timezone
 
@@ -22,9 +15,6 @@ EXPIRES = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
 
 
 class OfflineClob(ClobClient):
-    """The SDK's client over a market whose tick the test sets. It records
-    the path of every GET and refuses to send anything else."""
-
     def __init__(self, tick):
         super().__init__("https://clob.invalid", chain_id=137, key=KEY)
         self.tick = tick
@@ -51,13 +41,11 @@ class OfflineClob(ClobClient):
 
 
 def bid(signed):
-    """(dollars paid, shares bought) of a signed buy, in millionths."""
     return int(signed.makerAmount), int(signed.takerAmount)
 
 
 class RefreshTests(unittest.TestCase):
     def test_the_sdk_rounds_a_price_to_a_tick_it_remembers(self):
-        # The hazard this module exists for: a bid at 98.5c goes out at 98c.
         clob = OfflineClob(tick=0.01)
         clob.get_tick_size(TOKEN)
         clob.tick = 0.001
@@ -124,9 +112,6 @@ class SignTests(unittest.TestCase):
 
 
 class SignerTests(unittest.TestCase):
-    """The sniper's signer: it signs at a tick the market has not reached, and
-    once a token is prewarmed, signing sends nothing."""
-
     def setUp(self):
         self.clob = OfflineClob(tick=0.01)
         self.signer = ticks.Signer(self.clob, lambda: EXPIRES)
@@ -144,7 +129,6 @@ class SignerTests(unittest.TestCase):
         self.assertEqual(signed.tokenId, TOKEN)
 
     def test_it_signs_at_the_target_tick_whatever_tick_the_client_remembers(self):
-        # The market is still at 0.01 when the order is presigned for 0.001.
         self.clob.get_tick_size(TOKEN)
         self.signer.prewarm(TOKEN)
         self.assertEqual(bid(self.signer.sign(self.order(), "0.001")), (99_900_000, 100_000_000))

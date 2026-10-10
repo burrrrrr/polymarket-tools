@@ -1,7 +1,3 @@
-"""The worker's loop: it beats in tools.db, claims the jobs the console queued
-and runs them, one at a time, on a thread of their own, and runs the sniper
-on another beside them."""
-
 import os
 import threading
 from contextlib import closing
@@ -89,7 +85,6 @@ class JobThread:
         self._stop = threading.Event()
 
     def tick(self, conn):
-        """Claim the next job and start it, unless one is still running."""
         if self._thread is not None and self._thread.is_alive():
             return
         job = db.claim_job(conn, self.clock())
@@ -98,7 +93,6 @@ class JobThread:
             self._thread.start()
 
     def join(self):
-        """Wait for the running job to finish."""
         if self._thread is not None:
             self._thread.join()
 

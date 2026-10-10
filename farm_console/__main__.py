@@ -34,9 +34,9 @@ def main():
     parser = argparse.ArgumentParser(prog="python -m farm_console",
                                      description="Local web console for the reward farmer.")
     parser.add_argument("--db", help="SQLite file, the production database (default: farm.db "
-                                     f"{data_dir.WHERE})")
+                                     f"{data_dir.LOCATION_HELP})")
     parser.add_argument("--tools-db", help="SQLite file shared with the worker (default: "
-                                           f"tools.db {data_dir.WHERE})")
+                                           f"tools.db {data_dir.LOCATION_HELP})")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port (default: {DEFAULT_PORT})")
     args = parser.parse_args()

@@ -1,5 +1,3 @@
-"""The Overview page, and the sidebar status and banner that every page carries."""
-
 from contextlib import closing
 
 from fastapi import APIRouter, Request

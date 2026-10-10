@@ -1,7 +1,4 @@
-"""Restoring a snapshot: plan() decides what to do with each of its orders, and
-place() signs and posts the ones that are missing.
-
-A restore is safe to run again. Its plan is made against the orders open at
+"""A restore is safe to run again. Its plan is made against the orders open at
 that moment, so an order an earlier run placed is skipped as open.
 """
 
@@ -10,16 +7,13 @@ from datetime import timedelta
 from typing import NamedTuple
 
 from polymarket import orders, ticks
-from polymarket.orders import GTC, GTD, Posted, Rejected, Unanswered
+from polymarket.orders import GTC, GTD, MIN_EXPIRES_AFTER_S, Posted, Rejected, Unanswered
 from tools import db
 from tools.db import RestoreAction
 
-# The CLOB refuses an order that expires within a minute. The second minute is
-# for the job to reach the order.
-EXPIRY_MARGIN = timedelta(minutes=2)
-# This many posts in a row with no answer end the restore: every further post
-# would be one more order that may or may not rest.
-MAX_UNANSWERED = 3
+# The minute on top of the CLOB's is for the job to reach the order.
+EXPIRY_MARGIN = timedelta(seconds=MIN_EXPIRES_AFTER_S) + timedelta(minutes=1)
+MAX_UNANSWERED_IN_A_ROW = 3
 MAY_REST = "the order may rest: check your open orders"
 
 SKIPS = (RestoreAction.SKIP_LIVE, RestoreAction.SKIP_EXPIRED, RestoreAction.SKIP_FARMER,
@@ -27,8 +21,8 @@ SKIPS = (RestoreAction.SKIP_LIVE, RestoreAction.SKIP_EXPIRED, RestoreAction.SKIP
 
 
 class PlanLine(NamedTuple):
-    """What a restore would do with one snapshot order: PLACE or one of SKIPS,
-    the size left of the order to place, and why."""
+    """What a restore would do with one snapshot order: WOULD_PLACE or one of
+    SKIPS, the size left of the order to place, and why."""
 
     order: db.SnapshotOrder
     action: RestoreAction
@@ -76,10 +70,10 @@ def plan(snapshot_orders, live_orders, managed_markets, now):
             copies[_key(order)] -= 1
             action, reason = RestoreAction.SKIP_LIVE, "an open order matches it"
         elif order.size_matched > 0:
-            action = RestoreAction.PLACE
+            action = RestoreAction.WOULD_PLACE
             reason = f"{order.size_matched:g} of {order.size:g} had filled"
         else:
-            action, reason = RestoreAction.PLACE, "not open"
+            action, reason = RestoreAction.WOULD_PLACE, "not open"
         lines.append(PlanLine(stored, action, order.remaining, reason))
     return lines
 
@@ -102,8 +96,8 @@ def place(client, conn, job, clock, stop):
 
     Raises when the open orders cannot be listed, having placed nothing.
     Raises Stopped when the job waited longer than db.RESTORE_MAX_WAIT for a
-    worker, when `stop` is set between two orders, and after MAX_UNANSWERED
-    posts in a row got no answer. The lines stored by then stay.
+    worker, when `stop` is set between two orders, and after
+    MAX_UNANSWERED_IN_A_ROW posts got no answer. The lines stored by then stay.
     """
     waited, limit = clock() - job.created_at, db.RESTORE_MAX_WAIT
     if waited > limit:
@@ -113,15 +107,15 @@ def place(client, conn, job, clock, stop):
     planned = _planned(client, conn, job, clock())
     lines, tick_of, unanswered = [], {}, 0
     for line in planned:
-        if stop.is_set() or unanswered == MAX_UNANSWERED:
+        if stop.is_set() or unanswered == MAX_UNANSWERED_IN_A_ROW:
             why = ("the worker stopped" if stop.is_set() else
                    f"{unanswered} posts in a row got no answer from the CLOB")
             raise Stopped(f"{why} after {len(lines)} of {len(planned)} orders ({summary(lines)})")
         action, order_id, detail = line.action, None, line.reason
-        if action is RestoreAction.PLACE:
+        if action is RestoreAction.WOULD_PLACE:
             answer = _send(client, line, tick_of)
             if isinstance(answer, Posted):
-                order_id, unanswered = answer.order_id, 0
+                action, order_id, unanswered = RestoreAction.PLACED, answer.order_id, 0
             elif isinstance(answer, Rejected):
                 action, detail, unanswered = RestoreAction.REJECTED, answer.reason, 0
             elif isinstance(answer, Unanswered):
@@ -140,8 +134,9 @@ def summary(lines, preview=False):
     others = [(counts[RestoreAction.REJECTED], "rejected"),
               (counts[RestoreAction.ERROR], "in error"),
               (sum(counts[skip] for skip in SKIPS), "skipped")]
-    return ", ".join([f"{counts[RestoreAction.PLACE]} {'to place' if preview else 'placed'}",
-                      *(f"{n} {what}" for n, what in others if n)])
+    placing = (f"{counts[RestoreAction.WOULD_PLACE]} to place" if preview
+               else f"{counts[RestoreAction.PLACED]} placed")
+    return ", ".join([placing, *(f"{n} {what}" for n, what in others if n)])
 
 
 def _planned(client, conn, job, now):
@@ -157,12 +152,6 @@ def _key(order):
 
 
 def _send(client, line, tick_of):
-    """Sign one planned order at its market's tick and post it, post-only.
-
-    Returns what orders.post answered, or Unsent when the tick could not be
-    read or the order could not be signed. tick_of remembers each market's
-    tick for the job.
-    """
     order = line.order.order
     try:
         if order.market not in tick_of:

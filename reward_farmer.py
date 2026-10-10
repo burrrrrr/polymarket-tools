@@ -2551,7 +2551,7 @@ Examples:
   python reward_farmer.py --live --capital 300     # real orders
         """,
     )
-    parser.add_argument("--db", help=f"SQLite file (default: farm.db {data_dir.WHERE})")
+    parser.add_argument("--db", help=f"SQLite file (default: farm.db {data_dir.LOCATION_HELP})")
     parser.add_argument("--live", action="store_true",
                         help="Sign and post real orders (default: dry run)")
     parser.add_argument("--key-stdin", action="store_true",
@@ -2614,7 +2614,6 @@ Examples:
 
 def connect(args):
     """An authenticated client for a live run, or None after saying why there is none."""
-    # Imported here because the console imports this module and holds no key.
     from polymarket import client as polymarket_client
     from polymarket import keys
 

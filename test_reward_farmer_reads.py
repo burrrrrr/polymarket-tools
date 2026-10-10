@@ -1,6 +1,3 @@
-"""Tests for the order and the retries of the farmer's read of Gamma's market
-records. No request leaves the process."""
-
 import threading
 import unittest
 from unittest import mock
@@ -11,8 +8,6 @@ import reward_farmer
 
 
 def gamma_api(*statuses):
-    """An httpx client whose Gamma /markets answers with statuses in turn, then
-    with no market; and its requests, each with the thread that sent it."""
     calls = []
 
     def handle(request):

@@ -1,6 +1,3 @@
-"""Snapshots of the account's open orders: taking one, and importing the JSON
-files the old snapshot script saved."""
-
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,7 +76,6 @@ def import_files(conn, directory, local_zone=None):
 
 
 def _read_file(path, local_zone):
-    """(the UTC time a snapshot file was taken, [(OpenOrder, market name or None)])."""
     try:
         with open(path, encoding="utf-8") as f:
             saved = json.load(f)

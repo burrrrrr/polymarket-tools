@@ -1,5 +1,3 @@
-"""The event stream that tells an open page when to refresh its regions."""
-
 import asyncio
 
 from fastapi import APIRouter, Request

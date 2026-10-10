@@ -1,7 +1,3 @@
-"""Tests for python -m tools: the worker's entry point and the tools.db it opens.
-The region check, the key loader, the CLOB connection and the worker loop are
-fakes, so no key is read and nothing is sent."""
-
 import contextlib
 import io
 import json
@@ -27,15 +23,12 @@ OPEN_DB = db.open_db
 
 
 def open_scratch(path):
-    """open_db for a main under test, which never opens the repo's own tools.db."""
     if Path(path).resolve().parent == entry_point.REPO.resolve():
         raise AssertionError(f"main opened {path}, the repo's own database")
     return OPEN_DB(path)
 
 
 class Fakes:
-    """What main reaches for, replaced: each call is noted in `calls`."""
-
     def __init__(self, verdict=ALLOWED, key=KEY, run_raises=None, connect_raises=None):
         self.calls = []
         self.verdict, self.key = verdict, key
@@ -91,8 +84,6 @@ class Main(unittest.TestCase):
         self.db_path = os.path.join(tmp.name, "tools.db")
 
     def main(self, argv, fakes=None, stdin="", dotenv=None):
-        """main's exit code, what it printed and the fakes it reached. dotenv is
-        what the .env file sets when main loads it."""
         fakes = fakes or Fakes()
         out = io.StringIO()
         with contextlib.ExitStack() as stack:

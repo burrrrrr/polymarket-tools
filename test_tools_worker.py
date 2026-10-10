@@ -1,7 +1,3 @@
-"""Tests for tools.worker: the loop that beats, claims jobs and runs them. The
-client, the clock and the stop event are fakes, so nothing is sent and nothing
-sleeps."""
-
 import os
 import tempfile
 import threading
@@ -16,8 +12,7 @@ from tools.db import JobKind, JobState, RestoreAction
 from tools.worker import Handler
 
 START = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
-# Longer than any test takes: a wait that runs this long is a hang, and fails.
-GUARD_S = 10
+HANG_TIMEOUT_S = 10
 
 
 def at(seconds):
@@ -33,10 +28,6 @@ class Clock:
 
 
 class Stop:
-    """A stop event whose wait returns at once: it moves the clock on by the
-    wait, lets a running job finish unless told not to, and says stop on the
-    last of `beats` waits or once set. on_wait(n) runs inside the nth wait."""
-
     def __init__(self, clock, beats, settle_jobs=True, on_wait=lambda n: None):
         self.clock, self.beats, self.settle_jobs, self.on_wait = clock, beats, settle_jobs, on_wait
         self.waits = 0
@@ -48,7 +39,7 @@ class Stop:
         if self.settle_jobs:
             for thread in threading.enumerate():
                 if thread.name == worker.JOB_THREAD:
-                    thread.join(GUARD_S)
+                    thread.join(HANG_TIMEOUT_S)
         self.clock.now += timedelta(seconds=timeout)
         return self.is_set()
 
@@ -60,9 +51,6 @@ class Stop:
 
 
 class FakeSniper:
-    """The sniper as the worker builds and runs it. run() returns once the
-    worker's stop is set, or raises what `failure` holds."""
-
     built = []
     failure = None
 
@@ -185,12 +173,10 @@ class LoopTests(Scratch):
         self.assertEqual(db.read_worker_status(self.db).last_beat_at, at(1))
 
     def test_the_heartbeat_goes_on_while_a_job_runs(self):
-        # The job ends only when the loop reaches its third wait, so a loop
-        # that ran the job itself would never get there.
         released, beat_seen = threading.Event(), []
 
         def slow(run):
-            if not released.wait(GUARD_S):
+            if not released.wait(HANG_TIMEOUT_S):
                 raise TimeoutError("the loop did not beat while the job ran")
             beat_seen.append(db.read_worker_status(run.conn).last_beat_at)
 
@@ -219,7 +205,7 @@ class LoopTests(Scratch):
         told = []
 
         def handler(run):
-            told.append(run.stop.wait(GUARD_S))
+            told.append(run.stop.wait(HANG_TIMEOUT_S))
 
         self.queue()
         self.run_worker(Clob([]), stop=Stop(self.clock, 1, settle_jobs=False),
@@ -253,7 +239,7 @@ class RestoreJobTests(Scratch):
         self.assertEqual((db.read_job(self.db, job).state, db.read_job(self.db, job).error),
                          (JobState.DONE, None))
         self.assertEqual(self.lines(job), [(RestoreAction.SKIP_LIVE, 100.0, None),
-                                           (RestoreAction.PLACE, 100.0, None),
+                                           (RestoreAction.WOULD_PLACE, 100.0, None),
                                            (RestoreAction.SKIP_FARMER, 100.0, None)])
         self.assertEqual((venue.signed, venue.posts), ([], []), "a preview signed or posted")
         self.assertEqual(self.messages(job),
@@ -268,7 +254,7 @@ class RestoreJobTests(Scratch):
         self.run_worker(venue)
         self.assertEqual(db.read_job(self.db, job).state, JobState.DONE)
         self.assertEqual(self.lines(job), [(RestoreAction.SKIP_LIVE, 100.0, None),
-                                           (RestoreAction.PLACE, 100.0, "0xnew1"),
+                                           (RestoreAction.PLACED, 100.0, "0xnew1"),
                                            (RestoreAction.REJECTED, 100.0, None)])
         self.assertEqual([post_only for *_, post_only in venue.posts], [True, True])
         self.assertEqual(self.messages(job), [
@@ -287,18 +273,16 @@ class RestoreJobTests(Scratch):
         venue, runs, posted_two = Venue(), [], threading.Event()
 
         def hold_the_second_post():
-            # It returns only once the job has been told to stop, so the third
-            # order is reached with the stop set.
             if len(venue.posts) == 2:
                 posted_two.set()
-                runs[0].stop.wait(GUARD_S)
+                runs[0].stop.wait(HANG_TIMEOUT_S)
 
         def handler(run):
             runs.append(run)
             worker.HANDLERS[JobKind.RESTORE].run(run)
 
         def loop_waits(n):
-            if not posted_two.wait(GUARD_S):
+            if not posted_two.wait(HANG_TIMEOUT_S):
                 raise TimeoutError("the restore never reached its second order")
 
         venue.after_post = hold_the_second_post
@@ -309,8 +293,8 @@ class RestoreJobTests(Scratch):
         failed = db.read_job(self.db, job)
         self.assertEqual(failed.state, JobState.FAILED)
         self.assertIn("the worker stopped after 2 of 4 orders", failed.error)
-        self.assertEqual(self.lines(job), [(RestoreAction.PLACE, 100.0, "0xnew1"),
-                                           (RestoreAction.PLACE, 100.0, "0xnew2")])
+        self.assertEqual(self.lines(job), [(RestoreAction.PLACED, 100.0, "0xnew1"),
+                                           (RestoreAction.PLACED, 100.0, "0xnew2")])
         self.assertEqual(len(venue.posts), 2)
 
     def test_a_preview_needs_a_key(self):
@@ -407,14 +391,14 @@ class JobThreadTests(Scratch):
         def held(run):
             ran.append(run.job.id)
             entered.set()
-            if not release.wait(GUARD_S):
+            if not release.wait(HANG_TIMEOUT_S):
                 raise TimeoutError("never released")
 
         handlers = {kind: Handler(held, True) for kind in JobKind}
         jobs = worker.JobThread(self.path, Clob([]), client(self.gamma), self.clock, handlers)
         first, second = self.queue(), self.queue(JobKind.PREVIEW, snapshot_id=1)
         jobs.tick(self.db)
-        self.assertTrue(entered.wait(GUARD_S))
+        self.assertTrue(entered.wait(HANG_TIMEOUT_S))
         jobs.tick(self.db)
         self.assertEqual([db.read_job(self.db, j).state for j in (first, second)],
                          [JobState.RUNNING, JobState.QUEUED])

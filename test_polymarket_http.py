@@ -1,6 +1,3 @@
-"""Tests for polymarket.http: the rate-limit retry, chunked requests, and the
-client the order path keeps open. No request leaves the process."""
-
 import threading
 import unittest
 from unittest import mock
@@ -16,7 +13,6 @@ def client(handler):
 
 class GetWithRetryTests(unittest.TestCase):
     def answering(self, *responses):
-        """A client that gives these responses in turn, and the requests it saw."""
         replies, seen = list(responses), []
 
         def handler(request):
