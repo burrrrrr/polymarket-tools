@@ -5,6 +5,8 @@ import os
 import unittest
 from unittest import mock
 
+from py_clob_client_v2.client import ClobClient
+
 from polymarket import client
 from polymarket.client import ConfigError, connect
 
@@ -54,6 +56,14 @@ class ConnectTests(unittest.TestCase):
             self.connected({})
         self.assertIn("POLYMARKET_FUNDER_ADDRESS", str(raised.exception))
         self.assertEqual(FakeClob.built, [])
+
+    def test_the_sdk_is_left_to_post_once_and_never_retry_on_its_own(self):
+        # With retry_on_error the SDK re-posts after 30 ms on a timeout or a
+        # 5xx: the answers after which the first order may rest, which the
+        # restore and the sniper never retry.
+        self.assertNotIn("retry_on_error",
+                         self.connected({"POLYMARKET_FUNDER_ADDRESS": FUNDER}).kwargs)
+        self.assertFalse(ClobClient(client.CLOB_HOST, chain_id=137, key=KEY).retry_on_error)
 
     def test_a_number_that_does_not_parse_raises_naming_its_variable(self):
         for name in ("POLYMARKET_SIGNATURE_TYPE", "POLYMARKET_CHAIN_ID"):

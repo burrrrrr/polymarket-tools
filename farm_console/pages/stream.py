@@ -25,7 +25,8 @@ def routes(ctx):
         """Named events only, no HTML: `cycle` when the farmer finishes a cycle,
         `farm-event` when a farm_events row appears, `status` when the farmer or
         the worker starts or stops running, `job` when a worker job is queued,
-        changes state or logs a line."""
+        changes state or logs a line, `watch` when a sniper watch is armed,
+        changes, is sampled or logs a line."""
         conn = ctx.connect()
         tools = ctx.connect_tools() if ctx.tools_db is not None else None
         try:
@@ -36,12 +37,13 @@ def routes(ctx):
 
             def read_tools():
                 if tools is None:
-                    return None, False
+                    return None, False, None
                 return (tools_db.last_job_change(tools),
-                        tools_db.is_running(tools_db.read_worker_status(tools), ctx.clock()))
+                        tools_db.is_running(tools_db.read_worker_status(tools), ctx.clock()),
+                        tools_db.watch_version(tools))
 
             cycle, event_id, running = read()
-            job, working = read_tools()
+            job, working, watch = read_tools()
             yield ": connected\n\n"
             polls, quiet = 0, 0.0
             while ctx.max_polls is None or polls < ctx.max_polls:
@@ -50,7 +52,7 @@ def routes(ctx):
                 if await request.is_disconnected():
                     break
                 new_cycle, new_event_id, new_running = read()
-                new_job, new_working = read_tools()
+                new_job, new_working, new_watch = read_tools()
                 out = []
                 if new_cycle != cycle:
                     out.append(f"event: cycle\ndata: {farm_db.stamp(new_cycle)}\n\n")
@@ -64,8 +66,10 @@ def routes(ctx):
                                f"{'running' if new_working else 'stopped'}\n\n")
                 if new_job != job:
                     out.append(f"event: job\ndata: {new_job[0]}.{new_job[1]}\n\n")
+                if new_watch != watch:
+                    out.append(f"event: watch\ndata: {'.'.join(map(str, new_watch))}\n\n")
                 cycle, event_id, running = new_cycle, new_event_id, new_running
-                job, working = new_job, new_working
+                job, working, watch = new_job, new_working, new_watch
                 quiet = 0.0 if out else quiet + ctx.poll_s
                 if quiet >= KEEPALIVE_S:
                     out.append(": keepalive\n\n")

@@ -29,6 +29,7 @@
     <a href="/markets" class="{{ 'on' if page == 'markets' }}">Live markets <span class="badge t-q count">{{ chrome.quoting }}</span></a>
     <a href="/activity" class="{{ 'on' if page == 'activity' }}">Activity</a>
     <a href="/orders" class="{{ 'on' if page == 'orders' }}">Orders</a>
+    <a href="/sniper" class="{{ 'on' if page == 'sniper' }}">Sniper</a>
     <a href="/settings" class="{{ 'on' if page == 'settings' }}">Settings</a>
     <div class="status">
       {% call region("/partials/chrome/status", "sse:cycle, sse:status, every 15s") %}{% include "partials/status.html" %}{% endcall %}

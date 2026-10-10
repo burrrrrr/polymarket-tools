@@ -38,13 +38,15 @@ class Context:
 
     def __init__(self, db_path, token, clock, *, poll_s, max_polls, scan, fetch_rules,
                  fetch_position, fetch_info, fetch_book, fetch_total_rates, run_triage,
-                 fetch_page, funder, tools_db):
+                 fetch_page, funder, tools_db, search_markets, fetch_books):
         self.db_path = db_path
         self.tools_db = tools_db
         self.clock = clock
         self.poll_s = poll_s
         self.max_polls = max_polls
         self.fetch_position = fetch_position
+        self.search_markets = search_markets
+        self.fetch_books = fetch_books
         self.funder = funder
         self.templates = Jinja2Templates(directory=HERE / "templates")
         versions = {f.name: int(f.stat().st_mtime) for f in (HERE / "static").iterdir()}

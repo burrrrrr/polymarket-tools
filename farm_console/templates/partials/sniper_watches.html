@@ -1,0 +1,36 @@
+{%- from "_macros.html" import token_field -%}
+<div class="stack" style="gap: 16px">
+<div class="head" style="padding: 0"><h2>Watches</h2></div>
+{%- for w in watches %}
+{%- set row = w.row %}
+{%- set o = row.order %}
+<section class="panel pad stack" id="watch-{{ row.id }}" style="gap: 8px">
+  <div class="page-head">
+    <h2 class="wrap">{{ row.label }}</h2>
+    <span class="actions">
+      {%- if row.dry_run %}<span class="badge t-n">dry run</span>{% endif %}
+      <span class="badge {{ w.tone }}">{{ row.state.value }}</span>
+    </span>
+  </div>
+  <span class="mono small c-mut">{{ o.side.value }} {{ o.size | shares }} @ {{ o.price | cents }} · {{ o.order_type }}{% if o.expires_after_s %} {{ o.expires_after_s | span }} after the fire{% endif %} · target {{ row.target_tick }} · {% if row.guard %}guard: {{ 'bid' if o.side.value == 'BUY' else 'ask' }} {{ row.guard.price | cents }} &#177; {{ row.guard.tolerance | cents }} within {{ row.guard.max_age_s | span }}{% else %}no guard{% endif %} · armed {{ row.created_at | stamp_local }}</span>
+  <div class="scroll">
+    <table class="tbl tight">
+      <thead><tr><th>Tick</th><th>Bid</th><th>Ask</th><th>Age</th><th>Seen by</th><th>To post</th><th>Round trip</th><th>Attempts</th><th>Order</th></tr></thead>
+      <tbody><tr><td class="mono">{{ row.tick or '--' }}</td><td class="mono">{{ row.bid | cents }}</td><td class="mono">{{ row.ask | cents }}</td><td class="mono">{{ w.age | span if w.age is not none else '--' }}</td><td class="mono">{{ row.source or '--' }}</td><td class="mono">{{ '%.1f ms' % row.send_ms if row.send_ms is not none else '--' }}</td><td class="mono">{{ '%.0f ms' % row.post_ms if row.post_ms is not none else '--' }}</td><td class="mono">{{ row.attempts if row.attempts is not none else '--' }}</td><td class="mono">{{ row.order_id or '--' }}</td></tr></tbody>
+    </table>
+  </div>
+  <span class="{{ 'c-warn' if row.reason and row.reason.may_rest else '' }}">{{ w.sentence }}</span>
+  {%- for line in w.log %}
+  <div class="mono feed"><span class="t">{{ line.at | clock }}</span><span>{{ line.message }}</span></div>
+  {%- endfor %}
+  {%- if row.open and row.disarm_requested_at is none %}
+  <div class="actions">
+    <button class="btn btn-danger" type="button" hx-post="/sniper/{{ row.id }}/disarm" hx-target="closest div[hx-get]" hx-swap="innerHTML">Disarm</button>
+    <span class="hint">The worker answers within a second with disarmed, or with the order it had already sent.</span>
+  </div>
+  {%- endif %}
+</section>
+{%- else %}
+<span class="muted">No watches yet. Search for a market above and arm one of its outcomes.</span>
+{%- endfor %}
+</div>

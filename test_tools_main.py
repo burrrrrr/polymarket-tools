@@ -32,8 +32,8 @@ class Fakes:
         self.verdict, self.key = verdict, key
         self.run_raises, self.connect_raises = run_raises, connect_raises
         self.http = SimpleNamespace(close=lambda: self.calls.append("close"))
-        self.client = object()
-        self.run_args = self.stop = None
+        self.clients = []
+        self.run_args = self.sniper_client = self.stop = None
         self.handlers = {}
 
     def persistent_client(self):
@@ -58,16 +58,20 @@ class Fakes:
         self.connected_with = private_key
         if self.connect_raises:
             raise self.connect_raises
-        return self.client
+        self.clients.append(object())
+        return self.clients[-1]
 
-    def run(self, db_path, client, http, *, stop):
+    def run(self, db_path, client, http, *, stop, sniper_client=None):
         self.calls.append("run")
-        self.run_args, self.stop = (db_path, client, http), stop
+        self.run_args, self.sniper_client, self.stop = (db_path, client, http), sniper_client, stop
         if self.run_raises:
             raise self.run_raises
 
     def handle(self, signum, handler):
         self.handlers[signum] = handler
+
+    def set_switch_interval(self, seconds):
+        self.calls.append(f"switch {seconds:g}")
 
 
 class Main(unittest.TestCase):
@@ -89,6 +93,7 @@ class Main(unittest.TestCase):
                     ("polymarket.client.connect", fakes.connect),
                     ("tools.worker.run", fakes.run),
                     ("signal.signal", fakes.handle),
+                    ("sys.setswitchinterval", fakes.set_switch_interval),
                     ("getpass.getpass", lambda prompt: "master password"),
                     ("sys.stdin", io.StringIO(stdin))):
                 stack.enter_context(mock.patch(target, fake))
@@ -103,8 +108,11 @@ class WorkerTests(Main):
     def test_a_keyed_worker_checks_the_region_reads_the_key_and_connects_before_it_runs(self):
         code, out, fakes = self.main(["--db", self.db_path])
         self.assertEqual(code, 0)
-        self.assertEqual(fakes.calls, ["region", "key", "sdk", "connect", "run", "close"])
-        self.assertEqual(fakes.run_args, (self.db_path, fakes.client, fakes.http))
+        self.assertEqual(fakes.calls, ["switch 0.0005", "region", "key", "sdk", "connect",
+                                       "connect", "run", "close"])
+        jobs_client, sniper_client = fakes.clients
+        self.assertEqual(fakes.run_args, (self.db_path, jobs_client, fakes.http))
+        self.assertIs(fakes.sniper_client, sniper_client, "the sniper shares the jobs' client")
         self.assertEqual((fakes.connected_with, fakes.asked), (KEY, "master password"))
         self.load_dotenv.assert_called_once_with(entry_point.REPO / ".env")
         self.assertNotIn(KEY, out)
@@ -112,15 +120,16 @@ class WorkerTests(Main):
     def test_a_blocked_place_is_refused_before_the_key_is_read(self):
         code, out, fakes = self.main(["--db", self.db_path], Fakes(verdict=BLOCKED))
         self.assertEqual(code, 1)
-        self.assertEqual(fakes.calls, ["region", "close"])
+        self.assertEqual(fakes.calls, ["switch 0.0005", "region", "close"])
         self.assertIn("US: the API rejects new orders from here", out)
         self.assertFalse(os.path.exists(self.db_path))
 
     def test_without_a_key_nothing_is_checked_read_or_connected(self):
         code, _, fakes = self.main(["--db", self.db_path, "--no-key"])
         self.assertEqual(code, 0)
-        self.assertEqual(fakes.calls, ["run", "close"])
+        self.assertEqual(fakes.calls, ["switch 0.0005", "run", "close"])
         self.assertEqual(fakes.run_args, (self.db_path, None, fakes.http))
+        self.assertIsNone(fakes.sniper_client)
 
     def test_the_key_can_arrive_as_one_line_of_standard_input(self):
         with mock.patch.dict(os.environ):
@@ -128,14 +137,15 @@ class WorkerTests(Main):
                                          stdin=f"{KEY}\nnot read\n")
             self.assertNotIn(KEY, os.environ.values())
         self.assertEqual(code, 0)
-        self.assertEqual(fakes.calls, ["region", "sdk", "connect", "run", "close"])
+        self.assertEqual(fakes.calls, ["switch 0.0005", "region", "sdk", "connect", "connect",
+                                       "run", "close"])
         self.assertEqual(fakes.connected_with, KEY)
         self.assertNotIn(KEY, out)
 
     def test_an_empty_standard_input_is_no_key(self):
         code, out, fakes = self.main(["--db", self.db_path, "--key-stdin"], stdin="\n")
         self.assertEqual(code, 1)
-        self.assertEqual(fakes.calls, ["region", "close"])
+        self.assertEqual(fakes.calls, ["switch 0.0005", "region", "close"])
         self.assertIn("standard input", out)
 
     def test_the_two_key_flags_exclude_each_other(self):
@@ -146,7 +156,7 @@ class WorkerTests(Main):
         fakes = Fakes(key=KeyUnavailable("the Bitwarden CLI is not logged in: run `bw login`"))
         code, out, fakes = self.main(["--db", self.db_path], fakes)
         self.assertEqual(code, 1)
-        self.assertEqual(fakes.calls, ["region", "key", "close"])
+        self.assertEqual(fakes.calls, ["switch 0.0005", "region", "key", "close"])
         self.assertIn("run `bw login`", out)
 
     def test_an_account_the_environment_does_not_describe_ends_the_run(self):

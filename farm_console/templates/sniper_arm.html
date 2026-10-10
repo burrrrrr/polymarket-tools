@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% from "_macros.html" import token_field, field_error %}
+{% block title %}Arm a watch{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Arm a watch</h1>
+    <p class="sub">{{ pick.label }}</p>
+  </div>
+  <div class="actions"><a class="btn" href="/sniper">Back to the sniper</a></div>
+</header>
+{%- if refused %}<div class="notice" role="alert">{{ refused }}</div>{% endif %}
+<section class="panel pad stack" style="gap: 6px">
+  <h2>Live book</h2>
+  {%- if books_error %}
+  <span class="small c-warn">The book could not be read ({{ books_error }}).</span>
+  {%- else %}
+  <span class="mono">bid {{ bid | cents }} · ask {{ ask | cents }} · tick {{ '%g' % tick if tick else '--' }}</span>
+  {%- endif %}
+  <span class="hint">The worker reads the book itself when it adopts the watch, and a token already at the target tick is missed, not fired.</span>
+</section>
+
+<form class="panel pad stack" method="post" action="/sniper/arm" style="gap: 14px">
+  {{ token_field() }}
+  <input type="hidden" name="token_id" value="{{ pick.token_id }}">
+  <input type="hidden" name="market" value="{{ pick.market }}">
+  <input type="hidden" name="label" value="{{ pick.label }}">
+  <h2>Order</h2>
+  <div class="actions">
+    <label class="stack" style="gap: 4px"><span class="small muted">Side</span>
+      <select class="inp" name="side">{% for side in ('BUY', 'SELL') %}<option value="{{ side }}"{{ ' selected' if values.side == side }}>{{ side }}</option>{% endfor %}</select></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Price (dollars)</span><input class="inp mono" name="price" value="{{ values.price }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('price') }}></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Size (shares)</span><input class="inp mono" name="size" value="{{ values.size }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('size') }}></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Target tick</span><input class="inp mono" name="target_tick" value="{{ values.target_tick }}" list="ticks" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('target_tick') }}><datalist id="ticks">{% for tick in ticks %}<option value="{{ tick }}">{% endfor %}</datalist></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Expires after (s)</span><input class="inp mono" name="expires_after_s" value="{{ values.expires_after_s }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('expires_after_s') }}></label>
+  </div>
+  {%- for name in ('side', 'price', 'size', 'target_tick', 'expires_after_s') %}{{ field_error(errors or {}, name) }}{% endfor %}
+  <span class="hint">The order is post-only and signed for the target tick before the change, so the price must be a multiple of it. 0 seconds is good-til-cancelled; otherwise at least 60.</span>
+
+  <h2>Guard</h2>
+  <div class="actions">
+    <label class="actions"><input type="checkbox" name="guard" value="1"{{ ' checked' if values.guard == '1' }}> Guard the entry price</label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Required price</span><input class="inp mono" name="guard_price" value="{{ values.guard_price }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('guard_price') }}></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Tolerance</span><input class="inp mono" name="guard_tolerance" value="{{ values.guard_tolerance }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('guard_tolerance') }}></label>
+    <label class="stack" style="gap: 4px"><span class="small muted">Max quote age (s)</span><input class="inp mono" name="guard_max_age_s" value="{{ values.guard_max_age_s }}" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('guard_max_age_s') }}></label>
+  </div>
+  {%- for name in ('guard_price', 'guard_tolerance', 'guard_max_age_s') %}{{ field_error(errors or {}, name) }}{% endfor %}
+  <span class="hint">When the tick changes, the side's own best price (the bid for a BUY) in the last quote seen before the change must be within the tolerance of the required price, and that quote no older than the max age. Otherwise the watch closes as rejected and nothing is sent.</span>
+
+  <h2>Arm</h2>
+  <label class="actions"><input type="checkbox" name="dry_run" value="1"{{ ' checked' if values.dry_run == '1' }}> Dry run: rehearse everything up to the post, send nothing</label>
+  <div class="actions">
+    <label class="grow-field"><span class="sr">Type {{ confirm_word }} to confirm</span><input class="inp mono" name="confirm" placeholder="Type {{ confirm_word }} to confirm" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('confirm') }}></label>
+    <button class="btn btn-danger" type="submit">Arm watch</button>
+  </div>
+  {{ field_error(errors or {}, 'confirm') }}
+  <span class="hint">A live watch places a real order when the tick changes, so it needs the word. A dry run does not. A keyed worker must be running for a live watch to be adopted.</span>
+</form>
+{% endblock %}

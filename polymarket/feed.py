@@ -123,9 +123,10 @@ class MarketFeed:
     run(stop) holds one connection at a time. It subscribes to the token set
     and sends a PING every PING_S, because the server drops an idle socket.
     When the socket fails, or on_update raises, on_error gets the exception and
-    run reconnects after RECONNECT_S. set_tokens replaces the set: run closes
-    its connection within RECV_S and the next one subscribes to the new set.
-    While the set is empty run holds no connection.
+    run reconnects after RECONNECT_S. set_tokens replaces the set: within
+    RECV_S run subscribes to the new tokens and unsubscribes from the dropped
+    ones on the open connection, so the others keep their frames. While the
+    set is empty run holds no connection.
 
     on_update and on_error run on the thread that calls run. on_update gets
     only Updates for tokens in the set, although one price_change message lists
@@ -160,11 +161,19 @@ class MarketFeed:
                 stop.wait(RECONNECT_S)
 
     def _listen(self, stop, tokens):
-        """One connection, until stop is set or the token set is no longer tokens."""
+        """One connection, until stop is set or the token set is emptied."""
         with self._connect(WSS_MARKET_URL) as socket:
             socket.send(json.dumps({"assets_ids": sorted(tokens), "type": "market"}))
             pinged = self._clock()
-            while not stop.is_set() and self._tokens == tokens:
+            while not stop.is_set() and self._tokens:
+                wanted = self._tokens
+                if wanted != tokens:
+                    for ids, operation in ((wanted - tokens, "subscribe"),
+                                           (tokens - wanted, "unsubscribe")):
+                        if ids:
+                            socket.send(json.dumps({"assets_ids": sorted(ids),
+                                                    "operation": operation}))
+                    tokens = wanted
                 if self._clock() - pinged >= PING_S:
                     socket.send("PING")
                     pinged = self._clock()

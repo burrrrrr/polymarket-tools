@@ -13,7 +13,7 @@ from py_clob_client_v2.clob_types import OrderArgsV2
 from py_clob_client_v2.exceptions import PolyException
 
 from polymarket import ticks
-from polymarket.orders import Side
+from polymarket.orders import LimitOrder, Side
 
 KEY = "0x" + "11" * 32
 MARKET = "0x" + "08" * 32
@@ -121,6 +121,61 @@ class SignTests(unittest.TestCase):
     def test_a_tick_finer_than_the_client_remembers_is_refused_and_never_rounded(self):
         with self.assertRaisesRegex(PolyException, "invalid tick size"):
             ticks.sign(self.clob, TOKEN, Side.BUY, 0.985, 100, None, 0.001)
+
+
+class SignerTests(unittest.TestCase):
+    """The sniper's signer: it signs at a tick the market has not reached, and
+    once a token is prewarmed, signing sends nothing."""
+
+    def setUp(self):
+        self.clob = OfflineClob(tick=0.01)
+        self.signer = ticks.Signer(self.clob, lambda: EXPIRES)
+
+    def order(self, expires_after_s=0, price=0.999):
+        return LimitOrder(TOKEN, Side.BUY, price, 100, expires_after_s)
+
+    def test_prewarm_reads_the_token_and_the_venue_once_and_sign_then_sends_nothing(self):
+        self.signer.prewarm(TOKEN)
+        self.signer.prewarm(TOKEN)
+        self.assertEqual(self.clob.gets, ["/neg-risk", "/version"])
+        signed = self.signer.sign(self.order(), "0.001")
+        self.assertEqual(self.clob.gets, ["/neg-risk", "/version"], "sign reached the network")
+        self.assertEqual(bid(signed), (99_900_000, 100_000_000))
+        self.assertEqual(signed.tokenId, TOKEN)
+
+    def test_it_signs_at_the_target_tick_whatever_tick_the_client_remembers(self):
+        # The market is still at 0.01 when the order is presigned for 0.001.
+        self.clob.get_tick_size(TOKEN)
+        self.signer.prewarm(TOKEN)
+        self.assertEqual(bid(self.signer.sign(self.order(), "0.001")), (99_900_000, 100_000_000))
+        self.assertEqual(bid(self.signer.sign(self.order(price=0.9999), "0.0001")),
+                         (99_990_000, 100_000_000))
+        self.assertEqual(bid(self.signer.sign(self.order(price=0.99), "0.01")),
+                         (99_000_000, 100_000_000))
+
+    def test_a_price_illegal_at_the_tick_is_refused_and_never_rounded(self):
+        self.signer.prewarm(TOKEN)
+        with self.assertRaises(PolyException):
+            self.signer.sign(self.order(price=0.9995), "0.001")
+
+    def test_a_token_that_was_not_prewarmed_cannot_be_signed(self):
+        with self.assertRaises(KeyError):
+            self.signer.sign(self.order(), "0.001")
+        self.assertEqual(self.clob.gets, [])
+
+    def test_an_expiration_is_the_clock_plus_the_orders_seconds_and_none_is_zero(self):
+        self.signer.prewarm(TOKEN)
+        self.assertEqual(self.signer.sign(self.order(3600), "0.001").expiration,
+                         str(int(EXPIRES.timestamp()) + 3600))
+        self.assertEqual(self.signer.sign(self.order(0), "0.001").expiration, "0")
+
+    def test_a_venue_that_cannot_be_read_fails_the_prewarm(self):
+        class Unreachable(OfflineClob):
+            def _get(self, endpoint, headers=None, params=None):
+                raise ConnectionError("timed out")
+
+        with self.assertRaises(ConnectionError):
+            ticks.Signer(Unreachable(tick=0.01), lambda: EXPIRES).prewarm(TOKEN)
 
 
 class GridTests(unittest.TestCase):

@@ -1,5 +1,6 @@
 """The worker's loop: it beats in tools.db, claims the jobs the console queued
-and runs them, one at a time, on a thread of their own."""
+and runs them, one at a time, on a thread of their own, and runs the sniper
+on another beside them."""
 
 import os
 import threading
@@ -10,8 +11,10 @@ from typing import Any, Callable, NamedTuple
 
 from tools import db, restore, snapshot
 from tools.db import JobKind
+from tools.sniper import Sniper
 
 JOB_THREAD = "tools-job"
+SNIPER_THREAD = "tools-sniper"
 INTERRUPTED = "the worker stopped while this job was running"
 
 
@@ -127,15 +130,19 @@ class JobThread:
 
 
 def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=None,
-        handlers=HANDLERS):
+        handlers=HANDLERS, sniper_client=None, sniper=Sniper):
     """Run the worker on db_path until stop is set.
 
     client is the authenticated CLOB client, or None for a worker with no key,
-    which fails every job that needs one. http reads the public APIs. Each
-    poll_s the loop beats and starts the next queued job; stop.wait(poll_s) is
-    its only wait. A stopping worker tells its running job to stop, waits for
-    it, then writes when it stopped: a snapshot runs to its end, and a restore
-    ends before its next order.
+    which fails every job that needs one. sniper_client is the sniper's own
+    client, never the jobs': presigning leaves a tick the market has not
+    reached in its cache. http reads the public APIs. Each poll_s the loop
+    beats and starts the next queued job; stop.wait(poll_s) is its only wait.
+    The sniper runs on its own thread from the start, and a sniper that dies
+    stops the worker, which raises its error. A stopping worker tells its
+    running job and the sniper to stop, waits for them, then writes when it
+    stopped: a snapshot runs to its end, and a restore ends before its next
+    order.
 
     Raises db.WorkerRunning, touching nothing, while another worker beats on
     this database, and also when another worker took this one's place. A job
@@ -145,8 +152,20 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
         instance = db.start_worker(conn, clock(), os.getpid() if pid is None else pid,
                                    keyed=client is not None)
         jobs = JobThread(db_path, client, http, clock, handlers)
+        snipe = sniper(db_path, http, stop, client=sniper_client, clock=clock)
+        failure = []
+
+        def run_sniper():
+            try:
+                snipe.run()
+            except BaseException as e:
+                failure.append(e)
+                stop.set()
+
+        sniping = threading.Thread(target=run_sniper, name=SNIPER_THREAD, daemon=True)
         try:
             db.fail_running_jobs(conn, clock(), INTERRUPTED)
+            sniping.start()
             while True:
                 if not db.beat(conn, instance, clock()):
                     raise db.WorkerRunning("another worker took this worker's place")
@@ -154,5 +173,10 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
                 if stop.wait(poll_s):
                     break
         finally:
+            stop.set()
             jobs.close()
+            if sniping.is_alive():
+                sniping.join()
             db.stop_worker(conn, instance, clock())
+    if failure:
+        raise failure[0]

@@ -26,6 +26,36 @@ class Side(Enum):
     SELL = "SELL"
 
 
+# The ticks the CLOB uses, spelled as the SDK spells them.
+TICKS = ("0.1", "0.01", "0.001", "0.0001")
+
+
+def text(tick):
+    """The SDK's spelling of a tick: 0.001 is "0.001"."""
+    return f"{tick:g}"
+
+
+def on_grid(price, tick):
+    """Whether the price is a multiple of the tick, whatever the floats."""
+    steps = price / tick
+    return abs(steps - round(steps)) < 1e-6
+
+
+class LimitOrder(NamedTuple):
+    """What to sign and post: expires_after_s is seconds from signing, or 0 for
+    an order that rests until it is cancelled."""
+
+    token_id: str
+    side: Side
+    price: float
+    size: float
+    expires_after_s: int
+
+    @property
+    def order_type(self):
+        return GTD if self.expires_after_s else GTC
+
+
 @dataclass(frozen=True)
 class Posted:
     """The CLOB accepted the order, and this is its id."""

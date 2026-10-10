@@ -14,6 +14,7 @@ from reward_screener import CATEGORIES, ScreenConfig
 NOTE_MAX = 500
 CANCEL_ALL_WORD = "CANCEL"
 RESTORE_WORD = "PLACE"
+ARM_WORD = "ARM"
 
 
 class Field(NamedTuple):

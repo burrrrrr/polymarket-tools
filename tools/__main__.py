@@ -82,15 +82,17 @@ def import_snapshots(args):
 def run_worker(args):
     # Imported after .env is loaded: polymarket.hosts reads the environment once.
     from polymarket import http as polymarket_http
-    from tools import db, worker
+    from tools import db, sniper, worker
 
+    sys.setswitchinterval(sniper.SWITCH_INTERVAL_S)
     http = polymarket_http.persistent_client()
     try:
-        client = None
+        client = sniper_client = None
         if not args.no_key:
-            client = connect(args, http)
-            if client is None:
+            clients = connect(args, http)
+            if clients is None:
                 return 1
+            client, sniper_client = clients
         stop = threading.Event()
         for name in STOP_SIGNALS:
             if hasattr(signal, name):
@@ -98,7 +100,7 @@ def run_worker(args):
         print(f"Worker on {args.db}, {'keyed' if client else 'no key'}. Ctrl+C stops it.",
               flush=True)
         try:
-            worker.run(args.db, client, http, stop=stop)
+            worker.run(args.db, client, http, stop=stop, sniper_client=sniper_client)
         except db.WorkerRunning as e:
             return fail(f"Not started: {e}.")
         print("Worker stopped.", flush=True)
@@ -108,7 +110,9 @@ def run_worker(args):
 
 
 def connect(args, http):
-    """An authenticated client, or None after saying why there is none."""
+    """(the jobs' client, the sniper's client), both authenticated, or None
+    after saying why there is none. The sniper's client presigns orders at a
+    tick its market has not reached, so the jobs never sign through it."""
     from polymarket import client as polymarket_client
     from polymarket import http as polymarket_http
     from polymarket import keys, region
@@ -122,7 +126,7 @@ def connect(args, http):
     try:
         key = read_key(args.key_stdin)
         polymarket_http.use_for_sdk(http)
-        return polymarket_client.connect(key)
+        return polymarket_client.connect(key), polymarket_client.connect(key)
     except (keys.KeyUnavailable, polymarket_client.ConfigError) as e:
         fail(f"Not started: {e}.")
         return None

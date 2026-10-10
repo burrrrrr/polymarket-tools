@@ -35,11 +35,12 @@ class Clock:
 class Stop:
     """A stop event whose wait returns at once: it moves the clock on by the
     wait, lets a running job finish unless told not to, and says stop on the
-    last of `beats` waits. on_wait(n) runs inside the nth wait."""
+    last of `beats` waits or once set. on_wait(n) runs inside the nth wait."""
 
     def __init__(self, clock, beats, settle_jobs=True, on_wait=lambda n: None):
         self.clock, self.beats, self.settle_jobs, self.on_wait = clock, beats, settle_jobs, on_wait
         self.waits = 0
+        self.flag = False
 
     def wait(self, timeout):
         self.waits += 1
@@ -49,10 +50,36 @@ class Stop:
                 if thread.name == worker.JOB_THREAD:
                     thread.join(GUARD_S)
         self.clock.now += timedelta(seconds=timeout)
-        return self.waits >= self.beats
+        return self.is_set()
+
+    def set(self):
+        self.flag = True
 
     def is_set(self):
-        return self.waits >= self.beats
+        return self.flag or self.waits >= self.beats
+
+
+class FakeSniper:
+    """The sniper as the worker builds and runs it. run() returns once the
+    worker's stop is set, or raises what `failure` holds."""
+
+    built = []
+    failure = None
+
+    def __init__(self, db_path, http, stop, client=None, *, clock):
+        self.db_path, self.http, self.stop, self.client, self.clock = db_path, http, stop, client, clock
+        self.ran_on = None
+        self.returned_at = None
+        FakeSniper.built.append(self)
+
+    def run(self):
+        self.ran_on = threading.current_thread().name
+        if FakeSniper.failure is not None:
+            raise FakeSniper.failure
+        released = threading.Event()
+        while not self.stop.is_set():
+            released.wait(0.01)
+        self.returned_at = self.clock()
 
 
 class Scratch(unittest.TestCase):
@@ -64,11 +91,12 @@ class Scratch(unittest.TestCase):
         self.addCleanup(self.db.close)
         self.clock = Clock()
         self.gamma = Gamma(open_ids=[cid(1)])
+        FakeSniper.built, FakeSniper.failure = [], None
 
     def run_worker(self, clob, beats=1, **kwargs):
         stop = kwargs.pop("stop", None) or Stop(self.clock, beats)
         worker.run(self.path, clob, client(self.gamma), stop=stop, clock=self.clock, poll_s=1.0,
-                   pid=41, **kwargs)
+                   pid=41, **{"sniper": FakeSniper, **kwargs})
 
     def queue(self, kind=JobKind.SNAPSHOT, **params):
         return db.enqueue_job(self.db, kind, params or {"note": "before the upgrade"},
@@ -335,6 +363,41 @@ class RecoveryTests(Scratch):
         status = db.read_worker_status(self.db)
         self.assertEqual((status.pid, status.stopped_at), (99, None))
         self.assertEqual(db.latest_job(self.db, JobKind.SNAPSHOT).state, JobState.QUEUED)
+
+
+class SniperTests(Scratch):
+    def test_the_sniper_runs_on_its_own_thread_with_its_own_client_until_the_worker_stops(self):
+        sniper_client = object()
+        self.run_worker(Clob([]), beats=2, sniper_client=sniper_client)
+        (snipe,) = FakeSniper.built
+        self.assertEqual((snipe.db_path, snipe.ran_on), (self.path, worker.SNIPER_THREAD))
+        self.assertIs(snipe.client, sniper_client)
+        self.assertIsNot(snipe.client, self.db)
+        self.assertEqual(snipe.returned_at, at(2), "the sniper outlived the loop")
+        self.assertEqual(db.read_worker_status(self.db).stopped_at, at(2))
+        self.assertEqual([t.name for t in threading.enumerate() if t.name == worker.SNIPER_THREAD],
+                         [])
+
+    def test_a_keyless_worker_runs_a_keyless_sniper(self):
+        self.run_worker(None)
+        self.assertIsNone(FakeSniper.built[0].client)
+
+    def test_a_replaced_worker_stops_its_sniper_too(self):
+        def replaced(n):
+            if n == 1:
+                db.start_worker(self.db, self.clock() + timedelta(seconds=db.STALE_AFTER_S),
+                                pid=99, keyed=True)
+
+        with self.assertRaises(db.WorkerRunning):
+            self.run_worker(Clob([]), stop=Stop(self.clock, 5, on_wait=replaced))
+        self.assertIsNotNone(FakeSniper.built[0].returned_at)
+
+    def test_a_sniper_that_dies_takes_the_worker_down_with_its_error(self):
+        FakeSniper.failure = RuntimeError("feed thread bug")
+        with self.assertRaisesRegex(RuntimeError, "feed thread bug"):
+            self.run_worker(Clob([]), beats=50)
+        self.assertEqual(db.read_worker_status(self.db).stopped_at, self.clock())
+        self.assertLess(db.read_worker_status(self.db).last_beat_at, at(50))
 
 
 class JobThreadTests(Scratch):

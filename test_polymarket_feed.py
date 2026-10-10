@@ -293,18 +293,36 @@ class MarketFeedTests(unittest.TestCase):
         self.assertEqual(h.errors, [broken])
         self.assertEqual(delivered, [0.5, 0.7])
 
-    def test_a_new_token_set_closes_the_connection_and_the_next_one_subscribes_to_it(self):
+    def test_a_changed_token_set_is_sent_on_the_open_connection_and_the_others_keep_their_frames(
+            self):
+        # Measured on the live market channel on 2026-10-11: a subscribe
+        # operation adds tokens, an unsubscribe removes them, and the frames
+        # of the first token keep arriving through both.
         h = Harness([YES])
-        h.pending = [
-            [lambda: h.feed.set_tokens([YES, NO]), book(NO, "0.01"), QUIET, QUIET],
-            [book(NO, "0.001")],
-        ]
+        h.pending = [[lambda: h.feed.set_tokens([YES, NO]), book(NO, "0.01"), book(YES, "0.01"),
+                      lambda: h.feed.set_tokens([NO]), book(YES, "0.001"), book(NO, "0.001")]]
+        h.run(self)
+        self.assertEqual(len(h.sockets), 1, "the feed reconnected to change its tokens")
+        sent = [json.loads(text) for text in h.sockets[0].texts()]
+        self.assertEqual(sent[1:], [{"assets_ids": [NO], "operation": "subscribe"},
+                                    {"assets_ids": [YES], "operation": "unsubscribe"}])
+        self.assertEqual([(u.token_id, u.tick) for u in h.updates],
+                         [(NO, 0.01), (YES, 0.01), (NO, 0.001)])
+        self.assertEqual((h.errors, h.stop.waits), ([], []))
+
+    def test_an_emptied_token_set_closes_the_connection_and_holds_none(self):
+        h = Harness([YES], [lambda: h.feed.set_tokens([]), book(YES, "0.01")],
+                    stop=Stop(set_after_waits=2))
         h.run(self)
         self.assertTrue(h.sockets[0].closed)
-        self.assertEqual(h.sockets[0].subscription()["assets_ids"], [YES])
-        self.assertEqual(sorted(h.sockets[1].subscription()["assets_ids"]), [YES, NO])
-        self.assertEqual(h.updates, [Update(NO, 0.001, None, None, None, Kind.BOOK)])
-        self.assertEqual((h.errors, h.stop.waits), ([], []))
+        self.assertEqual((h.urls, h.updates, h.stop.waits), ([WSS_MARKET_URL], [], [RECV_S] * 2))
+
+    def test_a_reconnection_subscribes_to_the_set_as_it_is_then(self):
+        h = Harness([YES], [ConnectionError("gone")], [book(NO, "0.01")])
+        h.stop.wait = lambda seconds: h.feed.set_tokens([NO])
+        h.run(self)
+        self.assertEqual(h.sockets[1].subscription()["assets_ids"], [NO])
+        self.assertEqual([u.token_id for u in h.updates], [NO])
 
     def test_a_feed_with_no_tokens_holds_no_connection_and_waits_on_stop(self):
         h = Harness([], stop=Stop(set_after_waits=3)).run(self)

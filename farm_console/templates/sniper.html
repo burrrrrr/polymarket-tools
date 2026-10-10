@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region %}
+{% block title %}Sniper{% endblock %}
+{% block content %}
+<header>
+  <h1>Sniper</h1>
+  <p class="sub">Waits for a market's tick to shrink and posts one post-only order at the new best price, to be first in the queue. The worker watches and fires; the console only arms and disarms.</p>
+</header>
+{%- if chrome.worker.configured %}
+<form class="panel pad stack" method="get" action="/sniper" style="gap: 12px">
+  <h2>Find a market</h2>
+  <div class="actions">
+    <label class="grow-field"><span class="sr">Search open markets</span><input class="inp" name="q" value="{{ query }}" placeholder="Search open markets" autocomplete="off"></label>
+    <button class="btn btn-strong" type="submit">Search</button>
+  </div>
+  <span class="hint">Gamma's search, reranked: outcomes ready for the default setup first (a bid at 99.0c on a tick coarser than 0.001), then by relevance and volume. Bid, ask and tick come from the live book.</span>
+</form>
+{%- if search_error %}<div class="notice" role="alert">The search failed: {{ search_error }}</div>{% endif %}
+{%- if results is not none %}
+<section class="panel pad-table">
+  <div class="head"><h2>Results for “{{ query }}”</h2><span class="badge t-n">{{ results | length }}</span></div>
+  {%- if books_error %}<div class="pad"><span class="small c-warn">The books could not be read ({{ books_error }}): the statuses rest on Gamma alone.</span></div>{% endif %}
+  <div class="scroll">
+    <table class="tbl tight">
+      <thead><tr><th>Market</th><th>Outcome</th><th>Bid</th><th>Ask</th><th>Tick</th><th>24h volume</th><th>Status</th><th></th></tr></thead>
+      <tbody>
+        {%- for r in results %}
+        {%- set m = r.candidate.market %}
+        <tr><td class="wrap">{{ m.question }}<br><span class="small muted">{{ m.event_title }}</span></td><td>{{ r.candidate.outcome }}</td><td class="mono">{{ (r.book.bids[0][0] if r.book and r.book.bids else none) | cents }}</td><td class="mono">{{ (r.book.asks[0][0] if r.book and r.book.asks else none) | cents }}</td><td class="mono">{{ '%g' % r.book.tick if r.book and r.book.tick else ('%g' % m.tick if m.tick else '--') }}</td><td class="mono">{{ m.volume | human_volume }}</td><td><span class="badge {{ 't-q' if r.verdict.ready else 't-n' }}">{{ r.verdict.note }}</span></td><td><a class="btn small-btn" href="/sniper/arm?token_id={{ r.candidate.token_id }}&amp;market={{ m.condition_id }}&amp;label={{ r.candidate.label | urlencode }}">Arm</a></td></tr>
+        {%- else %}
+        <tr><td colspan="8" class="muted">No open market matched. Try other words.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{%- endif %}
+
+{% call region("/partials/sniper/watches", "sse:watch, sse:status") %}{% include "partials/sniper_watches.html" %}{% endcall %}
+{%- endif %}
+{% endblock %}

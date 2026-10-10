@@ -7,8 +7,9 @@ from datetime import datetime, timezone
 import httpx
 from py_clob_client_v2.exceptions import PolyApiException
 
-from polymarket.orders import (GTC, GTD, OpenOrder, Posted, Rejected, Side, Unanswered,
-                               open_orders, parse_order, post, read_response, terminal)
+from polymarket.orders import (GTC, GTD, TICKS, LimitOrder, OpenOrder, Posted, Rejected, Side,
+                               Unanswered, on_grid, open_orders, parse_order, post,
+                               read_response, terminal, text)
 
 TOKEN = "71" * 38
 MARKET = "0x" + "08" * 32
@@ -219,6 +220,18 @@ class TerminalTests(unittest.TestCase):
                        "HTTP 429: Too Many Requests", "order_version_mismatch", ""):
             with self.subTest(reason=reason):
                 self.assertFalse(terminal(Rejected(reason)))
+
+
+class LimitOrderTests(unittest.TestCase):
+    def test_an_order_that_expires_is_good_til_date_and_one_that_does_not_til_cancelled(self):
+        self.assertEqual(LimitOrder(TOKEN, Side.BUY, 0.999, 100.0, 0).order_type, GTC)
+        self.assertEqual(LimitOrder(TOKEN, Side.BUY, 0.999, 100.0, 3600).order_type, GTD)
+
+    def test_the_ticks_the_clob_uses_and_the_grid_of_each(self):
+        self.assertEqual(TICKS, ("0.1", "0.01", "0.001", "0.0001"))
+        self.assertTrue(on_grid(0.999, 0.001))
+        self.assertFalse(on_grid(0.999, 0.01))
+        self.assertEqual(text(0.001), "0.001")
 
 
 if __name__ == "__main__":
