@@ -7,9 +7,8 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-import farm_db
-import reward_farmer
-from farm_db import EventKind
+from farm import farm_db, reward_farmer
+from farm.farm_db import EventKind
 from tools import db as tools_db
 
 from . import glossary, remote, security, views

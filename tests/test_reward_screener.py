@@ -1,0 +1,1417 @@
+import base64
+import contextlib
+import io
+import json
+import os
+import tempfile
+import threading
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest import mock
+
+import httpx
+
+from farm import exit_value, farm_db, fill_cost, reward_screener
+from farm.exit_value import BuyTape, Piece, Sweep
+from farm.fill_cost import DISTANCES, FillCurve, History, Hit
+from farm.reward_screener import (
+    Mode,
+    Outlook,
+    Read,
+    RewardMarket,
+    ScreenConfig,
+    Skip,
+    Zones,
+    assess,
+    created_mid,
+    fav_bid_candidates,
+    fav_ceiling,
+    fill_return,
+    longshot_bid,
+    over_max_return,
+    parse_buys,
+    parse_gamma,
+    parse_hits,
+    plan_at,
+    plan_quotes,
+    price_offering,
+    resolution_signal,
+    round_size_down,
+    score,
+    under_free_return,
+)
+from polymarket.books import Levels
+
+MARKET = RewardMarket(
+    condition_id="0xc0nd",
+    slug="test-market",
+    question="Test?",
+    end_date=datetime(2027, 1, 1, tzinfo=timezone.utc),
+    neg_risk=False,
+    tick=0.001,
+    fav_token_id="fav-token",
+    fav_outcome="No",
+    rate_per_day=100.0,
+    v=0.035,
+    min_size=20.0,
+)
+
+CONFIG = ScreenConfig(
+    min_fav=0.90, expiry_buffer_days=7, min_window_days=30, horizon_cap_days=90,
+    capital=500, max_lead=0.005, min_low_score=0.10, min_rate=0,
+)
+
+# A quarter of a year to the end date: a longshot bid may rest up to 4.4c
+# before a fill gives the favorite buyer over 20% a year, and under 1.3c it
+# gives under 5%, the free zone. FAR has the free zone closed, so the naked
+# budget limits every price.
+YEARS = 0.25
+FAR = Zones(YEARS)
+DAY = 1 / 365.25
+
+
+def steady(mid):
+    """A quarter out with the midpoint having held at mid: the free zone is open."""
+    return Zones(YEARS, mid)
+
+# The 0.955 bid is dust below the 20-share reward minimum, so the best bid is
+# 0.95 and the reward midpoint (0.95 + 0.97) / 2 = 0.96.
+TIGHT_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+# A live favorite book with a 5.6c gap between the best bid and the best ask.
+WORKED_BOOK = Levels(
+    bids=[(0.934, 88.8), (0.922, 21.0), (0.574, 85.0), (0.573, 40.0)],
+    asks=[(0.990, 240.99), (0.994, 111.0), (0.997, 50.0), (0.998, 200.0), (0.999, 729.1)],
+    tick=0.001,
+)
+# The live Mistral favorite book: another maker's 487-share bid at 0.93 holds the
+# midpoint up over bids too small or too deep to matter.
+MISTRAL_MARKET = MARKET._replace(v=0.085)
+MISTRAL_BOOK = Levels(
+    bids=[(0.93, 487.0), (0.852, 18.64), (0.851, 10.0), (0.85, 20.0)],
+    asks=[(0.996, 6.75), (0.997, 150.0), (0.998, 250.0), (0.999, 573.9)],
+    tick=0.001,
+)
+# The Mistral book once the 0.93 bid left: the 0.1c longshot bid scores only 0.020.
+MISTRAL_BOOK_BID_GONE = MISTRAL_BOOK._replace(bids=MISTRAL_BOOK.bids[1:])
+
+
+class FavCeilingTest(unittest.TestCase):
+    def test_worked_example_may_lead_the_best_bid_by_max_lead(self):
+        self.assertEqual(fav_ceiling(WORKED_BOOK, 0.001, 20.0, ScreenConfig().max_lead), 0.939)
+
+    def test_max_lead_keeps_the_bid_from_jumping_the_spread(self):
+        wide = Levels(bids=[(0.95, 100.0)], asks=[(0.985, 100.0)], tick=0.001)
+        # Unbounded, only post-only stops it, a tick under the ask.
+        self.assertEqual(fav_ceiling(wide, 0.001, 20.0, 0.05), 0.984)
+        self.assertEqual(fav_ceiling(wide, 0.001, 20.0, CONFIG.max_lead), 0.955)
+        plan = plan_at(MARKET, wide, CONFIG, 0.955, YEARS)
+        self.assertAlmostEqual(plan.mid, 0.97)
+        self.assertAlmostEqual(plan.fav_bid_score, score(0.035, 0.015))
+
+    def test_tight_book_bid_under_the_best_bid_leaves_the_midpoint(self):
+        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG, 0.949, YEARS)
+        self.assertEqual((plan.fav_bid_price, plan.mid), (0.949, 0.96))
+
+    def test_bid_stays_a_tick_under_a_dust_ask(self):
+        book = Levels(bids=[(0.95, 100.0)], asks=[(0.953, 5.0), (0.985, 100.0)])
+        self.assertEqual(fav_ceiling(book, 0.001, 20.0, CONFIG.max_lead), 0.952)
+
+    def test_created_mid_moves_only_once_the_bid_passes_the_best_bid(self):
+        self.assertAlmostEqual(created_mid(0.94, 0.95, 0.97), 0.96)
+        self.assertAlmostEqual(created_mid(0.96, 0.95, 0.97), 0.965)
+
+
+class LongshotBidTest(unittest.TestCase):
+    """The favorite bid 0.855 x 584.79 scores 0.0271 against the 0.926 midpoint it
+    creates, so the longshot bid must add 15.86 to Q_two."""
+
+    def test_the_lowest_tick_covers_the_favorite_bid_within_the_naked_budget(self):
+        plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE, CONFIG, 0.855, YEARS)
+        # 15.86 / 0.0199 = 795.97 shares at 0.1c cost $0.80. The cheapest price
+        # scoring 0.10 is 1.6c, a 98.4c ask in front of the 99.6c best ask.
+        self.assertEqual((plan.low_price, plan.low_size), (0.001, 795.97))
+        self.assertEqual(plan.mode, Mode.FLOOR)
+        self.assertEqual((plan.fav_bid_price, plan.fav_bid_size), (0.855, 584.79))
+        self.assertGreaterEqual(plan.low_score * plan.low_size,
+                                plan.fav_bid_score * plan.fav_bid_size)
+        self.assertLessEqual(plan.low_price * plan.low_size, CONFIG.naked_budget)
+
+    def test_a_free_price_covers_a_need_that_costs_more_than_the_naked_budget(self):
+        # The 795.97 shares cost $0.80. A quarter out 0.1c offers 0.4% a year,
+        # and no budget limits a bid in the free zone, so the favorite bid
+        # keeps all 584.79 shares.
+        self.assertAlmostEqual(fill_return(0.001, YEARS), 0.004, places=4)
+        for budget in (0.5, 0.019, 0.0):
+            with self.subTest(budget=budget):
+                plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
+                               CONFIG._replace(naked_budget=budget), 0.855, YEARS)
+                self.assertEqual((plan.low_price, plan.low_size), (0.001, 795.97))
+                self.assertEqual(plan.mode, Mode.FLOOR)
+                self.assertEqual(plan.fav_bid_size, 584.79)
+
+    def test_a_free_price_stays_the_bid_as_the_need_passes_what_the_budget_buys_there(self):
+        # $10 buys 10,000 shares at 0.1c, 199.3 of score on this book. The
+        # bid stays at 0.1c, sized to cover and no larger, on both sides of
+        # that need.
+        for need in (100.0, 199.0, 199.31, 250.0, 1000.0, 5000.0):
+            with self.subTest(need=need):
+                bid = longshot_bid(MISTRAL_BOOK_BID_GONE, 0.926, 0.085, 0.001, 20.0, need,
+                                   10.0, 0.1, steady(0.926))
+                self.assertEqual(bid.price, 0.001)
+                self.assertGreaterEqual(bid.score * bid.size, need)
+                self.assertLess(bid.score * (bid.size - 0.01), need)
+
+    def test_a_bid_outside_the_free_zone_is_limited_by_the_budget_and_trims_the_favorite_bid(
+            self):
+        # TIGHT_BOOK's midpoint is 0.96 with v 3.5c, where nothing under 0.6c
+        # scores, and 37 days out 0.6c offers 6.1% a year. $10 buys 588.23
+        # shares at the 1.7c ceiling, which balance 147.05 of the 526.87
+        # favorite shares $500 buys.
+        self.assertGreater(fill_return(0.006, 37 * DAY), reward_screener.FREE_RETURN)
+        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949, 37 * DAY)
+        self.assertEqual((plan.low_price, plan.low_size), (0.017, 588.23))
+        self.assertEqual(plan.mode, Mode.BUDGET)
+        self.assertLessEqual(plan.low_price * plan.low_size, 10.0)
+        self.assertEqual(plan.fav_bid_size, 147.05)
+        self.assertAlmostEqual(plan.fav_bid_size,
+                               plan.low_score * plan.low_size / plan.fav_bid_score, delta=0.01)
+
+    def test_the_free_zone_ends_at_five_percent_a_year(self):
+        self.assertEqual(reward_screener.FREE_RETURN, 0.05)
+        # 24 days out 0.3c offers 4.7% a year and 0.4c 6.3%. 83 days out
+        # 1.1c offers just under 5%.
+        self.assertTrue(under_free_return(0.003, 24 * DAY))
+        self.assertFalse(under_free_return(0.004, 24 * DAY))
+        self.assertTrue(under_free_return(0.011, 83 * DAY))
+        self.assertFalse(under_free_return(0.012, 83 * DAY))
+        self.assertFalse(under_free_return(0.001, 0.0))
+
+    def test_a_free_price_above_the_lowest_tick_is_sized_without_the_budget(self):
+        # The Virginia senate book: 24 days out, v 4.5c, midpoint 0.9555.
+        # 0.1c scores 0.0011, $0.90 for each unit of score, and 0.2c 0.0031,
+        # $0.65. 0.3c scores 0.00605, $0.496 a unit, and offers 4.7% a year:
+        # the cheapest price the budget does not limit. 41,326.54 shares,
+        # $123.98, cover 250 on a $10 budget.
+        book = Levels(bids=[(0.951, 100.0)], asks=[(0.96, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9555, 0.045, 0.001, 20.0, 250.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.9555))
+        self.assertEqual((bid.price, bid.size), (0.003, 41326.54))
+        self.assertGreaterEqual(bid.score * bid.size, 250.0)
+        self.assertLessEqual(bid.price / bid.score, reward_screener.FREE_MAX_COST)
+        # A need the budget covers at a cheaper price rests there.
+        bid = longshot_bid(book, 0.9555, 0.045, 0.001, 20.0, 10.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.9555))
+        self.assertEqual((bid.price, bid.size), (0.001, 9000.0))
+
+    def test_a_price_costing_over_half_a_dollar_a_unit_of_score_is_limited_by_the_budget(self):
+        # Half a tick lower, at a 0.955 midpoint, 0.3c scores 0.0044, $0.675
+        # a unit, and 0.4c offers 6.3% a year. No price is free, and $10
+        # buys the most score at 1.1c, the highest price under 20% a year.
+        self.assertEqual(reward_screener.FREE_MAX_COST, 0.50)
+        book = Levels(bids=[(0.95, 100.0)], asks=[(0.96, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.955, 0.045, 0.001, 20.0, 250.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.955))
+        self.assertEqual((bid.price, bid.size), (0.011, 909.09))
+        self.assertLess(bid.score * bid.size, 250.0)
+
+    def test_the_lowest_tick_scoring_under_the_bound_gives_way_to_the_next_free_price(self):
+        # At a 0.9365 midpoint with v 6.5c a 0.1c share sits five half-ticks
+        # inside the band edge and scores 0.00148, $0.68 a unit. 6,760 of
+        # them fit a $10 budget for a need of 10. A need of 1,000 goes to
+        # 0.5c, the cheapest price costing at most $0.50 a unit, which a
+        # quarter out offers 2% a year.
+        book = Levels(bids=[(0.931, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
+        mid = (0.931 + 0.942) / 2
+        self.assertLess(score(0.065, 1 - mid - 0.001), 0.002)
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 10.0, 10.0, 0.1, steady(mid))
+        self.assertEqual((bid.price, bid.size), (0.001, 6760.0))
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, steady(mid))
+        self.assertEqual((bid.price, bid.size), (0.005, 100000.0))
+        self.assertGreater(0.004 / score(0.065, 1 - mid - 0.004), 0.5)
+        # With the free zone closed the budget limits every price: its $10
+        # buys the most score at the 2c ceiling.
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.02, 500.0))
+
+    def test_the_pfizer_bid_is_sized_without_the_budget(self):
+        # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
+        # 0.00716, $0.14 a unit, so it covers the need in full: 10,056.2
+        # shares for 72 and 139,669.43, $139.67, for 1,000, on a $10 budget.
+        book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1, steady(0.9395))
+        self.assertEqual((bid.price, bid.size), (0.001, 10056.2))
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, steady(0.9395))
+        self.assertEqual((bid.price, bid.size), (0.001, 139669.43))
+
+    def test_a_price_on_the_band_edge_is_not_sized_from_float_noise(self):
+        # At a 0.934 midpoint with v 6.5c a 0.1c share sits on the band edge
+        # and scores 7e-31, which would cover 500 with 7e32 shares. The bid
+        # goes to 1.1c, the cheapest price costing at most $0.50 a unit, and
+        # with the free zone closed to the 2.2c ceiling with its $10.
+        book = Levels(bids=[(0.93, 100.0)], asks=[(0.938, 100.0)], tick=0.001)
+        self.assertGreater(score(0.065, 1 - 0.934 - 0.001), 0.0)
+        bid = longshot_bid(book, 0.934, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, steady(0.934))
+        self.assertEqual((bid.price, bid.size), (0.011, 21125.0))
+        bid = longshot_bid(book, 0.934, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.022, 454.54))
+
+    def test_the_first_score_over_the_bound_at_the_lowest_tick_is_not_limited(self):
+        # v 6.5c and a 0.937 midpoint put 0.1c three ticks inside the band
+        # edge, scoring 0.00213: 234,722.23 shares, $234.72, cover 500.
+        book = Levels(bids=[(0.932, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
+        mid = (0.932 + 0.942) / 2
+        self.assertAlmostEqual(score(0.065, 1 - mid - 0.001), 0.00213, places=5)
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, steady(mid))
+        self.assertEqual((bid.price, bid.size), (0.001, 234722.23))
+
+    def test_a_score_a_floats_noise_under_the_bound_counts_as_the_bound(self):
+        # A score computed from a midpoint can land a float's noise under a
+        # round bound: 0.01 came out as 0.00999999999999968 on a live book.
+        zones = steady(0.99)
+        self.assertTrue(reward_screener.sized_without_budget(0.001, 0.002 - 1e-12, 0.035,
+                                                             zones))
+        self.assertFalse(reward_screener.sized_without_budget(0.001, 0.002 - 1e-6, 0.035,
+                                                              zones))
+
+    def test_a_price_is_free_only_where_it_passed_at_the_steady_midpoint_too(self):
+        # 0.1c scores 0.00716 against the Pfizer midpoint now, 0.9395. Three
+        # ticks lower in the last ten minutes it scored 0.0015, so the
+        # budget still limits it, and the bid rests at 0.5c, the cheapest
+        # price that cost at most $0.50 a unit there too. With no midpoint
+        # watched the free zone is closed, and $10 buys the most score at
+        # 0.1c, 10,000 shares.
+        book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1,
+                           Zones(YEARS, 0.9365))
+        self.assertEqual(bid.price, 0.005)
+        self.assertGreaterEqual(bid.score * bid.size, 1000.0)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.001, 10000.0))
+        self.assertFalse(reward_screener.sized_without_budget(0.001, 0.00716, 0.065,
+                                                              Zones(YEARS, 0.9365)))
+        self.assertTrue(reward_screener.sized_without_budget(0.001, 0.00716, 0.065,
+                                                             Zones(YEARS, 0.9395)))
+
+    def test_a_one_cent_tick_is_free_only_far_from_the_end_date(self):
+        # On a 1c tick the cheapest bid is 1c, where covering 500 takes
+        # 6,722.23 shares, $67. A quarter out 1c offers 4.1% a year and the
+        # budget does not limit it. 60 days out it offers 6.3%, and $10
+        # buys the most score at 2c.
+        book = Levels(bids=[(0.94, 100.0)], asks=[(0.96, 100.0)], tick=0.01)
+        bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1, steady(0.95))
+        self.assertEqual((bid.price, bid.size), (0.01, 6722.23))
+        bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1,
+                           Zones(60 * DAY, 0.95))
+        self.assertEqual((bid.price, bid.size), (0.02, 500.0))
+
+    def test_a_finer_tick_has_free_prices_under_a_tenth_of_a_cent(self):
+        # On a 0.01c tick the cheapest bid is 0.01c, where a share scores
+        # 0.0337. Covering 5,000 takes 148,270 shares, $14.83 on a $10 budget.
+        book = Levels(bids=[(0.95, 100.0)], asks=[(0.96, 100.0)], tick=0.0001)
+        bid = longshot_bid(book, 0.955, 0.055, 0.0001, 20.0, 5000.0, 10.0, 0.1, steady(0.955))
+        self.assertEqual(bid.price, 0.0001)
+        self.assertGreaterEqual(bid.score * bid.size, 5000.0)
+        self.assertGreater(bid.price * bid.size, 10.0)
+
+    def test_longshot_shares_awaiting_an_exit_put_every_price_back_under_the_budget(self):
+        # The free zone is closed then. On this book $10 buys 10,000 shares
+        # at 0.1c, 199.3 of the 250 needed.
+        self.assertTrue(reward_screener.free_zone_open(19.99, 20.0))
+        self.assertFalse(reward_screener.free_zone_open(20.0, 20.0))
+        bid = longshot_bid(MISTRAL_BOOK_BID_GONE, 0.926, 0.085, 0.001, 20.0, 250.0, 10.0, 0.1,
+                           FAR)
+        self.assertEqual((bid.price, bid.size), (0.001, 10000.0))
+
+    def test_no_price_reaching_min_low_score_plans_nothing_even_if_one_covers(self):
+        # No price under the 7.4c crossing limit scores 0.99, though 0.1c would cover.
+        self.assertIsInstance(plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
+                                      CONFIG._replace(min_low_score=0.99), 0.855, YEARS), Skip)
+
+    def test_a_budget_under_the_reward_minimum_size_outside_the_free_zone_plans_nothing(self):
+        # $0.30 buys the most score at the 1.7c ceiling: 17.64 shares, under
+        # the 20-share minimum.
+        self.assertIsInstance(plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=0.3),
+                                      0.949, 37 * DAY), Skip)
+
+    def test_the_mode_names_the_zone_of_the_longshot_bid(self):
+        # At a 0.9635 midpoint with v 3.5c a 0.1c bid scores nothing and a
+        # 0.2c bid 0.0002, where 180 shares cover a 20-share favorite bid
+        # for 36 cents. A quarter out 0.2c offers 0.8% a year, the free
+        # zone. 12 days out it offers 6.3%.
+        book = Levels(bids=[(0.95, 1000.0)], asks=[(0.977, 1000.0)], tick=0.001)
+        plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93, YEARS)
+        self.assertEqual((plan.low_price, plan.low_size), (0.002, 180.0))
+        self.assertEqual(plan.mode, Mode.FLOOR)
+        plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93, 12 * DAY)
+        self.assertEqual((plan.low_price, plan.low_size), (0.002, 180.0))
+        self.assertEqual(plan.mode, Mode.BUDGET)
+
+    def test_a_short_budget_buys_the_most_score_at_the_lowest_tick_near_the_band_edge(self):
+        # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
+        # 0.00716, so $10 buys 10000 shares and 71.6 of score; the 1.7c ceiling
+        # scores 0.109 and buys 64.4. Neither covers the 72 needed. This is
+        # the search while longshot shares await an exit and the budget
+        # limits every price.
+        book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.001, round_size_down(10.0 / 0.001)))
+        self.assertAlmostEqual(bid.score * bid.size, 71.6, delta=0.05)
+        self.assertAlmostEqual(bid.score, score(0.065, 0.0595))
+
+    def test_a_short_budget_sits_at_the_ceiling_when_it_buys_the_most_score(self):
+        # Favorite midpoint 0.96, v 0.035: nothing under 0.6c scores, and the
+        # score $25 buys rises with price up to the 1.7c ceiling (172.9 at
+        # 1470.58 shares versus 154.3 at 1.6c).
+        book = Levels(bids=[(0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+        bid = longshot_bid(book, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.017, 1470.58))
+        self.assertAlmostEqual(bid.score, score(0.035, 0.023))
+
+
+class ReturnLimitTest(unittest.TestCase):
+    """No longshot bid rests where its fill gives the favorite buyer over
+    MAX_RETURN a year. On TIGHT_BOOK, midpoint 0.96 with v 3.5c, nothing
+    under 0.6c scores and the cheapest price scoring 0.10 is 1.7c."""
+
+    def test_a_fill_gives_the_favorite_buyer_the_return_to_the_end_date(self):
+        # A longshot bid at q is a favorite ask at 1 - q, which pays 1 at
+        # the end date: (1 / (1 - q)) ** (1 / years) - 1 a year.
+        self.assertAlmostEqual(fill_return(0.003, 24 * DAY), 0.0468, places=4)
+        self.assertAlmostEqual(fill_return(0.025, 24 * DAY), 0.4701, places=4)
+        self.assertAlmostEqual(fill_return(0.011, 83 * DAY), 0.0499, places=4)
+        self.assertAlmostEqual(fill_return(0.1, 1.0), 1 / 0.9 - 1)
+
+    def test_with_no_time_left_every_price_offers_too_much(self):
+        self.assertEqual(fill_return(0.001, 0.0), float("inf"))
+        self.assertEqual(fill_return(0.001, 1e-9), float("inf"))
+        self.assertTrue(over_max_return(0.001, 0.0))
+
+    def test_the_limit_is_twenty_percent_a_year(self):
+        self.assertEqual(reward_screener.MAX_RETURN, 0.20)
+        # 30 days out 1.4c offers 18.7% and 1.5c 20.2%.
+        self.assertAlmostEqual(price_offering(0.20, 30 * DAY), 0.01486, places=5)
+        self.assertLess(fill_return(0.014, 30 * DAY), 0.20)
+        self.assertGreater(fill_return(0.015, 30 * DAY), 0.20)
+        self.assertFalse(over_max_return(0.014, 30 * DAY))
+        self.assertTrue(over_max_return(0.015, 30 * DAY))
+        self.assertAlmostEqual(fill_return(price_offering(0.20, 30 * DAY), 30 * DAY), 0.20)
+
+    def test_a_far_end_date_leaves_the_bid_at_the_ceiling(self):
+        bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.017, 1470.58))
+
+    def test_the_bid_rests_at_the_highest_price_under_the_limit(self):
+        # 30 days out the 1.7c ceiling offers 23.2% a year. $25 buys the
+        # most score under the limit at 1.4c: 1,785.71 shares scoring 0.0661.
+        bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1,
+                           Zones(30 * DAY))
+        self.assertEqual((bid.price, bid.size), (0.014, 1785.71))
+        self.assertAlmostEqual(bid.score, score(0.035, 0.026))
+        self.assertLess(bid.score * bid.size, 247.63)
+
+    def test_a_price_under_the_limit_that_covers_is_taken_as_before(self):
+        # A need of 100 is covered within $25 at 1.3c, the cheapest price
+        # that covers it, 30 days out as a quarter out.
+        for zones in (FAR, Zones(30 * DAY)):
+            with self.subTest(years_left=zones.years_left):
+                bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 100.0, 25.0, 0.1,
+                                   zones)
+                self.assertEqual((bid.price, bid.size), (0.013, 1914.07))
+
+    def test_no_price_under_the_limit_scoring_means_no_bid(self):
+        # 10 days out nothing over 0.4c is allowed, and nothing under 0.6c
+        # scores.
+        self.assertAlmostEqual(price_offering(0.20, 10 * DAY), 0.00498, places=5)
+        self.assertIsNone(longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0,
+                                       0.1, Zones(10 * DAY)))
+
+    def test_the_favorite_bid_shrinks_to_what_the_prices_under_the_limit_balance(self):
+        # 37 days out $10 at the 1.7c ceiling balances 147.05 favorite
+        # shares. 30 days out $10 at 1.4c balances 100.44.
+        far = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949, 37 * DAY)
+        near = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949,
+                       30 * DAY)
+        self.assertEqual((far.low_price, far.fav_bid_size), (0.017, 147.05))
+        self.assertEqual((near.low_price, near.low_size), (0.014, 714.28))
+        self.assertEqual(near.fav_bid_size, 100.44)
+        self.assertAlmostEqual(near.fav_bid_size,
+                               near.low_score * near.low_size / near.fav_bid_score, delta=0.01)
+
+    def test_no_longshot_bid_under_the_limit_plans_no_favorite_bid(self):
+        self.assertIsInstance(plan_at(MARKET, TIGHT_BOOK, CONFIG, 0.949, 10 * DAY), Skip)
+
+    def test_plan_quotes_reads_the_time_left_from_the_outlook(self):
+        plan, _ = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(years=30 * DAY), 0.96)
+        self.assertEqual(plan.low_price, 0.014)
+        self.assertEqual(plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(years=10 * DAY), 0.96),
+                         Skip("no scoring longshot bid within the naked budget"))
+
+
+# TIGHT_BOOK with a bid behind the best one, so it is not fragile.
+DEEP_BOOK = TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0), (0.895, 1000.0)])
+SCAN_NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
+# A scan's fill prior: the default rates, fit from 40 markets.
+PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=SCAN_NOW)
+
+
+def curve(*rates):
+    """A FillCurve with these rates from the first of DISTANCES, the last one
+    held to the end."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0)
+
+
+NO_FILLS = curve(0.0)
+
+
+def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40):
+    return Outlook(rate, years, fills, hurdle_rate)
+
+
+class FavBidCandidatesTest(unittest.TestCase):
+    def test_candidates_run_from_the_ceiling_to_the_last_scoring_price(self):
+        # Ceiling 0.95 + 0.005. Under the best bid the midpoint stays 0.96, so
+        # 0.926 is the deepest price scoring; 0.925 sits on the band edge.
+        prices = fav_bid_candidates(TIGHT_BOOK, 0.035, 0.001, 20.0, 0.005)
+        self.assertEqual((prices[0], prices[-1], len(prices)), (0.955, 0.926, 30))
+
+    def test_a_cap_under_the_ceiling_starts_the_walk_there(self):
+        prices = fav_bid_candidates(TIGHT_BOOK, 0.035, 0.001, 20.0, 0.005, cap=0.95)
+        self.assertEqual(prices[:2], [0.95, 0.949])
+
+    def test_a_one_sided_book_has_no_candidates(self):
+        one_sided = TIGHT_BOOK._replace(asks=[])
+        self.assertEqual(fav_bid_candidates(one_sided, 0.035, 0.001, 20.0, 0.005), [])
+
+
+class ValueQuoteTest(unittest.TestCase):
+    # Others score ((3.5 - 1) / 3.5)^2 x 100 = 51.02 on each side of the 0.96 midpoint.
+    BOOK = Levels(bids=[(0.95, 100.0)], asks=[(0.97, 100.0)], tick=0.001)
+    THEIR_Q = (0.025 / 0.035) ** 2 * 100
+    # Newsom's bid: the book, the mid, v, the reward minimum, our score, the
+    # bid, its capital and p_true.
+    NEWSOM = (Levels(bids=[(0.969, 100.0)], asks=[(0.979, 100.0)], tick=0.001), 0.974, 0.035,
+              20.0, THEIR_Q, (0.960, 2083.0), 2000.0, 0.98)
+
+    def test_net_is_the_pool_share_less_fills_times_the_loss_of_a_fill(self):
+        # 2c under the 0.96 midpoint a sweep reaches the bid 0.1 times a day and
+        # fills all 200 shares. With no sale price a share sells at the 96c
+        # p_true, 59.7% of 200 shares in 30 days. A year out at 40% that is
+        # worth 93.17c today.
+        fills = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
+                                            (0.94, 200.0), 190.0, 0.96, outlook(fills, years=1.0))
+        self.assertAlmostEqual(value.reward_per_day, 50.0)
+        self.assertAlmostEqual(value.fills_per_day, 20.0)
+        self.assertAlmostEqual(value.loss_per_share, 0.00831, places=5)
+        self.assertAlmostEqual(value.net_per_day, 50.0 - 20.0 * value.loss_per_share)
+        self.assertAlmostEqual(value.net_apr, value.net_per_day * 365 / 190.0)
+
+    def test_the_bid_fills_at_its_distance_below_the_mid_it_is_given(self):
+        # 1.25c under the midpoint, halfway between the 1c and 1.5c rates.
+        fills = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
+                                            (0.9475, 100.0), 95.0, 0.98, outlook(fills))
+        self.assertAlmostEqual(value.fills_per_day, 100 * 0.175)
+        moved = reward_screener.value_quote(self.BOOK, 0.9625, 0.035, 20.0, self.THEIR_Q,
+                                            (0.9475, 100.0), 95.0, 0.98, outlook(fills))
+        self.assertAlmostEqual(moved.fills_per_day, 100 * 0.15)
+
+    def test_a_fill_sells_at_its_sale_price_at_the_measured_rate(self):
+        # No hurdle and 30 days out, so nothing is discounted: 67.4% of 100
+        # shares sell at the 97c sale price and the rest resolve worth the
+        # 98c p_true.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.98)
+        value = reward_screener.value_quote(*quote, soon, sale_price=0.97)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - (0.674 * 0.97 + 0.326 * 0.98))
+        self.assertEqual(value.fills_per_day,
+                         reward_screener.value_quote(*quote, soon).fills_per_day)
+
+    def test_without_a_sale_price_a_share_sells_at_p_true(self):
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.98)
+        value = reward_screener.value_quote(*quote, soon)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - 0.98)
+        self.assertEqual(value, reward_screener.value_quote(*quote, soon, sale_price=0.98))
+
+    def test_a_sale_is_never_credited_over_p_true(self):
+        # A scan's p_true is the 96c mid, and the farmer's ask rests a cent
+        # over it: sold or resolved the share is worth 96c, as it is with no
+        # sale price.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.96)
+        value = reward_screener.value_quote(*quote, soon, sale_price=0.97)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - 0.96)
+        self.assertEqual(value, reward_screener.value_quote(*quote, soon))
+
+    def test_a_newsom_shaped_fill_costs_over_two_cents_a_share(self):
+        # A 98c favorite 0.228 years out, mid 97.4c, 2,083 shares bid at
+        # 96.0c. The ask a cent over the mid is over p_true, so a share sells
+        # at 98c, and 33.8% of 2,083 shares sell in 30 days: 93.66c today.
+        value = reward_screener.value_quote(*self.NEWSOM, outlook(curve(0.5), years=0.228),
+                                            sale_price=0.984)
+        self.assertAlmostEqual(value.loss_per_share, 0.02342, places=5)
+
+    def test_shares_already_held_make_the_same_fill_cost_more(self):
+        # The fill leaves 3,083 or 7,083 shares to sell, 29.4% or 20.2% of them
+        # in 30 days. Without a count of shares held, none are.
+        newsom = outlook(curve(0.5), years=0.228)
+        none = reward_screener.value_quote(*self.NEWSOM, newsom)
+        some = reward_screener.value_quote(*self.NEWSOM, newsom, held=1000.0)
+        more = reward_screener.value_quote(*self.NEWSOM, newsom, held=5000.0)
+        self.assertEqual(none, reward_screener.value_quote(*self.NEWSOM, newsom, held=0.0))
+        self.assertAlmostEqual(some.loss_per_share, 0.02665, places=5)
+        self.assertAlmostEqual(more.loss_per_share, 0.03398, places=5)
+        self.assertEqual(more.fills_per_day, none.fills_per_day)
+
+    def test_a_fill_worth_more_than_its_price_adds_nothing_to_the_net(self):
+        # No hurdle and 30 days out, a 94c fill is worth the 98c p_true: it
+        # loses -4c a share, 50 shares a day. The bid nets its reward and no
+        # more.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
+                                            (0.94, 100.0), 94.0, 0.98, soon)
+        self.assertAlmostEqual(value.loss_per_share, -0.04)
+        self.assertAlmostEqual(value.fills_per_day, 50.0)
+        self.assertEqual(value.fill_cost_per_day, 0.0)
+        self.assertAlmostEqual(value.net_per_day, 50.0)
+        self.assertAlmostEqual(value.net_apr, 50.0 * 365 / 94.0)
+
+    def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
+                                            5.0, 0.98, outlook(curve(1e6)))
+        self.assertEqual(value.fills_per_day, 0.0)
+        self.assertAlmostEqual(value.net_per_day, 50.0)
+
+
+class PlanQuotesTest(unittest.TestCase):
+    def test_with_no_fills_the_bid_sits_at_the_ceiling(self):
+        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(), 0.96)
+        self.assertEqual(plan.fav_bid_price, 0.955)
+        self.assertEqual(value.fills_per_day, 0.0)
+
+    def test_sweeps_through_the_top_of_the_book_push_the_bid_below_where_they_reach(self):
+        # A sweep reaches 1c under the 0.96 midpoint every day and never 1.5c.
+        # A fill there loses 2.8c a share, more than a $10 pool pays for the
+        # 125 shares a day, so the bid steps down to 1.5c under or more.
+        swept = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(swept, rate=10.0), 0.96)
+        self.assertLessEqual(plan.fav_bid_price, 0.945)
+        self.assertEqual(value.size, plan.fav_bid_size)
+        self.assertEqual(value.fills_per_day, 0.0)
+
+    def test_fills_costing_more_than_any_bid_earns_plan_nothing(self):
+        # A sweep through every bid each day, two years out at a 1,000% hurdle.
+        self.assertEqual(plan_quotes(MARKET, TIGHT_BOOK, CONFIG,
+                                     outlook(curve(1.0), years=2.0, hurdle_rate=10.0), 0.96),
+                         Skip("fills cost more than the rewards"))
+
+
+class AssessTest(unittest.TestCase):
+    def test_reward_stays_gross_and_the_rank_is_the_net_yield(self):
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
+        self.assertEqual(a.fill_source, "prior")
+        self.assertIsNone(a.history)
+        self.assertGreater(a.fill_cost_usd, 0)
+        self.assertAlmostEqual(a.est_daily_usd - a.fill_cost_usd, a.net_daily_usd)
+        self.assertAlmostEqual(a.apr, a.est_daily_usd / a.capital_usd * 365)
+        self.assertAlmostEqual(a.rank_score,
+                               a.net_daily_usd / a.capital_usd * min(a.days_left, 90))
+        default = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, fill_cost.DEFAULT_PRIOR)
+        self.assertEqual(default.fill_source, "default")
+
+    def test_a_scan_values_a_fill_with_nothing_held_and_the_book_mid_as_p_true(self):
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
+        price, size = a.plan.fav_bid_price, a.plan.fav_bid_size
+        worth = fill_cost.share_value(a.book_mid, a.book_mid, fill_cost.sales_per_day(size),
+                                      fill_cost.years_until(MARKET.end_date, SCAN_NOW), 0.40)
+        self.assertGreater(a.fills_per_day, 0)
+        self.assertAlmostEqual(a.loss_per_share, price - worth)
+
+    def test_a_history_prices_the_fills_and_is_stored(self):
+        history = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90,
+                          8, 40.0)
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR, history)
+        self.assertEqual(a.fill_source, "history")
+        self.assertEqual(fill_cost.history_from_json(a.history), history)
+        fills = fill_cost.fill_curve(history, PRIOR, CONFIG.min_fav)
+        self.assertAlmostEqual(a.fills_per_day,
+                               a.plan.fav_bid_size * fills.per_day(a.mid - a.plan.fav_bid_price))
+        prior_only = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
+        self.assertNotAlmostEqual(a.fills_per_day, prior_only.fills_per_day)
+
+
+def listing_item(cid, rate):
+    return {"condition_id": cid, "market_slug": cid, "question": f"{cid}?", "active": True,
+            "accepting_orders": True, "enable_order_book": True, "minimum_tick_size": 0.001,
+            "end_date_iso": "2028-10-01T00:00:00Z", "rewards": {"max_spread": 3.5, "min_size": 20},
+            "tokens": [{"token_id": f"fav-{cid}", "price": 0.96, "outcome": "No"},
+                       {"token_id": f"long-{cid}", "price": 0.04, "outcome": "Yes"}]}
+
+
+class ExcludedCategoryTest(unittest.TestCase):
+    def screen(self, tags, config=ScreenConfig()):
+        item = {**listing_item("0x1", 100.0), "tags": tags}
+        return reward_screener.screen_listing(item, {"0x1": 100.0}, config, SCAN_NOW)
+
+    def test_sports_crypto_and_esports_are_skipped_by_default(self):
+        for tags in (["Sports", "NBA"], ["Crypto", "Bitcoin"], ["Esports", "lol"],
+                     ["football", "NFL (All)", "NFL"]):
+            with self.subTest(tags=tags):
+                self.assertEqual(self.screen(tags), Skip("excluded category"))
+
+    def test_other_and_missing_tags_pass(self):
+        for tags in (["Politics", "Elections"], [], None):
+            with self.subTest(tags=tags):
+                self.assertIsInstance(self.screen(tags), RewardMarket)
+
+    def test_only_the_configured_categories_are_skipped(self):
+        config = ScreenConfig(excluded_categories=("politics",))
+        self.assertIsInstance(self.screen(["Sports"], config), RewardMarket)
+        self.assertEqual(self.screen(["POLITICS"], config), Skip("excluded category"))
+        self.assertIsInstance(self.screen(["Crypto"], ScreenConfig(excluded_categories=())),
+                              RewardMarket)
+
+    def test_the_cli_takes_a_comma_list_or_none(self):
+        parse = lambda *argv: reward_screener.build_parser().parse_args(["scan", *argv]).exclude
+        self.assertEqual(parse(), ("sports", "esports", "crypto"))
+        self.assertEqual(parse("--exclude", "Politics, tech"), ("politics", "tech"))
+        self.assertEqual(parse("--exclude", "none"), ())
+        with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+            parse("--exclude", "sports,golf")
+
+
+class ScanHelpTest(unittest.TestCase):
+    def test_the_scan_help_renders_the_naked_budget_entry_whole(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
+            reward_screener.build_parser().parse_args(["scan", "--help"])
+        self.assertIn("--naked-budget NAKED_BUDGET USD a longshot bid may cost where a fill gives "
+                      "the favorite buyer 5% a year or more. Each market's longshot bid is priced "
+                      "with it, as the farmer would with this budget approved (default: 10.0) "
+                      "--min-rate", " ".join(out.getvalue().split()))
+
+
+class RunScanTest(unittest.TestCase):
+    RATES = {"0x1": 300.0, "0x2": 200.0, "0x3": 100.0}
+
+    def scan(self, histories, prior=fill_cost.DEFAULT_PRIOR, tape_markets=2, sample=0,
+             books={}, rejected=frozenset(), tags={}, gamma={}, tapes={}):
+        asked = []
+
+        def fake_reads(http, markets, now, floor):
+            asked.append([m.condition_id for m in markets])
+            return {cid: Read(h, tapes.get(cid)) for cid, h in histories.items()
+                    if cid in asked[-1]}
+
+        with mock.patch.multiple(
+                reward_screener,
+                fetch_paginated=lambda http, path: [{**listing_item(c, r), "tags": tags.get(c)}
+                                                    for c, r in self.RATES.items()],
+                fetch_total_rates=lambda http: dict(self.RATES),
+                fetch_levels=lambda http, ids: {t: books.get(t, DEEP_BOOK) for t in ids},
+                fetch_gamma=lambda http, ids: dict(gamma),
+                fetch_reads=fake_reads,
+                PRIOR_SAMPLE=sample), mock.patch("builtins.print"):
+            result = reward_screener.run_scan(CONFIG._replace(tape_markets=tape_markets),
+                                              SCAN_NOW, prior, frozenset(rejected))
+        return result, asked
+
+    # A sweep through every bid each hour for 60 days, none of them recovered,
+    # held two years at 40%.
+    HEAVY = History((1440,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90, 0, 43200.0)
+    BUSY = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90, 8, 40.0)
+    QUIET = History((0,) * len(DISTANCES), 60.0, SCAN_NOW, 0.90, 0, 0.0)
+
+    def test_only_the_top_markets_read_a_history_and_one_whose_fills_cost_too_much_drops(self):
+        result, asked = self.scan({"0x1": self.HEAVY})
+        self.assertEqual(asked, [["0x1", "0x2"]])
+        self.assertEqual([a.market.condition_id for a in result.assessments], ["0x2", "0x3"])
+        self.assertEqual([a.fill_source for a in result.assessments], ["default", "default"])
+        self.assertEqual(result.funnel.assess_skips, {"fills cost more than the rewards": 1})
+        self.assertEqual(result.funnel.assessed, 2)
+        self.assertIsNone(result.prior)
+
+    def test_listing_tags_and_the_gamma_event_land_in_the_stored_market(self):
+        gamma = {"0x1": parse_gamma({"slug": "0x1", "events": [
+                     {"slug": "2027-french-election", "title": "2027 French election",
+                      "closed": False}]}),
+                 "0x2": parse_gamma({"slug": "0x2"})}
+        result, _ = self.scan({}, tags={"0x1": ["Politics", "French Election"]}, gamma=gamma)
+        stored = {a.market.condition_id: json.loads(reward_screener.scan_row(a).metrics)["market"]
+                  for a in result.assessments}
+        topic = {cid: (m["tags"], m["event_slug"], m["event_title"]) for cid, m in stored.items()}
+        self.assertEqual(topic, {
+            "0x1": (["Politics", "French Election"], "2027-french-election",
+                    "2027 French election"),
+            "0x2": ([], None, None),
+            "0x3": ([], None, None),
+        })
+
+    def test_a_rejected_market_gives_its_top_slot_to_the_next_but_is_still_assessed(self):
+        result, asked = self.scan({}, rejected={"0x1"})
+        self.assertEqual(asked, [["0x2", "0x3"]])
+        self.assertIn("0x1", [a.market.condition_id for a in result.assessments])
+
+    def test_a_rejected_market_can_still_be_sampled(self):
+        result, asked = self.scan({}, tape_markets=0, sample=3, rejected={"0x1"})
+        self.assertIn("0x1", asked[0])
+
+    def test_the_top_markets_histories_alone_fit_no_prior(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 1):
+            result, asked = self.scan({"0x1": self.QUIET, "0x2": self.QUIET})
+        self.assertEqual(asked, [["0x1", "0x2"]])
+        self.assertIsNone(result.prior)
+
+    def test_the_prior_is_fit_from_the_random_sample_and_each_sampled_market_its_own(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 1):
+            result, asked = self.scan(
+                {"0x1": self.BUSY, "0x2": self.QUIET, "0x3": self.QUIET},
+                tape_markets=1, sample=3)
+        self.assertEqual((asked[0][0], sorted(asked[0])), ("0x1", ["0x1", "0x2", "0x3"]))
+        self.assertEqual(result.prior.markets, 3)
+        self.assertEqual(result.prior.rates,
+                         tuple(e / 180.0 for e in self.BUSY.events))
+        self.assertEqual({a.market.condition_id: a.fill_source for a in result.assessments},
+                         {"0x1": "history", "0x2": "history", "0x3": "history"})
+
+    def test_the_sample_draws_markets_the_stored_prior_dropped_but_not_unpriced_ones(self):
+        steep = fill_cost.Prior((50.0,) * len(DISTANCES), (1000.0,) * len(DISTANCES), 1,
+                                SCAN_NOW, 0.90, 0.0, 1000.0)
+        cheap = Levels(bids=[(0.80, 1000.0)], asks=[(0.82, 1000.0)], tick=0.001)
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
+            result, asked = self.scan({c: self.QUIET for c in self.RATES}, steep,
+                                      sample=3, books={"fav-0x3": cheap})
+        self.assertEqual(sorted(asked[0]), ["0x1", "0x2"])
+        self.assertEqual(result.prior.markets, 2)
+        self.assertEqual([a.market.condition_id for a in result.assessments], ["0x1", "0x2"])
+
+    # A buy an hour before the scan over ten days of tape.
+    TAPE = BuyTape([Sweep(SCAN_NOW.timestamp() - 3600, (Piece(0.97, 50.0),))], SCAN_NOW,
+                   SCAN_NOW.timestamp() - 10 * 86400)
+
+    def test_the_exit_prior_is_fit_from_the_sampled_markets_tapes(self):
+        tapes = {"0x1": self.TAPE, "0x2": self.TAPE}
+        histories = {c: self.QUIET for c in self.RATES}
+        with mock.patch.object(exit_value, "PRIOR_MIN_MARKETS", 2):
+            sampled, _ = self.scan(histories, tape_markets=1, sample=3, tapes=tapes)
+            top, _ = self.scan(histories, tape_markets=3, tapes=tapes)
+        self.assertEqual((sampled.exit_prior.markets, sampled.exit_prior.at), (2, SCAN_NOW))
+        self.assertGreater(sampled.exit_prior.arrival_per_day, 0)
+        self.assertIsNone(top.exit_prior)
+        self.assertIsNone(sampled.prior)
+
+    def test_every_market_is_valued_again_on_the_prior_the_sample_fit(self):
+        with mock.patch.object(fill_cost, "PRIOR_MIN_MARKETS", 2):
+            result, asked = self.scan({c: self.QUIET for c in self.RATES}, PRIOR,
+                                      tape_markets=0, sample=2)
+        self.assertEqual((result.prior.markets, result.prior.at), (2, SCAN_NOW))
+        [unread_id] = set(self.RATES) - set(asked[0])
+        unread = {a.market.condition_id: a for a in result.assessments}[unread_id]
+        self.assertEqual(unread.fill_source, "prior")
+        fills = fill_cost.fill_curve(None, result.prior, CONFIG.min_fav)
+        self.assertAlmostEqual(unread.fills_per_day, unread.plan.fav_bid_size
+                               * fills.per_day(unread.mid - unread.plan.fav_bid_price))
+
+
+class FragileMidTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    def test_one_bid_holding_the_favorite_above_min_fav_is_skipped(self):
+        # The live DeepSeek book: a lone 20-share bid at 79c under asks at 99.7c.
+        lone = Levels(bids=[(0.943, 20.0), (0.79, 20.0)], asks=[(0.985, 100.0)], tick=0.001)
+        self.assertEqual(assess(MARKET, lone, CONFIG, self.NOW, PRIOR), Skip("fragile midpoint"))
+
+    def test_last_qualifying_bid_counts_as_fragile(self):
+        self.assertEqual(assess(MARKET, TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0)]),
+                                CONFIG, self.NOW, PRIOR), Skip("fragile midpoint"))
+
+    def test_dust_does_not_count_as_the_best_bid(self):
+        # Pulling the 0.95 level leaves dust at 0.955 and a qualifying bid at 0.895:
+        # (0.895 + 0.97) / 2 = 0.9325 is 2.75c under the 0.96 midpoint. Measured
+        # from a midpoint that counted the dust, 0.9625, the fall would reach 3c.
+        deep = TIGHT_BOOK._replace(bids=[(0.955, 5.0), (0.95, 1000.0), (0.895, 1000.0)])
+        self.assertNotIsInstance(assess(MARKET, deep, CONFIG, self.NOW, PRIOR), Skip)
+
+    def test_a_fall_of_fragile_drop_when_the_best_bid_leaves_is_fragile(self):
+        # The Mistral book before its 0.93 bid left: pulling it drops the midpoint
+        # from (0.93 + 0.997) / 2 = 0.9635 to (0.85 + 0.997) / 2 = 0.9235, still above
+        # min_fav but 4c down: FAV_BID would follow from 0.935 (score 0.404) to 0.855 (0.027).
+        self.assertEqual(assess(MISTRAL_MARKET, MISTRAL_BOOK, CONFIG, self.NOW, PRIOR),
+                         Skip("fragile midpoint"))
+        self.assertNotIsInstance(assess(MISTRAL_MARKET, MISTRAL_BOOK,
+                                        CONFIG._replace(fragile_drop=0.05), self.NOW, PRIOR), Skip)
+
+    def test_a_smaller_fall_when_the_best_bid_leaves_is_not_fragile(self):
+        # A 0.91 bid behind it holds the midpoint at (0.91 + 0.997) / 2 = 0.9535, 1c down.
+        backed = MISTRAL_BOOK._replace(bids=[(0.93, 487.0), (0.91, 100.0), (0.85, 20.0)])
+        self.assertNotIsInstance(assess(MISTRAL_MARKET, backed, CONFIG, self.NOW, PRIOR), Skip)
+
+
+class ResolutionSignalTest(unittest.TestCase):
+    """Decided markets stay open on the CLOB until on-chain resolution."""
+
+    def gamma(self, **fields):
+        return parse_gamma({"slug": "m", "events": [{"slug": "e", "closed": False}],
+                            "umaResolutionStatuses": "[]", **fields})
+
+    def test_open_market_has_no_signal(self):
+        self.assertIsNone(resolution_signal(self.gamma()))
+
+    def test_closed_parent_event_means_decided(self):
+        info = self.gamma(events=[{"slug": "wnba-2026-mvp", "closed": True}])
+        self.assertEqual(resolution_signal(info), "event closed")
+
+    def test_proposed_resolution_sent_as_a_json_string(self):
+        info = self.gamma(umaResolutionStatuses='["proposed", "disputed"]')
+        self.assertEqual(resolution_signal(info), "resolution proposed")
+
+    def test_proposed_resolution_sent_as_a_list(self):
+        self.assertEqual(resolution_signal(self.gamma(umaResolutionStatuses=["proposed"])),
+                         "resolution proposed")
+
+    def test_missing_gamma_record_has_no_signal(self):
+        self.assertIsNone(resolution_signal(None))
+        self.assertIsNone(resolution_signal(parse_gamma({"slug": "m"})))
+
+
+HISTORY_NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
+FAV_TOKEN, LONG_TOKEN = "fav-token", "long-token"
+
+
+def priced(side, asset, price, tx="0xt", wallet="0xw", size=10.0, seconds_ago=60):
+    return {"transactionHash": tx, "proxyWallet": wallet, "side": side, "asset": asset,
+            "size": size, "price": price, "timestamp": int(HISTORY_NOW.timestamp()) - seconds_ago}
+
+
+class ParseHitsTest(unittest.TestCase):
+    AT = HISTORY_NOW.timestamp() - 60
+
+    def test_a_hit_reaches_as_deep_as_the_makers_it_filled(self):
+        taker = [priced("SELL", FAV_TOKEN, 0.95, wallet="0xtaker")]
+        makers = [priced("BUY", FAV_TOKEN, 0.94, wallet="0xm1"),
+                  priced("SELL", LONG_TOKEN, 0.07, wallet="0xm2"),
+                  priced("BUY", FAV_TOKEN, 0.90, tx="0xother", wallet="0xm3")]
+        hits = parse_hits(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(len(hits), 1)
+        self.assertAlmostEqual(hits[0].deep, 0.93)
+
+    def test_buying_the_other_outcome_hits_favorite_bids_at_one_minus_its_price(self):
+        taker = [priced("BUY", LONG_TOKEN, 0.06), priced("BUY", FAV_TOKEN, 0.97, tx="0xlift"),
+                 priced("SELL", LONG_TOKEN, 0.05, tx="0xask")]
+        hits = parse_hits(taker, taker, FAV_TOKEN)
+        self.assertEqual(len(hits), 1)
+        self.assertAlmostEqual(hits[0].deep, 0.94)
+        self.assertEqual(hits[0].at, self.AT)
+
+    def test_maker_rows_are_what_is_left_after_each_taker_row_is_removed_once(self):
+        # Two taker orders in one transaction buy the favorite at 0.90; the
+        # full listing repeats them and adds one maker with the same key.
+        lift = priced("BUY", FAV_TOKEN, 0.90)
+        taker = [priced("SELL", FAV_TOKEN, 0.95), lift, lift]
+        maker = [priced("BUY", FAV_TOKEN, 0.94, wallet="0xm")]
+        self.assertAlmostEqual(parse_hits(taker, taker + maker, FAV_TOKEN)[0].deep, 0.94)
+        self.assertAlmostEqual(parse_hits(taker, taker + maker + [lift], FAV_TOKEN)[0].deep, 0.90)
+
+    def test_malformed_rows_are_dropped(self):
+        good = priced("SELL", FAV_TOKEN, 0.95)
+        bad = [
+            {**good, "transactionHash": None}, {**good, "asset": ""},
+            {**good, "side": "HOLD", "asset": LONG_TOKEN},
+            {**good, "size": 0}, {**good, "size": "lots"}, {**good, "price": 1.0},
+            {**good, "price": None}, {**good, "timestamp": None}, "row", None,
+        ]
+        self.assertEqual(parse_hits(bad, bad, FAV_TOKEN), [])
+        deep_but_broken = {**priced("BUY", FAV_TOKEN, 0.80, wallet="0xm"), "size": -5}
+        hits = parse_hits([good] + bad, [good, deep_but_broken] + bad, FAV_TOKEN)
+        self.assertEqual(hits, [Hit(self.AT, 0.95)])
+
+
+class ParseBuysTest(unittest.TestCase):
+    AT = HISTORY_NOW.timestamp() - 60
+
+    def test_a_buy_is_the_ladder_of_maker_asks_it_took_highest_first(self):
+        # The taker row prints the volume-weighted price, not the top of the ladder.
+        taker = [priced("BUY", FAV_TOKEN, 0.9351, wallet="0xtaker", size=70.0)]
+        makers = [priced("SELL", FAV_TOKEN, 0.935, wallet="0xm1", size=62.28),
+                  priced("SELL", FAV_TOKEN, 0.935, wallet="0xm2", size=5.36),
+                  priced("SELL", FAV_TOKEN, 0.939, wallet="0xm3", size=2.3)]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.at, self.AT)
+        self.assertEqual([p.price for p in buy.pieces], [0.939, 0.935])
+        self.assertEqual([round(p.size, 2) for p in buy.pieces], [2.3, 67.64])
+
+    def test_selling_the_other_outcome_buys_the_favorite_at_one_minus_its_price(self):
+        taker = [priced("SELL", LONG_TOKEN, 0.04, wallet="0xtaker", size=50.0)]
+        makers = [priced("BUY", LONG_TOKEN, 0.04, wallet="0xm1", size=30.0),
+                  priced("SELL", FAV_TOKEN, 0.955, wallet="0xm2", size=20.0)]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.96, 30.0), Piece(0.955, 20.0)))
+
+    def test_only_the_makers_of_its_own_transaction_are_a_buys_pieces(self):
+        taker = [priced("BUY", FAV_TOKEN, 0.95, wallet="0xtaker")]
+        makers = [priced("SELL", FAV_TOKEN, 0.95, wallet="0xm1"),
+                  priced("SELL", FAV_TOKEN, 0.99, tx="0xother", wallet="0xm2")]
+        [buy] = parse_buys(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.95, 10.0),))
+
+    def test_a_buy_listed_without_its_makers_is_one_piece_at_its_own_price(self):
+        taker = [priced("SELL", LONG_TOKEN, 0.0648685, size=70.0)]
+        [buy] = parse_buys(taker, taker, FAV_TOKEN)
+        self.assertEqual(buy.pieces, (Piece(0.9351315, 70.0),))
+
+    def test_taker_rows_of_one_transaction_are_one_buy(self):
+        taker = [priced("BUY", FAV_TOKEN, 0.95, wallet="0xtaker"),
+                 priced("SELL", LONG_TOKEN, 0.04, wallet="0xtaker", size=5.0),
+                 priced("BUY", FAV_TOKEN, 0.97, tx="0xlater", seconds_ago=30)]
+        buys = parse_buys(taker, taker, FAV_TOKEN)
+        self.assertEqual(buys, [Sweep(self.AT, (Piece(0.96, 5.0), Piece(0.95, 10.0))),
+                                Sweep(self.AT + 30, (Piece(0.97, 10.0),))])
+
+    def test_a_hit_on_favorite_bids_is_not_a_buy_and_hits_are_read_as_before(self):
+        hit = [priced("SELL", FAV_TOKEN, 0.95, tx="0xhit", wallet="0xtaker")]
+        hit_makers = [priced("BUY", FAV_TOKEN, 0.94, tx="0xhit", wallet="0xm1")]
+        buy = [priced("BUY", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xtaker")]
+        buy_makers = [priced("SELL", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xm2")]
+        taker, every = hit + buy, hit + hit_makers + buy + buy_makers
+        self.assertEqual(parse_buys(taker, every, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.97, 10.0),))])
+        self.assertEqual(parse_hits(taker, every, FAV_TOKEN), [Hit(self.AT, 0.94)])
+
+    def test_malformed_rows_are_dropped(self):
+        good = priced("BUY", FAV_TOKEN, 0.95)
+        bad = [{**good, "transactionHash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
+               {**good, "price": 1.0}, {**good, "timestamp": None}, "row", None]
+        self.assertEqual(parse_buys(bad, bad, FAV_TOKEN), [])
+        broken_maker = {**priced("SELL", FAV_TOKEN, 0.99, wallet="0xm"), "size": -5}
+        self.assertEqual(parse_buys([good] + bad, [good, broken_maker] + bad, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.95, 10.0),))])
+
+
+DAY_S = 86400
+
+
+def hourly_mids(price, days=70):
+    return [(int(HISTORY_NOW.timestamp()) - 3600 * n, price) for n in range(days * 24)]
+
+
+def history_api(all_pages, taker_pages=(), mids=(), statuses=()):
+    """An httpx client serving /trades pages by takerOnly and offset, and the
+    mids inside each /prices-history interval, after statuses."""
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        if len(calls) <= len(statuses) and statuses[len(calls) - 1] == 429:
+            return httpx.Response(429, headers={"retry-after": "2"})
+        params = request.url.params
+        if request.url.path == "/prices-history":
+            lo, hi = int(params["startTs"]), int(params["endTs"])
+            return httpx.Response(200, json={"history": [
+                {"t": t, "p": p} for t, p in mids
+                if not isinstance(t, (int, float)) or lo <= t <= hi]})
+        pages = taker_pages if params["takerOnly"] == "true" else all_pages
+        index = int(params["offset"]) // 1000
+        return httpx.Response(200, json=pages[index] if index < len(pages) else [])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+def listed(calls, path):
+    return [c.url.params for c in calls if c.url.path == path]
+
+
+class FetchReadTest(unittest.TestCase):
+    def test_a_read_reads_all_rows_then_taker_rows_then_mids(self):
+        taker = [priced("SELL", FAV_TOKEN, 0.95, tx="0xa", wallet="0xt", seconds_ago=DAY_S)]
+        maker = [priced("BUY", FAV_TOKEN, 0.93, tx="0xa", wallet="0xm", seconds_ago=DAY_S)]
+        http, calls = history_api([taker + maker], [taker], hourly_mids(0.96))
+        history = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW,
+                                             0.90).history
+        self.assertEqual([p["takerOnly"] for p in listed(calls, "/trades")], ["false", "true"])
+        self.assertEqual(calls[-1].url.path, "/prices-history")
+        reach = [history.events[fill_cost.DISTANCES.index(d)] for d in (0.02, 0.03)]
+        self.assertEqual(reach, [1, 0])
+        self.assertAlmostEqual(history.days, 60.0)
+        self.assertEqual((history.read_at, history.floor), (HISTORY_NOW, 0.90))
+
+    def test_a_read_takes_its_buys_from_the_same_requests_and_the_same_start(self):
+        hit = [priced("SELL", FAV_TOKEN, 0.95, tx="0xa", wallet="0xt", seconds_ago=DAY_S)]
+        buy = [priced("BUY", FAV_TOKEN, 0.97, tx="0xb", wallet="0xt", seconds_ago=2 * DAY_S)]
+        ask = [priced("SELL", FAV_TOKEN, 0.97, tx="0xb", wallet="0xm", seconds_ago=2 * DAY_S)]
+        old = [priced("BUY", FAV_TOKEN, 0.96, tx="0xc", wallet="0xt", seconds_ago=61 * DAY_S)]
+        http, calls = history_api([hit + buy + ask + old], [hit + buy + old], hourly_mids(0.96))
+        read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        self.assertEqual([c.url.path for c in calls], ["/trades"] * 2 + ["/prices-history"] * 5)
+        start = HISTORY_NOW.timestamp() - 60 * DAY_S
+        self.assertEqual((read.tape.read_at, read.tape.first_at), (HISTORY_NOW, start))
+        self.assertEqual(read.tape.sweeps,
+                         (Sweep(HISTORY_NOW.timestamp() - 2 * DAY_S, (Piece(0.97, 10.0),)),))
+
+    def test_mids_are_read_in_chunks_of_at_most_fourteen_days(self):
+        http, calls = history_api([[]], [[]], hourly_mids(0.96))
+        reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        chunks = [(int(p["startTs"]), int(p["endTs"])) for p in listed(calls, "/prices-history")]
+        self.assertEqual(len(chunks), 5)
+        self.assertTrue(all(0 < hi - lo <= 14 * DAY_S for lo, hi in chunks), chunks)
+        self.assertEqual([lo for lo, _ in chunks[1:]], [hi for _, hi in chunks[:-1]])
+        self.assertEqual(chunks[-1][1], int(HISTORY_NOW.timestamp()))
+        self.assertEqual(listed(calls, "/prices-history")[0]["fidelity"], "1")
+
+    def test_mids_repeated_across_chunks_or_malformed_are_read_once_or_dropped(self):
+        end = int(HISTORY_NOW.timestamp())
+        start = end - 20 * DAY_S
+        mids = [(start + 14 * DAY_S, 0.95), (start + 7, "x"), (None, 0.95), (start + 9, 0.94)]
+        http, _ = history_api([[]], mids=mids)
+        self.assertEqual(reward_screener.fetch_mids(http, FAV_TOKEN, start, end),
+                         [(start + 9, 0.94), (start + 14 * DAY_S, 0.95)])
+
+    def test_a_listing_cut_by_the_row_cap_is_complete_only_from_its_oldest_row(self):
+        # 2,000 rows reaching back 10 days: the taker rows are then read only
+        # back to there, and the history covers those 10 days.
+        first = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432 * n) for n in range(1000)]
+        second = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=432000 + 432 * n)
+                  for n in range(1, 1001)]
+        taker = [priced("BUY", FAV_TOKEN, 0.97, tx=f"0x{n}", seconds_ago=3600 * n)
+                 for n in range(1000)]
+        http, calls = history_api([first, second], [taker, taker], hourly_mids(0.96))
+        read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
+        trades = listed(calls, "/trades")
+        self.assertEqual([(p["takerOnly"], p["offset"]) for p in trades],
+                         [("false", "0"), ("false", "1000"), ("true", "0")])
+        self.assertAlmostEqual(read.history.days, 10.0)
+        oldest = HISTORY_NOW.timestamp() - 10 * DAY_S
+        self.assertEqual((read.tape.first_at, len(read.tape.sweeps)), (oldest, 241))
+        self.assertEqual(int(listed(calls, "/prices-history")[0]["startTs"]), int(oldest - 60 - 3600))
+
+    def test_a_full_page_reaching_past_the_cutoff_is_complete_from_the_cutoff(self):
+        page = [priced("BUY", FAV_TOKEN, 0.97, seconds_ago=3600 * n) for n in range(1000)]
+        http, calls = history_api([page, page])
+        cutoff = HISTORY_NOW.timestamp() - 30 * DAY_S
+        rows, complete_from = reward_screener.fetch_trades(http, "0xc0nd", False, cutoff)
+        self.assertEqual((len(calls), len(rows), complete_from), (1, 1000, cutoff))
+
+    def test_a_short_page_is_the_whole_listing(self):
+        http, calls = history_api([], [[priced("SELL", FAV_TOKEN, 0.95)]])
+        cutoff = HISTORY_NOW.timestamp() - 30 * DAY_S
+        rows, complete_from = reward_screener.fetch_trades(http, "0xc0nd", True, cutoff)
+        self.assertEqual((len(calls), len(rows), complete_from), (1, 1, cutoff))
+        self.assertEqual(calls[0].url.params["takerOnly"], "true")
+
+    def test_a_rate_limited_read_waits_and_retries(self):
+        http, calls = history_api([[priced("SELL", FAV_TOKEN, 0.95)]], statuses=(429,))
+        with mock.patch("time.sleep") as sleep:
+            rows, _ = reward_screener.fetch_trades(http, "0xc0nd", False, 0.0)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c.args for c in sleep.call_args_list], [(2.0,)])
+        self.assertEqual(len(rows), 1)
+
+    def test_a_failed_market_is_left_out_of_the_reads(self):
+        http = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+        with mock.patch("builtins.print") as printed:
+            reads = reward_screener.fetch_reads(http, [MARKET], HISTORY_NOW, 0.90)
+        self.assertEqual(reads, {})
+        self.assertIn("test-market", printed.call_args.args[0])
+
+
+def books_api(fail_when=lambda tokens: False, gate=None):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        tokens = [item["token_id"] for item in json.loads(request.content)]
+        if gate is not None:
+            gate.wait()
+        if fail_when(tokens):
+            return httpx.Response(502)
+        return httpx.Response(200, json=[
+            {"asset_id": t, "tick_size": "0.001", "bids": [{"price": "0.95", "size": "100"}],
+             "asks": [{"price": "0.97", "size": "40"}]} for t in tokens])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+class FetchLevelsTest(unittest.TestCase):
+    TOKENS = [str(n) for n in range(1201)]
+    BOOK = Levels(bids=[(0.95, 100.0)], asks=[(0.97, 40.0)], tick=0.001)
+
+    def test_each_token_is_asked_for_once_in_posts_of_at_most_500(self):
+        http, calls = books_api()
+        books = reward_screener.fetch_levels(http, self.TOKENS + self.TOKENS[:10])
+        asked = [[item["token_id"] for item in json.loads(c.content)] for c in calls]
+        self.assertEqual(sorted(len(tokens) for tokens in asked), [201, 500, 500])
+        self.assertEqual(sorted(t for tokens in asked for t in tokens), sorted(self.TOKENS))
+        self.assertEqual({(c.method, c.url.path, c.extensions["timeout"]["read"]) for c in calls},
+                         {("POST", "/books", 20)})
+        self.assertEqual(books, dict.fromkeys(self.TOKENS, self.BOOK))
+
+    def test_a_failed_chunk_is_reported_and_the_other_chunks_are_kept(self):
+        http, _ = books_api(fail_when=lambda tokens: "700" in tokens)
+        with mock.patch("builtins.print") as printed:
+            books = reward_screener.fetch_levels(http, self.TOKENS)
+        self.assertEqual(sorted(books), sorted(self.TOKENS[:500] + self.TOKENS[1000:]))
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("  Warning: /books chunk of 500 failed (Server error '502 Bad Gateway'",
+                      printed.call_args.args[0])
+
+    def test_the_chunks_are_read_at_the_same_time(self):
+        http, _ = books_api(gate=threading.Barrier(3, timeout=5))
+        with mock.patch("builtins.print"):
+            books = reward_screener.fetch_levels(http, self.TOKENS)
+        self.assertEqual(len(books), len(self.TOKENS))
+
+    def test_no_tokens_sends_no_request(self):
+        http, calls = books_api()
+        self.assertEqual((reward_screener.fetch_levels(http, []), calls), ({}, []))
+
+
+def gamma_markets_api(fail_when=lambda ids: False, status=500, gate=None):
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        ids = request.url.params.get_list("condition_ids")
+        if gate is not None:
+            gate.wait()
+        if fail_when(ids):
+            return httpx.Response(status, headers={"retry-after": "1"})
+        return httpx.Response(200, json=[{"conditionId": c, "slug": f"slug-{c}"} for c in ids])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+class FetchGammaTest(unittest.TestCase):
+    IDS = [f"0x{n:03x}" for n in range(250)]
+
+    def test_ids_are_read_in_chunks_of_a_hundred_each_with_its_size_as_the_limit(self):
+        http, calls = gamma_markets_api()
+        info = reward_screener.fetch_gamma(http, self.IDS)
+        asked = [c.url.params for c in calls]
+        self.assertEqual(sorted(len(p.get_list("condition_ids")) for p in asked), [50, 100, 100])
+        for params in asked:
+            self.assertEqual(params["limit"], str(len(params.get_list("condition_ids"))))
+            self.assertNotIn("closed", params)
+        self.assertEqual({(c.method, c.url.path, c.extensions["timeout"]["read"]) for c in calls},
+                         {("GET", "/markets", 20)})
+        self.assertEqual({cid: i.slug for cid, i in info.items()},
+                         {cid: f"slug-{cid}" for cid in self.IDS})
+
+    def test_a_failed_chunk_is_reported_and_leaves_its_markets_bare(self):
+        http, _ = gamma_markets_api(fail_when=lambda ids: self.IDS[120] in ids)
+        with mock.patch("builtins.print") as printed:
+            info = reward_screener.fetch_gamma(http, self.IDS)
+        self.assertEqual(sorted(info), sorted(self.IDS[:100] + self.IDS[200:]))
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("  Warning: Gamma chunk of 100 failed (Server error '500 Internal Server "
+                      "Error'", printed.call_args.args[0])
+
+    def test_a_rate_limited_chunk_fails_at_once_without_a_retry(self):
+        http, calls = gamma_markets_api(fail_when=lambda ids: True, status=429)
+        with mock.patch("time.sleep") as sleep, mock.patch("builtins.print") as printed:
+            info = reward_screener.fetch_gamma(http, self.IDS[:3])
+        self.assertEqual((info, len(calls)), ({}, 1))
+        sleep.assert_not_called()
+        self.assertIn("  Warning: Gamma chunk of 3 failed (Client error '429 Too Many Requests'",
+                      printed.call_args.args[0])
+
+    def test_the_chunks_are_read_at_the_same_time(self):
+        http, _ = gamma_markets_api(gate=threading.Barrier(3, timeout=5))
+        with mock.patch("builtins.print"):
+            info = reward_screener.fetch_gamma(http, self.IDS)
+        self.assertEqual(len(info), len(self.IDS))
+
+    def test_no_ids_sends_no_request(self):
+        http, calls = gamma_markets_api()
+        self.assertEqual((reward_screener.fetch_gamma(http, []), calls), ({}, []))
+
+
+REWARD_ROWS = [(f"0x{n:04d}", n % 7 + 1) for n in range(2000)]
+
+
+def offset_cursor(offset):
+    return base64.b64encode(str(offset).encode()).decode()
+
+
+NATIVE_CONFIG = [{"asset_address": "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB",
+                  "start_date": "2026-10-01", "end_date": "2500-12-31", "rate_per_day": 1}]
+
+
+def rewards_api(rows, gone=lambda offset: 0, next_cursor=None, sponsored_only=()):
+    """A /rewards/markets/current over rows [(condition_id, rate)], paged as the
+    CLOB pages it: 500 rows from a base64 row offset, LTE= after a short page.
+    gone(offset) is how many leading rows have left the listing by the time the
+    page at that offset is read. A cursor that is not an offset ends the listing.
+    Each row has a native reward config, except the sponsored_only ones."""
+    offsets = []
+
+    def handle(request):
+        try:
+            offset = int(base64.b64decode(request.url.params["next_cursor"]))
+        except ValueError:
+            return httpx.Response(200, json={"data": [], "next_cursor": "LTE="})
+        offsets.append(offset)
+        page = rows[gone(offset):][offset:offset + 500]
+        cursor = offset_cursor(offset + 500) if len(page) == 500 else "LTE="
+        return httpx.Response(200, json={
+            "data": [{"condition_id": c, "total_daily_rate": r,
+                      "rewards_config": [] if c in sponsored_only else NATIVE_CONFIG}
+                     for c, r in page],
+            "next_cursor": next_cursor or cursor, "limit": 500, "count": len(page)})
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), offsets
+
+
+class FetchTotalRatesTest(unittest.TestCase):
+    def test_markets_leaving_mid_read_skip_no_market_still_listed(self):
+        http, _ = rewards_api(REWARD_ROWS, gone=lambda offset: 50 if offset >= 800 else 0)
+        rates = reward_screener.fetch_total_rates(http)
+        self.assertEqual([c for c, r in REWARD_ROWS[50:] if rates.get(c) != r], [])
+        self.assertLessEqual(set(rates), {c for c, _ in REWARD_ROWS})
+
+    def test_a_market_paid_only_by_sponsors_is_left_out(self):
+        sponsored = {REWARD_ROWS[3][0], REWARD_ROWS[1200][0]}
+        http, _ = rewards_api(REWARD_ROWS, sponsored_only=sponsored)
+        rates = reward_screener.fetch_total_rates(http)
+        self.assertEqual(sorted(sponsored & rates.keys()), [])
+        self.assertEqual([c for c, r in REWARD_ROWS if c not in sponsored and rates.get(c) != r], [])
+
+    def test_a_listing_that_keeps_shifting_past_the_overlap_raises_after_rereading(self):
+        http, offsets = rewards_api(REWARD_ROWS, gone=lambda offset: 150 if offset >= 800 else 0)
+        with self.assertRaises(RuntimeError):
+            reward_screener.fetch_total_rates(http)
+        self.assertEqual(offsets.count(0), reward_screener.REWARDS_ATTEMPTS)
+
+    def test_a_listing_not_sorted_by_condition_id_raises(self):
+        http, _ = rewards_api(REWARD_ROWS[::-1])
+        with self.assertRaises(ValueError):
+            reward_screener.fetch_total_rates(http)
+
+    def test_a_cursor_that_is_not_a_row_offset_raises(self):
+        http, _ = rewards_api(REWARD_ROWS, next_cursor="aWQ6MTI4NDk2OA==")
+        with self.assertRaises(ValueError):
+            reward_screener.fetch_total_rates(http)
+
+
+class StoreTest(unittest.TestCase):
+    def test_a_scan_stores_the_exit_prior_it_fit_beside_the_stored_fill_prior(self):
+        conn = farm_db.open_db(":memory:")
+        self.addCleanup(conn.close)
+        funnel = farm_db.ScanFunnel(SCAN_NOW, 1.0, 0, 0, 0, {}, {})
+        exit_prior = exit_value.DEFAULT_EXIT_PRIOR._replace(markets=30, at=SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel, PRIOR), SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel, None,
+                                                               exit_prior), SCAN_NOW)
+        reward_screener.store(conn, reward_screener.ScanResult([], set(), funnel), SCAN_NOW)
+        self.assertEqual((reward_screener.load_prior(conn), reward_screener.load_exit_prior(conn)),
+                         (PRIOR, exit_prior))
+
+
+class ApproveTest(unittest.TestCase):
+    """approve warns when the budget is short of the longshot leg the scan planned."""
+
+    def approve(self, low_price, low_size, budget, low_score=0.2, days=90):
+        """What approve prints for a row whose scan planned this longshot
+        leg on a book with a 0.99 midpoint, ending `days` from today."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "farm.db")
+        conn = farm_db.open_db(path)
+        end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        plan = {"fav_bid_price": 0.95, "mid": 0.99, "low_price": low_price,
+                "low_size": low_size, "low_score": low_score}
+        metrics = {"plan": plan, "book_mid": 0.99, "market": {"v": 0.035, "end_date": end}}
+        farm_db.store_scan(conn, [farm_db.ScanRow(
+            "0xc0nd", "test-market", "Test?", end, 1.0, json.dumps(metrics))], ["0xc0nd"],
+            SCAN_NOW)
+        conn.close()
+        args = reward_screener.build_parser().parse_args(
+            ["approve", "test-market", "--db", path, "--p-true", "0.97", "--budget", str(budget)])
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            reward_screener.cmd_approve(args)
+        return printed.getvalue()
+
+    def test_a_budget_under_a_longshot_bid_outside_the_free_zone_warns(self):
+        # 90 days out a 2c bid offers a favorite buyer 8.5% a year.
+        self.assertIn("ties up $30.00, above the $25.00 naked budget",
+                      self.approve(0.02, 1500.0, 25.0))
+
+    def test_a_budget_under_a_free_bid_does_not_warn(self):
+        # 30,000 shares at 0.1c cost $30, and no budget limits them.
+        printed = self.approve(0.001, 30000.0, 25.0)
+        self.assertNotIn("Warning", printed)
+        self.assertIn("Approved test-market", printed)
+
+    def test_a_budget_under_a_bid_costing_over_half_a_dollar_a_unit_of_score_warns(self):
+        # A 0.1c share scoring 0.0015 costs $0.67 a unit and is sized within
+        # the budget, so a smaller budget cuts the leg. One scoring 0.007 is
+        # not.
+        self.assertIn("ties up $30.00, above the $25.00 naked budget",
+                      self.approve(0.001, 30000.0, 25.0, low_score=0.0015))
+        self.assertNotIn("Warning", self.approve(0.001, 30000.0, 25.0, low_score=0.007))
+
+    def test_the_same_bid_warns_once_the_end_date_takes_it_out_of_the_free_zone(self):
+        # 10,000 shares at 0.3c cost $30. 90 days out they offer 1.2% a
+        # year, and 20 days out 5.6%.
+        self.assertNotIn("Warning", self.approve(0.003, 10000.0, 25.0))
+        self.assertIn("ties up $30.00, above the $25.00 naked budget",
+                      self.approve(0.003, 10000.0, 25.0, days=20))
+
+
+class LoadExitPriorTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = farm_db.open_db(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def store(self, text):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (farm_db.SCAN_EXIT_PRIOR_KEY, text, "2026-10-04T12:00:00+00:00"))
+
+    def test_no_stored_exit_prior_reads_as_the_default(self):
+        self.assertEqual(reward_screener.load_exit_prior(self.conn), exit_value.DEFAULT_EXIT_PRIOR)
+
+    def test_a_stored_exit_prior_is_read_back(self):
+        prior = exit_value.DEFAULT_EXIT_PRIOR._replace(markets=40, at=HISTORY_NOW)
+        self.store(json.dumps(exit_value.exit_prior_to_json(prior)))
+        self.assertEqual(reward_screener.load_exit_prior(self.conn), prior)
+
+    def test_a_malformed_stored_exit_prior_reads_as_the_default(self):
+        for text in ("{not json", json.dumps({"v": 1}), json.dumps([1, 2])):
+            with self.subTest(text=text):
+                self.conn.execute("DELETE FROM settings")
+                self.store(text)
+                self.assertEqual(reward_screener.load_exit_prior(self.conn),
+                                 exit_value.DEFAULT_EXIT_PRIOR)
+
+
+class LoadPriorTest(unittest.TestCase):
+    def setUp(self):
+        self.conn = farm_db.open_db(":memory:")
+        self.addCleanup(self.conn.close)
+
+    def store(self, text):
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)",
+                (farm_db.SCAN_FILL_PRIOR_KEY, text, "2026-10-04T12:00:00+00:00"))
+
+    def test_no_stored_prior_reads_as_the_default(self):
+        self.assertEqual(reward_screener.load_prior(self.conn), fill_cost.DEFAULT_PRIOR)
+
+    def test_a_stored_prior_is_read_back(self):
+        prior = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=HISTORY_NOW)
+        self.store(json.dumps(fill_cost.prior_to_json(prior)))
+        self.assertEqual(reward_screener.load_prior(self.conn), prior)
+
+    def test_a_malformed_stored_prior_reads_as_the_default(self):
+        for text in ("{not json", json.dumps({"v": 1}), json.dumps([1, 2])):
+            with self.subTest(text=text):
+                self.conn.execute("DELETE FROM settings")
+                self.store(text)
+                self.assertEqual(reward_screener.load_prior(self.conn), fill_cost.DEFAULT_PRIOR)
+
+
+if __name__ == "__main__":
+    unittest.main()

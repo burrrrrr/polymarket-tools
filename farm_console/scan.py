@@ -7,8 +7,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
-import farm_db
-import reward_screener
+from farm import farm_db, reward_screener
 
 
 class ScanPhase(Enum):

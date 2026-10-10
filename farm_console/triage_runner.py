@@ -4,8 +4,7 @@ import threading
 from collections import deque
 from contextlib import closing
 
-import farm_db
-import triage
+from farm import farm_db, triage
 
 WORKERS = 2
 

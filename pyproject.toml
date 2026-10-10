@@ -26,5 +26,6 @@ py-modules = []
 packages = []
 
 [tool.pytest.ini_options]
-testpaths = ["."]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
 norecursedirs = ["handoff", ".claude", ".venv", "snapshots"]

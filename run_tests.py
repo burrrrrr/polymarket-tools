@@ -1,6 +1,6 @@
 """Run the test suite, one process a module.
 
-    python run_tests.py                  every test_*.py beside this file
+    python run_tests.py                  every tests/test_*.py
     python run_tests.py test_farm_db     the modules named
 
 The modules share nothing: each test works in its own temporary directory.
@@ -17,18 +17,22 @@ from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+TESTS = os.path.join(ROOT, "tests")
+# The test modules import each other by bare name.
+ENV = {**os.environ,
+       "PYTHONPATH": os.pathsep.join(filter(None, (TESTS, os.environ.get("PYTHONPATH"))))}
 
 
 def run(module):
     started = time.monotonic()
-    done = subprocess.run([sys.executable, "-m", "unittest", module], cwd=ROOT,
+    done = subprocess.run([sys.executable, "-m", "unittest", module], cwd=ROOT, env=ENV,
                           capture_output=True, text=True)
     return module, done, time.monotonic() - started
 
 
 def main(modules):
     modules = modules or sorted(
-        os.path.basename(path)[:-3] for path in glob(os.path.join(ROOT, "test_*.py")))
+        os.path.basename(path)[:-3] for path in glob(os.path.join(TESTS, "test_*.py")))
     started = time.monotonic()
     with ThreadPoolExecutor(min(len(modules), os.cpu_count() or 4)) as pool:
         results = list(pool.map(run, modules))

@@ -1,6 +1,9 @@
 .env
 snapshots/
 
+# The data directory POLYMARKET_DATA_DIR names: the databases and snapshots/
+data/
+
 # Python cache files
 __pycache__/
 *.pyc

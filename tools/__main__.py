@@ -14,7 +14,8 @@ instead, for a machine with no vault: unlock the vault elsewhere and pipe the
 key in over SSH. --no-key starts a worker that fails every job that needs one.
 
 --db defaults to tools.db in the data directory (see data_dir.py): the
-directory POLYMARKET_DATA_DIR names, or the repo directory.
+directory POLYMARKET_DATA_DIR names, or the repo directory. DIR defaults to
+the snapshots folder of the same directory.
 """
 
 import argparse
@@ -34,7 +35,6 @@ from polymarket import keys, region
 from tools import db, snapshot, sniper, worker
 
 REPO = Path(__file__).parent.parent
-DEFAULT_SNAPSHOTS = REPO / "snapshots"
 STOP_SIGNALS = ("SIGINT", "SIGTERM", "SIGBREAK")
 
 
@@ -57,8 +57,8 @@ def build_parser():
         description="Store each orders_snapshot_*.json file as a snapshot. A file stored "
                     "before is skipped. The files' times are read in this machine's time "
                     "zone. Needs no key.")
-    importer.add_argument("directory", nargs="?", default=str(DEFAULT_SNAPSHOTS),
-                          help=f"where the files are (default: {DEFAULT_SNAPSHOTS})")
+    importer.add_argument("directory", nargs="?",
+                          help=f"where the files are (default: snapshots {data_dir.LOCATION_HELP})")
     # SUPPRESS keeps a --db given before the command when none follows it.
     importer.add_argument("--db", default=argparse.SUPPRESS, help="as above")
     return parser
@@ -72,6 +72,7 @@ def main(argv=None):
     except data_dir.NoDataDir as e:
         return fail(f"Not started: {e}.")
     if args.command == "import-snapshots":
+        args.directory = data_dir.snapshots_path(args.directory)
         return import_snapshots(args)
     return run_worker(args)
 

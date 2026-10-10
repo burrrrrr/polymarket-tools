@@ -5,8 +5,8 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-import farm_db
-from farm_db import CommandKind
+from farm import farm_db
+from farm.farm_db import CommandKind
 
 from .. import forms, views
 from ..context import FARMER_DEFAULTS, form_of, see_other

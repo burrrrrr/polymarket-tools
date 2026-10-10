@@ -4,9 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-import farm_db
-import reward_screener
-import triage
+from farm import farm_db, reward_screener, triage
 
 from .. import forms, views
 from ..context import form_of, see_other

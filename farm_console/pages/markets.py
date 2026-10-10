@@ -5,8 +5,8 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
-import farm_db
-from farm_db import EventKind
+from farm import farm_db
+from farm.farm_db import EventKind
 
 from .. import charts, views
 from ..context import CONTROLS_EVENT, as_json, form_of, region_template

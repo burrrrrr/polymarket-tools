@@ -3,7 +3,7 @@ from contextlib import closing
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
 
-import farm_db
+from farm import farm_db
 
 from .. import views
 from ..context import as_json, region_template

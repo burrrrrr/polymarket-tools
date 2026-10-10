@@ -5,7 +5,7 @@ from typing import NamedTuple, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-import farm_db
+from farm import farm_db
 from tools import db as tools_db
 from tools.db import JobKind, JobState, RestoreAction
 

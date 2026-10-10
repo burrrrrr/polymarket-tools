@@ -4,8 +4,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
-import reward_screener
-import triage
+from farm import reward_screener, triage
 
 from . import remote, security
 from .context import HERE, Context

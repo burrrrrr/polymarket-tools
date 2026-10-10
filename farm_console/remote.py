@@ -8,8 +8,7 @@ from typing import NamedTuple, Optional
 
 import httpx
 
-import reward_farmer
-import reward_screener
+from farm import reward_farmer, reward_screener
 from polymarket import books
 from polymarket.gamma import request_markets
 from polymarket.parse import parse_time

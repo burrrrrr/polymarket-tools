@@ -7,9 +7,9 @@ with any error writes nothing.
 import math
 from typing import NamedTuple, Optional
 
-import farm_db
-from farm_db import Bound
-from reward_screener import CATEGORIES, ScreenConfig
+from farm import farm_db
+from farm.farm_db import Bound
+from farm.reward_screener import CATEGORIES, ScreenConfig
 
 NOTE_MAX = 500
 CANCEL_ALL_WORD = "CANCEL"

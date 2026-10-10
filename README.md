@@ -3,10 +3,10 @@
 A reward farmer for Polymarket, the web console that controls it, and a keyed
 worker that runs two order tools from that console.
 
-- `reward_screener.py` ranks the markets that pay liquidity rewards and stores
-  them in `farm.db` for you to approve or reject.
-- `reward_farmer.py` rests post-only orders on the approved markets to earn
-  those rewards. It is a dry run unless you pass `--live`.
+- `farm/reward_screener.py` ranks the markets that pay liquidity rewards and
+  stores them in `farm.db` for you to approve or reject.
+- `farm/reward_farmer.py` rests post-only orders on the approved markets to
+  earn those rewards. It is a dry run unless you pass `--live`.
 - `python -m farm_console` serves a local web console. It shows what the
   farmer does, and it is where you run scans, approve markets, and control
   the farmer. It holds no wallet key.
@@ -54,8 +54,8 @@ browser --HTTP--> console (no key) --rows--> tools.db <--rows-- worker (key)
 
 | Process | Command | Wallet key | What it reads and writes |
 | --- | --- | --- | --- |
-| Screener | `python reward_screener.py` | Never | Reads Polymarket's public APIs. Writes its scan to `farm.db`. |
-| Farmer | `python reward_farmer.py` | Only with `--live` | Reads your decisions, settings, and commands from `farm.db` every cycle and writes what it does there. Records books to `farm_books.db`. With `--live` it posts and cancels orders. |
+| Screener | `python -m farm.reward_screener` | Never | Reads Polymarket's public APIs. Writes its scan to `farm.db`. |
+| Farmer | `python -m farm.reward_farmer` | Only with `--live` | Reads your decisions, settings, and commands from `farm.db` every cycle and writes what it does there. Records books to `farm_books.db`. With `--live` it posts and cancels orders. |
 | Console | `python -m farm_console` | Never | Serves HTTP on `127.0.0.1`. Reads and writes `farm.db` and `tools.db`. Reads the public APIs for a scan, the Review page, and the Sniper search. |
 | Worker | `python -m tools` | Yes, unless `--no-key` | Reads the jobs and the watches the console wrote to `tools.db` and writes the results there. Posts the orders of a restore and of a watch. |
 
@@ -67,9 +67,9 @@ The worker is a process of its own for three reasons:
 
 - A console restart does not stop an armed watch or a restore in progress.
 - The wallet key stays out of the process that parses HTTP.
-  `test_farm_console_orders.py` and `test_farm_console_sniper.py` fail if
-  importing the console loads `polymarket.keys`, `polymarket.client`, or the
-  worker.
+  `tests/test_farm_console_orders.py` and
+  `tests/test_farm_console_sniper.py` fail if importing the console loads
+  `polymarket.keys`, `polymarket.client`, or the worker.
 - The sniper does not share Python's interpreter lock with scans and the
   console's event stream.
 
@@ -79,27 +79,30 @@ markets the farmer manages, the console reads them from `farm.db` at your
 click and puts them in the job.
 
 Both databases run in WAL mode with a 5-second busy timeout, and every column
-has one writer process. `farm_db.py` owns the schema of `farm.db` and every
-statement run against it. `tools/db.py` does the same for `tools.db`.
+has one writer process. `farm/farm_db.py` owns the schema of `farm.db` and
+every statement run against it. `tools/db.py` does the same for `tools.db`.
 
 ### Files
 
-The farmer, the screener, and their analysis modules are single files at the
-repository root. The code that talks to Polymarket, the worker, and the
+Each folder holds one part of the code. The farmer and the screener, their
+analysis tools, the code that talks to Polymarket, the worker, and the
 console are packages.
 
 ```text
-reward_screener.py   the screener: scan, list, approve, reject
-reward_farmer.py     the farmer
-farm_db.py           farm.db: the schema and every statement
-farm_books.py        farm_books.db: the favorite books the farmer records
-fill_cost.py         how often a favorite bid fills, and what a fill costs
-exit_value.py        what a favorite exit is worth
-fill_backtest.py     backtest of the fill forecast
-exit_backtest.py     backtest of the exit model
-triage.py            a screen of candidate markets that runs the claude CLI
-triage_eval.py       the evaluation of that screen
-scoring_probe.py     read-only: how long an order rests before it scores
+farm/                the screener and the farmer
+  reward_screener.py the screener: scan, list, approve, reject
+  reward_farmer.py   the farmer
+  farm_db.py         farm.db: the schema and every statement
+  farm_books.py      farm_books.db: the favorite books the farmer records
+  fill_cost.py       how often a favorite bid fills, and what a fill costs
+  exit_value.py      what a favorite exit is worth
+  triage.py          a screen of candidate markets that runs the claude CLI
+
+analysis/            backtests and probes you run by hand
+  fill_backtest.py   backtest of the fill forecast
+  exit_backtest.py   backtest of the exit model
+  triage_eval.py     the evaluation of the triage screen
+  scoring_probe.py   read-only: how long an order rests before it scores
 
 polymarket/          talks to Polymarket and holds no strategy
   hosts.py           where the services live
@@ -132,15 +135,16 @@ farm_console/        the web console
   templates/         the pages' HTML
   static/            CSS, htmx, and the console's scripts
 
-test_*.py            the tests, at the repository root
+tests/               the tests
+data_dir.py          where each program looks for the databases
 run_tests.py         runs every test module
 pyproject.toml       the dependencies and the pytest settings
 .env.example         the settings each process reads at start
 ```
 
 `git ls-files` lists every tracked file. Git ignores the data: `.env`,
-`farm.db`, `farm_books.db`, `tools.db`, and the old snapshot files in
-`snapshots/`.
+`farm.db`, `farm_books.db`, `tools.db`, the old snapshot files in
+`snapshots/`, and everything in `data/`.
 
 ## Install
 
@@ -154,11 +158,12 @@ pip install -e ".[dev]"
 
 The code runs from the checkout, and the install brings only the
 dependencies. Run every command in this file from the repository root, so
-that Python finds the `polymarket`, `tools`, and `farm_console` packages.
+that Python finds the `farm`, `analysis`, `polymarket`, `tools`, and
+`farm_console` packages.
 
 Two outside programs are optional. The Bitwarden CLI (`bw`) is needed only
 when the wallet key comes from a Bitwarden vault. The `claude` CLI is needed
-only for the screen in `triage.py`.
+only for the screen in `farm/triage.py`.
 
 ## Set up the environment
 
@@ -173,9 +178,10 @@ only for the screen in `triage.py`.
 3. Decide where the wallet key comes from. See
    [Where the wallet key comes from](#where-the-wallet-key-comes-from).
 
-The farmer, the console, the worker, and the scoring probe each load `.env`
-from the repository root when they start. A variable already set in the real
-environment wins over its line in `.env`. The screener reads no `.env`.
+The farmer, the screener, the console, the worker, the scoring probe, and
+`python -m analysis.triage_eval` each load `.env` from the repository root
+when they start. A variable already set in the real environment wins over its
+line in `.env`.
 
 | Variable | Needed | Meaning |
 | --- | --- | --- |
@@ -197,8 +203,8 @@ the `py_clob_client_v2.config` module.
 ### Where the wallet key comes from
 
 Three programs read the key: a farmer started with `--live`, the worker
-unless you start it with `--no-key`, and `scoring_probe.py`. A dry-run farmer,
-the screener, and the console read no key.
+unless you start it with `--no-key`, and `analysis/scoring_probe.py`. A
+dry-run farmer, the screener, and the console read no key.
 
 Each of the three reads `POLYMARKET_PRIVATE_KEY` when it is set. Otherwise it
 reads the note of a Bitwarden item. `POLYMARKET_KEY_SOURCE=env` or
@@ -226,7 +232,7 @@ the key from one line of standard input and skip both sources:
 
 ```bash
 python -m tools --key-stdin
-python reward_farmer.py --live --key-stdin
+python -m farm.reward_farmer --live --key-stdin
 ```
 
 That lets you unlock the vault on your own machine and send only the key to
@@ -247,33 +253,35 @@ nothing.
 
 ### Where the databases live
 
-The farmer, the console, and the worker look for `farm.db` and `tools.db` in
-one data directory. It is the directory `POLYMARKET_DATA_DIR` names, and the
-repository root when the variable is not set. The three processes therefore
-agree wherever you start each one.
+The farmer, the screener, the console, and the worker look for `farm.db` and
+`tools.db` in one data directory. It is the directory `POLYMARKET_DATA_DIR`
+names, and the repository root when the variable is not set. The processes
+therefore agree wherever you start each one.
 
 - You can set `POLYMARKET_DATA_DIR` in `.env` or in the real environment. A
-  relative value is taken from the repository root.
+  relative value is taken from the repository root, so
+  `POLYMARKET_DATA_DIR=data` names the `data/` folder of the checkout, which
+  Git ignores.
 - The directory must exist. No program creates it, because a mistyped
   directory would start every process on empty databases. A program that
-  cannot find it prints `Not started: POLYMARKET_DATA_DIR is not a directory`
-  with the path, and exits.
-- `--db` on the farmer and the worker, and `--db` and `--tools-db` on the
-  console, each name one file outright. A relative path there is read from
-  the current directory.
+  cannot find it prints `POLYMARKET_DATA_DIR is not a directory` with the
+  path, and exits.
+- `--db` on the farmer, the screener, and the worker, and `--db` and
+  `--tools-db` on the console, each name one file outright. A relative path
+  there is read from the current directory.
 - The farmer writes `farm_books.db` in the directory of its `farm.db`.
-- The screener is the exception. It reads neither `.env` nor
-  `POLYMARKET_DATA_DIR`, and its `--db` defaults to `farm.db` in the current
-  directory. When you set a data directory, run the screener with `--db` and
-  the path of the `farm.db` in it, or scan from the console's Discover page,
-  which writes to the console's `farm.db`.
+- `python -m tools import-snapshots` looks for the old snapshot files in the
+  `snapshots` folder of the data directory. See
+  [Import the old snapshot files](#import-the-old-snapshot-files).
+- `python -m analysis.triage_eval` finds `farm.db` the same way.
+  `python -m analysis.exit_backtest fetch` has no default: give it `--db`.
 
 ## Run the processes
 
 A usual session has three terminals, each in the repository root:
 
 ```bash
-python reward_farmer.py      # the farmer, a dry run
+python -m farm.reward_farmer  # the farmer, a dry run
 python -m farm_console       # the console, on http://127.0.0.1:8787
 python -m tools              # the worker, with the key
 ```
@@ -286,14 +294,15 @@ directory (see [Where the databases live](#where-the-databases-live)).
 
 ### Screener
 
-`python reward_screener.py` runs one scan and exits. It needs no key. See
+`python -m farm.reward_screener` runs one scan and exits. It needs no key. See
 [Reward screener](#reward-screener). The console's Discover page runs the
 same scan.
 
 ### Farmer
 
-`python reward_farmer.py` is a dry run that reads live public data and sends
-nothing. `python reward_farmer.py --live` signs and posts real orders.
+`python -m farm.reward_farmer` is a dry run that reads live public data and
+sends nothing. `python -m farm.reward_farmer --live` signs and posts real
+orders.
 
 A live start first checks the region this machine connects from and prints
 the result, as the worker does. From a place where Polymarket rejects new
@@ -357,9 +366,9 @@ dry-run watches. Use it to rehearse a watch with no key in the process.
 
 ### Scoring probe
 
-`python scoring_probe.py` measures how long an order rests before Polymarket
-counts it for rewards. It reads the live key, lists your open orders, and
-places and cancels nothing. Its module docstring has the details.
+`python -m analysis.scoring_probe` measures how long an order rests before
+Polymarket counts it for rewards. It reads the live key, lists your open
+orders, and places and cancels nothing. Its module docstring has the details.
 
 ## Safety
 
@@ -397,10 +406,10 @@ places and cancels nothing. Its module docstring has the details.
 
 ## Reward screener
 
-`reward_screener.py` ranks the markets that pay Polymarket liquidity rewards
-for one farming strategy, and stores them in `farm.db` (SQLite) for you to
-approve or reject. It is read-only. It places, cancels, and signs nothing, and
-it needs no credentials.
+`farm/reward_screener.py` ranks the markets that pay Polymarket liquidity
+rewards for one farming strategy, and stores them in `farm.db` (SQLite) for
+you to approve or reject. It is read-only. It places, cancels, and signs
+nothing, and it needs no credentials.
 
 The strategy targets markets whose favorite outcome trades at 90c or more. You
 rest a favorite bid just under the midpoint, priced where its rewards minus
@@ -417,7 +426,7 @@ about 20,000 favorite buys on 250 markets, 0.4% accepted under 2% a year,
 2.8% under 5%, 23% under 10%, 74% under 20% and 90% under 30%. That return
 puts each longshot price in one of three zones:
 
-- Free, under 5% a year (`FREE_RETURN` in `reward_screener.py`): 0.3c on a
+- Free, under 5% a year (`FREE_RETURN` in `farm/reward_screener.py`): 0.3c on a
   market 25 days from its end date, 1.1c on one 83 days out. The naked budget
   does not limit a bid there. Where a share costs at most $0.50 for each unit
   of its score (`FREE_MAX_COST`), the bid is sized to balance the favorite
@@ -435,17 +444,17 @@ Returns rise as the end date nears, so a price moves from one zone to the
 next without the book changing. A scan labels each plan by its longshot bid:
 mode `floor` in the free zone and `budget` above it.
 
-`reward_farmer.py` reads the approved rows. The screener never changes
+`farm/reward_farmer.py` reads the approved rows. The screener never changes
 your decisions, so rescanning is always safe.
 
 ```bash
-python reward_screener.py                     # same as 'scan' with defaults
-python reward_screener.py scan --mode floor --top 20 --json scan.json
-python reward_screener.py scan --exclude sports,politics
-python reward_screener.py list --status approved
-python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --budget 25
-python reward_screener.py approve <slug-or-condition-id> --p-true 0.97 --capital 200
-python reward_screener.py reject <slug-or-condition-id> --note "resolution risk"
+python -m farm.reward_screener                # same as 'scan' with defaults
+python -m farm.reward_screener scan --mode floor --top 20 --json scan.json
+python -m farm.reward_screener scan --exclude sports,politics
+python -m farm.reward_screener list --status approved
+python -m farm.reward_screener approve <slug-or-condition-id> --p-true 0.97 --budget 25
+python -m farm.reward_screener approve <slug-or-condition-id> --p-true 0.97 --capital 200
+python -m farm.reward_screener reject <slug-or-condition-id> --note "resolution risk"
 ```
 
 Most of a scan is reading the fill histories. `/rewards/markets/current`
@@ -653,7 +662,7 @@ A scan holds no shares and has no p_true, so it values a fill with an
 inventory of the bid alone and the book midpoint as p_true. The farmer's ask
 rests over the midpoint, so a scan's a(b) is the midpoint.
 
-The measurement is the table `SOLD` in `fill_cost.py`, next to the command
+The measurement is the table `SOLD` in `farm/fill_cost.py`, next to the command
 that produced it. No fill under 53 days from resolution was replayed for the
 30 days.
 
@@ -707,7 +716,7 @@ and keeps its status. Retiring markets is the farmer's job.
 
 ## Reward farmer
 
-`reward_farmer.py` farms the liquidity rewards on the markets you approved
+`farm/reward_farmer.py` farms the liquidity rewards on the markets you approved
 with the screener. It runs as a daemon. Every cycle it reads each market's
 order book, plans the orders it wants resting, compares them with the orders
 it has, and cancels or places the difference.
@@ -723,16 +732,16 @@ Both modes publish what the farmer does to `farm_state`, `farmer_status`,
 console the same way a live run does. A dry run still never writes to `markets`.
 
 ```bash
-python reward_farmer.py                       # dry run on farm.db, forever
-python reward_farmer.py --once                # one dry-run cycle, then exit
-python reward_farmer.py --db scratch.db       # dry run on another database
-python reward_farmer.py --live                # real orders
-python reward_farmer.py --live --keep-orders  # Ctrl+C leaves the orders resting
-python reward_farmer.py --live --key-stdin    # the wallet key is piped in
+python -m farm.reward_farmer                       # dry run on farm.db, forever
+python -m farm.reward_farmer --once                # one dry-run cycle, then exit
+python -m farm.reward_farmer --db scratch.db       # dry run on another database
+python -m farm.reward_farmer --live                # real orders
+python -m farm.reward_farmer --live --keep-orders  # Ctrl+C leaves the orders resting
+python -m farm.reward_farmer --live --key-stdin    # the wallet key is piped in
 ```
 
 The farmer also records each quoting market's favorite book to
-`farm_books.db`, beside `farm.db`, every five minutes. `farm_books.py` owns
+`farm_books.db`, beside `farm.db`, every five minutes. `farm/farm_books.py` owns
 that file, and no other process writes it.
 
 A cycle prints a market's summary line only when it differs from the last
@@ -778,8 +787,8 @@ four slots per market:
 Q_two comes from the covered `FAV_ASK` first, and only the remainder from the
 naked `LONG_BID`. A `LONG_BID` in the free zone is sized without the budget
 where a share there costs at most $0.50 for each unit of its score
-(`FREE_MAX_COST` in `reward_screener.py`: a 0.1c share must score 0.002), so
-the favorite bid is never trimmed for it. That
+(`FREE_MAX_COST` in `farm/reward_screener.py`: a 0.1c share must score 0.002),
+so the favorite bid is never trimmed for it. That
 bound is on the arithmetic, not the dollars: the size that covers is Q_one
 divided by the score, and at the band edge the score runs to zero. At the
 bound a bid costs $0.50 for each unit of score it covers, so at most
@@ -788,7 +797,7 @@ the budget limits the price like any other. Among the free prices that pass,
 the bid takes the cheapest: it offers the least return, so it fills least,
 and on most markets it is 0.1c. A price is free of the
 budget only once it has passed that test on every cycle for ten
-minutes (`FREE_DWELL_S` in `reward_farmer.py`): the farmer keeps the lowest
+minutes (`FREE_DWELL_S` in `farm/reward_farmer.py`): the farmer keeps the lowest
 midpoint of those ten minutes, where a longshot share scores least, and tests
 each price there too. One cycle that fails puts the price back under the
 budget at once. A midpoint that flickers across the test therefore rests the
@@ -1038,10 +1047,10 @@ cancels the orders 10 seconds after the heartbeats stop.
 3. Make sure the wallet holds enough USDC. At startup the live farmer compares
    your collateral balance with the favorite bids it plans and warns if the
    balance is short.
-4. Start `python reward_farmer.py --live`. It checks the region it connects
-   from and does not start from a place where Polymarket rejects new orders.
-   It then reads the wallet key from the environment or from Bitwarden, and
-   locks the vault again as soon as the key is read (see
+4. Start `python -m farm.reward_farmer --live`. It checks the region it
+   connects from and does not start from a place where Polymarket rejects new
+   orders. It then reads the wallet key from the environment or from
+   Bitwarden, and locks the vault again as soon as the key is read (see
    [Where the wallet key comes from](#where-the-wallet-key-comes-from)).
    Leave `--heartbeat` off.
 5. Stop it with Ctrl+C or a `stop` command, which cancel the orders on the
@@ -1049,7 +1058,7 @@ cancels the orders 10 seconds after the heartbeats stop.
 
 ### The farm.db contract
 
-`farm_db.py` owns the schema and every SQL statement the tools run against
+`farm/farm_db.py` owns the schema and every SQL statement the tools run against
 `farm.db`. Opening the file migrates an older one in place: missing columns
 are added with `ALTER TABLE` and missing tables are created, so opening it
 twice changes nothing. The file runs in WAL mode with a 5-second busy
@@ -1069,7 +1078,7 @@ Each column has exactly one writer process:
 | `farm_mids` | Farmer | At most one row per managed market per minute, in dry run too: the midpoint, the book midpoint, and the prices the `FAV_BID` and `LONG_BID` rest at after that cycle (NULL when the slot rests nothing). Rows older than 7 days are deleted at startup. The console draws its midpoint chart from it |
 
 This table leaves out four tables: `fav_buys`, `decisions`, `mutes`, and
-`triage`. The module docstring of `farm_db.py` lists every table with its
+`triage`. The module docstring of `farm/farm_db.py` lists every table with its
 writer.
 
 The one exception to one writer per column: the live farmer retires a market
@@ -1133,10 +1142,10 @@ Pages:
 
 ### Running a scan from the console
 
-The Discover page runs the same scan as `python reward_screener.py scan`, in a
-background thread of the console. It takes two to three minutes. The page shows
-the current stage while it runs, then the counts and the duration, or the
-error. Only one scan runs at a time: a second request while one runs gets
+The Discover page runs the same scan as `python -m farm.reward_screener scan`,
+in a background thread of the console. It takes two to three minutes. The
+page shows the current stage while it runs, then the counts and the duration,
+or the error. Only one scan runs at a time: a second request while one runs gets
 "A scan is already in progress". The form starts from the parameters of the
 last scan run from the console, or the screener's defaults. A scan stores its
 rows and its funnel in one transaction and never changes your decisions.
@@ -1184,7 +1193,7 @@ rows and its funnel in one transaction and never changes your decisions.
 
 There is no live switch. Live mode needs the private key, which the farmer
 reads in its own terminal, so you start it there:
-`python reward_farmer.py --live`.
+`python -m farm.reward_farmer --live`.
 
 ### Security
 
@@ -1269,7 +1278,7 @@ Settings and scan parameters take their explanations from it too. A template
 shows a term's button with `{{ tip('naked_budget') }}`, and an unknown key fails
 the page instead of rendering an empty tip. `farm_console/static/tips.js`, with
 no dependencies, shows one tooltip on the page body, so a scrolling table never
-clips it. `test_farm_console_tips.py` fails when a template uses a key the
+clips it. `tests/test_farm_console_tips.py` fails when a template uses a key the
 glossary lacks, or when the glossary has an entry no page uses.
 
 
@@ -1312,9 +1321,12 @@ The snapshot script this page replaces saved each snapshot as an
 `orders_snapshot_*.json` file. To store those files as snapshots, run:
 
 ```bash
-python -m tools import-snapshots                   # the files in snapshots/
+python -m tools import-snapshots                   # the files in snapshots
 python -m tools import-snapshots path/to/files     # the files somewhere else
 ```
+
+With no path, the import reads the `snapshots` folder of the data directory
+(see [Where the databases live](#where-the-databases-live)).
 
 The import needs no key and no running worker. It takes the same `--db` as
 the worker, before or after the command. It prints one line, in this form:
@@ -1682,15 +1694,15 @@ the farmer's heartbeat.
 ## Tests
 
 ```bash
-python run_tests.py                  # every test_*.py, one process a module
+python run_tests.py                  # every module in tests/, one process each
 python run_tests.py test_farm_db     # only the modules you name
 pytest                               # the same tests under pytest
 ```
 
 `run_tests.py` runs the modules side by side, prints one line for each with
 its test count and time, and exits with status 1 when a module fails. Bare
-`pytest` works because `pyproject.toml` keeps it out of `handoff/`,
-`.claude/`, `.venv/`, and `snapshots/`.
+`pytest` works because `pyproject.toml` points it at `tests/` and puts the
+repository root and `tests/` on the import path.
 
 The tests never touch the network and never hold a real key. Each one works
 in its own temporary directory, with fake clients where the code would talk
