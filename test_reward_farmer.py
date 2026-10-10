@@ -29,8 +29,10 @@ from reward_farmer import (
     Farmer,
     around_kept_bid,
     build_parser,
+    capital_room,
     config_from,
     drop_ask,
+    ev_cap,
     farm_position,
     fill_events,
     keep_failure,
@@ -45,12 +47,13 @@ from reward_farmer import (
     step_state,
     strip_own,
     target_orders,
+    value_of,
     without_backed_off,
 )
 import fill_cost
 from exit_value import TAPE_ROWS_FARMER, BuyTape, Piece, Sweep, tape_to_json
 from fill_cost import DISTANCES, FillCurve, History
-from reward_screener import Levels, Read, round_size_up
+from reward_screener import Levels, Read, fav_bid_candidates, round_size_down, round_size_up
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
@@ -144,10 +147,23 @@ NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90, 0, 0.0)
 NO_BUYS = BuyTape((), NOW, NOW.timestamp() - 60 * 86400)
 
 
-def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET):
-    """target_orders against a book, valued at the scan's rate with these fills."""
-    outlook = market_outlook(fm, None, None, PRIOR, cfg, NOW)._replace(fills=fills)
-    return target_orders(fm, book, position, cfg, naked, outlook)
+def outlook_with(fm, fills, cfg=CFG):
+    """The market's Outlook at the scan's rate, with these fills."""
+    return market_outlook(fm, None, None, PRIOR, cfg, NOW)._replace(fills=fills)
+
+
+def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET, resting=()):
+    """target_orders against a book with these orders resting, valued at the
+    scan's rate with these fills."""
+    return target_orders(fm, book, position, cfg, naked, outlook_with(fm, fills, cfg),
+                         resting=resting)
+
+
+def bid_value(fm, book, price, size=None, position=Position(), fills=QUIET, fill_mid=None):
+    """The QuoteValue of the orders planned around a favorite bid at price,
+    of all the capital left unless a size is given."""
+    target = quotes_at(fm, book, position, CFG, True, price, size, fill_mid)
+    return value_of(target, fm, book, position, CFG, outlook_with(fm, fills), fill_mid)
 
 
 class BalancingTest(unittest.TestCase):
@@ -382,11 +398,16 @@ class ReconcileTest(unittest.TestCase):
         self.intents = by_slot(self.target)
 
     def run_reconcile(self, orders):
-        return reconcile(self.target, orders, self.fm, Position(), CFG)
+        target = plan(self.fm, FLOOR_BOOK, resting=orders)
+        return reconcile(target, orders, self.fm, Position(), CFG)
 
-    def keep(self, price, target=None):
-        target = target or self.target
-        order = live("a", Slot.FAV_BID, price, self.intents[Slot.FAV_BID].size)
+    def rest(self, price, size=507.61):
+        """A favorite bid resting at price, and the target planned with it resting."""
+        order = live("a", Slot.FAV_BID, price, size)
+        return order, plan(self.fm, FLOOR_BOOK, resting=[order])
+
+    def keep(self, price, size=507.61):
+        order, target = self.rest(price, size)
         return keep_failure(order, self.intents[Slot.FAV_BID], target, self.fm, Position(), CFG)
 
     def long_keep(self, price, size, cfg=CFG):
@@ -460,21 +481,21 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(self.long_keep(0.004, 675.82), "above the target price")
 
     def test_balancing_orders_are_planned_around_the_kept_favorite_bid(self):
-        kept = live("a", Slot.FAV_BID, 0.981, 507.61)
-        around = around_kept_bid(self.target, [kept], self.fm, FLOOR_BOOK, Position(), CFG, True)
+        kept, target = self.rest(0.981)
+        around = around_kept_bid(target, [kept], self.fm, FLOOR_BOOK, Position(), CFG, True)
         intents = by_slot(around)
         self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.FAV_BID].size), (0.981, 507.61))
         q_one, q_two = q_sums(around)
         self.assertGreaterEqual(q_two, q_one - 1e-9)
         self.assertLess(intents[Slot.LONG_BID].size, self.intents[Slot.LONG_BID].size)
-        self.assertEqual(around.fav, self.target.fav)
+        self.assertEqual(around.fav, target.fav)
         orders = [kept, live("b", Slot.LONG_BID, 0.001, intents[Slot.LONG_BID].size)]
         self.assertEqual(reconcile(around, orders, self.fm, Position(), CFG), [])
 
     def test_a_target_whose_favorite_bid_is_not_kept_is_left_as_planned(self):
-        orders = [live("a", Slot.FAV_BID, 0.95, 507.61)]
-        around = around_kept_bid(self.target, orders, self.fm, FLOOR_BOOK, Position(), CFG, True)
-        self.assertIs(around, self.target)
+        order, target = self.rest(0.95)
+        around = around_kept_bid(target, [order], self.fm, FLOOR_BOOK, Position(), CFG, True)
+        self.assertIs(around, target)
 
     def test_a_deeper_bid_earning_most_of_the_best_net_stays(self):
         # 98.1c scores (2.6 / 3.5)^2 = 0.55, under 0.8 of the target's 0.73,
@@ -483,32 +504,56 @@ class ReconcileTest(unittest.TestCase):
         self.assertIsNone(self.keep(0.981))
 
     def test_a_bid_trailing_the_best_net_by_more_than_the_keep_ratio_is_replaced(self):
-        curve = self.target.fav.curve
-        self.assertLess(curve[0.979].net_per_day, 0.8 * curve[0.985].net_per_day)
+        order, target = self.rest(0.979)
+        self.assertLess(target.fav.resting["a"].net_per_day, 0.8 * target.fav.best.net_per_day)
         self.assertEqual(self.keep(0.979), "net below keep ratio")
 
     def test_a_bid_netting_no_more_than_the_plan_without_it_is_replaced(self):
-        no_better = self.target.fav._replace(
-            baseline_per_day=self.target.fav.curve[0.981].net_per_day)
-        self.assertEqual(self.keep(0.981, self.target._replace(fav=no_better)),
-                         "net below keep ratio")
+        order, target = self.rest(0.981)
+        no_better = target.fav._replace(baseline_per_day=target.fav.resting["a"].net_per_day)
+        self.assertEqual(
+            keep_failure(order, self.intents[Slot.FAV_BID], target._replace(fav=no_better),
+                         self.fm, Position(), CFG),
+            "net below keep ratio")
 
     def test_a_bid_above_the_candidates_is_replaced(self):
         self.assertEqual(self.keep(0.99), "outside the bid candidates")
 
-    def test_a_favorite_bid_is_sized_against_the_plan_at_its_own_price(self):
+    def test_a_resting_bid_is_valued_at_its_own_price_and_size(self):
+        order, target = self.rest(0.981, 300.0)
+        value = target.fav.resting["a"]
+        self.assertEqual((value.price, value.size), (0.981, 300.0))
+        self.assertEqual(value, bid_value(self.fm, FLOOR_BOOK, 0.981, 300.0))
+
+    def test_a_bid_the_plan_was_not_told_rests_is_replaced(self):
+        order = live("a", Slot.FAV_BID, 0.985, 507.61)
+        self.assertEqual(
+            keep_failure(order, self.intents[Slot.FAV_BID], self.target, self.fm, Position(),
+                         CFG),
+            "outside the bid candidates")
+
+    def test_a_bid_the_budget_cannot_balance_is_held_to_what_it_balances(self):
         # A $0.30 naked budget trims the favorite bid to what the floor bid
         # covers, so the plan rests 225.33 shares at 98.5c and 324.48 at the
         # target's 98.0c, and 98.5c nets within a cent of the best.
         fm = market(naked_budget_usd=0.3)
-        target = plan(fm, FLOOR_BOOK)
-        fav = by_slot(target)[Slot.FAV_BID]
-        self.assertEqual((fav.price, fav.size), (0.98, 324.48))
-        resting = live("a", Slot.FAV_BID, 0.985, 225.33)
-        self.assertIsNone(keep_failure(resting, fav, target, fm, Position(), CFG))
-        oversized = live("a", Slot.FAV_BID, 0.985, 324.48)
-        self.assertEqual(keep_failure(oversized, fav, target, fm, Position(), CFG),
-                         "size out of range")
+
+        def keep(size):
+            order = live("a", Slot.FAV_BID, 0.985, size)
+            target = plan(fm, FLOOR_BOOK, resting=[order])
+            fav = by_slot(target)[Slot.FAV_BID]
+            self.assertEqual((fav.price, fav.size), (0.98, 324.48))
+            return keep_failure(order, fav, target, fm, Position(), CFG)
+
+        self.assertIsNone(keep(225.33))
+        self.assertEqual(keep(324.48), "size out of range")
+
+    def test_a_bid_over_the_capital_is_replaced(self):
+        # $500 buys 507.61 shares at 98.5c. A bid a quarter over the capital
+        # stays, as one a quarter over its planned size did.
+        self.assertIsNone(self.keep(0.985, 634.0))
+        self.assertEqual(self.keep(0.985, 635.0), "over the capital")
+        self.assertEqual(capital_room(self.fm, Position(fav_shares=100.0, fav_avg=0.97)), 403.0)
 
     def test_places_every_target_when_nothing_rests(self):
         actions = self.run_reconcile([])
@@ -841,9 +886,7 @@ NEWSOM_BOOK = Levels(bids=[(0.969, 1000.0), (0.950, 5000.0)],
 
 
 def newsom_bid_value(position=Position(), fm=NEWSOM, fill_mid=None, price=0.960):
-    outlook = market_outlook(fm, None, None, PRIOR, CFG, NOW)._replace(fills=QUIET)
-    target = target_orders(fm, NEWSOM_BOOK, position, CFG, True, outlook, fill_mid=fill_mid)
-    return target.fav.curve[price]
+    return bid_value(fm, NEWSOM_BOOK, price, position=position, fill_mid=fill_mid)
 
 
 def sold_at(sale_price, shares=2083.33, p_true=0.99):
@@ -923,7 +966,7 @@ class FillNeverGainsTest(unittest.TestCase):
         # At the 93.3c band edge a share sells at the 98.7c ask and is worth
         # 1.09c more than it costs, 11.6 shares a day. The bid nets its
         # $0.0004 reward.
-        edge = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS).fav.curve[0.933]
+        edge = bid_value(TRUMP, TRUMP_BOOK, 0.933, fills=TRUMP_FILLS)
         self.assertAlmostEqual(edge.loss_per_share, -0.01093, places=5)
         self.assertAlmostEqual(edge.fills_per_day, 11.6, places=1)
         self.assertEqual(edge.fill_cost_per_day, 0.0)
@@ -932,20 +975,191 @@ class FillNeverGainsTest(unittest.TestCase):
 
     def test_the_bid_does_not_go_to_the_band_edge_for_its_fills(self):
         # Counted as income, the edge's fills made it the best bid at $0.13 a
-        # day. The bid rests at 94.4c, the highest price whose fills cost
-        # nothing, for its $0.06 reward.
+        # day. All the capital nets the most at 94.4c, the highest price
+        # where its fills cost nothing, for a $0.061 reward. Half of it at
+        # 95.7c nets $0.067: a $0.128 reward less fills that cost $0.061.
+        full = max((bid_value(TRUMP, TRUMP_BOOK, price, fills=TRUMP_FILLS)
+                    for price in fav_bid_candidates(TRUMP_BOOK, TRUMP.v, TRUMP.tick,
+                                                    TRUMP.min_size, CFG.max_lead,
+                                                    ev_cap(TRUMP, CFG))),
+                   key=lambda value: value.net_per_day)
+        self.assertEqual((full.price, full.fill_cost_per_day), (0.944, 0.0))
+        self.assertAlmostEqual(full.net_per_day, 0.0613, places=4)
         target = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS)
-        self.assertEqual(target.fav.best.price, 0.944)
-        self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.944)
-        self.assertAlmostEqual(target.fav.best.net_per_day, 0.0613, places=4)
+        bid = by_slot(target)[Slot.FAV_BID]
+        self.assertEqual((bid.price, bid.size), (0.957, 1044.93))
+        self.assertAlmostEqual(target.fav.best.net_per_day, 0.0671, places=4)
 
     def test_a_fill_that_costs_is_still_charged(self):
         # At 95.3c a fill loses 0.89c a share, 14.1 shares a day.
-        value = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS).fav.curve[0.953]
+        value = bid_value(TRUMP, TRUMP_BOOK, 0.953, fills=TRUMP_FILLS)
         self.assertAlmostEqual(value.loss_per_share, 0.00890, places=5)
         self.assertAlmostEqual(value.net_per_day,
                                value.reward_per_day - value.fills_per_day * value.loss_per_share)
         self.assertLess(value.net_per_day, value.reward_per_day)
+
+
+# Newsom on its $3 pool, in a book 3,000 shares deep at the top, where a
+# sweep reaches a bid 1c under the mid about four times a year.
+POOL = NEWSOM._replace(rate_per_day=3.0)
+POOL_BOOK = Levels(bids=[(0.969, 3000.0), (0.950, 5000.0)],
+                   asks=[(0.979, 3000.0), (0.990, 5000.0)], tick=0.001)
+FEW = curve(0.05, 0.04, 0.03, 0.02, 0.012, 0.010, 0.006, 0.003, 0.002)
+
+
+def exhaustive(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET):
+    """The QuoteValue of the favorite bid that nets the most, with every
+    candidate price planned and valued at every size of the ladder: the bid
+    target_orders must choose without planning them all. A tie goes to the
+    lower price, then to the smaller size."""
+    outlook, room = outlook_with(fm, fills, cfg), capital_room(fm, position)
+    best = None
+    for price in fav_bid_candidates(book, fm.v, fm.tick, fm.min_size, cfg.max_lead,
+                                    ev_cap(fm, cfg)):
+        for fraction in reward_farmer.SIZE_LADDER:
+            target = quotes_at(fm, book, position, cfg, naked, price,
+                               round_size_down(fraction * room / price))
+            if Slot.FAV_BID in by_slot(target):
+                value = value_of(target, fm, book, position, cfg, outlook)
+                if best is None or value.net_per_day >= best.net_per_day - 1e-12:
+                    best = value
+    return best
+
+
+# A bid that leads this book by half a cent is the only one in a 2c band, so
+# it earns the whole pool at any size.
+ALONE = market(v=0.02, capital=2000.0)
+ALONE_BOOK = Levels(bids=[(0.95, 1000.0)], asks=[(0.985, 1000.0)], tick=0.001)
+FREE = curve(0.0)
+
+
+class SizeChoiceTest(unittest.TestCase):
+    """The capital is the most a favorite bid may be, and the farmer rests
+    the size at or under it that nets the most. At 96.4c on POOL all $2,000
+    nets $0.16 a day, three quarters of it $0.21, half $0.22, a quarter $0.16
+    and an eighth $0.10."""
+
+    def chosen(self, fm=POOL, book=POOL_BOOK, position=Position(), fills=FEW):
+        target = plan(fm, book, position, fills=fills)
+        bid, best = by_slot(target)[Slot.FAV_BID], target.fav.best
+        self.assertEqual((bid.price, bid.size), (best.price, best.size))
+        return best
+
+    def test_a_bid_whose_fills_cost_rests_under_its_capital(self):
+        # All of it earns $0.85 and loses 24.9 shares a day at 2.74c. Half
+        # earns $0.49 and loses 12.4 shares a day at 2.20c.
+        best = self.chosen()
+        self.assertEqual((best.price, best.size), (0.964, 1037.34))
+        self.assertAlmostEqual(best.net_per_day, 0.2181, places=4)
+        self.assertLess(best.price * best.size, POOL.capital / 1.9)
+
+    def test_a_bid_whose_fills_cost_nothing_rests_all_its_capital(self):
+        # Two days out a 98.5c fill of a 99.5c share is worth more than it
+        # costs, and $500 buys 507.61 shares.
+        best = self.chosen(market(end_date=NOW + timedelta(days=2)), FLOOR_BOOK, fills=SWEPT)
+        self.assertEqual(best.fill_cost_per_day, 0.0)
+        self.assertEqual((best.price, best.size), (0.985, 507.61))
+
+    def test_doubling_the_capital_does_not_lower_the_net_chosen(self):
+        # $1,000 buys the 1,037 shares that net the most, and more capital
+        # leaves the bid there: all of $1,000 is half of $2,000, a quarter of
+        # $4,000 and an eighth of $8,000.
+        nets = [self.chosen(POOL._replace(capital=capital)).net_per_day
+                for capital in (250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0)]
+        for less, more in zip(nets, nets[1:]):
+            self.assertGreaterEqual(more, less)
+        self.assertEqual(nets[2:], nets[2:3] * 4)
+        self.assertLess(nets[1], nets[2])
+
+    def test_shares_already_held_shrink_the_bid(self):
+        # 5,000 shares held at 96c leave the same $2,000 of a $6,800 capital,
+        # and a fill on top of them takes longer to sell.
+        held = Position(fav_shares=5000.0, fav_avg=0.96)
+        fm = POOL._replace(capital=6800.0)
+        self.assertEqual(capital_room(fm, held), 2000.0)
+        best = self.chosen(fm, position=held)
+        self.assertEqual((best.price, best.size), (0.964, 518.67))
+
+    def test_a_size_under_the_reward_minimum_is_not_planned(self):
+        # At a 1,100-share minimum half the capital buys too few shares to
+        # score, so three quarters of it rests.
+        best = self.chosen(POOL._replace(min_size=1100.0))
+        self.assertEqual((best.price, best.size), (0.964, 1556.01))
+
+    def test_the_naked_budget_still_trims_the_bid(self):
+        # $0.30 buys 300 longshot shares at 0.1c, which balance 324.48
+        # favorite shares at 98.0c whatever size the bid starts at.
+        intents = by_slot(plan(market(naked_budget_usd=0.3), FLOOR_BOOK))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((fav.price, fav.size), (0.98, 324.48))
+        self.assertEqual((low.price, low.size), (0.001, 300.0))
+
+    def test_a_tie_goes_to_the_smaller_size(self):
+        # Every size earns the whole $100 pool and no fill costs anything.
+        best = self.chosen(ALONE, ALONE_BOOK, fills=FREE)
+        self.assertEqual((best.reward_per_day, best.fill_cost_per_day), (100.0, 0.0))
+        self.assertEqual((best.price, best.size),
+                         (0.955, round_size_down(0.125 * 2000.0 / 0.955)))
+
+    def test_the_bid_chosen_is_the_best_of_every_price_and_size(self):
+        held = Position(fav_shares=5000.0, fav_avg=0.96)
+        cases = {
+            "a quiet market": (market(), FLOOR_BOOK, Position(), CFG, QUIET),
+            "swept at the top": (market(rate_per_day=10.0), FLOOR_BOOK, Position(), CFG, SWEPT),
+            "two days out": (market(end_date=NOW + timedelta(days=2)), FLOOR_BOOK, Position(),
+                             CFG, SWEPT),
+            "a budget longshot bid": (market(p_true=0.98), BUDGET_BOOK, Position(), CFG, QUIET),
+            "trimmed by the budget": (market(naked_budget_usd=0.3), FLOOR_BOOK, Position(), CFG,
+                                      QUIET),
+            "Mistral": (MISTRAL, MISTRAL_BOOK, Position(), MISTRAL_CFG, QUIET),
+            "Newsom on a $100 pool": (NEWSOM, NEWSOM_BOOK, Position(), CFG, QUIET),
+            "Newsom in a thin book": (POOL, NEWSOM_BOOK, Position(), CFG, QUIET),
+            "Newsom": (POOL, POOL_BOOK, Position(), CFG, FEW),
+            "Newsom with $250": (POOL._replace(capital=250.0), POOL_BOOK, Position(), CFG, FEW),
+            "Newsom with $8,000": (POOL._replace(capital=8000.0), POOL_BOOK, Position(), CFG,
+                                   FEW),
+            "Newsom holding 5,000": (POOL._replace(capital=6800.0), POOL_BOOK, held, CFG, FEW),
+            "Newsom at a 1,100-share minimum": (POOL._replace(min_size=1100.0), POOL_BOOK,
+                                                Position(), CFG, FEW),
+            "Trump": (TRUMP, TRUMP_BOOK, Position(), CFG, TRUMP_FILLS),
+            "OpenSI": (OPENSI, OPENSI_BOOK, OPENSI_HELD, CFG, QUIET),
+            "alone in the band": (ALONE, ALONE_BOOK, Position(), CFG, FREE),
+            "alone, fills costing": (ALONE, ALONE_BOOK, Position(), CFG, QUIET),
+        }
+        sizes = set()
+        for name, (fm, book, position, cfg, fills) in cases.items():
+            with self.subTest(name):
+                best = plan(fm, book, position, cfg, fills=fills).fav.best
+                self.assertIsNotNone(best)
+                self.assertEqual(best, exhaustive(fm, book, position, cfg, fills=fills))
+                full = round_size_down(capital_room(fm, position) / best.price)
+                sizes.add(round(best.size / full, 3))
+        self.assertTrue({1.0, 0.75, 0.5, 0.25, 0.125} <= sizes, sizes)
+
+
+class RestingBidTest(unittest.TestCase):
+    """A resting favorite bid is judged by what the orders planned around it
+    net as it rests. At 96.4c on POOL half the capital is the target at $0.22
+    a day. Three quarters of it nets $0.21, all of it $0.16 and an eighth
+    $0.10."""
+
+    def keep(self, price, size):
+        order = live("a", Slot.FAV_BID, price, size)
+        target = plan(POOL, POOL_BOOK, fills=FEW, resting=[order])
+        return keep_failure(order, by_slot(target)[Slot.FAV_BID], target, POOL, Position(), CFG)
+
+    def test_the_nets_at_each_size(self):
+        nets = [bid_value(POOL, POOL_BOOK, 0.964, size, fills=FEW).net_per_day
+                for size in (2074.68, 1556.01, 1037.34, 259.33)]
+        for net, expected in zip(nets, (0.1635, 0.2134, 0.2181, 0.1017)):
+            self.assertAlmostEqual(net, expected, places=4)
+
+    def test_a_bid_one_size_off_the_target_netting_within_the_keep_margin_stays(self):
+        self.assertIsNone(self.keep(0.964, 1556.01))
+
+    def test_a_bid_netting_far_less_is_replaced(self):
+        self.assertEqual(self.keep(0.964, 259.33), "net below keep ratio")
+        self.assertEqual(self.keep(0.964, 2074.68), "net below keep ratio")
 
 
 class BackoffTest(unittest.TestCase):

@@ -516,7 +516,9 @@ Key `scan` options:
 - `--expiry-buffer-days` (7) stops farming this many days before the market
   ends. `--min-window-days` (30) is the fewest farmable days a market needs.
 - `--horizon-cap-days` (90) caps the days counted toward rank.
-- `--capital` (500) is the USD behind the favorite bid.
+- `--capital` (500) is the USD behind the favorite bid. A scan sizes its bid
+  at all of it. The farmer treats a market's capital as the most it may bid
+  and chooses the size.
 - `--hurdle-rate` (0.40) sets what a filled share costs, the same setting
   the farmer has. The scan has no p_true, so it costs a fill against the
   book midpoint.
@@ -576,8 +578,9 @@ farm horizon, so long-dated markets rank higher than short ones with the same
 yield.
 
 `approve` takes your probability that the favorite wins (`--p-true`) and the
-longshot risk budget (`--budget`, default $25). `--capital` sets the USD
-behind this market's favorite bid, in place of the farmer's `--capital`.
+longshot risk budget (`--budget`, default $25). `--capital` sets the most USD
+the farmer may bid on this market's favorite, in place of the farmer's
+`--capital`.
 Without it, a market keeps the capital it already has, or uses the farmer's
 default if it has none. `approve` warns, but still approves,
 when the planned favorite bid is at or above `--p-true`, because a fill would
@@ -663,6 +666,18 @@ that reaches your bid fills all of it. On a short-dated market, or far under
 the midpoint, L(b) is negative: the share is worth more than the bid pays.
 A bid rests for its reward, so that fill costs nothing and is never counted
 as income.
+
+The farmer chooses Q as well as b. A market's capital is the most its
+favorite bid may be, favorite shares already held counted at cost. At each
+price the farmer values all of the capital left, then three quarters, a half,
+a quarter and an eighth of it, and leaves out a size under the reward
+minimum. The reward is a share of the pool, so each further share earns less.
+L grows with Q, because a larger inventory sells more slowly. So the size
+that nets the most can be under the capital, and the farmer rests that size
+at the price where it nets the most. Where the fills of all the capital cost
+nothing, no smaller size nets more. The naked budget is a separate limit: a
+bid it cannot balance shrinks to what it balances, whatever the capital. A
+scan sizes its bid at all of `--capital`.
 
 A scan holds no shares and has no p_true, so it values a fill with an
 inventory of the bid alone and the book midpoint as p_true. The farmer's ask
@@ -780,7 +795,7 @@ four slots per market:
 
 | Slot | Order | Side | Purpose |
 | --- | --- | --- | --- |
-| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price with the best net of its fill cost (see [The fill-cost model](#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, and only when that net beats what the orders earn without it. Uses cash. |
+| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
 | `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
 | `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price whose size, enough to balance Q_one, keeps its cost plus any longshot shares held within the market's approved budget, and never above the cheapest price scoring `--min-low-score`. On a `floor` market that is 0.1c to 0.2c, where it almost never fills. On a `budget` market it rests higher. |
@@ -886,7 +901,8 @@ next farmer starts, so it does not stop that farmer.
   `--expiry-buffer-days`, even if the farmer dies.
 - The favorite bid never prices above `p_true - --ev-margin`.
 - `--capital` caps each market's favorite exposure. Favorite shares already
-  held count against it at cost.
+  held count against it at cost. The favorite bid rests at the size at or
+  under what is left that nets the most.
 - The approved budget caps the naked longshot leg: the resting longshot bid
   plus longshot shares held, at cost.
 - A longshot fill (your longshot shares went up) prints an `ALERT` and pauses
@@ -895,11 +911,14 @@ next farmer starts, so it does not stop that farmer.
 - An order that is still close to its target stays in place. It must sit on
   the current tick, score at least `--keep-ratio` of the target, keep a size
   within -20% and +25% of the target, and stay within the price cap or
-  budget. Otherwise it is replaced. A favorite bid is judged by its net
-  instead of its score. It stays while its price is still a candidate, its
-  net trails the best price's by no more than `1 - --keep-ratio` of it (or
-  $0.02/day, if more), and it beats the orders without it. This keeps queue position and avoids
-  churning orders on every small move of the midpoint.
+  budget. Otherwise it is replaced. A favorite bid is judged by its net as
+  it rests, at its own price and size, instead of its score and the target's
+  size. It stays while its price is still a candidate, its net trails the
+  best bid's by no more than `1 - --keep-ratio` of it (or $0.02/day, if
+  more), it beats the orders without it, the naked budget still balances at
+  least 80% of it, and it is no more than 25% over the capital left. This
+  keeps queue position and avoids churning orders on every small move of the
+  midpoint.
 - An order the CLOB rejects, such as a post-only cross or an unfunded bid,
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
@@ -947,14 +966,14 @@ it does not manage.
 | `--live` | off | Sign and post real orders |
 | `--once` | off | Run one cycle and exit |
 | `--interval` | 5 | Seconds between cycles |
-| `--capital` | 500 | USD per market behind the favorite bid, held favorite shares included at cost |
+| `--capital` | 500 | Most USD a market's favorite bid may be, held favorite shares included at cost. The farmer rests the size at or under it that nets the most |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask minimum above its average cost |
 | `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this |
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
-| `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets at least this share of the best price's |
+| `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets, at its own price and size, at least this share of the best bid's |
 | `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus what it sells for, discounted at this rate over the weeks the sale takes |
 | `--drop-threshold` | 0.03 | Fall in the favorite's ask, where its asks add up to three reward minimums, that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |

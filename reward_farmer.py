@@ -22,11 +22,12 @@ farmer rests on both sides, in four slots per market:
             the share sells for: the ask the fill would leave resting, never
             credited over p_true, and p_true for what is unsold at
             resolution (fill_cost.py has the measurements). The bid rests at
-            the price in the band whose rewards net of expected fills (from
-            the market's fill history, shrunk toward the last scan's
-            cross-market prior) are highest, never above p_true minus a
-            margin, and only when that net beats the orders without it.
-            Until the market's history is read it does not rest at all.
+            the price in the band, and the size at or under the market's
+            capital, whose rewards net of expected fills (from the market's
+            fill history, shrunk toward the last scan's cross-market prior)
+            are highest, never above p_true minus a margin, and only when
+            that net beats the orders without it. Until the market's history
+            is read it does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same.
@@ -114,9 +115,9 @@ minutes, and resets on the next accepted place.
 Reconciling keeps an existing order when it is still close enough to target
 (same price grid, most of the target score, size within -20%/+25%) instead of
 replacing it on every wiggle of the midpoint. A favorite bid is held to most
-of the best price's net instead of the score and to the size planned at its
-own price, and the orders that balance it are planned around the bid that
-stays rather than the target. A longshot bid is kept while it covers
+of the best bid's net instead of the score, valued as it rests at its own
+price and size, and the orders that balance it are planned around the bid
+that stays rather than the target. A longshot bid is kept while it covers
 keep_ratio of the score it balances, up to twice it above the floor, at a
 price no higher than target or within two ticks of the min-score price. A
 favorite ask more than two ticks under its target is replaced although it
@@ -207,6 +208,9 @@ BUY, SELL = "BUY", "SELL"
 # hovering at the threshold does not flap the quotes on and off.
 RESUME_MARGIN = 0.005
 
+# The fractions of the capital left that a favorite bid is planned at.
+SIZE_LADDER = (1.0, 0.75, 0.5, 0.25, 0.125)
+
 # An order whose size left this band around the target gets replaced.
 KEEP_SIZE_RANGE = (0.8, 1.25)
 
@@ -229,7 +233,7 @@ ASK_PRICE_SLACK_TICKS = 2
 # so a cover check exact to the share would replace them every cycle.
 SIZE_STEP = 0.01
 
-# A resting favorite bid stays while its net trails the best price's by no
+# A resting favorite bid stays while its net trails the best bid's by no
 # more than this, in $/day, or (1 - keep_ratio) of the best net if larger.
 NET_KEEP_SLACK_USD = 0.02
 
@@ -370,17 +374,19 @@ class LiveOrder(NamedTuple):
     size_remaining: float
 
 
-EMPTY_CURVE = MappingProxyType({})
+NOTHING_RESTING = MappingProxyType({})
 
 
 class FavChoice(NamedTuple):
     """How the favorite bid was priced. best is the QuoteValue of the bid
-    chosen, or None with the reason there is none. curve maps every
-    candidate price whose plan kept a favorite bid to its QuoteValue;
+    chosen, or None with the reason there is none. resting maps the id of
+    each favorite bid resting to the QuoteValue of the orders planned around
+    it as it rests, at its own price and size; a bid no plan can rest, off
+    the candidate prices or with nothing to balance it, has no entry.
     baseline_per_day is what the plan with no favorite bid earns."""
 
     best: Optional[QuoteValue] = None
-    curve: MappingProxyType = EMPTY_CURVE
+    resting: MappingProxyType = NOTHING_RESTING
     baseline_per_day: float = 0.0
     reason: str = ""
 
@@ -521,6 +527,11 @@ def exit_floor(position, fm, cfg):
     return ceil_to_tick(position.fav_avg + cfg.min_capture, fm.tick)
 
 
+def capital_room(fm, position):
+    """USD of favorite bid the capital still allows after favorite shares held, at cost."""
+    return max(0.0, fm.capital - position.fav_shares * position.fav_avg)
+
+
 def naked_room(fm, position):
     """USD of longshot bid the budget still allows after longshot shares held."""
     return max(0.0, fm.naked_budget_usd - position.long_shares * position.long_avg)
@@ -568,9 +579,8 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     with no favorite bid when fav_price is None, scored against the mid they create.
     The favorite ask prices off fill_mid per plan_fav_ask_price.
 
-    `levels` is the favorite book without our own resting orders. The bid is
-    sized from the capital left after favorite inventory at cost, or starts at
-    fav_size when given (a bid already resting). Sizes are
+    `levels` is the favorite book without our own resting orders. The bid
+    starts at fav_size, or at all of capital_room without one. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
     LONG_BID at the cheapest price that covers the rest within the budget, no
     higher than the min_low_score price (longshot_bid), then the favorite bid
@@ -587,8 +597,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
 
     fav_bid = None
     if fav_price is not None and fav_size is None:
-        room = fm.capital - position.fav_shares * position.fav_avg
-        fav_size = round_size_down(max(0.0, room) / fav_price)
+        fav_size = round_size_down(capital_room(fm, position) / fav_price)
     if fav_price is not None:
         fav_bid = fav_price, fav_size
     long_ask = fav_ask = None
@@ -689,56 +698,96 @@ def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
 
 
 def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False,
-                  fill_mid=None):
+                  fill_mid=None, resting=()):
     """The orders this market should rest, with the favorite bid at the price
-    that earns the most net of what its fills cost.
+    and size that earn the most net of what its fills cost.
 
     Every price from fav_bid_candidates, capped at ev_cap, is planned with
-    quotes_at and valued with value_quote on the plan as balanced. The
-    baseline is the plan with no favorite bid: nothing, or the exits alone.
-    The best price is quoted only when its net beats the baseline's reward,
-    and a tie goes to the lower price. Fills not drawn from the market's own
-    history quote the baseline, so real money is never bid on the prior
-    alone, unless bid_without_history (a preview of a market the farmer has
-    not read yet).
+    quotes_at at each SIZE_LADDER fraction of capital_room that buys the
+    reward minimum, and valued with value_quote on the plan as balanced. The
+    capital is the most the bid may be: reward is a share of the pool, so
+    each further share earns less, while a fill costs more a share the more
+    inventory it leaves. The baseline is the plan with no favorite bid:
+    nothing, or the exits alone. The best bid is quoted only when its net
+    beats the baseline's reward, and a tie goes to the lower price, then to
+    the smaller size. Fills not drawn from the market's own history quote the
+    baseline, so real money is never bid on the prior alone, unless
+    bid_without_history (a preview of a market the farmer has not read yet).
+
+    Not every size is planned. A smaller bid at a price earns no more reward
+    than a larger one there, and a fill never pays, so once a size's reward
+    is under the best net found, no smaller size at its price can be chosen.
+    Every price is valued at its full size first, which sets that bar high
+    before any smaller size is tried. A price where the full size rests no
+    bid rests no smaller one: the naked budget trims every size it cannot
+    balance to the same bid.
+
+    resting is the orders the market rests now. Each favorite bid among them
+    at a candidate price is planned and valued the same way at its own price
+    and size (FavChoice.resting), which is what keep_failure judges it by.
     """
     base = quotes_at(fm, levels, position, cfg, naked_allowed, None, fill_mid=fill_mid)
     if base.mid is None:
         return base._replace(fav=FavChoice(reason="one-sided book"))
     baseline = value_of(base, fm, levels, position, cfg, outlook, fill_mid).net_per_day
-    if not outlook.fills.from_history and not bid_without_history:
-        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline, "no fill history yet"))
 
-    plans, curve = {}, {}
-    for price in fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
-                                    ev_cap(fm, cfg)):
-        plan = quotes_at(fm, levels, position, cfg, naked_allowed, price, fill_mid=fill_mid)
+    def no_bid(reason):
+        return base._replace(fav=FavChoice(baseline_per_day=baseline, reason=reason))
+
+    if not outlook.fills.from_history and not bid_without_history:
+        return no_bid("no fill history yet")
+
+    def valued(price, size):
+        """(plan, its QuoteValue) with the favorite bid at price, starting at
+        size, or None when the plan rests no favorite bid."""
+        plan = quotes_at(fm, levels, position, cfg, naked_allowed, price, size, fill_mid)
         if any(i.slot is Slot.FAV_BID for i in plan.intents):
-            plans[price], curve[price] = plan, value_of(plan, fm, levels, position, cfg,
-                                                        outlook, fill_mid)
-    if not curve:
-        return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline,
-                                           "no scoring favorite bid"))
+            return plan, value_of(plan, fm, levels, position, cfg, outlook, fill_mid)
+        return None
+
+    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
+                                ev_cap(fm, cfg))
+    room = capital_room(fm, position)
+    full = [valued(price, round_size_down(room / price)) for price in prices]
+    bar = max((value.net_per_day for _, value in filter(None, full)), default=None)
     best = None
-    for value in curve.values():
-        if best is None or value.net_per_day >= best.net_per_day - 1e-12:
-            best = value
-    curve = MappingProxyType(curve)
-    if best.net_per_day <= baseline:
-        return base._replace(fav=FavChoice(None, curve, baseline, (
-            f"no favorite bid pays: best net {signed_usd(best.net_per_day)}/day at "
-            f"{cents(best.price, fm.tick)}")))
-    return plans[best.price]._replace(fav=FavChoice(best, curve, baseline))
+    for price, choice in zip(prices, full):
+        smaller = (round_size_down(fraction * room / price) for fraction in SIZE_LADDER[1:])
+        while choice:
+            if best is None or choice[1].net_per_day >= best[1].net_per_day - 1e-12:
+                best = choice
+            bar = max(bar, choice[1].net_per_day)
+            size = next(smaller, 0.0)
+            if size < fm.min_size or choice[1].reward_per_day < bar - 1e-12:
+                break
+            choice = valued(price, size)
+    if best is None:
+        return no_bid("no scoring favorite bid")
+    plan, value = best
+    if value.net_per_day <= baseline:
+        return no_bid(f"no favorite bid pays: best net {signed_usd(value.net_per_day)}/day at "
+                      f"{cents(value.price, fm.tick)}")
+    rested = {}
+    for order in resting:
+        price = round(order.price, tick_decimals(fm.tick))
+        if order.slot is Slot.FAV_BID and price in prices:
+            around = valued(price, order.size_remaining)
+            if around:
+                rested[order.id] = around[1]
+    return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline))
 
 
 def keep_failure(order, intent, target, fm, position, cfg):
     """Why a resting order is not close enough to its target to leave alone, or None.
 
-    A favorite bid is judged by its net on target.fav.curve rather than its
-    score: the net-best price moves a tick with every wiggle of the midpoint,
-    while the net at the resting price barely changes. Its size is held to
-    the plan at its own price too, since a budget-trimmed bid's size moves a
-    third between neighboring prices.
+    A favorite bid is judged by the net of the orders planned around it as
+    it rests (target.fav.resting) rather than by its score or the target's
+    size: the net-best price moves a tick with every wiggle of the midpoint,
+    while the net of the bid resting barely changes. It stays while that net
+    is within the keep margin of the best net and above the baseline, the
+    plan around it still rests at least 80% of it (a budget-trimmed bid's
+    size moves a third between neighboring prices), and it is no more than
+    25% over the capital left.
     A longshot bid is judged by the score it covers rather than its size: near
     the band edge a half-tick of mid moves its per-share score, and so the
     covering size, by a third. Score is min(Q_one, Q_two), so a shortfall
@@ -760,7 +809,7 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "off the tick grid"
     if order.slot is Slot.FAV_BID:
         fav = target.fav
-        value = fav.curve.get(round(order.price, tick_decimals(fm.tick)))
+        value = fav.resting.get(order.id)
         if value is None:
             return "outside the bid candidates"
         size = value.size
@@ -791,6 +840,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "size out of range"
     if order.slot is Slot.FAV_BID and order.price > ev_cap(fm, cfg) + 1e-9:
         return "above the EV cap"
+    if order.slot is Slot.FAV_BID and order.price * order.size_remaining > (
+            high * capital_room(fm, position) + 1e-9):
+        return "over the capital"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
         return "below the exit floor"
     if order.slot is Slot.LONG_BID and order.price * order.size_remaining > naked_room(fm, position) + 1e-9:
@@ -1927,7 +1979,7 @@ class Farmer:
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
                 market_outlook(fm, self.total_rates.rates, self.history(fm), self.prior,
                                self.cfg, now),
-                fill_mid=managed.fill_mid,
+                fill_mid=managed.fill_mid, resting=orders,
             )
             if previewing:
                 preview = planned
@@ -2170,10 +2222,8 @@ class Farmer:
         self.emit(EventKind.RETIRE, line, fm.condition_id, data={"reason": reason})
 
     def check_collateral(self):
-        planned = sum(
-            max(0.0, m.fm.capital - m.position.fav_shares * m.position.fav_avg)
-            for m in self.active() if m.position is not None
-        )
+        planned = sum(capital_room(m.fm, m.position)
+                      for m in self.active() if m.position is not None)
         try:
             resp = self.client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -2354,8 +2404,9 @@ Examples:
     )
     for flag, kind, default, help_text in (
         ("--interval", float, 5.0, "Seconds between cycles"),
-        ("--capital", float, 500.0, "USD per market behind the favorite bid, "
-                                    "favorite inventory at cost included"),
+        ("--capital", float, 500.0, "Most USD a market's favorite bid may be, favorite "
+                                    "inventory at cost included. The farmer rests the "
+                                    "size at or under it that nets the most"),
         ("--max-lead", float, 0.005, "Most the favorite bid may sit above the best bid "
                                      "already in the book. 0 joins it"),
         ("--ask-offset", float, 0.01, "Favorite ask distance above the midpoint"),

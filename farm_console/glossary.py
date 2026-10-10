@@ -101,7 +101,9 @@ GLOSSARY = {
                                          "budget, so set it to what you'd approve with."),
     "capital_cap": Term("Capital cap", "The most USD this market may tie up on the favorite "
                                        "side: resting favorite bids plus favorite shares held, "
-                                       "at cost. Leave blank to use the farmer's default."),
+                                       "at cost. The farmer rests the bid size at or under it "
+                                       "that nets the most. Leave blank to use the farmer's "
+                                       "default."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
                                  "the EV margin. The farmer never bids above that cap, and "
                                  "below it picks the price with the best net of fill costs."),
@@ -149,8 +151,9 @@ GLOSSARY = {
                                    "earn nothing above 90c."),
 
     # order slots and their decisions
-    "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price earning "
-                               "the most rewards net of what its fills cost: a filled share "
+    "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price and the "
+                               "size within the capital cap that earn the most rewards net "
+                               "of what its fills cost: a filled share "
                                "ties up capital until FAV_ASK sells it, or until the market "
                                "resolves if it never does."),
     "LONG_BID": Term("LONG_BID", "Buys the longshot far below its midpoint. It exists only to "
@@ -191,8 +194,9 @@ GLOSSARY = {
     # settings and scan parameters
     "capital": Term("Capital per market", "The most USD one market may tie up on the "
                                           "favorite side: its resting bid plus farm inventory "
-                                          "at cost. The screener sizes the planned favorite "
-                                          "bid with it."),
+                                          "at cost. The farmer rests the bid size at or under "
+                                          "it that nets the most. A scan sizes its planned "
+                                          "favorite bid at all of it."),
     "max_lead": Term("Max lead", "The most the favorite bid may sit above the best bid "
                                  "already in the book, in price: 0.005 is 0.5c. 0 joins "
                                  "the best bid."),
@@ -214,8 +218,8 @@ GLOSSARY = {
                                                 "bid shrinks to match."),
     "keep_ratio": Term("Keep ratio", "Keep a resting order while it scores at least this "
                                      "fraction of its target. A favorite bid stays while it "
-                                     "earns at least this fraction of the best price's net "
-                                     "$/day."),
+                                     "earns, at its own price and size, at least this "
+                                     "fraction of the best bid's net $/day."),
     "drop_threshold": Term("Ask drop threshold", "A fall this large in the favorite's "
                                                  "ask within the drop window starts a "
                                                  "cooldown. Only the ask counts, because a "
