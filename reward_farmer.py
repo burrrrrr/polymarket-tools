@@ -1912,13 +1912,17 @@ class Farmer:
         return pre_fill_mid([(s.at, s.book_mid) for s in samples], seen_at)
 
     def last_fill_mid(self, fm):
-        """The mid before the last favorite fill on record, for inventory held
-        when the farmer starts; earlier fills of the same inventory are not
-        weighed."""
+        """The fill mid of inventory held when the farmer starts: the higher of
+        the mid before the last favorite fill on record and the fill mid that
+        fill recorded, which weighs the earlier fills of the same inventory."""
         fills = farm_db.read_events(self.db, condition_id=fm.condition_id,
                                     kinds=(EventKind.FILL,), limit=100)
         last = next((e for e in fills if e.slot == Slot.FAV_BID.name), None)
-        return self.fill_mid_seen(fm, last.at) if last else None
+        if last is None:
+            return None
+        mids = [m for m in ((last.data or {}).get("fill_mid"), self.fill_mid_seen(fm, last.at))
+                if m]
+        return max(mids, default=None)
 
     def record_fill(self, managed, slot, shares):
         """A fill inferred from a position change, priced at the slot's resting order.

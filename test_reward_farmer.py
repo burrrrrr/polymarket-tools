@@ -2471,6 +2471,19 @@ class ExitFarmerTest(FarmerHarness):
         self.holdings.return_value = {FAV: (100.0, 0.95)}
         self.assertEqual(self.ask_target(self.started_farmer()), 0.985)
 
+    def test_a_restart_keeps_the_higher_fill_mid_the_last_fill_recorded(self):
+        # An earlier fill of the same inventory found the mid at 97.5c; it had
+        # fallen to 96.5c by the last one, which recorded the 97.5c in force.
+        self.sample_mid(0.965, seconds_ago=300)
+        fill_at = datetime.now(timezone.utc) - timedelta(seconds=180)
+        farm_db.publish(self.ui, farm_db.FarmerStatus(
+            "dry", 1, fill_at, fill_at, 1.0, False, 1, {}, fill_at), events=[farm_db.Event(
+                fill_at, farm_db.EventKind.FILL, "FILL", CID, "FAV_BID", 0.95, 100.0, None,
+                {"fill_mid": 0.975})])
+        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        self.holdings.return_value = {FAV: (100.0, 0.95)}
+        self.assertEqual(self.ask_target(self.started_farmer()), 0.985)
+
 
 class LiveFarmerTest(FarmerHarness):
     """A live farmer on two markets against a mock CLOB that rests what it accepts."""
