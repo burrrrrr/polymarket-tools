@@ -151,6 +151,7 @@ class CalibrateTest(unittest.TestCase):
         cls.found = cases(cls.markets, 14.0)
         cls.picked = exit_backtest.picks(cls.markets, cls.found, PARAMS.half_life_days,
                                          [PARAMS], "model")[PARAMS]
+        cls.priors = {}
 
     def expected(self, cell, fill):
         size, part = cell
@@ -188,10 +189,14 @@ class CalibrateTest(unittest.TestCase):
 
     def forecast_at(self, i, price):
         """The model's predicted sold fraction at price for case i, through
-        exit_value alone: the tape as of t, the prior fit on the other folds."""
+        exit_value alone: the tape as of t, the prior fit on the other folds,
+        once for each fold and t."""
         c, m = self.found[i], self.found[i].market
-        fold = exit_backtest.folds(self.markets)
-        prior = fit([k for k in self.markets if fold[k.condition_id] != c.fold], PARAMS, c.t)
+        if (c.fold, c.t) not in self.priors:
+            fold = exit_backtest.folds(self.markets)
+            self.priors[c.fold, c.t] = fit(
+                [k for k in self.markets if fold[k.condition_id] != c.fold], PARAMS, c.t)
+        prior = self.priors[c.fold, c.t]
         model = exit_value.ExitModel(m.tape.as_of(c.t), prior, PARAMS, exit_backtest.POLICY,
                                      c.mid, m.end_date, m.expires_at,
                                      datetime.fromtimestamp(c.t, timezone.utc), m.tick,

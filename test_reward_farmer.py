@@ -2014,6 +2014,7 @@ class FarmerHarness(unittest.TestCase):
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
+            ("fetch_gamma", mock.Mock(return_value={})),
             ("log", mock.Mock()),
         ):
             patcher = mock.patch.object(reward_farmer, name, fake)
