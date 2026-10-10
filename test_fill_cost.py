@@ -19,10 +19,10 @@ from fill_cost import (
     fit_prior,
     history_from_json,
     history_to_json,
-    hold_discount,
     make_history,
     prior_from_json,
     prior_to_json,
+    sales_per_day,
     share_value,
     years_until,
 )
@@ -32,61 +32,86 @@ T = NOW.timestamp()
 DAY = 86400.0
 
 
-def summed_discount(exit_per_day, years, hurdle_rate, stuck_share, steps=200000):
-    """hold_discount by summing the exit density over a grid instead of its
+def summed_value(p_true, sale_price, per_day, years, hurdle_rate, steps=200000):
+    """share_value by summing the sale density over a grid instead of its
     closed form."""
-    lam, delta = exit_per_day * 365.25, math.log(1 + hurdle_rate)
+    lam, delta = per_day * 365.25, math.log(1 + hurdle_rate)
     dt = years / steps
-    exiting = sum(lam * math.exp(-(lam + delta) * (i + 0.5) * dt) * dt for i in range(steps))
-    exiting += math.exp(-(lam + delta) * years)
-    return (1 - stuck_share) * exiting + stuck_share * math.exp(-delta * years)
+    sold = sum(lam * math.exp(-(lam + delta) * (i + 0.5) * dt) * dt for i in range(steps))
+    return sale_price * sold + p_true * math.exp(-(lam + delta) * years)
 
 
 class LossTest(unittest.TestCase):
-    def test_a_share_that_never_exits_is_discounted_to_resolution(self):
-        # A year out at 40%: 0.97 / 1.4 = 0.692857 today.
-        self.assertAlmostEqual(hold_discount(0.0, 1.0, 0.40, 0.25), 1 / 1.4)
-        self.assertAlmostEqual(hold_discount(0.5, 1.0, 0.40, 1.0), 1 / 1.4)
-        self.assertAlmostEqual(share_value(0.97, None, 0.0, 1.0, 0.40, 0.25), 0.97 / 1.4)
+    def test_a_share_that_never_sells_is_worth_p_true_discounted_to_resolution(self):
+        # A year out at 40%: 0.97 / 1.4 = 0.692857 today, whatever it would sell for.
+        self.assertAlmostEqual(share_value(0.97, 0.95, 0.0, 1.0, 0.40), 0.97 / 1.4)
 
-    def test_a_fast_exit_with_nothing_stuck_is_barely_discounted(self):
-        self.assertAlmostEqual(hold_discount(1e6, 1.0, 0.40, 0.0), 1.0, places=6)
-        self.assertAlmostEqual(hold_discount(1e6, 1.0, 0.40, 0.25), 0.75 + 0.25 / 1.4, places=6)
+    def test_a_share_sold_at_once_is_worth_its_sale_price(self):
+        self.assertAlmostEqual(share_value(0.97, 0.95, 1e6, 1.0, 0.40), 0.95, places=6)
 
-    def test_a_week_long_hold_matches_the_exit_density_summed(self):
-        self.assertAlmostEqual(hold_discount(1 / 7, 1.0, 0.40, 0.25),
-                               summed_discount(1 / 7, 1.0, 0.40, 0.25), places=7)
-        self.assertAlmostEqual(hold_discount(1 / 7, 0.02, 0.40, 0.0),
-                               summed_discount(1 / 7, 0.02, 0.40, 0.0), places=7)
+    def test_a_week_long_hold_matches_the_sale_density_summed(self):
+        for years in (1.0, 0.02):
+            with self.subTest(years=years):
+                self.assertAlmostEqual(share_value(0.97, 0.95, 1 / 7, years, 0.40),
+                                       summed_value(0.97, 0.95, 1 / 7, years, 0.40), places=7)
 
-    def test_without_a_hurdle_nothing_is_discounted(self):
-        self.assertEqual(hold_discount(0.0, 1.0, 0.0, 0.25), 1.0)
-        self.assertAlmostEqual(hold_discount(0.2, 1.0, 0.0, 0.25), 1.0)
+    def test_what_is_unsold_at_resolution_is_worth_p_true_not_the_sale_price(self):
+        # No hurdle, 14 days out, sold at 1 / 37.44 a day: 31.2% sell at 94.5c
+        # and the 68.8% left resolve worth 97c.
+        self.assertAlmostEqual(share_value(0.97, 0.945, 1 / 37.44, 14 / 365.25, 0.0),
+                               0.312 * 0.945 + 0.688 * 0.97, places=5)
+        # At 40%, 0.228 years out: 90% sell, discounted over their wait, and
+        # the tenth unsold is worth 97c at resolution. 91.9c today.
+        self.assertAlmostEqual(share_value(0.97, 0.945, 1 / 37.44, 0.228, 0.40), 0.91915,
+                               places=5)
 
-    def test_a_short_dated_fill_below_the_discounted_value_is_welcome(self):
-        self.assertLess(0.95 - share_value(0.99, None, 0.0, 2 / 365.25, 0.40, 1.0), 0)
+    def test_without_a_hurdle_or_a_sale_nothing_is_lost(self):
+        self.assertEqual(share_value(0.97, 0.95, 0.0, 1.0, 0.0), 0.97)
 
-    def test_an_exiting_share_is_worth_the_ask_it_sells_at(self):
-        # Plague, 0.228 years out, exiting 1.191 times a day: three quarters
-        # sell at the 98.1c ask with almost no wait, the stuck quarter is worth
-        # 99c at resolution, 92.6% of it today.
-        self.assertAlmostEqual(share_value(0.99, 0.981, 1.191, 0.228, 0.40, 0.25), 0.9644,
-                               places=4)
-        self.assertAlmostEqual(share_value(0.99, None, 1.191, 0.228, 0.40, 0.25),
-                               0.99 * hold_discount(1.191, 0.228, 0.40, 0.25))
-        self.assertAlmostEqual(share_value(0.99, 0.99, 1.191, 0.228, 0.40, 0.25),
-                               0.99 * hold_discount(1.191, 0.228, 0.40, 0.25))
-
-    def test_an_ask_over_p_true_is_credited_at_p_true(self):
-        # Bardella valued its exit at a 96c ask against a 92c p_true: the ask's
-        # sales come on the mid-recovery clock, which sells far slower than it
-        # says, so a fill must not look worth more than p_true.
-        self.assertAlmostEqual(share_value(0.92, 0.96, 1.191, 0.228, 0.40, 0.25),
-                               share_value(0.92, None, 1.191, 0.228, 0.40, 0.25))
+    def test_a_short_dated_fill_below_the_discounted_value_loses_less_than_nothing(self):
+        self.assertLess(0.95 - share_value(0.99, 0.953, 1 / 37.44, 2 / 365.25, 0.40), 0)
 
     def test_years_run_to_the_end_date_and_never_go_negative(self):
         self.assertAlmostEqual(years_until(NOW + timedelta(days=365.25), NOW), 1.0)
         self.assertEqual(years_until(NOW - timedelta(days=1), NOW), 0.0)
+
+
+class MeasuredExitTest(unittest.TestCase):
+    """In the 30 days after a fill the farmer's ask sold 67.4% of a 100-share
+    fill and 41.9% of a 1,000-share one."""
+
+    def sold(self, shares):
+        """The fraction of an inventory gone in 30 days at sales_per_day's rate."""
+        return 1 - math.exp(-30 * sales_per_day(shares))
+
+    def test_the_measured_inventories_sell_their_measured_fractions(self):
+        self.assertAlmostEqual(self.sold(100.0), 0.674)
+        self.assertAlmostEqual(self.sold(1000.0), 0.419)
+        # 67.4% in 30 days is a mean hold of 27 days, 41.9% one of 55.
+        self.assertAlmostEqual(sales_per_day(100.0), 0.03736, places=5)
+        self.assertAlmostEqual(sales_per_day(1000.0), 0.01810, places=5)
+
+    def test_between_them_the_fraction_is_linear_in_the_log_of_the_size(self):
+        # 316.2 shares is halfway from 100 to 1,000 in ln.
+        self.assertAlmostEqual(self.sold(math.sqrt(100.0 * 1000.0)), (0.674 + 0.419) / 2)
+
+    def test_2000_shares_sell_what_the_line_through_the_two_sizes_says(self):
+        # Each tenfold in size takes 25.5 points off, so 34.2% of 2,000 shares
+        # sell in 30 days, a mean hold of 72 days. Measured, 30.9% did.
+        self.assertAlmostEqual(self.sold(2000.0), 0.674 - 0.255 * math.log10(20.0))
+        self.assertAlmostEqual(self.sold(2000.0), 0.342, places=3)
+        self.assertAlmostEqual(sales_per_day(2000.0), 0.01396, places=5)
+
+    def test_a_smaller_inventory_sells_no_faster_than_100_shares(self):
+        for shares in (0.0, 1.0, 50.0):
+            with self.subTest(shares=shares):
+                self.assertAlmostEqual(self.sold(shares), 0.674)
+
+    def test_a_larger_inventory_sells_slower_down_to_5_percent(self):
+        # 20,000 shares sell 8.7%, and the line would reach 4.2% at 30,000.
+        self.assertAlmostEqual(self.sold(20000.0), 0.674 - 0.255 * math.log10(200.0))
+        self.assertAlmostEqual(self.sold(30000.0), 0.05)
+        self.assertAlmostEqual(self.sold(1e6), 0.05)
 
 
 B = T - 10 * DAY

@@ -59,11 +59,15 @@ GLOSSARY = {
                                        "it is that pooled rate alone, and the farmer does not "
                                        "bid."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
-                                       "minus p_true discounted at the hurdle rate over its "
-                                       "expected hold, days until the market's measured exit "
-                                       "for most fills, the end date for the stuck share. "
-                                       "Without a p_true it uses the midpoint. A sweep that "
-                                       "reaches the bid fills all of it."),
+                                       "minus what it is worth today at the hurdle rate. The "
+                                       "farmer's ask sells it slowly, measured at 67% of a "
+                                       "100-share inventory and 42% of a 1,000-share one in "
+                                       "30 days, at the ask's price or p_true if that is "
+                                       "lower. A share unsold at the end date is worth "
+                                       "p_true. Without a p_true it uses the midpoint. A "
+                                       "sweep that reaches the bid fills all of it. Never "
+                                       "under zero: a fill worth more than its price is not "
+                                       "counted as income."),
     "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
                                "this."),
     "net_daily": Term("Net/day", "The favorite bid's share of the pool less what its fills "
@@ -242,18 +246,13 @@ GLOSSARY = {
                                              "would follow the next bid down and its score "
                                              "would collapse."),
     "hurdle_rate": Term("Hurdle rate", "The yearly return capital must beat, 0.40 is 40%. A "
-                                       "filled favorite share costs its price minus p_true "
-                                       "discounted at this rate over its expected hold: "
-                                       "until the farmer sells it back, mostly within days, "
-                                       "or to the end date for the stuck share. On a "
-                                       "short-dated market, or one whose fills sell back "
-                                       "fast, that cost is negative and fills are welcome."),
-    "stuck_share": Term("Stuck share", "The share of fills never sold back, 0.25 is 25%: the "
-                                       "midpoint falls under the min favorite mid, which "
-                                       "pulls the ask, or the market collapses. Those are "
-                                       "held to the end date. The rest sell back after a "
-                                       "hold set by how fast the market's midpoint "
-                                       "recovered after past sweeps."),
+                                       "filled favorite share costs its price minus what it "
+                                       "sells for, discounted at this rate over its hold: "
+                                       "until the farmer's ask sells it, weeks on average "
+                                       "and longer the more shares are held, or until the "
+                                       "end date. On a short-dated market a share can be "
+                                       "worth more than its price. That fill costs nothing "
+                                       "and is not counted as income."),
     "tape_markets": Term("Markets read for fills", "How many of the top markets read their "
                                                    "fill history: 60 days of trades and "
                                                    "midpoints. Up to 60 more drawn at random "

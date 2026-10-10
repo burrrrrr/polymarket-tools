@@ -503,14 +503,14 @@ class ReviewTest(Writes):
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
         self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
-        # Capped at 93.0c the bid scores 0.02. At a 300% hurdle its fills
-        # still pay while most sell back within days, but held to resolution
-        # they cost more than that earns.
+        # Capped at 93.0c the bid scores 0.02, and at a 300% hurdle its fills
+        # cost less than that earns. A 2.4c margin caps it at 92.6c, where it
+        # scores 0.0008, and at a 1,000% hurdle its fills cost more.
         farm_db.put_settings(self.db, {"hurdle_rate": 3.0}, self.now)
         self.assertIn("Buy No 93.0c", self.live(p_true="95"))
-        farm_db.put_settings(self.db, {"stuck_share": 1.0}, self.now)
+        farm_db.put_settings(self.db, {"hurdle_rate": 10.0, "ev_margin": 0.024}, self.now)
         self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
-                                                 r"bid pays: best net -\$\d+\.\d\d/day at 9\d\.\dc\.")
+                                                 r"bid pays: best net -\$\d+\.\d\d/day at 92\.6c\.")
 
     def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
         from farm_console.app import utc_now
@@ -975,7 +975,7 @@ class ScanTest(Writes):
         farm_db.put_scan_params(self.db, {"min_fav": 0.92, "capital": 300.0, "bid_offset": 0.01,
                                           "fav_target_score": 0.45, "depth_haircut": 0.5,
                                           "fill_lookback_days": 30.0,
-                                          "sweep_prior_weight": 0.25,
+                                          "sweep_prior_weight": 0.25, "stuck_share": 0.25,
                                           "excluded_categories": ["politics", "golf"]}, self.now)
         resp = self.client.get("/discover")
         self.assertEqual(resp.status_code, 200)
@@ -988,7 +988,7 @@ class ScanTest(Writes):
         self.assertIn('name="fragile_drop" value="0.03"', resp.text)
         self.assertIn('name="naked_budget" value="10"', resp.text)
         for retired in ("bid_offset", "fav_target_score", "depth_haircut",
-                        "fill_lookback_days", "sweep_prior_weight"):
+                        "fill_lookback_days", "sweep_prior_weight", "stuck_share"):
             self.assertNotIn(retired, resp.text)
 
 
@@ -1056,6 +1056,7 @@ class SettingsTest(Writes):
         self.assertRegex(page, r'(?s)name="min_fav" value="0.9".*?farmer&#39;s value')
         self.assertRegex(page, r'(?s)name="cooldown_s" value="600".*?>default<')
         self.assertNotIn("Global caps", page)
+        self.assertNotIn("stuck_share", page)
 
     def save(self, group, **changes):
         page = self.client.get("/settings").text

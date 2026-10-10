@@ -36,7 +36,6 @@ SCAN_FIELDS = {
     "min_rate": Field("Min pool ($/day)", bound=Bound(0)),
     "fragile_drop": Field("Fragile mid drop", bound=Bound(0, 1)),
     "hurdle_rate": Field("Hurdle rate", bound=Bound(0, 10)),
-    "stuck_share": Field("Stuck share", bound=Bound(0, 1)),
     "tape_markets": Field("Markets read for fills", bound=Bound(0, 2000)),
 }
 
@@ -52,7 +51,6 @@ SETTING_FIELDS = {
     "min_low_score": Field("Min longshot score", QUOTING),
     "keep_ratio": Field("Keep ratio", QUOTING),
     "hurdle_rate": Field("Hurdle rate", QUOTING),
-    "stuck_share": Field("Stuck share", QUOTING),
     "drop_threshold": Field("Ask drop threshold", SAFETY),
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),

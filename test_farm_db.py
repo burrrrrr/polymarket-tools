@@ -137,7 +137,7 @@ class SettingsTest(ScratchDb):
         farm_db.put_setting(conn, "keep_ratio", 0.5, NOW)
         with conn:
             for key in ("fav_target_score", "depth_haircut", "fill_lookback_days",
-                        "sweep_prior_weight"):
+                        "sweep_prior_weight", "stuck_share"):
                 conn.execute("INSERT INTO settings VALUES (?, '0.45', ?)",
                              (key, NOW.isoformat()))
         for _ in range(2):
@@ -166,6 +166,7 @@ class SettingsTest(ScratchDb):
             ("hurdle_rate", "-0.1"),
             ("hurdle_rate", "10.5"),
             ("depth_haircut", "0.5"),
+            ("stuck_share", "0.25"),
             ("no_such_key", "1"),
         ):
             with self.subTest(key=key, text=text), self.assertRaises(ValueError):

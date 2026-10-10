@@ -11,10 +11,10 @@ the point, because the farmer will hold real inventory on whatever it is told.
 The strategy being screened for: on a market whose favorite outcome trades at
 90c or more, rest a favorite BID just under the midpoint and a longshot BID
 far below the longshot midpoint (a fill there is not wanted). A favorite fill
-is not free either: the share ties up capital until the farmer sells it back,
-mostly within days, or until the market resolves when it cannot, so the
-favorite bid sits at the price where its rewards net of what its fills cost
-are highest (fill_cost.py has the model).
+is not free either: the share ties up capital until the farmer's ask sells
+it, which takes weeks, or until the market resolves first. So the favorite
+bid sits at the price where its rewards net of what its fills cost are
+highest (fill_cost.py has the model and the measurements).
 Polymarket only scores the two-sided minimum once the midpoint is above 0.90,
 so the longshot bid exists purely to make the favorite bid count. On a 0.001
 tick a longshot bid at 0.1c-0.2c almost never fills and costs nearly nothing,
@@ -176,9 +176,8 @@ SCAN_HELP = {
     "fragile_drop": "Skip a market whose midpoint falls this much once its best bid "
                       "leaves",
     "hurdle_rate": "Yearly return capital must beat; a filled share costs its price "
-                   "minus the midpoint discounted at this rate over its expected hold",
-    "stuck_share": "Share of fills never sold back, held to the end date; the rest "
-                   "exit at the market's measured exit rate",
+                   "minus what it sells for, discounted at this rate over the weeks "
+                   "the sale takes",
     "tape_markets": "How many of the top markets read their fill history; the "
                     "cross-market fill prior is fit from a random sample of every "
                     "market it values, and a market not read is valued on that "
@@ -301,21 +300,20 @@ class Assessment(NamedTuple):
 
 class Outlook(NamedTuple):
     """What valuing a quote needs beyond the book, worked out by the caller:
-    the daily pool, the years to resolution, the fill curve, the hurdle rate
-    a filled share is discounted at, and the share of fills held to
-    resolution instead of exiting at the curve's exit rate."""
+    the daily pool, the years to resolution, the fill curve and the hurdle
+    rate a filled share is discounted at."""
 
     rate_per_day: float
     years_left: float
     fills: fill_cost.FillCurve
     hurdle_rate: float
-    stuck_share: float
 
 
 class QuoteValue(NamedTuple):
     """One configuration of our quotes, valued per day. price is the favorite
     bid's, or None for a configuration without one: no fills, and the reward
-    the other legs earn alone."""
+    the other legs earn alone. loss_per_share is what a filled share loses,
+    negative when the share is worth more than its price."""
 
     price: Optional[float]
     size: float
@@ -326,7 +324,9 @@ class QuoteValue(NamedTuple):
 
     @property
     def fill_cost_per_day(self):
-        return self.fills_per_day * self.loss_per_share
+        """What the fills cost a day, never less than nothing: a bid rests
+        for its reward, so a fill worth more than its price is not income."""
+        return self.fills_per_day * max(self.loss_per_share, 0.0)
 
     @property
     def net_per_day(self):
@@ -355,7 +355,6 @@ class ScreenConfig(NamedTuple):
     min_rate: float = 0.0
     fragile_drop: float = 0.03
     hurdle_rate: float = 0.40
-    stuck_share: float = 0.25
     # How many markets read their fill history; the key predates histories.
     tape_markets: float = 100.0
     # Keys of CATEGORIES whose markets the prefilter skips.
@@ -598,18 +597,21 @@ def fav_bid_candidates(levels, v, tick, min_size, max_lead, cap=None):
     return prices
 
 
-def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook,
-                exit_price=None):
+def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook, held=0.0,
+                sale_price=None):
     """What a configuration of our quotes earns per day, net of what its fills cost.
 
     levels is the favorite book without our orders, mid the midpoint once our
-    quotes join it, my_q our Q_min there, and bid the favorite bid's (price,
-    size), or None. The reward is our share of the pool against
-    competing_score. A fill of the favorite bid loses its price less
-    fill_cost.share_value, the exiting share sold at exit_price, or at p_true
-    without one, and the whole bid fills each time a sweep reaches past its
+    quotes join it, my_q our Q_min there, bid the favorite bid's (price,
+    size), or None, and held the favorite shares already in inventory: none
+    for a scan or a preview. The reward is our share of the pool against
+    competing_score. The whole bid fills each time a sweep reaches past its
     distance below mid: a sweep would find our bid in the book, so mid is the
-    one our quotes create.
+    one our quotes create. A fill loses its price less fill_cost.share_value:
+    the share sells at sale_price, the ask the farmer would rest for it,
+    credited never over p_true, or at p_true without one, at the rate that
+    ask sells the inventory the fill leaves, fill_cost.sales_per_day of held
+    plus the bid.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
@@ -623,8 +625,8 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
         reward_per_day=reward,
         fills_per_day=size * outlook.fills.per_day(mid - price),
         loss_per_share=price - fill_cost.share_value(
-            p_true, exit_price, outlook.fills.exit_per_day, outlook.years_left,
-            outlook.hurdle_rate, outlook.stuck_share),
+            p_true, p_true if sale_price is None else min(sale_price, p_true),
+            fill_cost.sales_per_day(held + size), outlook.years_left, outlook.hurdle_rate),
     )
 
 
@@ -719,8 +721,7 @@ def assess(market, levels, config, now, prior, history=None):
         return Skip("fragile midpoint")
 
     outlook = Outlook(market.rate_per_day, fill_cost.years_until(market.end_date, now),
-                      fill_cost.fill_curve(history, prior, config.min_fav), config.hurdle_rate,
-                      config.stuck_share)
+                      fill_cost.fill_curve(history, prior, config.min_fav), config.hurdle_rate)
     planned = plan_quotes(market, levels, config, outlook, book_mid)
     if isinstance(planned, Skip):
         return planned
@@ -1506,7 +1507,6 @@ def config_from(args):
         min_rate=args.min_rate,
         fragile_drop=args.fragile_drop,
         hurdle_rate=args.hurdle_rate,
-        stuck_share=args.stuck_share,
         tape_markets=args.tape_markets,
         excluded_categories=args.exclude,
     )

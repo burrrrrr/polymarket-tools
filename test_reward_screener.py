@@ -166,17 +166,17 @@ SCAN_NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=SCAN_NOW)
 
 
-def curve(*rates, exit_per_day=0.0):
+def curve(*rates):
     """A FillCurve with these rates from the first of DISTANCES, the last one
-    held to the end. By default a filled share never exits."""
-    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, exit_per_day)
+    held to the end."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0)
 
 
 NO_FILLS = curve(0.0)
 
 
-def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40, stuck_share=0.25):
-    return Outlook(rate, years, fills, hurdle_rate, stuck_share)
+def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40):
+    return Outlook(rate, years, fills, hurdle_rate)
 
 
 class FavBidCandidatesTest(unittest.TestCase):
@@ -199,18 +199,24 @@ class ValueQuoteTest(unittest.TestCase):
     # Others score ((3.5 - 1) / 3.5)^2 x 100 = 51.02 on each side of the 0.96 midpoint.
     BOOK = Levels(bids=[(0.95, 100.0)], asks=[(0.97, 100.0)], tick=0.001)
     THEIR_Q = (0.025 / 0.035) ** 2 * 100
+    # Newsom's bid: the book, the mid, v, the reward minimum, our score, the
+    # bid, its capital and p_true.
+    NEWSOM = (Levels(bids=[(0.969, 100.0)], asks=[(0.979, 100.0)], tick=0.001), 0.974, 0.035,
+              20.0, THEIR_Q, (0.960, 2083.0), 2000.0, 0.98)
 
-    def test_net_is_the_pool_share_less_fills_times_the_discounted_loss(self):
+    def test_net_is_the_pool_share_less_fills_times_the_loss_of_a_fill(self):
         # 2c under the 0.96 midpoint a sweep reaches the bid 0.1 times a day and
-        # fills all 200 shares. A year at 40%: 0.98 / 1.4 = 0.70.
+        # fills all 200 shares. With no sale price a share sells at the 96c
+        # p_true, 59.7% of 200 shares in 30 days. A year out at 40% that is
+        # worth 93.17c today.
         fills = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
-                                            (0.94, 200.0), 190.0, 0.98, outlook(fills, years=1.0))
+                                            (0.94, 200.0), 190.0, 0.96, outlook(fills, years=1.0))
         self.assertAlmostEqual(value.reward_per_day, 50.0)
         self.assertAlmostEqual(value.fills_per_day, 20.0)
-        self.assertAlmostEqual(value.loss_per_share, 0.24)
-        self.assertAlmostEqual(value.net_per_day, 50.0 - 20.0 * 0.24)
-        self.assertAlmostEqual(value.net_apr, (50.0 - 4.8) * 365 / 190.0)
+        self.assertAlmostEqual(value.loss_per_share, 0.00831, places=5)
+        self.assertAlmostEqual(value.net_per_day, 50.0 - 20.0 * value.loss_per_share)
+        self.assertAlmostEqual(value.net_apr, value.net_per_day * 365 / 190.0)
 
     def test_the_bid_fills_at_its_distance_below_the_mid_it_is_given(self):
         # 1.25c under the midpoint, halfway between the 1c and 1.5c rates.
@@ -222,30 +228,66 @@ class ValueQuoteTest(unittest.TestCase):
                                             (0.9475, 100.0), 95.0, 0.98, outlook(fills))
         self.assertAlmostEqual(moved.fills_per_day, 100 * 0.15)
 
-    def test_a_fill_that_sells_back_fast_costs_less_than_one_held_to_resolution(self):
-        # A year at 40%: held, 0.98 / 1.4 = 0.70 today. Selling back at once,
-        # all but the stuck quarter are worth 0.98.
-        rates = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
-        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0, 0.98)
-        held = reward_screener.value_quote(*quote, outlook(curve(*rates), years=1.0))
-        fast = reward_screener.value_quote(
-            *quote, outlook(curve(*rates, exit_per_day=1e6), years=1.0))
-        self.assertEqual(fast.fills_per_day, held.fills_per_day)
-        self.assertAlmostEqual(held.loss_per_share, 0.94 - 0.98 / 1.4)
-        self.assertAlmostEqual(fast.loss_per_share, 0.94 - 0.98 * (0.75 + 0.25 / 1.4), places=6)
-        self.assertGreater(fast.net_per_day, held.net_per_day)
+    def test_a_fill_sells_at_its_sale_price_at_the_measured_rate(self):
+        # No hurdle and 30 days out, so nothing is discounted: 67.4% of 100
+        # shares sell at the 97c sale price and the rest resolve worth the
+        # 98c p_true.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.98)
+        value = reward_screener.value_quote(*quote, soon, sale_price=0.97)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - (0.674 * 0.97 + 0.326 * 0.98))
+        self.assertEqual(value.fills_per_day,
+                         reward_screener.value_quote(*quote, soon).fills_per_day)
 
-    def test_a_fill_sold_at_an_exit_ask_is_worth_that_ask(self):
-        # Plague: a 96.8c bid on a 99c favorite 0.228 years out, whose sweeps
-        # exit 1.191 times a day. Sold at p_true a fill gains 0.31c a share;
-        # sold at the 98.1c ask it loses 0.36c.
-        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.968, 100.0), 96.8, 0.99)
-        plague = outlook(curve(0.5, exit_per_day=1.191), years=0.228)
-        at_p_true = reward_screener.value_quote(*quote, plague)
-        at_ask = reward_screener.value_quote(*quote, plague, exit_price=0.981)
-        self.assertAlmostEqual(at_p_true.loss_per_share, -0.0031, places=4)
-        self.assertAlmostEqual(at_ask.loss_per_share, 0.0036, places=4)
-        self.assertEqual(at_ask.fills_per_day, at_p_true.fills_per_day)
+    def test_without_a_sale_price_a_share_sells_at_p_true(self):
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.98)
+        value = reward_screener.value_quote(*quote, soon)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - 0.98)
+        self.assertEqual(value, reward_screener.value_quote(*quote, soon, sale_price=0.98))
+
+    def test_a_sale_is_never_credited_over_p_true(self):
+        # A scan's p_true is the 96c mid, and the farmer's ask rests a cent
+        # over it: sold or resolved the share is worth 96c, as it is with no
+        # sale price.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 100.0), 94.0, 0.96)
+        value = reward_screener.value_quote(*quote, soon, sale_price=0.97)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - 0.96)
+        self.assertEqual(value, reward_screener.value_quote(*quote, soon))
+
+    def test_a_newsom_shaped_fill_costs_over_two_cents_a_share(self):
+        # A 98c favorite 0.228 years out, mid 97.4c, 2,083 shares bid at
+        # 96.0c. The ask a cent over the mid is over p_true, so a share sells
+        # at 98c, and 33.8% of 2,083 shares sell in 30 days: 93.66c today.
+        value = reward_screener.value_quote(*self.NEWSOM, outlook(curve(0.5), years=0.228),
+                                            sale_price=0.984)
+        self.assertAlmostEqual(value.loss_per_share, 0.02342, places=5)
+
+    def test_shares_already_held_make_the_same_fill_cost_more(self):
+        # The fill leaves 3,083 or 7,083 shares to sell, 29.4% or 20.2% of them
+        # in 30 days. Without a count of shares held, none are.
+        newsom = outlook(curve(0.5), years=0.228)
+        none = reward_screener.value_quote(*self.NEWSOM, newsom)
+        some = reward_screener.value_quote(*self.NEWSOM, newsom, held=1000.0)
+        more = reward_screener.value_quote(*self.NEWSOM, newsom, held=5000.0)
+        self.assertEqual(none, reward_screener.value_quote(*self.NEWSOM, newsom, held=0.0))
+        self.assertAlmostEqual(some.loss_per_share, 0.02665, places=5)
+        self.assertAlmostEqual(more.loss_per_share, 0.03398, places=5)
+        self.assertEqual(more.fills_per_day, none.fills_per_day)
+
+    def test_a_fill_worth_more_than_its_price_adds_nothing_to_the_net(self):
+        # No hurdle and 30 days out, a 94c fill is worth the 98c p_true: it
+        # loses -4c a share, 50 shares a day. The bid nets its reward and no
+        # more.
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
+                                            (0.94, 100.0), 94.0, 0.98, soon)
+        self.assertAlmostEqual(value.loss_per_share, -0.04)
+        self.assertAlmostEqual(value.fills_per_day, 50.0)
+        self.assertEqual(value.fill_cost_per_day, 0.0)
+        self.assertAlmostEqual(value.net_per_day, 50.0)
+        self.assertAlmostEqual(value.net_apr, 50.0 * 365 / 94.0)
 
     def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
@@ -261,10 +303,11 @@ class PlanQuotesTest(unittest.TestCase):
         self.assertEqual(value.fills_per_day, 0.0)
 
     def test_sweeps_through_the_top_of_the_book_push_the_bid_below_where_they_reach(self):
-        # A sweep reaches 1c under the 0.96 midpoint every day and never 1.5c;
-        # a fill there loses 6c, so the bid steps down to 1.5c under or more.
+        # A sweep reaches 1c under the 0.96 midpoint every day and never 1.5c.
+        # A fill there loses 2.8c a share, more than a $10 pool pays for the
+        # 125 shares a day, so the bid steps down to 1.5c under or more.
         swept = curve(1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
-        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(swept), 0.96)
+        plan, value = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(swept, rate=10.0), 0.96)
         self.assertLessEqual(plan.fav_bid_price, 0.945)
         self.assertEqual(value.size, plan.fav_bid_size)
         self.assertEqual(value.fills_per_day, 0.0)
@@ -289,11 +332,13 @@ class AssessTest(unittest.TestCase):
         default = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, fill_cost.DEFAULT_PRIOR)
         self.assertEqual(default.fill_source, "default")
 
-    def test_the_stuck_share_setting_prices_the_fills(self):
-        stuck = assess(MARKET, DEEP_BOOK, CONFIG._replace(stuck_share=1.0), SCAN_NOW, PRIOR)
-        exiting = assess(MARKET, DEEP_BOOK, CONFIG._replace(stuck_share=0.0), SCAN_NOW, PRIOR)
-        self.assertGreater(stuck.fills_per_day, 0)
-        self.assertLess(stuck.net_daily_usd, exiting.net_daily_usd)
+    def test_a_scan_values_a_fill_with_nothing_held_and_the_book_mid_as_p_true(self):
+        a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
+        price, size = a.plan.fav_bid_price, a.plan.fav_bid_size
+        worth = fill_cost.share_value(a.book_mid, a.book_mid, fill_cost.sales_per_day(size),
+                                      fill_cost.years_until(MARKET.end_date, SCAN_NOW), 0.40)
+        self.assertGreater(a.fills_per_day, 0)
+        self.assertAlmostEqual(a.loss_per_share, price - worth)
 
     def test_a_history_prices_the_fills_and_is_stored(self):
         history = History((30, 25, 20, 15, 10, 6, 3, 1, 0, 0, 0, 0), 60.0, SCAN_NOW, 0.90,

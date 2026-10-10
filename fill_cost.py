@@ -3,27 +3,38 @@ How often a resting favorite bid fills, and what a filled share costs.
 
 A fill is not free: the share ties up capital, which has a hurdle rate r,
 until it leaves. The farmer offers a filled share back through FAV_ASK, and
-the mid mostly recovers to where the sweep found it within days, so a share
-mostly exits after an exponential hold T of rate lambda a year, cut short at
-resolution Y years out. A share in stuck_share q never exits: the mid falls
-under min_fav and the ask is pulled, or the market collapses, and it is held
-to resolution. With delta = ln(1 + r), a share bought at b that exits at the
-ask a and is worth p_true at resolution loses L = b - share_value today,
-share_value = (1 - q) * a * E[exp(-delta * min(T, Y))]
-+ q * p_true * exp(-delta * Y); without an ask, a is p_true and share_value
-is p_true times hold_discount. On a short-dated market, or one whose fills
-exit fast, L can be negative and fills are welcome.
+that ask sells slowly: 67% of a 100-share inventory and 42% of a 1,000-share
+one in 30 days (SOLD). So a share is sold after an exponential hold T of rate
+lambda a year, sales_per_day of the inventory the fill leaves the farmer
+holding, cut short at resolution Y years out, where a share still unsold is
+worth p_true. The shares that sell go at about that ask's price, so the sale
+is at the ask the farmer would rest for the inventory, never credited over
+p_true, and at p_true for a caller with no ask to give. With
+delta = ln(1 + r) and k = lambda + delta, a share bought at b that sells at a
+loses L = b - share_value today,
+share_value = a * lambda / k * (1 - exp(-k * Y)) + p_true * exp(-k * Y).
+reward_screener.value_quote is the one place that puts these together. On a
+short-dated market L can be negative. A bid rests for its reward, so its
+QuoteValue charges such fills nothing and never counts them as income.
 
 A bid fills when a sweep reaches past it: taker trades hitting favorite bids
 in one burst, whose deepest fill trades below the bid. A market's History
 counts, at each distance in DISTANCES, the sweeps that reached that far below
 the mid they found, over its last HISTORY_DAYS days of trades, at most one an
-hour, and times how long the mid took to recover after those at
-EXIT_DISTANCE. Few markets see enough sweeps to be rated alone, so each count
-is shrunk toward a Prior that a scan pools across markets, by as many days of
-evidence as the markets' spread around the pooled rate is worth, and the exit
-rate likewise. A bid of Q shares then fills Q times the FillCurve's rate at
-its distance a day: a sweep that reaches it fills all of it.
+hour. Few markets see enough sweeps to be rated alone, so each count is
+shrunk toward a Prior that a scan pools across markets, by as many days of
+evidence as the markets' spread around the pooled rate is worth. A bid of Q
+shares then fills Q times the FillCurve's rate at its distance a day: a sweep
+that reaches it fills all of it.
+
+A History also times how long the mid took to be back where each sweep at
+EXIT_DISTANCE found it (exits, held_days), a Prior pools that
+(exit_rate, exit_strength) and a FillCurve carries the shrunk rate
+(exit_per_day). Fills were valued on that clock until the ask's sales were
+measured: the mid is back within days, and the ask sells over weeks. Nothing
+values a fill with it now. It is still read, fit and stored, because the
+rows in farm.db carry it, and dropping it would change JSON_VERSION and stop
+every bid until each market's history is read again.
 
 Everything here is pure; the screener reads trades and mids, and calls
 make_history and fit_prior.
@@ -49,8 +60,7 @@ YEAR_DAYS = 365.25
 DISTANCES = (0.0, 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.075, 0.10)
 # The exit clock runs on the sweeps reaching more than 1c below the mid, about
 # where a favorite bid rests. One exit rate a market, not one per distance:
-# measured holds were 5.0, 7.2 and 7.6 days at 1, 1.5 and 2c, and at holds of
-# days the cost barely depends on their exact length.
+# the mid was back after 5.0, 7.2 and 7.6 days at 1, 1.5 and 2c.
 EXIT_DISTANCE = 0.01
 HISTORY_DAYS = 60.0
 # A sweep is measured against the minute mid at least this long before it
@@ -69,37 +79,54 @@ FLOOR_RATE = 1e-4
 THROUGH_EPS = 1e-9
 JSON_VERSION = 2
 
+# What became of a filled share, measured on 2026-10-10 on the 250 markets
+# `exit_backtest.py fetch` and `fill_backtest.py fetch` cached. A new
+# measurement replaces the numbers here.
+#
+# (shares a sweep filled, the fraction of them the farmer's ask sold in the
+# SOLD_DAYS after): every sweep of the cache replayed against the buys that
+# followed it, the ask priced as the farmer prices it and a buy at or above
+# it selling. The 30-day "sold >=" column of section 4 of replay.txt, 5,078
+# bids on 169 markets, from
+#   python handoff\exit-pricing\replay\replay.py --out handoff\exit-pricing\replay --reps 2000
+# whose replay_rows.csv has one row per bid, size, horizon and fill rule: the
+# mean of `sold` over the rows of a size with H 30 and rule at-or-above. The
+# same column has 2,000 shares at 0.309, where the line through SOLD says
+# 0.342.
+SOLD_DAYS = 30.0
+SOLD = ((100.0, 0.674), (1000.0, 0.419))
+# The line through SOLD passes this near 28,000 shares, far past the largest
+# fill replayed, and turns negative past 44,000.
+MIN_SOLD = 0.05
 
-def hold_discount(exit_per_day, years, hurdle_rate, stuck_share):
-    """What p_true is worth today per share filled, at the hurdle rate: the
-    stuck share discounted over `years` to resolution, the rest over an
-    exponential hold at exit_per_day cut short there,
-    E[exp(-delta * min(T, Y))] = lam / k * (1 - exp(-k * Y)) + exp(-k * Y)
-    with delta = ln(1 + hurdle_rate), lam the exits a year, k = lam + delta.
-    No exits, or stuck_share 1, discounts everything to resolution."""
-    delta = math.log1p(hurdle_rate)
-    lam = exit_per_day * YEAR_DAYS
-    k = lam + delta
-    exiting = 1.0 if k == 0 else lam / k * -math.expm1(-k * years) + math.exp(-k * years)
-    return (1 - stuck_share) * exiting + stuck_share * math.exp(-delta * years)
+
+def share_value(p_true, sale_price, per_day, years, hurdle_rate):
+    """What a filled share is worth today at the hurdle rate: sale_price
+    after an exponential hold of rate per_day, cut short at resolution
+    `years` out, where a share still unsold is worth p_true,
+    sale_price * lam / k * (1 - exp(-k * Y)) + p_true * exp(-k * Y)
+    with delta = ln(1 + hurdle_rate), lam the sales a year, k = lam + delta.
+    No sales leave p_true discounted to resolution."""
+    lam = per_day * YEAR_DAYS
+    k = lam + math.log1p(hurdle_rate)
+    sold = 0.0 if k == 0 else lam / k * -math.expm1(-k * years)
+    return sale_price * sold + p_true * math.exp(-k * years)
 
 
-def share_value(p_true, exit_price, exit_per_day, years, hurdle_rate, stuck_share):
-    """What a filled share is worth today at the hurdle rate: the exiting
-    share sells at exit_price after hold_discount's hold, the stuck share is
-    worth p_true at resolution. exit_price None sells at p_true, and an ask
-    over p_true is credited at p_true: the hold is the mid's recovery, and
-    asks sell far slower than that, so a fill never looks worth more than
-    p_true."""
-    exit_price = p_true if exit_price is None else min(exit_price, p_true)
-    exiting = hold_discount(exit_per_day, years, hurdle_rate, 0.0)
-    held = math.exp(-math.log1p(hurdle_rate) * years)
-    return (1 - stuck_share) * exit_price * exiting + stuck_share * p_true * held
+def sales_per_day(shares):
+    """The rate, a day, at which the farmer's ask sells a share out of an
+    inventory of `shares`: the hazard under which SOLD's fraction is gone in
+    SOLD_DAYS. The fraction is linear in ln(shares) through SOLD's two sizes,
+    the smaller size's for anything smaller, and never under MIN_SOLD."""
+    (small, most), (large, less) = SOLD
+    sold = most if shares <= small else max(MIN_SOLD, most + (less - most)
+                                            * math.log(shares / small) / math.log(large / small))
+    return -math.log1p(-sold) / SOLD_DAYS
 
 
 def years_until(end_date, now):
-    """Years to resolution, never negative: how long a stuck share is held, and
-    where an exiting share's hold is cut short. The end date, not the expiry
+    """Years to resolution, never negative: where a filled share's hold is
+    cut short and what is unsold pays out. The end date, not the expiry
     buffer: the farmer retires early, but the share does not resolve early."""
     return max(0.0, (end_date - now).total_seconds() / DAY_S / YEAR_DAYS)
 
@@ -152,9 +179,9 @@ class Prior(NamedTuple):
 
 class FillCurve(NamedTuple):
     """Events a day that sweep past a bid at each DISTANCES point,
-    non-increasing in distance, and the exits a day of a filled share.
-    from_history says the market's own history went into it; False is the
-    prior alone."""
+    non-increasing in distance. from_history says the market's own history
+    went into it; False is the prior alone. exit_per_day is how often a day
+    the mid was back where a sweep found it, which no valuation reads."""
 
     rates: tuple
     from_history: bool
@@ -185,8 +212,7 @@ DEFAULT_PRIOR = Prior(
     at=None,
     floor=0.90,
     # The exit rate is fit_prior's over the 74 approved markets of
-    # 2026-10-05, a set biased toward markets that recovered, which
-    # stuck_share covers.
+    # 2026-10-05, a set biased toward markets that recovered.
     exit_rate=0.2143,
     exit_strength=3.981,
 )

@@ -16,15 +16,17 @@ spread v. Score is sampled once a minute and the pool is paid daily. So the
 farmer rests on both sides, in four slots per market:
 
   FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until
-            FAV_ASK sells it, or to resolution for the --stuck-share that
-            never sells, so it costs the price less, discounted at the
-            hurdle rate over that hold, the ask the fill would leave resting
-            or p_true for the stuck share. The bid rests at the price in the
-            band whose rewards net of expected fills (from the market's fill
-            history, shrunk toward the last scan's cross-market prior) are
-            highest, never above p_true minus a margin, and only when that
-            net beats the orders without it. Until the market's history is
-            read it does not rest at all.
+            FAV_ASK sells it, which takes weeks and longer the more shares
+            are held, or until the market resolves first. So it costs the
+            price less, discounted at the hurdle rate over that hold, what
+            the share sells for: the ask the fill would leave resting, never
+            credited over p_true, and p_true for what is unsold at
+            resolution (fill_cost.py has the measurements). The bid rests at
+            the price in the band whose rewards net of expected fills (from
+            the market's fill history, shrunk toward the last scan's
+            cross-market prior) are highest, never above p_true minus a
+            margin, and only when that net beats the orders without it.
+            Until the market's history is read it does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same.
@@ -488,7 +490,6 @@ class FarmConfig(NamedTuple):
     naked_cooldown_s: float
     expiry_buffer_days: float
     hurdle_rate: float
-    stuck_share: float
 
 
 # ---------------------------------------------------------------------------
@@ -543,8 +544,8 @@ def plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid=None):
     """Favorite ask above both the midpoint and our cost, or None if it would cross.
 
     The midpoint is the one before the fill the inventory came from when that
-    is higher, because the fill_cost exit clock ends a hold when the mid is
-    back there.
+    is higher. fill_cost.SOLD is the share of a fill this ask sold, so a
+    change to the rule here calls for a new measurement there.
     """
     tick = fm.tick
     anchor = max(book_mid, fill_mid or 0.0)
@@ -658,8 +659,7 @@ def market_outlook(fm, total_rates, history, prior, cfg, now):
     """The Outlook a favorite bid on this market is valued with: fills from its
     history shrunk toward prior, or prior alone without a history."""
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate,
-                   cfg.stuck_share)
+                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate)
 
 
 def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
@@ -676,14 +676,16 @@ def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
 
 def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
     """value_quote of a planned set of orders, its favorite bid included, a
-    fill sold at its fill_exit_price."""
+    fill adding to the favorite shares the position holds and sold at its
+    fill_exit_price."""
     by = {i.slot: i for i in target.intents}
     bid = by.get(Slot.FAV_BID)
     capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
-    exit_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
+    sale_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
-                       bid and (bid.price, bid.size), capital, fm.p_true, outlook, exit_price)
+                       bid and (bid.price, bid.size), capital, fm.p_true, outlook,
+                       position.fav_shares, sale_price)
 
 
 def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False,
@@ -2308,7 +2310,6 @@ def config_from(args):
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
-        stuck_share=args.stuck_share,
     )
 
 
@@ -2374,11 +2375,9 @@ Examples:
                                             "a longshot fill"),
         ("--expiry-buffer-days", float, 7.0, "Retire this many days before the end date"),
         ("--hurdle-rate", float, 0.40, "Yearly return capital must beat; a filled share "
-                                       "costs its price minus p_true discounted at this "
-                                       "rate over its expected hold"),
-        ("--stuck-share", float, 0.25, "Share of fills never sold back, held to the end "
-                                       "date; the rest exit at the market's measured "
-                                       "exit rate"),
+                                       "costs its price minus what it sells for, "
+                                       "discounted at this rate over the weeks the sale "
+                                       "takes"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

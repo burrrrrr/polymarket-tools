@@ -71,7 +71,6 @@ CFG = FarmConfig(
     naked_cooldown_s=3600.0,
     expiry_buffer_days=7.0,
     hurdle_rate=0.40,
-    stuck_share=0.25,
 )
 
 
@@ -130,7 +129,7 @@ def q_sums(target):
 
 def curve(*rates):
     """Fills drawn from the market's history: these rates from the first of
-    DISTANCES, the last one held to the end. A filled share never exits."""
+    DISTANCES, the last one held to the end."""
     return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0)
 
 
@@ -326,8 +325,10 @@ class NetPricingTest(unittest.TestCase):
 
     def test_sweeps_through_the_top_of_the_book_push_the_bid_below_where_they_reach(self):
         # The 98.5c cap sits 0.5c under the 99.0c midpoint, where a sweep fills
-        # the bid daily; it steps down to 1.5c under or more, which none reach.
-        fm = market()
+        # the bid daily. A fill there loses 2.5c a share, more than a $10 pool
+        # pays for 507 shares a day, so the bid steps down to 1.5c under or
+        # more, which none reach.
+        fm = market(rate_per_day=10.0)
         target = plan(fm, FLOOR_BOOK, fills=SWEPT)
         fav = by_slot(target)[Slot.FAV_BID]
         self.assertLessEqual(fav.price, 0.975)
@@ -358,9 +359,8 @@ class NetPricingTest(unittest.TestCase):
     def test_the_outlook_takes_the_live_rate_the_end_date_and_the_fill_curve(self):
         fm = market(rate_per_day=100.0, end_date=NOW + timedelta(days=365.25))
         outlook = market_outlook(fm, {"0xc0nd": 40.0}, NO_SWEEPS, PRIOR, CFG, NOW)
-        self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate,
-                          outlook.stuck_share),
-                         (40.0, 1.0, CFG.hurdle_rate, CFG.stuck_share))
+        self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate),
+                         (40.0, 1.0, CFG.hurdle_rate))
         self.assertEqual(outlook.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, CFG.min_fav))
         self.assertTrue(outlook.fills.from_history)
         unread = market_outlook(fm, {"0xother": 40.0}, None, PRIOR, CFG, NOW)
@@ -498,15 +498,15 @@ class ReconcileTest(unittest.TestCase):
 
     def test_a_favorite_bid_is_sized_against_the_plan_at_its_own_price(self):
         # A $0.30 naked budget trims the favorite bid to what the floor bid
-        # covers, so the plan rests 300 shares at 98.1c and 225.33 at the
-        # target's 98.5c, and 98.1c nets within a cent of the best.
+        # covers, so the plan rests 225.33 shares at 98.5c and 324.48 at the
+        # target's 98.0c, and 98.5c nets within a cent of the best.
         fm = market(naked_budget_usd=0.3)
         target = plan(fm, FLOOR_BOOK)
         fav = by_slot(target)[Slot.FAV_BID]
-        self.assertEqual((fav.price, fav.size), (0.985, 225.33))
-        resting = live("a", Slot.FAV_BID, 0.981, 300.0)
+        self.assertEqual((fav.price, fav.size), (0.98, 324.48))
+        resting = live("a", Slot.FAV_BID, 0.985, 225.33)
         self.assertIsNone(keep_failure(resting, fav, target, fm, Position(), CFG))
-        oversized = live("a", Slot.FAV_BID, 0.981, 400.0)
+        oversized = live("a", Slot.FAV_BID, 0.985, 324.48)
         self.assertEqual(keep_failure(oversized, fav, target, fm, Position(), CFG),
                          "size out of range")
 
@@ -831,49 +831,121 @@ class AskKeepTest(unittest.TestCase):
         self.assertEqual(self.keep(0.962), "score below keep ratio")
 
 
-# Plague's shape: a 99c favorite 0.228 years out with a 97.05c mid, whose
-# sweeps are back at the mid in under a day.
-PLAGUE = market(p_true=0.99, end_date=NOW + timedelta(days=0.228 * 365.25))
-PLAGUE_BOOK = Levels(bids=[(0.970, 1000.0), (0.960, 5000.0)],
-                     asks=[(0.971, 1000.0), (0.990, 5000.0)], tick=0.001)
-PLAGUE_FILLS = QUIET._replace(exit_per_day=1.191)
+# Newsom's shape: a 98c favorite 0.228 years out with a 97.4c mid and $2,000
+# behind its bid. SURE is the same market held to be worth 99c, over the ask
+# a fill would leave resting.
+NEWSOM = market(p_true=0.98, end_date=NOW + timedelta(days=0.228 * 365.25), capital=2000.0)
+SURE = NEWSOM._replace(p_true=0.99)
+NEWSOM_BOOK = Levels(bids=[(0.969, 1000.0), (0.950, 5000.0)],
+                     asks=[(0.979, 1000.0), (0.990, 5000.0)], tick=0.001)
 
 
-def plague_bid_value(position=Position(), fm=PLAGUE, fill_mid=None, price=0.968):
-    outlook = market_outlook(fm, None, None, PRIOR, CFG, NOW)._replace(fills=PLAGUE_FILLS)
-    target = target_orders(fm, PLAGUE_BOOK, position, CFG, True, outlook, fill_mid=fill_mid)
+def newsom_bid_value(position=Position(), fm=NEWSOM, fill_mid=None, price=0.960):
+    outlook = market_outlook(fm, None, None, PRIOR, CFG, NOW)._replace(fills=QUIET)
+    target = target_orders(fm, NEWSOM_BOOK, position, CFG, True, outlook, fill_mid=fill_mid)
     return target.fav.curve[price]
 
 
-def sold_at(exit_price):
-    """What a Plague share is worth today when it exits at exit_price."""
-    return fill_cost.share_value(0.99, exit_price, 1.191, 0.228, CFG.hurdle_rate,
-                                 CFG.stuck_share)
+def sold_at(sale_price, shares=2083.33, p_true=0.99):
+    """What a share bought by a Newsom fill is worth today, sold at
+    sale_price out of an inventory of `shares`."""
+    return fill_cost.share_value(p_true, sale_price, fill_cost.sales_per_day(shares), 0.228,
+                                 CFG.hurdle_rate)
 
 
 class FillValueTest(unittest.TestCase):
-    """A favorite bid's fill is valued at the favorite ask the farmer would
-    rest for the inventory the fill leaves it holding, not at p_true."""
+    """A favorite bid's fill is valued sold at the favorite ask the farmer
+    would rest for the inventory the fill leaves it holding, never over
+    p_true, at the measured rate that ask sells that inventory."""
 
     def test_a_fill_sells_at_the_ask_off_the_mid_it_found(self):
-        # 97.05c + 1c: a 96.8c fill is worth 96.44c today and costs 0.36c a
-        # share, where selling at p_true it would gain 0.31c.
-        value = plague_bid_value()
-        self.assertAlmostEqual(sold_at(0.981), 0.9644, places=4)
-        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.981))
-        self.assertAlmostEqual(value.loss_per_share, 0.0036, places=4)
+        # 97.4c + 1c: 33.8% of 2,083 shares sell at 98.4c in 30 days, and a
+        # 96.0c fill is worth 94.22c today.
+        value = newsom_bid_value(fm=SURE)
+        self.assertEqual(value.size, 2083.33)
+        self.assertAlmostEqual(value.loss_per_share, 0.960 - sold_at(0.984))
+        self.assertAlmostEqual(value.loss_per_share, 0.01783, places=5)
 
-    def test_a_fill_mid_above_the_book_mid_anchors_the_exit(self):
-        value = plague_bid_value(fill_mid=0.975)
-        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.985))
+    def test_an_ask_over_p_true_is_credited_at_p_true(self):
+        # The 98.4c ask is over Newsom's 98c: a share sells for 98c, and the
+        # fill costs 2.3c a share.
+        value = newsom_bid_value()
+        self.assertAlmostEqual(value.loss_per_share, 0.960 - sold_at(0.98, p_true=0.98))
+        self.assertAlmostEqual(value.loss_per_share, 0.02342, places=5)
+
+    def test_a_fill_mid_above_the_book_mid_anchors_the_ask(self):
+        value = newsom_bid_value(fm=SURE, fill_mid=0.977)
+        self.assertAlmostEqual(value.loss_per_share, 0.960 - sold_at(0.987))
 
     def test_the_exit_floor_takes_the_cost_blended_over_the_fill(self):
-        # 1,000 shares at 98.5c rest their ask at 99.0c; 1,048.55 more at
-        # 96.8c blend the cost to 97.63c, flooring the exit at 98.2c.
-        held = Position(fav_shares=1000.0, fav_avg=0.985)
-        value = plague_bid_value(held, PLAGUE._replace(capital=2000.0))
-        self.assertEqual(value.size, 1048.55)
-        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.982))
+        # 4,000 shares at 98.5c rest their ask at 99.0c. 1,104.16 more at
+        # 96.0c blend the cost to 97.96c, flooring the ask at 98.5c, over the
+        # 98.4c the mid sets.
+        held = Position(fav_shares=4000.0, fav_avg=0.985)
+        value = newsom_bid_value(held, SURE._replace(capital=5000.0))
+        self.assertEqual(value.size, 1104.16)
+        self.assertAlmostEqual(value.loss_per_share, 0.960 - sold_at(0.985, 5104.16))
+
+    def test_the_sale_rate_is_that_of_the_shares_held_and_the_bid_together(self):
+        # 1,000 shares at 96c leave capital for 1,083.33 more, so the fill
+        # leaves the same 2,083.33 to sell and costs the same.
+        held = Position(fav_shares=1000.0, fav_avg=0.96)
+        value = newsom_bid_value(held)
+        self.assertEqual(value.size, 1083.33)
+        self.assertAlmostEqual(value.loss_per_share, newsom_bid_value().loss_per_share)
+
+    def test_shares_already_held_make_the_same_fill_cost_more(self):
+        # With the capital for the full bid on top of them, the fill leaves
+        # 3,083.33 shares, 29.4% of which sell in 30 days.
+        held = Position(fav_shares=1000.0, fav_avg=0.96)
+        value = newsom_bid_value(held, NEWSOM._replace(capital=2960.0))
+        self.assertEqual(value.size, 2083.33)
+        self.assertAlmostEqual(value.loss_per_share, 0.02666, places=5)
+
+
+# Trump goes to space: a 99c favorite 0.228 years out with a 97.7c mid, a
+# 4.5c band and a $3 pool, $2,000 behind its bid, on a book deep enough that
+# the bid earns cents a day.
+TRUMP = market(p_true=0.99, v=0.045, rate_per_day=3.0, min_size=200.0, capital=2000.0,
+               naked_budget_usd=10.0, end_date=NOW + timedelta(days=0.228 * 365.25))
+TRUMP_BOOK = Levels(bids=[(0.976, 4000.0), (0.970, 3000.0), (0.968, 5000.0)],
+                    asks=[(0.978, 3000.0), (0.983, 2000.0), (0.988, 5000.0)], tick=0.001)
+# A sweep takes the top of the book every other day, reaches 1c under the
+# mid every 11 weeks and 4c under every 6 months.
+TRUMP_FILLS = curve(0.46, 0.089, 0.076, 0.015, 0.013, 0.0096, 0.0076, 0.0054, 0.0054)
+
+
+class FillNeverGainsTest(unittest.TestCase):
+    """A bid rests for its reward. A fill worth more than its price costs
+    nothing, and is never counted as income."""
+
+    def test_a_fill_worth_more_than_its_price_adds_nothing_to_the_net(self):
+        # At the 93.3c band edge a share sells at the 98.7c ask and is worth
+        # 1.09c more than it costs, 11.6 shares a day. The bid nets its
+        # $0.0004 reward.
+        edge = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS).fav.curve[0.933]
+        self.assertAlmostEqual(edge.loss_per_share, -0.01093, places=5)
+        self.assertAlmostEqual(edge.fills_per_day, 11.6, places=1)
+        self.assertEqual(edge.fill_cost_per_day, 0.0)
+        self.assertAlmostEqual(edge.reward_per_day, 0.0004, places=4)
+        self.assertEqual(edge.net_per_day, edge.reward_per_day)
+
+    def test_the_bid_does_not_go_to_the_band_edge_for_its_fills(self):
+        # Counted as income, the edge's fills made it the best bid at $0.13 a
+        # day. The bid rests at 94.4c, the highest price whose fills cost
+        # nothing, for its $0.06 reward.
+        target = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS)
+        self.assertEqual(target.fav.best.price, 0.944)
+        self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.944)
+        self.assertAlmostEqual(target.fav.best.net_per_day, 0.0613, places=4)
+
+    def test_a_fill_that_costs_is_still_charged(self):
+        # At 95.3c a fill loses 0.89c a share, 14.1 shares a day.
+        value = plan(TRUMP, TRUMP_BOOK, fills=TRUMP_FILLS).fav.curve[0.953]
+        self.assertAlmostEqual(value.loss_per_share, 0.00890, places=5)
+        self.assertAlmostEqual(value.net_per_day,
+                               value.reward_per_day - value.fills_per_day * value.loss_per_share)
+        self.assertLess(value.net_per_day, value.reward_per_day)
 
 
 class BackoffTest(unittest.TestCase):

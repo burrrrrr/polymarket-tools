@@ -240,7 +240,7 @@ ADDED_COLUMNS = {
 # Settings the farmer no longer has. A row left behind would be reported as
 # an unknown setting on every start.
 RETIRED_SETTINGS = ("fav_target_score", "depth_haircut", "fill_lookback_days",
-                    "sweep_prior_weight")
+                    "sweep_prior_weight", "stuck_share")
 
 
 def stamp(dt):
@@ -666,7 +666,6 @@ SETTINGS = {
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
-    "stuck_share": Bound(0, 1),
 }
 
 
