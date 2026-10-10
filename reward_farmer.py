@@ -34,19 +34,25 @@ farmer rests on both sides, in four slots per market:
   FAV_ASK   favorite SELL, Q_two, covered by favorite shares. Exits favorite
             inventory above its average cost and frees the capital again.
   LONG_BID  longshot BUY, Q_two, naked. It exists only to make Q_one count.
-            On a FLOOR market it rests at 0.1c, where it almost never fills,
-            sized to cover the rest of Q_one whatever that costs: the
-            market's naked_budget_usd does not limit a bid at the floor. On
-            a BUDGET market, where a 0.1c share scores next to nothing, it
-            takes the cheapest price whose covering size fits the budget,
-            less longshot shares held, and never one above the cheapest price
-            scoring --min-low-score. Once a longshot bid has filled, the
-            budget less the shares held limits every price, the floor too,
-            until LONG_ASK has sold them. And the floor is free of the
-            budget only once a share there has scored FLOOR_MIN_SCORE on
-            every cycle for FLOOR_DWELL_S: a score that flickers across the
-            bound would flip the plan, and the favorite bid's size with it,
-            as often as it crossed.
+            A fill of it at price q sells the favorite at 1 - q, so its
+            zones go by the annual return that gives a favorite buyer who
+            holds to the end date (reward_screener.fill_return). Under
+            FREE_RETURN almost no buyer takes it, and the bid is sized to
+            cover the rest of Q_one whatever that costs: the market's
+            naked_budget_usd does not limit it, so long as a share costs at
+            most FREE_MAX_COST for each unit of its score. It takes the
+            cheapest such price, 0.1c on most markets, unless a cheaper
+            price covers within the budget. From FREE_RETURN up it takes
+            the cheapest price whose covering size fits the budget, less
+            longshot shares held, and never one above the cheapest price
+            scoring --min-low-score. Over MAX_RETURN it does
+            not rest at all: such a bid is one convergence fills. Once a
+            longshot bid has filled, the budget less the shares held limits
+            every price until LONG_ASK has sold them. And a price is free
+            of the budget only once it has passed its test on every cycle
+            for FREE_DWELL_S: a midpoint that flickers across the test would
+            flip the plan, and the favorite bid's size with it, as often as
+            it crossed.
 
 Q_two comes from the covered FAV_ASK first and only the remainder from the
 naked LONG_BID. When the budget leaves the LONG_BID short of Q_one, the
@@ -126,8 +132,10 @@ replacing it on every wiggle of the midpoint. A favorite bid is held to most
 of the best bid's net instead of the score, valued as it rests at its own
 price and size, and the orders that balance it are planned around the bid
 that stays rather than the target. A longshot bid is kept while it covers
-keep_ratio of the score it balances, up to twice it above the lowest tick,
-at a price no higher than target or within two ticks of the min-score price. A
+keep_ratio of the score it balances, up to twice it where the naked budget
+limits it above the lowest tick,
+at a price no higher than target or within two ticks of the min-score price,
+and not once its price has come to offer more than MAX_RETURN a year. A
 favorite ask more than two ticks under its target is replaced although it
 scores more, so it follows a target that rises. Replacing an order loses its queue
 position, costs two API calls, and scores nothing for the ~30 seconds before
@@ -186,30 +194,31 @@ from reward_screener import (
     QuoteValue,
     Read,
     Skip,
+    Zones,
     _chunks,
     _float,
     _make_output_safe,
     adjust_levels,
-    FLOOR_MIN_SCORE,
-    FLOOR_PRICE,
     adjusted_mid,
-    at_floor,
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
     fetch_levels,
     fetch_read,
     fetch_total_rates,
-    floor_free,
+    fill_return,
     floor_to_tick,
+    free_zone_open,
     get_with_retry,
     load_prior,
     longshot_bid,
+    over_max_return,
     parse_time,
     q_min,
     resolution_signal,
     round_size_down,
     score,
+    sized_without_budget,
     tick_decimals,
     value_quote,
 )
@@ -230,21 +239,26 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 # of the score it balances gets replaced, so a kept bid cannot ratchet up to
 # the whole naked budget where a fill costs real money. At the lowest tick it
 # stays: at 0.1c the extra cover costs cents, and on a 1c tick one tick of
-# mid moves the cover by more than this multiple.
+# mid moves the cover by more than this multiple. A bid free of the budget
+# stays too: it cost at most FREE_MAX_COST a unit of the score it was sized
+# for, and a smaller one in its place would save part of that for 30 seconds
+# unscored. Near the band edge, where the dearer free prices sit, a tick of
+# mid moves the cover by a third to a half, so such a bid would be replaced
+# often.
 LONG_COVER_MAX = 2.0
 
-# How long a floor share must have scored FLOOR_MIN_SCORE, on every cycle,
-# before the floor is free of the naked budget. One cycle under the bound
-# puts the market back under its budget at once. Live, a 107-share bid coming
-# and going moved one market's floor score between 0.0008 and 0.0053 every
-# few cycles, and its favorite bid flipped between all and a quarter of its
-# capital 17 times in seven minutes.
-FLOOR_DWELL_S = 600
+# How long a price must have passed its test for the free zone, on every
+# cycle, before the naked budget leaves a bid there alone (steady_mid). One
+# cycle that fails puts the price back under the budget at once. Live, a
+# 107-share bid coming and going moved what one market's 0.1c share scored
+# between 0.0008 and 0.0053 every few cycles, and its favorite bid flipped
+# between all and a quarter of its capital 17 times in seven minutes.
+FREE_DWELL_S = 600
 
 # farm_mids samples further apart than this, or a last one older than this at
-# start, do not vouch for the floor's score in between. They are due every
+# start, do not vouch for the midpoint in between. They are due every
 # MID_SAMPLE_S.
-FLOOR_SEED_GAP_S = 180
+FREE_SEED_GAP_S = 180
 
 # A longshot bid priced over target stays while it is within this many ticks
 # of the cheapest price scoring min_low_score, which moves a tick with each
@@ -362,12 +376,13 @@ class FarmMarket(NamedTuple):
     naked_budget_usd: float
     expires_at: datetime
     capital: float
+    # What decides where the longshot bid may rest (reward_screener.Zones): an
+    # observation, not a term. years_left is read with the terms each cycle.
+    # steady_mid is the farmer's own, set each cycle from its watch of the
+    # midpoint (Managed.mid_watch), and None without that evidence.
+    zones: Zones
     paused: bool = False
     naked_paused: bool = False
-    # Whether the floor's score has held at FLOOR_MIN_SCORE for FLOOR_DWELL_S,
-    # as the farmer's tracker saw it this cycle (Managed.floor_since). Not a
-    # term of the market: without that evidence it is False.
-    floor_steady: bool = False
 
     def token(self, role):
         return self.fav_token_id if role is Role.FAV else self.long_token_id
@@ -565,59 +580,82 @@ def capital_room(fm, position):
 
 def naked_room(fm, position):
     """USD of longshot bid the budget still allows after longshot shares held,
-    at cost. It does not limit a floor bid while the floor is free of the
-    budget (floor_is_free)."""
+    at cost. It does not limit a bid sized without the budget
+    (free_of_budget)."""
     return max(0.0, fm.naked_budget_usd - position.long_shares * position.long_avg)
 
 
-def floor_score(fm, book_mid):
-    """What a longshot share at the floor scores against the favorite midpoint
-    of the book without our orders; nothing on a one-sided book. A favorite
-    bid of ours only lifts the midpoint a plan scores against, so the floor
-    scores no less in the plan than here. A favorite ask of ours under the
-    book's can lower it, and the plan's own test of the bound
-    (sized_without_budget) then holds the floor to the budget."""
+class MidWatch(NamedTuple):
+    """A market's midpoint, in the book without our orders, over the dwell:
+    since when every cycle has had one, and the (time, midpoint) of each
+    cycle of the last FREE_DWELL_S."""
+
+    since: datetime
+    mids: tuple
+
+
+def watch_mid(watch, book_mid, at):
+    """The watch after a cycle at `at` whose book without our orders has the
+    midpoint book_mid. A one-sided book has none and ends the watch."""
     if book_mid is None:
-        return 0.0
-    return order_score(Slot.LONG_BID, FLOOR_PRICE, book_mid, fm.v)
-
-
-def steady_since(since, share_score, at):
-    """Since when the floor's score has held at FLOOR_MIN_SCORE, given that
-    it held since `since` (None if it did not) and scores share_score at
-    `at`. None while it scores less."""
-    if share_score < FLOOR_MIN_SCORE - 1e-9:
         return None
-    return at if since is None else since
+    if watch is None:
+        return MidWatch(at, ((at, book_mid),))
+    kept = tuple((t, mid) for t, mid in watch.mids if (at - t).total_seconds() <= FREE_DWELL_S)
+    return watch._replace(mids=kept + ((at, book_mid),))
 
 
-def dwelt(since, now):
-    """Whether a floor score steady since `since` has held for FLOOR_DWELL_S."""
-    return since is not None and (now - since).total_seconds() >= FLOOR_DWELL_S
+def steady_mid(watch, now):
+    """The lowest midpoint of the last FREE_DWELL_S, or None unless the
+    midpoint has been watched that long. A price is free of the naked budget
+    only if it passes its test there too (sized_without_budget). A longshot
+    share scores least against the lowest favorite midpoint, so the test has
+    then passed on every cycle of the dwell, and one cycle that fails it
+    counts at once and for the whole dwell after.
+
+    The midpoint is the book's without our orders, the one the lifecycle
+    watches. A favorite bid of ours only lifts the midpoint a plan scores
+    against, so a share scores no less in the plan than here. A favorite ask
+    of ours under the book's can lower it, and the plan's own test then
+    holds the price to the budget."""
+    if watch is None or (now - watch.since).total_seconds() < FREE_DWELL_S:
+        return None
+    return min((mid for t, mid in watch.mids if (now - t).total_seconds() <= FREE_DWELL_S),
+               default=None)
 
 
-def seeded_steady_since(samples, fm, now):
-    """steady_since at start, from the market's farm_mids samples: (time, book
-    midpoint), oldest first. A gap over FLOOR_SEED_GAP_S between samples
-    starts the count again, and a last sample older than that is no evidence
-    at all, so a market the farmer has not watched starts with its floor
-    under the budget."""
-    since = last = None
+def seeded_watch(samples, now):
+    """The watch at start, from the market's farm_mids samples: (time, book
+    midpoint), oldest first. A gap over FREE_SEED_GAP_S between samples
+    starts the watch again, and a last sample older than that is no evidence
+    at all, so a market the farmer has not watched starts with its free zone
+    closed."""
+    watch = last = None
     for at, book_mid in samples:
-        if last is not None and (at - last).total_seconds() > FLOOR_SEED_GAP_S:
-            since = None
-        since, last = steady_since(since, floor_score(fm, book_mid), at), at
-    if last is None or (now - last).total_seconds() > FLOOR_SEED_GAP_S:
+        if last is not None and (at - last).total_seconds() > FREE_SEED_GAP_S:
+            watch = None
+        watch, last = watch_mid(watch, book_mid, at), at
+    if last is None or (now - last).total_seconds() > FREE_SEED_GAP_S:
         return None
-    return since
+    return watch
 
 
-def floor_is_free(fm, position):
-    """Whether the naked budget leaves this market's floor bid alone: its
-    floor score has held steady (fm.floor_steady) and it holds no longshot
-    shares that rest an exit (floor_free). The one test the plan, the keep
-    rule and the console's figures share."""
-    return fm.floor_steady and floor_free(position.long_shares, fm.min_size)
+def long_zones(fm, position):
+    """The zones this market's longshot bid is planned and kept by: fm.zones,
+    with the free zone closed while longshot shares rest an exit
+    (free_zone_open)."""
+    if free_zone_open(position.long_shares, fm.min_size):
+        return fm.zones
+    return fm.zones._replace(steady_mid=None)
+
+
+def free_of_budget(price, mid, fm, position):
+    """Whether the naked budget leaves a longshot bid of this market at price
+    alone this cycle, scored against the favorite midpoint mid
+    (sized_without_budget). The one test the plan, the keep rule and the
+    console's figures share."""
+    return sized_without_budget(price, order_score(Slot.LONG_BID, price, mid, fm.v), fm.v,
+                                long_zones(fm, position))
 
 
 def mirror(price, tick):
@@ -665,12 +703,14 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     `levels` is the favorite book without our own resting orders. The bid
     starts at fav_size, or at all of capital_room without one. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
-    LONG_BID, at the floor whatever the rest costs where the floor scores, or
-    else at the cheapest price that covers the rest within the budget, no
-    higher than the min_low_score price (longshot_bid), then the favorite bid
+    LONG_BID, at the cheapest free price whatever the rest costs, or else at
+    the cheapest price that covers the rest within the budget, no higher
+    than the min_low_score price (longshot_bid), then the favorite bid
     shrinks to whatever Q_two reached. While longshot shares rest an exit the
-    budget limits the floor too (floor_free), so a filled floor bid cannot
-    grow the next one.
+    budget limits every price (long_zones), so a filled bid cannot grow the
+    next one. No LONG_BID rests at a price offering over MAX_RETURN a year
+    (fm.zones): when the prices under it cannot cover, the favorite bid
+    shrinks or goes the same way.
     The LONG_BID is re-derived when the favorite bid is dropped, because the
     cheapest covering price depends on what it must cover. A bid that ends
     below the reward minimum size is dropped, because an order that does not
@@ -727,7 +767,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
             return None
         return longshot_bid(levels, mid, v, tick, fm.min_size, q_one - q_two_covered,
                             naked_room(fm, position), cfg.min_low_score,
-                            floor_is_free(fm, position))
+                            long_zones(fm, position))
 
     low = long_bid(q_one_exits + fav_score * fav_size)
     q_two = q_two_covered + (low.score * low.size if low else 0.0)
@@ -878,18 +918,23 @@ def keep_failure(order, intent, target, fm, position, cfg):
     A longshot bid is judged by the score it covers rather than its size: near
     the band edge a half-tick of mid moves its per-share score, and so the
     covering size, by a third. Score is min(Q_one, Q_two), so a shortfall
-    loses that fraction of the score while over-coverage at the floor costs
+    loses that fraction of the score while over-coverage at 0.1c costs
     almost nothing. But a replacement scores nothing for about 30 seconds
     (Polymarket starts scoring an order ~30s after it is placed, measured
     live), and above a 0.90 mid that zeroes the whole market, so the bid is
     replaced only once it covers less than keep_ratio of the need. A bid
     priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
     price scoring min_low_score, the fill-risk bound the plan prices under.
-    The naked budget does not hold a floor bid while the floor is free of it
-    (floor_is_free). That bid stays whatever it costs. Once the floor is no
-    longer free, because its score dipped under the bound or longshot shares
-    rest an exit, a floor bid over the budget is replaced by the budgeted
-    one, once, and FLOOR_DWELL_S keeps the plan there.
+    The naked budget does not hold a bid while its price is free of it
+    (free_of_budget). That bid stays whatever it costs or covers. Once the
+    price is no longer free, because the midpoint dipped under its test,
+    longshot shares rest an exit, or the nearing end date took the price out
+    of the free zone, a bid over the budget is replaced by the plan's, once,
+    and FREE_DWELL_S keeps the plan there.
+    A longshot bid whose price has come to offer the favorite buyer more
+    than MAX_RETURN a year is replaced whatever it covers. Returns only rise
+    as the end date nears, so a resting bid leaves each zone once, and the
+    target that replaces it is priced by the same zones in the same cycle.
     A favorite ask is judged by score too, but one more than
     ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
     """
@@ -910,6 +955,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
                 or value.net_per_day <= fav.baseline_per_day):
             return "net below keep ratio"
     elif order.slot is Slot.LONG_BID:
+        if over_max_return(order.price, fm.zones.years_left):
+            return "over the return limit"
         need = intent.score * intent.size
         per_share = order_score(Slot.LONG_BID, order.price, target.mid, fm.v)
         covers = per_share * order.size_remaining
@@ -919,7 +966,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
             return "above the target price"
         if covers + per_share * SIZE_STEP < cfg.keep_ratio * need - 1e-9:
             return "short of the cover needed"
-        if order.price > fm.tick + 1e-9 and covers > LONG_COVER_MAX * need + 1e-9:
+        if (order.price > fm.tick + 1e-9 and covers > LONG_COVER_MAX * need + 1e-9
+                and not free_of_budget(order.price, target.mid, fm, position)):
             return "over twice the cover needed"
     elif order.slot is Slot.FAV_ASK and order.price < (
             intent.price - ASK_PRICE_SLACK_TICKS * fm.tick - 1e-9):
@@ -937,9 +985,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "over the capital"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
         return "below the exit floor"
-    free = at_floor(order.price) and floor_is_free(fm, position)
-    if order.slot is Slot.LONG_BID and not free and (
-            order.price * order.size_remaining > naked_room(fm, position) + 1e-9):
+    if (order.slot is Slot.LONG_BID
+            and order.price * order.size_remaining > naked_room(fm, position) + 1e-9
+            and not free_of_budget(order.price, target.mid, fm, position)):
         return "over the naked budget"
     return None
 
@@ -1186,7 +1234,9 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
     preview is what a paused market would place on resume; its intents show
     as the target with decision "preview" and are never acted on. FAV_BID
     also carries the economics of the bid chosen (or previewed) and the fill
-    history behind them.
+    history behind them. LONG_BID carries, for the bid it rests once the
+    cycle's actions land, the annual return a fill would give the favorite
+    buyer and whether the naked budget leaves it alone (free_of_budget).
     """
     intents = {i.slot: i for i in target.intents}
     previews = {i.slot: i for i in preview.intents} if preview else {}
@@ -1230,7 +1280,12 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
     views[Slot.FAV_BID.name].update(
         economics=economics_view(fav), fav_reason=fav.reason,
         history=fill_cost.history_to_json(history) if history else None)
-    views[Slot.LONG_BID.name].update(floor_free=floor_is_free(fm, position))
+    low = views[Slot.LONG_BID.name]
+    rests = farm_db.resting_order(low)
+    offers = fill_return(rests[0], fm.zones.years_left) if rests else None
+    low.update(
+        fill_return=offers if offers is not None and math.isfinite(offers) else None,
+        budget_free=bool(rests) and free_of_budget(rests[0], target.mid, fm, position))
     return views
 
 
@@ -1311,8 +1366,9 @@ def rewards_active(info, condition_id, total_rates):
     return total_rates is None or total_rates.get(condition_id, 0) > 0
 
 
-def farm_market(row, info, cfg):
-    """An approved DB row plus its market record as a FarmMarket, or Skip."""
+def farm_market(row, info, cfg, now):
+    """An approved DB row plus its market record as a FarmMarket, or Skip,
+    with the time its end date leaves at now."""
     market = json.loads(row["metrics"])["market"]
     fav = market["fav_token_id"]
     others = [t for t in info.token_ids if t != fav]
@@ -1338,6 +1394,7 @@ def farm_market(row, info, cfg):
         naked_budget_usd=row["naked_budget_usd"] or 0.0,
         expires_at=end_date - timedelta(days=cfg.expiry_buffer_days),
         capital=row["capital_usd"] if row["capital_usd"] is not None else cfg.capital,
+        zones=Zones(fill_cost.years_until(end_date, now)),
         paused=bool(row["paused"]),
         naked_paused=bool(row["naked_paused"]),
     )
@@ -1594,8 +1651,8 @@ class Managed:
         self.approved = True
         self.state = State(Phase.QUOTING)
         self.recent_asks = deque()
-        # Since when the floor's score has held at FLOOR_MIN_SCORE (steady_since).
-        self.floor_since = None
+        # The midpoint over the dwell (watch_mid), None while unwatched.
+        self.mid_watch = None
         self.naked_paused_until = None
         self.fill_mid = None
         self.held = None
@@ -1710,7 +1767,7 @@ class Farmer:
         self.infos.refresh(self.http, now)
         self.reload(now)
         self.seed_histories(now)
-        self.seed_floors(now)
+        self.seed_watches(now)
         self.refresh_positions(now)
         self.positions_at = time.monotonic() + POSITIONS_S
         if not self.markets:
@@ -1719,16 +1776,15 @@ class Farmer:
             self.check_collateral()
         self.flush()
 
-    def seed_floors(self, now):
-        """Take each market's floor steadiness from its farm_mids samples of the
-        last run, so a restart keeps the floor bids that run sized without the
-        budget where the score held, and puts back under the budget the ones
-        where it did not."""
-        since = now - timedelta(seconds=FLOOR_DWELL_S + FLOOR_SEED_GAP_S)
+    def seed_watches(self, now):
+        """Take each market's watch of its midpoint from its farm_mids samples
+        of the last run, so a restart keeps the bids that run sized without
+        the budget where the midpoint held, and puts back under the budget
+        the ones where it did not."""
+        since = now - timedelta(seconds=FREE_DWELL_S + FREE_SEED_GAP_S)
         for managed in self.markets.values():
             samples = farm_db.read_mids(self.db, managed.fm.condition_id, since)
-            managed.floor_since = seeded_steady_since(
-                [(s.at, s.book_mid) for s in samples], managed.fm, now)
+            managed.mid_watch = seeded_watch([(s.at, s.book_mid) for s in samples], now)
 
     def seed_histories(self, now):
         """Take each wanted market's history from its farm_state row, and its
@@ -1826,7 +1882,7 @@ class Farmer:
             info = self.infos.read.get(cid)
             if info is None:
                 continue
-            fm = farm_market(row, info, self.cfg)
+            fm = farm_market(row, info, self.cfg, now)
             if isinstance(fm, Skip):
                 if self.skips.get(cid) != fm.reason:
                     self.skips[cid] = fm.reason
@@ -2054,8 +2110,9 @@ class Farmer:
         book = strip_own(levels, orders, fm) if self.live else levels
         book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
         book_ask = drop_ask(book.asks, fm.min_size)
-        managed.floor_since = steady_since(managed.floor_since, floor_score(fm, book_mid), now)
-        fm = managed.fm = fm._replace(floor_steady=dwelt(managed.floor_since, now))
+        managed.mid_watch = watch_mid(managed.mid_watch, book_mid, now)
+        fm = managed.fm = fm._replace(
+            zones=fm.zones._replace(steady_mid=steady_mid(managed.mid_watch, now)))
         obs = Observation(
             mid=book_mid,
             ask=book_ask,

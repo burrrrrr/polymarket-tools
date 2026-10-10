@@ -24,19 +24,24 @@ from reward_screener import (
     RewardMarket,
     ScreenConfig,
     Skip,
+    Zones,
     assess,
     created_mid,
     fav_bid_candidates,
     fav_ceiling,
+    fill_return,
     longshot_bid,
+    over_max_return,
     parse_buys,
     parse_gamma,
     parse_hits,
     plan_at,
     plan_quotes,
+    price_offering,
     resolution_signal,
     round_size_down,
     score,
+    under_free_return,
 )
 
 MARKET = RewardMarket(
@@ -57,6 +62,19 @@ CONFIG = ScreenConfig(
     min_fav=0.90, expiry_buffer_days=7, min_window_days=30, horizon_cap_days=90,
     capital=500, max_lead=0.005, min_low_score=0.10, min_rate=0,
 )
+
+# A quarter of a year to the end date: a longshot bid may rest up to 4.4c
+# before a fill gives the favorite buyer over 20% a year, and under 1.3c it
+# gives under 5%, the free zone. FAR has the free zone closed, so the naked
+# budget limits every price.
+YEARS = 0.25
+FAR = Zones(YEARS)
+DAY = 1 / 365.25
+
+
+def steady(mid):
+    """A quarter out with the midpoint having held at mid: the free zone is open."""
+    return Zones(YEARS, mid)
 
 # The 0.955 bid is dust below the 20-share reward minimum, so the best bid is
 # 0.95 and the reward midpoint (0.95 + 0.97) / 2 = 0.96.
@@ -88,12 +106,12 @@ class FavCeilingTest(unittest.TestCase):
         # Unbounded, only post-only stops it, a tick under the ask.
         self.assertEqual(fav_ceiling(wide, 0.001, 20.0, 0.05), 0.984)
         self.assertEqual(fav_ceiling(wide, 0.001, 20.0, CONFIG.max_lead), 0.955)
-        plan = plan_at(MARKET, wide, CONFIG, 0.955)
+        plan = plan_at(MARKET, wide, CONFIG, 0.955, YEARS)
         self.assertAlmostEqual(plan.mid, 0.97)
         self.assertAlmostEqual(plan.fav_bid_score, score(0.035, 0.015))
 
     def test_tight_book_bid_under_the_best_bid_leaves_the_midpoint(self):
-        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG, 0.949)
+        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG, 0.949, YEARS)
         self.assertEqual((plan.fav_bid_price, plan.mid), (0.949, 0.96))
 
     def test_bid_stays_a_tick_under_a_dust_ask(self):
@@ -109,8 +127,8 @@ class LongshotBidTest(unittest.TestCase):
     """The favorite bid 0.855 x 584.79 scores 0.0271 against the 0.926 midpoint it
     creates, so the longshot bid must add 15.86 to Q_two."""
 
-    def test_the_floor_covers_the_favorite_bid_within_the_naked_budget(self):
-        plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE, CONFIG, 0.855)
+    def test_the_lowest_tick_covers_the_favorite_bid_within_the_naked_budget(self):
+        plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE, CONFIG, 0.855, YEARS)
         # 15.86 / 0.0199 = 795.97 shares at 0.1c cost $0.80. The cheapest price
         # scoring 0.10 is 1.6c, a 98.4c ask in front of the 99.6c best ask.
         self.assertEqual((plan.low_price, plan.low_size), (0.001, 795.97))
@@ -120,34 +138,39 @@ class LongshotBidTest(unittest.TestCase):
                                 plan.fav_bid_score * plan.fav_bid_size)
         self.assertLessEqual(plan.low_price * plan.low_size, CONFIG.naked_budget)
 
-    def test_the_floor_covers_a_need_that_costs_more_than_the_naked_budget(self):
-        # The 795.97 shares cost $0.80. No budget limits a bid at the floor,
-        # so the favorite bid keeps all 584.79 shares.
+    def test_a_free_price_covers_a_need_that_costs_more_than_the_naked_budget(self):
+        # The 795.97 shares cost $0.80. A quarter out 0.1c offers 0.4% a year,
+        # and no budget limits a bid in the free zone, so the favorite bid
+        # keeps all 584.79 shares.
+        self.assertAlmostEqual(fill_return(0.001, YEARS), 0.004, places=4)
         for budget in (0.5, 0.019, 0.0):
             with self.subTest(budget=budget):
                 plan = plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
-                               CONFIG._replace(naked_budget=budget), 0.855)
+                               CONFIG._replace(naked_budget=budget), 0.855, YEARS)
                 self.assertEqual((plan.low_price, plan.low_size), (0.001, 795.97))
                 self.assertEqual(plan.mode, Mode.FLOOR)
                 self.assertEqual(plan.fav_bid_size, 584.79)
 
-    def test_the_floor_stays_the_bid_as_the_need_passes_what_the_budget_buys_there(self):
+    def test_a_free_price_stays_the_bid_as_the_need_passes_what_the_budget_buys_there(self):
         # $10 buys 10,000 shares at 0.1c, 199.3 of score on this book. The
-        # bid stays at the floor, sized to cover and no larger, on both sides
-        # of that need.
+        # bid stays at 0.1c, sized to cover and no larger, on both sides of
+        # that need.
         for need in (100.0, 199.0, 199.31, 250.0, 1000.0, 5000.0):
             with self.subTest(need=need):
                 bid = longshot_bid(MISTRAL_BOOK_BID_GONE, 0.926, 0.085, 0.001, 20.0, need,
-                                   10.0, 0.1)
+                                   10.0, 0.1, steady(0.926))
                 self.assertEqual(bid.price, 0.001)
                 self.assertGreaterEqual(bid.score * bid.size, need)
                 self.assertLess(bid.score * (bid.size - 0.01), need)
 
-    def test_a_bid_above_the_floor_is_limited_by_the_budget_and_trims_the_favorite_bid(self):
+    def test_a_bid_outside_the_free_zone_is_limited_by_the_budget_and_trims_the_favorite_bid(
+            self):
         # TIGHT_BOOK's midpoint is 0.96 with v 3.5c, where nothing under 0.6c
-        # scores. $10 buys 588.23 shares at the 1.7c ceiling, which balance
-        # 147.05 of the 526.87 favorite shares $500 buys.
-        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949)
+        # scores, and 37 days out 0.6c offers 6.1% a year. $10 buys 588.23
+        # shares at the 1.7c ceiling, which balance 147.05 of the 526.87
+        # favorite shares $500 buys.
+        self.assertGreater(fill_return(0.006, 37 * DAY), reward_screener.FREE_RETURN)
+        plan = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949, 37 * DAY)
         self.assertEqual((plan.low_price, plan.low_size), (0.017, 588.23))
         self.assertEqual(plan.mode, Mode.BUDGET)
         self.assertLessEqual(plan.low_price * plan.low_size, 10.0)
@@ -155,113 +178,184 @@ class LongshotBidTest(unittest.TestCase):
         self.assertAlmostEqual(plan.fav_bid_size,
                                plan.low_score * plan.low_size / plan.fav_bid_score, delta=0.01)
 
-    def test_a_floor_share_scoring_under_the_bound_is_limited_by_the_budget(self):
-        # At a 0.9365 midpoint with v 6.5c the floor sits five half-ticks
-        # inside the band edge and scores 0.00148, under FLOOR_MIN_SCORE.
-        # Covering 1,000 there would take 676,000 shares. The budget limits
-        # the bid: 6,760 floor shares fit it for a need of 10, and for a need
-        # of 1,000 its $10 buys the most score at the 2c ceiling.
+    def test_the_free_zone_ends_at_five_percent_a_year(self):
+        self.assertEqual(reward_screener.FREE_RETURN, 0.05)
+        # 24 days out 0.3c offers 4.7% a year and 0.4c 6.3%. 83 days out
+        # 1.1c offers just under 5%.
+        self.assertTrue(under_free_return(0.003, 24 * DAY))
+        self.assertFalse(under_free_return(0.004, 24 * DAY))
+        self.assertTrue(under_free_return(0.011, 83 * DAY))
+        self.assertFalse(under_free_return(0.012, 83 * DAY))
+        self.assertFalse(under_free_return(0.001, 0.0))
+
+    def test_a_free_price_above_the_lowest_tick_is_sized_without_the_budget(self):
+        # The Virginia senate book: 24 days out, v 4.5c, midpoint 0.9555.
+        # 0.1c scores 0.0011, $0.90 for each unit of score, and 0.2c 0.0031,
+        # $0.65. 0.3c scores 0.00605, $0.496 a unit, and offers 4.7% a year:
+        # the cheapest price the budget does not limit. 41,326.54 shares,
+        # $123.98, cover 250 on a $10 budget.
+        book = Levels(bids=[(0.951, 100.0)], asks=[(0.96, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9555, 0.045, 0.001, 20.0, 250.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.9555))
+        self.assertEqual((bid.price, bid.size), (0.003, 41326.54))
+        self.assertGreaterEqual(bid.score * bid.size, 250.0)
+        self.assertLessEqual(bid.price / bid.score, reward_screener.FREE_MAX_COST)
+        # A need the budget covers at a cheaper price rests there.
+        bid = longshot_bid(book, 0.9555, 0.045, 0.001, 20.0, 10.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.9555))
+        self.assertEqual((bid.price, bid.size), (0.001, 9000.0))
+
+    def test_a_price_costing_over_half_a_dollar_a_unit_of_score_is_limited_by_the_budget(self):
+        # Half a tick lower, at a 0.955 midpoint, 0.3c scores 0.0044, $0.675
+        # a unit, and 0.4c offers 6.3% a year. No price is free, and $10
+        # buys the most score at 1.1c, the highest price under 20% a year.
+        self.assertEqual(reward_screener.FREE_MAX_COST, 0.50)
+        book = Levels(bids=[(0.95, 100.0)], asks=[(0.96, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.955, 0.045, 0.001, 20.0, 250.0, 10.0, 0.1,
+                           Zones(24 * DAY, 0.955))
+        self.assertEqual((bid.price, bid.size), (0.011, 909.09))
+        self.assertLess(bid.score * bid.size, 250.0)
+
+    def test_the_lowest_tick_scoring_under_the_bound_gives_way_to_the_next_free_price(self):
+        # At a 0.9365 midpoint with v 6.5c a 0.1c share sits five half-ticks
+        # inside the band edge and scores 0.00148, $0.68 a unit. 6,760 of
+        # them fit a $10 budget for a need of 10. A need of 1,000 goes to
+        # 0.5c, the cheapest price costing at most $0.50 a unit, which a
+        # quarter out offers 2% a year.
         book = Levels(bids=[(0.931, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
         mid = (0.931 + 0.942) / 2
-        self.assertLess(score(0.065, 1 - mid - 0.001), reward_screener.FLOOR_MIN_SCORE)
-        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 10.0, 10.0, 0.1)
+        self.assertLess(score(0.065, 1 - mid - 0.001), 0.002)
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 10.0, 10.0, 0.1, steady(mid))
         self.assertEqual((bid.price, bid.size), (0.001, 6760.0))
-        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1)
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, steady(mid))
+        self.assertEqual((bid.price, bid.size), (0.005, 100000.0))
+        self.assertGreater(0.004 / score(0.065, 1 - mid - 0.004), 0.5)
+        # With the free zone closed the budget limits every price: its $10
+        # buys the most score at the 2c ceiling.
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, FAR)
         self.assertEqual((bid.price, bid.size), (0.02, 500.0))
 
-    def test_the_pfizer_floor_is_sized_without_the_budget(self):
+    def test_the_pfizer_bid_is_sized_without_the_budget(self):
         # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
-        # 0.00716, over FLOOR_MIN_SCORE, so the floor covers the need in full:
-        # 10,056.2 shares for 72 and 139,669.43, $139.67, for 1,000, on a $10
-        # budget.
+        # 0.00716, $0.14 a unit, so it covers the need in full: 10,056.2
+        # shares for 72 and 139,669.43, $139.67, for 1,000, on a $10 budget.
         book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
-        self.assertGreater(score(0.065, 0.0595), reward_screener.FLOOR_MIN_SCORE)
-        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1, steady(0.9395))
         self.assertEqual((bid.price, bid.size), (0.001, 10056.2))
-        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, steady(0.9395))
         self.assertEqual((bid.price, bid.size), (0.001, 139669.43))
 
-    def test_a_floor_on_the_band_edge_is_not_sized_from_float_noise(self):
-        # At a 0.934 midpoint with v 6.5c the floor sits on the band edge and
-        # scores 7e-31, which would cover 500 with 7e32 shares. The bid goes
-        # to the 2.2c ceiling with its $10.
+    def test_a_price_on_the_band_edge_is_not_sized_from_float_noise(self):
+        # At a 0.934 midpoint with v 6.5c a 0.1c share sits on the band edge
+        # and scores 7e-31, which would cover 500 with 7e32 shares. The bid
+        # goes to 1.1c, the cheapest price costing at most $0.50 a unit, and
+        # with the free zone closed to the 2.2c ceiling with its $10.
         book = Levels(bids=[(0.93, 100.0)], asks=[(0.938, 100.0)], tick=0.001)
         self.assertGreater(score(0.065, 1 - 0.934 - 0.001), 0.0)
-        bid = longshot_bid(book, 0.934, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1)
+        bid = longshot_bid(book, 0.934, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, steady(0.934))
+        self.assertEqual((bid.price, bid.size), (0.011, 21125.0))
+        bid = longshot_bid(book, 0.934, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, FAR)
         self.assertEqual((bid.price, bid.size), (0.022, 454.54))
 
-    def test_the_first_floor_score_over_the_bound_is_not_limited(self):
-        # v 6.5c and a 0.937 midpoint put the floor three ticks inside the
-        # band edge, scoring 0.00213: 234,722.23 shares, $234.72, cover 500.
-        # Half a tick lower it scores 0.00148, and the bid goes to the 2c
-        # ceiling with its $10.
+    def test_the_first_score_over_the_bound_at_the_lowest_tick_is_not_limited(self):
+        # v 6.5c and a 0.937 midpoint put 0.1c three ticks inside the band
+        # edge, scoring 0.00213: 234,722.23 shares, $234.72, cover 500.
         book = Levels(bids=[(0.932, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
         mid = (0.932 + 0.942) / 2
         self.assertAlmostEqual(score(0.065, 1 - mid - 0.001), 0.00213, places=5)
-        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1)
+        bid = longshot_bid(book, mid, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1, steady(mid))
         self.assertEqual((bid.price, bid.size), (0.001, 234722.23))
-        lower = Levels(bids=[(0.931, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
-        bid = longshot_bid(lower, (0.931 + 0.942) / 2, 0.065, 0.001, 20.0, 500.0, 10.0, 0.1)
-        self.assertEqual((bid.price, bid.size), (0.02, 500.0))
 
     def test_a_score_a_floats_noise_under_the_bound_counts_as_the_bound(self):
         # A score computed from a midpoint can land a float's noise under a
         # round bound: 0.01 came out as 0.00999999999999968 on a live book.
-        bound = reward_screener.FLOOR_MIN_SCORE
-        self.assertTrue(reward_screener.sized_without_budget(0.001, bound - 1e-12))
-        self.assertFalse(reward_screener.sized_without_budget(0.001, bound - 1e-6))
+        zones = steady(0.99)
+        self.assertTrue(reward_screener.sized_without_budget(0.001, 0.002 - 1e-12, 0.035,
+                                                             zones))
+        self.assertFalse(reward_screener.sized_without_budget(0.001, 0.002 - 1e-6, 0.035,
+                                                              zones))
 
-    def test_a_coarse_tick_has_no_floor(self):
-        # On a 1c tick the cheapest bid is 1c, ten times the floor, and the
-        # budget limits it: covering 500 there takes 6,722.23 shares, $67.
+    def test_a_price_is_free_only_where_it_passed_at_the_steady_midpoint_too(self):
+        # 0.1c scores 0.00716 against the Pfizer midpoint now, 0.9395. Three
+        # ticks lower in the last ten minutes it scored 0.0015, so the
+        # budget still limits it, and the bid rests at 0.5c, the cheapest
+        # price that cost at most $0.50 a unit there too. With no midpoint
+        # watched the free zone is closed, and $10 buys the most score at
+        # 0.1c, 10,000 shares.
+        book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1,
+                           Zones(YEARS, 0.9365))
+        self.assertEqual(bid.price, 0.005)
+        self.assertGreaterEqual(bid.score * bid.size, 1000.0)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.001, 10000.0))
+        self.assertFalse(reward_screener.sized_without_budget(0.001, 0.00716, 0.065,
+                                                              Zones(YEARS, 0.9365)))
+        self.assertTrue(reward_screener.sized_without_budget(0.001, 0.00716, 0.065,
+                                                             Zones(YEARS, 0.9395)))
+
+    def test_a_one_cent_tick_is_free_only_far_from_the_end_date(self):
+        # On a 1c tick the cheapest bid is 1c, where covering 500 takes
+        # 6,722.23 shares, $67. A quarter out 1c offers 4.1% a year and the
+        # budget does not limit it. 60 days out it offers 6.3%, and $10
+        # buys the most score at 2c.
         book = Levels(bids=[(0.94, 100.0)], asks=[(0.96, 100.0)], tick=0.01)
-        bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1)
+        bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1, steady(0.95))
+        self.assertEqual((bid.price, bid.size), (0.01, 6722.23))
+        bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1,
+                           Zones(60 * DAY, 0.95))
         self.assertEqual((bid.price, bid.size), (0.02, 500.0))
 
-    def test_a_finer_tick_has_floor_prices_under_a_tenth_of_a_cent(self):
+    def test_a_finer_tick_has_free_prices_under_a_tenth_of_a_cent(self):
         # On a 0.01c tick the cheapest bid is 0.01c, where a share scores
         # 0.0337. Covering 5,000 takes 148,270 shares, $14.83 on a $10 budget.
         book = Levels(bids=[(0.95, 100.0)], asks=[(0.96, 100.0)], tick=0.0001)
-        bid = longshot_bid(book, 0.955, 0.055, 0.0001, 20.0, 5000.0, 10.0, 0.1)
+        bid = longshot_bid(book, 0.955, 0.055, 0.0001, 20.0, 5000.0, 10.0, 0.1, steady(0.955))
         self.assertEqual(bid.price, 0.0001)
         self.assertGreaterEqual(bid.score * bid.size, 5000.0)
         self.assertGreater(bid.price * bid.size, 10.0)
 
-    def test_longshot_shares_awaiting_an_exit_put_the_floor_back_under_the_budget(self):
-        # The budget then limits every price, as before the floor was freed.
-        # On this book $10 buys 10,000 floor shares, 199.3 of the 250 needed.
+    def test_longshot_shares_awaiting_an_exit_put_every_price_back_under_the_budget(self):
+        # The free zone is closed then. On this book $10 buys 10,000 shares
+        # at 0.1c, 199.3 of the 250 needed.
+        self.assertTrue(reward_screener.free_zone_open(19.99, 20.0))
+        self.assertFalse(reward_screener.free_zone_open(20.0, 20.0))
         bid = longshot_bid(MISTRAL_BOOK_BID_GONE, 0.926, 0.085, 0.001, 20.0, 250.0, 10.0, 0.1,
-                           floor_is_free=False)
+                           FAR)
         self.assertEqual((bid.price, bid.size), (0.001, 10000.0))
 
     def test_no_price_reaching_min_low_score_plans_nothing_even_if_one_covers(self):
         # No price under the 7.4c crossing limit scores 0.99, though 0.1c would cover.
         self.assertIsInstance(plan_at(MISTRAL_MARKET, MISTRAL_BOOK_BID_GONE,
-                                      CONFIG._replace(min_low_score=0.99), 0.855), Skip)
+                                      CONFIG._replace(min_low_score=0.99), 0.855, YEARS), Skip)
 
-    def test_a_budget_under_the_reward_minimum_size_above_the_floor_plans_nothing(self):
+    def test_a_budget_under_the_reward_minimum_size_outside_the_free_zone_plans_nothing(self):
         # $0.30 buys the most score at the 1.7c ceiling: 17.64 shares, under
         # the 20-share minimum.
         self.assertIsInstance(plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=0.3),
-                                      0.949), Skip)
+                                      0.949, 37 * DAY), Skip)
 
-    def test_a_longshot_bid_above_a_tenth_of_a_cent_is_budget_mode(self):
+    def test_the_mode_names_the_zone_of_the_longshot_bid(self):
         # At a 0.9635 midpoint with v 3.5c a 0.1c bid scores nothing and a
-        # 0.2c bid 0.0002, where 180 shares cover a 20-share favorite bid.
+        # 0.2c bid 0.0002, where 180 shares cover a 20-share favorite bid
+        # for 36 cents. A quarter out 0.2c offers 0.8% a year, the free
+        # zone. 12 days out it offers 6.3%.
         book = Levels(bids=[(0.95, 1000.0)], asks=[(0.977, 1000.0)], tick=0.001)
-        plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93)
+        plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93, YEARS)
+        self.assertEqual((plan.low_price, plan.low_size), (0.002, 180.0))
+        self.assertEqual(plan.mode, Mode.FLOOR)
+        plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93, 12 * DAY)
         self.assertEqual((plan.low_price, plan.low_size), (0.002, 180.0))
         self.assertEqual(plan.mode, Mode.BUDGET)
 
-    def test_a_short_budget_buys_the_most_score_at_the_floor_near_the_band_edge(self):
+    def test_a_short_budget_buys_the_most_score_at_the_lowest_tick_near_the_band_edge(self):
         # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
         # 0.00716, so $10 buys 10000 shares and 71.6 of score; the 1.7c ceiling
         # scores 0.109 and buys 64.4. Neither covers the 72 needed. This is
         # the search while longshot shares await an exit and the budget
-        # limits the floor.
+        # limits every price.
         book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
-        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1,
-                           floor_is_free=False)
+        bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1, FAR)
         self.assertEqual((bid.price, bid.size), (0.001, round_size_down(10.0 / 0.001)))
         self.assertAlmostEqual(bid.score * bid.size, 71.6, delta=0.05)
         self.assertAlmostEqual(bid.score, score(0.065, 0.0595))
@@ -271,9 +365,88 @@ class LongshotBidTest(unittest.TestCase):
         # score $25 buys rises with price up to the 1.7c ceiling (172.9 at
         # 1470.58 shares versus 154.3 at 1.6c).
         book = Levels(bids=[(0.95, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
-        bid = longshot_bid(book, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1)
+        bid = longshot_bid(book, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1, FAR)
         self.assertEqual((bid.price, bid.size), (0.017, 1470.58))
         self.assertAlmostEqual(bid.score, score(0.035, 0.023))
+
+
+class ReturnLimitTest(unittest.TestCase):
+    """No longshot bid rests where its fill gives the favorite buyer over
+    MAX_RETURN a year. On TIGHT_BOOK, midpoint 0.96 with v 3.5c, nothing
+    under 0.6c scores and the cheapest price scoring 0.10 is 1.7c."""
+
+    def test_a_fill_gives_the_favorite_buyer_the_return_to_the_end_date(self):
+        # A longshot bid at q is a favorite ask at 1 - q, which pays 1 at
+        # the end date: (1 / (1 - q)) ** (1 / years) - 1 a year.
+        self.assertAlmostEqual(fill_return(0.003, 24 * DAY), 0.0468, places=4)
+        self.assertAlmostEqual(fill_return(0.025, 24 * DAY), 0.4701, places=4)
+        self.assertAlmostEqual(fill_return(0.011, 83 * DAY), 0.0499, places=4)
+        self.assertAlmostEqual(fill_return(0.1, 1.0), 1 / 0.9 - 1)
+
+    def test_with_no_time_left_every_price_offers_too_much(self):
+        self.assertEqual(fill_return(0.001, 0.0), float("inf"))
+        self.assertEqual(fill_return(0.001, 1e-9), float("inf"))
+        self.assertTrue(over_max_return(0.001, 0.0))
+
+    def test_the_limit_is_twenty_percent_a_year(self):
+        self.assertEqual(reward_screener.MAX_RETURN, 0.20)
+        # 30 days out 1.4c offers 18.7% and 1.5c 20.2%.
+        self.assertAlmostEqual(price_offering(0.20, 30 * DAY), 0.01486, places=5)
+        self.assertLess(fill_return(0.014, 30 * DAY), 0.20)
+        self.assertGreater(fill_return(0.015, 30 * DAY), 0.20)
+        self.assertFalse(over_max_return(0.014, 30 * DAY))
+        self.assertTrue(over_max_return(0.015, 30 * DAY))
+        self.assertAlmostEqual(fill_return(price_offering(0.20, 30 * DAY), 30 * DAY), 0.20)
+
+    def test_a_far_end_date_leaves_the_bid_at_the_ceiling(self):
+        bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1, FAR)
+        self.assertEqual((bid.price, bid.size), (0.017, 1470.58))
+
+    def test_the_bid_rests_at_the_highest_price_under_the_limit(self):
+        # 30 days out the 1.7c ceiling offers 23.2% a year. $25 buys the
+        # most score under the limit at 1.4c: 1,785.71 shares scoring 0.0661.
+        bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0, 0.1,
+                           Zones(30 * DAY))
+        self.assertEqual((bid.price, bid.size), (0.014, 1785.71))
+        self.assertAlmostEqual(bid.score, score(0.035, 0.026))
+        self.assertLess(bid.score * bid.size, 247.63)
+
+    def test_a_price_under_the_limit_that_covers_is_taken_as_before(self):
+        # A need of 100 is covered within $25 at 1.3c, the cheapest price
+        # that covers it, 30 days out as a quarter out.
+        for zones in (FAR, Zones(30 * DAY)):
+            with self.subTest(years_left=zones.years_left):
+                bid = longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 100.0, 25.0, 0.1,
+                                   zones)
+                self.assertEqual((bid.price, bid.size), (0.013, 1914.07))
+
+    def test_no_price_under_the_limit_scoring_means_no_bid(self):
+        # 10 days out nothing over 0.4c is allowed, and nothing under 0.6c
+        # scores.
+        self.assertAlmostEqual(price_offering(0.20, 10 * DAY), 0.00498, places=5)
+        self.assertIsNone(longshot_bid(TIGHT_BOOK, 0.96, 0.035, 0.001, 20.0, 247.63, 25.0,
+                                       0.1, Zones(10 * DAY)))
+
+    def test_the_favorite_bid_shrinks_to_what_the_prices_under_the_limit_balance(self):
+        # 37 days out $10 at the 1.7c ceiling balances 147.05 favorite
+        # shares. 30 days out $10 at 1.4c balances 100.44.
+        far = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949, 37 * DAY)
+        near = plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=10.0), 0.949,
+                       30 * DAY)
+        self.assertEqual((far.low_price, far.fav_bid_size), (0.017, 147.05))
+        self.assertEqual((near.low_price, near.low_size), (0.014, 714.28))
+        self.assertEqual(near.fav_bid_size, 100.44)
+        self.assertAlmostEqual(near.fav_bid_size,
+                               near.low_score * near.low_size / near.fav_bid_score, delta=0.01)
+
+    def test_no_longshot_bid_under_the_limit_plans_no_favorite_bid(self):
+        self.assertIsInstance(plan_at(MARKET, TIGHT_BOOK, CONFIG, 0.949, 10 * DAY), Skip)
+
+    def test_plan_quotes_reads_the_time_left_from_the_outlook(self):
+        plan, _ = plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(years=30 * DAY), 0.96)
+        self.assertEqual(plan.low_price, 0.014)
+        self.assertEqual(plan_quotes(MARKET, TIGHT_BOOK, CONFIG, outlook(years=10 * DAY), 0.96),
+                         Skip("no scoring longshot bid within the naked budget"))
 
 
 # TIGHT_BOOK with a bid behind the best one, so it is not fragile.
@@ -1016,16 +1189,20 @@ class StoreTest(unittest.TestCase):
 class ApproveTest(unittest.TestCase):
     """approve warns when the budget is short of the longshot leg the scan planned."""
 
-    def approve(self, low_price, low_size, budget, low_score=0.2):
+    def approve(self, low_price, low_size, budget, low_score=0.2, days=90):
+        """What approve prints for a row whose scan planned this longshot
+        leg on a book with a 0.99 midpoint, ending `days` from today."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = os.path.join(tmp.name, "farm.db")
         conn = farm_db.open_db(path)
-        plan = {"fav_bid_price": 0.95, "low_price": low_price, "low_size": low_size,
-                "low_score": low_score}
+        end = (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+        plan = {"fav_bid_price": 0.95, "mid": 0.99, "low_price": low_price,
+                "low_size": low_size, "low_score": low_score}
+        metrics = {"plan": plan, "book_mid": 0.99, "market": {"v": 0.035, "end_date": end}}
         farm_db.store_scan(conn, [farm_db.ScanRow(
-            "0xc0nd", "test-market", "Test?", MARKET.end_date.isoformat(), 1.0,
-            json.dumps({"plan": plan}))], ["0xc0nd"], SCAN_NOW)
+            "0xc0nd", "test-market", "Test?", end, 1.0, json.dumps(metrics))], ["0xc0nd"],
+            SCAN_NOW)
         conn.close()
         args = reward_screener.build_parser().parse_args(
             ["approve", "test-market", "--db", path, "--p-true", "0.97", "--budget", str(budget)])
@@ -1034,22 +1211,31 @@ class ApproveTest(unittest.TestCase):
             reward_screener.cmd_approve(args)
         return printed.getvalue()
 
-    def test_a_budget_under_a_longshot_bid_above_the_floor_warns(self):
+    def test_a_budget_under_a_longshot_bid_outside_the_free_zone_warns(self):
+        # 90 days out a 2c bid offers a favorite buyer 8.5% a year.
         self.assertIn("ties up $30.00, above the $25.00 naked budget",
                       self.approve(0.02, 1500.0, 25.0))
 
-    def test_a_budget_under_a_floor_bid_does_not_warn(self):
+    def test_a_budget_under_a_free_bid_does_not_warn(self):
         # 30,000 shares at 0.1c cost $30, and no budget limits them.
         printed = self.approve(0.001, 30000.0, 25.0)
         self.assertNotIn("Warning", printed)
         self.assertIn("Approved test-market", printed)
 
-    def test_a_budget_under_a_floor_bid_scoring_under_the_bound_warns(self):
-        # A floor share scoring 0.0015 is sized within the budget, so a
-        # smaller budget cuts the leg. One scoring 0.007 is not.
+    def test_a_budget_under_a_bid_costing_over_half_a_dollar_a_unit_of_score_warns(self):
+        # A 0.1c share scoring 0.0015 costs $0.67 a unit and is sized within
+        # the budget, so a smaller budget cuts the leg. One scoring 0.007 is
+        # not.
         self.assertIn("ties up $30.00, above the $25.00 naked budget",
                       self.approve(0.001, 30000.0, 25.0, low_score=0.0015))
         self.assertNotIn("Warning", self.approve(0.001, 30000.0, 25.0, low_score=0.007))
+
+    def test_the_same_bid_warns_once_the_end_date_takes_it_out_of_the_free_zone(self):
+        # 10,000 shares at 0.3c cost $30. 90 days out they offer 1.2% a
+        # year, and 20 days out 5.6%.
+        self.assertNotIn("Warning", self.approve(0.003, 10000.0, 25.0))
+        self.assertIn("ties up $30.00, above the $25.00 naked budget",
+                      self.approve(0.003, 10000.0, 25.0, days=20))
 
 
 class LoadExitPriorTest(unittest.TestCase):

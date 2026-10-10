@@ -16,18 +16,23 @@ it, which takes weeks, or until the market resolves first. So the favorite
 bid sits at the price where its rewards net of what its fills cost are
 highest (fill_cost.py has the model and the measurements).
 Polymarket only scores the two-sided minimum once the midpoint is above 0.90,
-so the longshot bid exists purely to make the favorite bid count. On a 0.001
-tick a longshot bid at 0.1c almost never fills and costs a thousandth of a
-dollar a share, but it only scores if it sits inside the reward band. That
-splits markets into two modes:
+so the longshot bid exists purely to make the favorite bid count. A naked
+longshot bid at price q is a favorite ask at 1 - q, so whether it fills turns
+on the annual return it offers a favorite buyer who holds to the end date,
+(1 / (1 - q)) ^ (1 / years left) - 1, and that return sets three zones:
 
-  FLOOR   the longshot bid rests at 0.1c. Where a share there scores at
-          least FLOOR_MIN_SCORE it is sized to balance the favorite bid
-          whatever that costs: the naked budget does not limit it.
-  BUDGET  the longshot bid must sit higher to score or to fit the budget, at
-          most at the cheapest price scoring min_low_score; the naked risk on
-          that leg is budgeted per market at approval time, and the favorite
-          bid shrinks to what the budget balances.
+  FREE      under FREE_RETURN a year. Almost no buyer takes that, so the
+            naked budget does not limit the bid: where a share costs at most
+            FREE_MAX_COST for each unit of its score, it is sized to balance
+            the favorite bid whatever that costs.
+  BUDGETED  from FREE_RETURN to MAX_RETURN. The naked risk on the leg is
+            budgeted per market at approval time, and the favorite bid
+            shrinks to what the budget balances.
+  NONE      over MAX_RETURN. No longshot bid rests there, nor the favorite
+            bid it would balance.
+
+A scan labels each plan by its longshot bid: mode `floor` in the free zone,
+`budget` above it.
 
 Reward scoring follows Polymarket's published formula. An order at distance
 s from the adjusted midpoint scores S(v, s) = ((v - s) / v)^2 inside the max
@@ -128,19 +133,26 @@ HISTORY_THREADS = 4
 PRIOR_SAMPLE = 60
 FILLS_COST_TOO_MUCH = "fills cost more than the rewards"
 
-# The longshot floor, 0.1c. A longshot bid at or below it is the FLOOR mode,
-# and the naked budget does not limit it where it scores (FLOOR_MIN_SCORE): a
-# fill there is rare and costs a thousandth of a dollar a share. A market on
-# a coarser tick has no floor.
-FLOOR_PRICE = 0.001
-# The least a floor share may score for its bid to be sized without the
-# budget. The covering size is need / score, and at the band edge the score
-# runs to zero (the edge itself scores a float-noise 1e-30). At 0.002 the
-# floor sits 4.5% of the band inside its edge, two to four ticks on the
-# bands in use, and the bid costs at most half a dollar for each unit of
-# score it covers: 0.5 x its score x its size for the favorite bid it
-# balances.
-FLOOR_MIN_SCORE = 0.002
+# The longshot bid's zones, by the return a fill gives the favorite buyer, a
+# year. A naked longshot bid at price q is a favorite ask at 1 - q, and
+# whether it fills turns on the return that ask offers held to the end date
+# (fill_return), not on its price alone. Of about 20,000 favorite buys on 250
+# markets with the favorite at 90c to 97c, 0.4% accepted under 2% a year,
+# 2.8% under 5%, 23% under 10%, 74% under 20% and 90% under 30%.
+#
+# Under FREE_RETURN the naked budget does not limit the bid: 0.3c on a market
+# 25 days from its end date, 1.1c on one 83 days out.
+FREE_RETURN = 0.05
+# Over MAX_RETURN no longshot bid rests. 0.20 is a test value.
+MAX_RETURN = 0.20
+# The most a bid sized without the budget may cost for each unit of score it
+# covers, in USD: its price over what a share there scores. The covering
+# size is need / score, and at the band edge the score runs to zero (the edge
+# itself scores a float-noise 1e-30), so without a bound one share of need
+# buys any number of dollars. At 0.50 a 0.1c share must score 0.002, which
+# puts it 4.5% of the band inside its edge, and a bid costs at most half its
+# favorite bid's score times its size.
+FREE_MAX_COST = 0.50
 # The naked budget a scan prices each longshot bid within, and the one a new
 # review and the console's quotable check start with.
 DEFAULT_NAKED_BUDGET = 10.0
@@ -181,12 +193,12 @@ SCAN_HELP = {
     "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
                 "0 joins it",
     "min_low_score": "The longshot bid never sits above the cheapest price scoring this per "
-                     "share. Above the 0.1c floor it takes the cheapest price that covers "
+                     "share. Outside the free zone it takes the cheapest price that covers "
                      "the favorite bid within the naked budget, or else the price where the "
                      "budget buys the most score",
-    "naked_budget": "USD a longshot bid above the 0.1c floor may cost. Each market's "
-                    "longshot bid is priced with it, as the farmer would with this budget "
-                    "approved",
+    "naked_budget": "USD a longshot bid may cost where a fill gives the favorite buyer 5% "
+                    "a year or more. Each market's longshot bid is priced with it, as the "
+                    "farmer would with this budget approved",
     "min_rate": "Minimum daily reward pool in USD",
     "fragile_drop": "Skip a market whose midpoint falls this much once its best bid "
                       "leaves",
@@ -232,6 +244,10 @@ def tally(counter):
 # ---------------------------------------------------------------------------
 
 class Mode(Enum):
+    """A scan's label for a plan, by its longshot bid: FLOOR in the free zone
+    (under_free_return), BUDGET above it. The values are what scan rows
+    store."""
+
     FLOOR = "floor"
     BUDGET = "budget"
 
@@ -265,6 +281,22 @@ class LongshotBid(NamedTuple):
     price: float
     size: float
     score: float
+
+
+class Zones(NamedTuple):
+    """What decides where a market's longshot bid may rest at one moment.
+
+    years_left, to the end date, sets the return each price offers
+    (fill_return), and so its zone. steady_mid is the favorite midpoint a
+    price's test for the free zone must also pass at
+    (sized_without_budget): the lowest the book's has been over the
+    farmer's dwell, or the book's now for a scan or a preview, which have
+    no cycles behind them. None closes the free zone: the midpoint has not
+    been watched long enough, or longshot shares rest an exit
+    (free_zone_open)."""
+
+    years_left: float
+    steady_mid: Optional[float] = None
 
 
 class QuotePlan(NamedTuple):
@@ -502,65 +534,115 @@ def created_mid(price, best_bid, best_ask):
     return (max(price, best_bid) + best_ask) / 2
 
 
-def at_floor(price):
-    """Whether a longshot bid at price is a floor bid."""
-    return price <= FLOOR_PRICE + 1e-9
+def fill_return(price, years_left):
+    """The annual return a fill of a longshot bid at price gives the favorite
+    buyer on its other side, who pays 1 - price for a share that pays 1 at
+    the end date, years_left away. Infinite with no time left."""
+    if years_left <= 0:
+        return math.inf
+    growth = -math.log1p(-price) / years_left
+    return math.expm1(growth) if growth < 700 else math.inf
 
 
-def floor_free(long_shares, min_size):
-    """Whether the naked budget leaves a market's floor bid alone: while the
-    market holds no longshot shares that rest an exit. A floor bid that
-    filled leaves such shares. Their exit adds to Q_one, and a floor bid
-    sized to balance that would grow with every fill. So the budget, less
-    the shares held at cost, then limits the floor like any other price."""
+def price_offering(annual_return, years_left):
+    """The longshot price whose fill gives the favorite buyer annual_return
+    (fill_return). A lower price offers less, and with no time left every
+    price offers more."""
+    return 1 - (1 + annual_return) ** -years_left
+
+
+def over_max_return(price, years_left):
+    """Whether a longshot bid at price would offer the favorite buyer more
+    than MAX_RETURN a year. No longshot bid rests there."""
+    return price > price_offering(MAX_RETURN, years_left)
+
+
+def under_free_return(price, years_left):
+    """Whether a longshot bid at price would offer the favorite buyer under
+    FREE_RETURN a year: the free zone."""
+    return price < price_offering(FREE_RETURN, years_left)
+
+
+def free_zone_open(long_shares, min_size):
+    """Whether a market's free zone is open: while it holds no longshot
+    shares that rest an exit. A longshot bid that filled leaves such shares.
+    Their exit adds to Q_one, and a bid sized without the budget to balance
+    that would grow with every fill. So the budget, less the shares held at
+    cost, then limits every price."""
     return long_shares < min_size
 
 
-def sized_without_budget(price, share_score, floor_is_free=True):
-    """Whether the naked budget leaves a longshot bid at price alone: a floor
-    bid whose share scores at least FLOOR_MIN_SCORE, while the floor is free
-    of the budget (floor_free)."""
-    return floor_is_free and at_floor(price) and share_score >= FLOOR_MIN_SCORE - 1e-9
+def sized_without_budget(price, share_score, v, zones):
+    """Whether the naked budget leaves a longshot bid at price alone: the
+    price is in the free zone (under_free_return), and a share there costs
+    at most FREE_MAX_COST for each unit of its score, both at share_score,
+    what it scores now, and at what it scored against zones.steady_mid.
+    Never while the free zone is closed (no steady_mid)."""
+    if zones.steady_mid is None or not under_free_return(price, zones.years_left):
+        return False
+    steady = score(v, (1 - zones.steady_mid) - price)
+    return min(share_score, steady) >= price / FREE_MAX_COST - 1e-9
 
 
-def budget_cost(price, size, share_score, floor_is_free=True):
+def budget_cost(price, size, share_score, v, zones):
     """USD a longshot bid takes of the naked budget: its cost, or nothing
     where it is sized without the budget (sized_without_budget)."""
-    return 0.0 if sized_without_budget(price, share_score, floor_is_free) else price * size
+    return 0.0 if sized_without_budget(price, share_score, v, zones) else price * size
 
 
-def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, floor_is_free=True):
-    """The naked longshot bid adding `need` to Q_two. Above the floor it costs
-    at most `room` USD. LongshotBid, or None when need is not positive or
-    nothing fits.
+def planned_budget_cost(metrics, years_left):
+    """USD the longshot leg a stored scan row planned would take of the
+    naked budget with years_left to the end date (budget_cost), its free
+    zone tested at the book midpoint the scan read."""
+    plan, market = metrics["plan"], metrics.get("market") or {}
+    zones = Zones(years_left, metrics.get("book_mid", plan.get("mid")))
+    return budget_cost(plan["low_price"], plan["low_size"], plan.get("low_score", 0.0),
+                       market.get("v") or 0.0, zones)
+
+
+def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, zones):
+    """The naked longshot bid adding `need` to Q_two. Outside the free zone it
+    costs at most `room` USD. LongshotBid, or None when need is not positive
+    or nothing fits.
 
     The bid never prices above the ceiling, the cheapest price scoring at
-    least min_score. Up to the ceiling it takes the cheapest price whose
-    covering size, round_size_up(need / score) and at least min_size, it may
-    rest. The cheaper the bid, the deeper it shows on the favorite's ask side
-    and the more No buyers fill ahead of it, so a 0.1c bid scoring 0.02 beats
-    a 1.6c bid scoring 0.10.
+    least min_score, nor at a price offering the favorite buyer more than
+    MAX_RETURN a year (over_max_return, by zones.years_left). Returns rise
+    as the end date nears, so the highest price allowed falls with it. When
+    the prices left cannot cover, the caller trims the favorite bid, and
+    with none left there is no bid.
 
-    A floor bid whose share scores at least FLOOR_MIN_SCORE may rest any size
-    (sized_without_budget): room does not limit it. So there the floor is the
-    bid whatever the need, the price cannot jump as the need grows, and the
-    caller never trims the favorite bid for it. FLOOR_MIN_SCORE bounds the
-    arithmetic, not the dollars: the covering size is need / score, and at
-    the band edge the score runs to zero.
+    Up to the ceiling it takes the cheapest price whose covering size,
+    round_size_up(need / score) and at least min_size, it may rest. The
+    cheaper the bid, the deeper it shows on the favorite's ask side and the
+    more No buyers fill ahead of it, so a 0.1c bid scoring 0.02 beats a 1.6c
+    bid scoring 0.10.
 
-    Every other size must cost at most room: a bid above the floor, a floor
-    bid scoring under FLOOR_MIN_SCORE, and any bid while floor_is_free is
-    false (floor_free: the market holds longshot shares that rest an exit).
+    A price in the free zone, offering the favorite buyer under FREE_RETURN
+    a year, may rest any size where a share costs at most FREE_MAX_COST for
+    each unit of its score (sized_without_budget): room does not limit it.
+    The cheapest such price is the bid whatever the need, unless a cheaper
+    price covers within room. So the bid offers the least return that
+    balances, its price cannot jump as the need grows, and the caller never
+    trims the favorite bid for it. The test must also pass at
+    zones.steady_mid, so a midpoint that wobbles across it cannot move the
+    bid from cycle to cycle: a price stops being free at the first cycle that
+    fails it and becomes free again only once the farmer's dwell has passed.
+    On most markets the cheapest free price is the lowest tick, 0.1c.
+
+    Every other size must cost at most room: a bid from FREE_RETURN up, a
+    cheaper one costing more than FREE_MAX_COST a unit of score, and any bid
+    while the free zone is closed (zones.steady_mid is None).
     When no price up to the ceiling covers within room, the bid goes to the
     price where the size room buys scores the most, ties to the cheaper, and
     the caller trims the favorite bid to the Q_two that reaches; None when
     room buys less than min_size there. Score per dollar is U-shaped in
     price: 0.1c buys ten times the shares of 1c, so near the band edge the
-    floor with the whole room often beats the ceiling (Pfizer, $10 at a
-    0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c ceiling,
-    49.8 at 1c). Sitting at the ceiling there made the plan jump between the
-    floor and the ceiling as the need crossed what the floor covers,
-    replacing the bid every few cycles.
+    lowest tick with the whole room often beats the ceiling (Pfizer, $10 at
+    a 0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c ceiling,
+    49.8 at 1c). Sitting at the ceiling there made the plan jump between
+    0.1c and the ceiling as the need crossed what 0.1c covers, replacing the
+    bid every few cycles.
 
     With no ceiling under the crossing limit there is no bid, even if a
     lower-scoring price could cover.
@@ -587,13 +669,16 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, floor_is
         n += 1
     if not scored or scored[-1][1] < min_score:
         return None
+    scored = [(p, s) for p, s in scored
+              if s > 0 and not over_max_return(p, zones.years_left)]
     for price, s in scored:
-        if s > 0:
-            size = max(min_size, round_size_up(need / s))
-            if sized_without_budget(price, s, floor_is_free) or size * price <= room + 1e-9:
-                return LongshotBid(price, size, s)
+        size = max(min_size, round_size_up(need / s))
+        if sized_without_budget(price, s, v, zones) or size * price <= room + 1e-9:
+            return LongshotBid(price, size, s)
+    if not scored:
+        return None
     price, size, s = max(
-        ((p, round_size_down(room / p), s) for p, s in scored if s > 0),
+        ((p, round_size_down(room / p), s) for p, s in scored),
         key=lambda bid: (bid[2] * bid[1], -bid[0]),
     )
     return LongshotBid(price, size, s) if size >= min_size else None
@@ -687,14 +772,16 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
     )
 
 
-def plan_at(market, levels, config, fav_price):
+def plan_at(market, levels, config, fav_price, years_left):
     """Size our favorite bid at fav_price and price our longshot bid. QuotePlan or Skip.
 
     The longshot bid is longshot_bid with config.naked_budget, covering the
     favorite bid's score, as the farmer prices it with no longshot shares
-    held: at the floor whatever that costs, above it within the budget. When
-    the budget leaves it short, the favorite bid shrinks to match, as the
-    farmer's does: score beyond the smaller side earns nothing.
+    held, years_left to the end date, and the book's midpoint having held:
+    in the free zone whatever that costs, above it within the budget, and
+    nowhere over MAX_RETURN. When that leaves it short, the favorite bid
+    shrinks to match, as the farmer's does: score beyond the smaller side
+    earns nothing.
 
     A favorite bid above the best bid drags the midpoint up toward itself, so
     both legs are scored against the midpoint that includes it (QuotePlan.mid),
@@ -707,8 +794,9 @@ def plan_at(market, levels, config, fav_price):
     fav_score = score(v, mid - fav_price)
     if fav_score <= 0:
         return Skip("favorite bid outside band")
+    zones = Zones(years_left, adjusted_mid(levels.bids, levels.asks, market.min_size))
     low = longshot_bid(levels, mid, v, tick, market.min_size, fav_score * fav_size,
-                       config.naked_budget, config.min_low_score)
+                       config.naked_budget, config.min_low_score, zones)
     if low is not None:
         fav_size = min(fav_size, round_size_down(low.score * low.size / fav_score))
     if low is None or fav_size < market.min_size:
@@ -722,7 +810,7 @@ def plan_at(market, levels, config, fav_price):
         low_price=low.price,
         low_size=low.size,
         low_score=low.score,
-        mode=Mode.FLOOR if at_floor(low.price) else Mode.BUDGET,
+        mode=Mode.FLOOR if under_free_return(low.price, years_left) else Mode.BUDGET,
     )
 
 
@@ -737,7 +825,7 @@ def plan_quotes(market, levels, config, outlook, p_true):
     best, reason = None, "favorite bid outside band"
     for price in fav_bid_candidates(levels, market.v, market.tick, market.min_size,
                                     config.max_lead):
-        plan = plan_at(market, levels, config, price)
+        plan = plan_at(market, levels, config, price, outlook.years_left)
         if isinstance(plan, Skip):
             reason = plan.reason
             continue
@@ -1655,13 +1743,16 @@ def cmd_approve(args):
         print(f"Error: no market {args.market!r} in {args.db}; run a scan first")
         sys.exit(1)
 
-    plan = json.loads(row["metrics"])["plan"]
+    metrics = json.loads(row["metrics"])
+    plan = metrics["plan"]
     if plan["fav_bid_price"] >= args.p_true:
         print(
             f"Warning: planned favorite bid {plan['fav_bid_price'] * 100:.1f}c is "
             f"at or above p_true {args.p_true * 100:.1f}c; a fill would be -EV"
         )
-    low_capital = budget_cost(plan["low_price"], plan["low_size"], plan.get("low_score", 0.0))
+    end_date = parse_time(row["end_date"]) or parse_time(metrics["market"]["end_date"])
+    low_capital = planned_budget_cost(
+        metrics, fill_cost.years_until(end_date, datetime.now(timezone.utc)))
     if args.budget < low_capital - 1e-9:
         print(
             f"Warning: planned longshot leg ties up ${low_capital:.2f}, above the "
@@ -1736,8 +1827,8 @@ Examples:
     approve.add_argument("--p-true", type=float, required=True,
                          help="Your probability the favorite resolves YES")
     approve.add_argument("--budget", type=float, default=25.0,
-                         help="Naked USD risk allowed on the longshot leg above the 0.1c "
-                              "floor (default: 25)")
+                         help="Naked USD risk allowed on the longshot leg where a fill gives "
+                              "the favorite buyer 5%% a year or more (default: 25)")
     approve.add_argument("--capital", type=float,
                          help="USD behind this market's favorite bid (default: keep the "
                               "current value, else the farmer's --capital)")

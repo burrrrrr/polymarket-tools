@@ -30,15 +30,16 @@ from test_farm_console import (
 )
 from test_triage import background, envelope, news
 
-# Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
-# sits at the cheapest price covering the favorite bid within the budget (BUDGET), and
-# the favorite bid rests at the 95.5c ceiling. Each book's deepest bid sits outside the
+# Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, which 40 days out
+# offers a favorite buyer over 5% a year, so the longshot bid sits at the cheapest price
+# covering the favorite bid within the budget (BUDGET), and the favorite bid rests at
+# the 95.5c ceiling. Each book's deepest bid sits outside the
 # band, so it scores nothing, but if the best bid left it would keep the midpoint
 # above min_fav and less than 3c down (not fragile).
 BUDGET_BOOK = Levels(bids=[(0.955, 5.0), (0.95, 1000.0), (0.90, 1000.0)],
                      asks=[(0.97, 1000.0)], tick=0.001)
-# Favorite mid 0.99: a 0.1c longshot bid scores (FLOOR); the favorite bid rests at the
-# 99.0c ceiling.
+# Favorite mid 0.99: a 0.1c longshot bid scores, in the free zone (FLOOR); the favorite
+# bid rests at the 99.0c ceiling.
 FLOOR_BOOK = Levels(bids=[(0.985, 1000.0), (0.95, 1000.0)], asks=[(0.995, 1000.0)],
                     tick=0.001)
 # Its favorite fell since the scan: mid 0.885 is under min_fav, so the farmer would not quote.
@@ -59,12 +60,14 @@ def form(client, **fields):
 
 class Writes(Console):
     """Console with real assessments: D (budget, rank 30), E (floor, rank 20) and
-    F (floor, rank 10) are candidates; A and B are approved."""
+    F (floor, rank 10) are candidates; A and B are approved. D ends in 40 days,
+    where the prices that score on its book offer a favorite buyer over 5% a
+    year, and the others in 100."""
 
     def setUp(self):
         super().setUp()
         farm_db.store_scan(self.db, [
-            assessed_row("0xddd", "delta", BUDGET_BOOK, self.now, 30.0),
+            assessed_row("0xddd", "delta", BUDGET_BOOK, self.now, 30.0, days=40),
             assessed_row("0xeee", "echo", FLOOR_BOOK, self.now, 20.0),
             assessed_row("0xfff", "foxtrot", FLOOR_BOOK, self.now, 10.0),
             assessed_row(A, "alpha", FLOOR_BOOK, self.now, 5.0),
@@ -430,6 +433,25 @@ class ReviewTest(Writes):
         return views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
                                  self.now, False, prior)
 
+    def test_the_preview_prices_the_longshot_bid_by_the_time_to_the_end_date(self):
+        # 40 days from the end date the longshot bid rests at 1.7c, the
+        # cheapest price scoring 0.10. 20 days out that offers the favorite
+        # buyer 37% a year, and nothing over 0.9c is allowed. 100 days out
+        # 1c offers 3.7% a year, the free zone, at $0.49 for each unit of
+        # score, and the bid rests there whatever the budget.
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
+
+        def longshot_bid(days):
+            row = {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
+                   "end_date": (self.now + timedelta(days=days)).isoformat()}
+            live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
+                                     self.now, False, fill_cost.DEFAULT_PRIOR)
+            return next(o.price for o in live.orders if o.slot == "LONG_BID")
+
+        self.assertEqual(longshot_bid(40), 0.017)
+        self.assertEqual(longshot_bid(20), 0.009)
+        self.assertEqual(longshot_bid(100), 0.01)
+
     def test_live_partial_projects_the_plan_out_of_band(self):
         fragment, figures = self.projection(self.live())
         live = self.planned(0.97, None)
@@ -446,6 +468,10 @@ class ReviewTest(Writes):
         prior = fill_cost.DEFAULT_PRIOR._replace(rates=rates, markets=37, at=self.now)
         farm_db.store_scan(self.db, [], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now,
                            prior=fill_cost.prior_to_json(prior))
+        # 100 days out a fill ties capital up long enough to cost something.
+        self.db.execute("UPDATE markets SET end_date = ? WHERE condition_id = '0xddd'",
+                        ((self.now + timedelta(days=100)).isoformat(),))
+        self.db.commit()
         fragment, figures = self.projection(self.live())
         self.assertIn(f"Fills from the cross-market prior alone (37 markets, scan of "
                       f"{views.stamp_local(self.now)})", fragment)
@@ -490,7 +516,7 @@ class ReviewTest(Writes):
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
         fm = reward_farmer.farm_market(
             {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
-             "capital_usd": None}, self.remote.info("0xddd"), cfg)
+             "capital_usd": None}, self.remote.info("0xddd"), cfg, self.now)
         target = reward_farmer.target_orders(
             fm, BUDGET_BOOK, reward_farmer.Position(), cfg, True,
             reward_farmer.market_outlook(fm, None, None, fill_cost.DEFAULT_PRIOR, cfg, self.now),
@@ -510,8 +536,8 @@ class ReviewTest(Writes):
         self.assertNotEqual(re.findall(r"FAV_BID ([\d,.]+)</td>", full),
                             re.findall(r"FAV_BID ([\d,.]+)</td>", capped))
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
-        self.assertIn("Enter a naked budget. Until then a longshot bid above the 0.1c floor is "
-                      "planned with $0", self.live(naked_budget="x"))
+        self.assertIn("Enter a naked budget. Until then a longshot bid outside the free zone "
+                      "is planned with $0", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
         # Capped at 93.0c the bid scores 0.02, and at a 300% hurdle its fills
         # cost less than that earns. A 2.4c margin caps it at 92.6c, where it
@@ -553,7 +579,7 @@ class ReviewTest(Writes):
                    metrics=json.dumps({**metrics, **stored}))
         live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
                                  self.now, False, fill_cost.DEFAULT_PRIOR)
-        fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg)
+        fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg, self.now)
         history = fill_cost.history_from_json(stored.get("history"))
         outlook = reward_farmer.market_outlook(fm, None, history, fill_cost.DEFAULT_PRIOR, cfg,
                                                self.now)
@@ -811,12 +837,12 @@ class ReviewTest(Writes):
         metrics = {"market": {"tick": 0.001, "v": 0.085}, "best_bid": 0.934, "best_ask": 0.99,
                    "plan": {"fav_bid_price": 0.97, "mid": 0.98, "fav_bid_score": 0.779,
                             "low_price": 0.001, "low_size": 100.0, "mode": "floor"}}
-        text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines)
+        text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01, 0.25).lines)
         self.assertIn("capped at 95.0c (p_true − 1.0c): scores 0.585, not 0.779", text)
         self.assertNotIn("0.419", text)
         del metrics["best_bid"], metrics["best_ask"]
         self.assertIn("scores 0.419, not 0.779",
-                      " ".join(views.ev_check(metrics, 0.96, "25", 0.01).lines))
+                      " ".join(views.ev_check(metrics, 0.96, "25", 0.01, 0.25).lines))
 
     def test_ev_check_warns_when_budget_is_below_the_longshot_leg(self):
         plan = json.loads(self.row("0xddd")["metrics"])["plan"]
@@ -825,11 +851,26 @@ class ReviewTest(Writes):
                       self.ev("0xddd", "97", "5"))
         self.assertNotIn("Longshot", self.ev("0xddd", "97", str(cost)))
 
-    def test_ev_check_does_not_warn_of_a_budget_under_a_floor_bid(self):
-        # 0xeee plans its longshot bid at the 0.1c floor, which no budget limits.
+    def test_ev_check_does_not_warn_of_a_budget_under_a_free_bid(self):
+        # 0xeee plans its longshot bid at 0.1c, which 100 days out offers a
+        # favorite buyer 0.4% a year. No budget limits it.
         plan = json.loads(self.row("0xeee")["metrics"])["plan"]
         self.assertEqual(plan["low_price"], 0.001)
         self.assertNotIn("Longshot", self.ev("0xeee", "99", "0"))
+        farm_db.set_approval(self.db, "0xeee", 0.99, 0.0, None, now=self.now)
+        self.assertNotIn("is over your", self.client.get("/review/0xeee").text)
+
+    def test_ev_check_warns_once_the_end_date_takes_the_bid_out_of_the_free_zone(self):
+        # Five days from its end date the same 0.1c bid offers 7.6% a year,
+        # and the budget limits it. The page and the partial both say so.
+        self.db.execute("UPDATE markets SET end_date = ? WHERE condition_id = '0xeee'",
+                        ((self.now + timedelta(days=5)).isoformat(),))
+        self.db.commit()
+        plan = json.loads(self.row("0xeee")["metrics"])["plan"]
+        warning = f"Longshot ${plan['low_price'] * plan['low_size']:,.2f} is over your $0.00"
+        self.assertIn(warning, self.ev("0xeee", "99", "0"))
+        farm_db.set_approval(self.db, "0xeee", 0.99, 0.0, None, now=self.now)
+        self.assertIn(warning, self.client.get("/review/0xeee").text)
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
         from farm_console.app import utc_now
@@ -1031,10 +1072,12 @@ class DiscoverTest(Writes):
         self.assertIn("page 3 of 3", self.client.get("/discover?page=3").text)
 
     def test_mode_filter_and_paging_links_keep_the_filters(self):
+        # The same book 200 days out plans its longshot bid at 1c, which
+        # offers under 5% a year: the free zone, labelled floor.
         budget = self.ids("?mode=budget")
-        self.assertEqual(budget, [f"0x{i:04d}" for i in range(0, 120, 3)] + ["0xddd"])
+        self.assertEqual(budget, [f"0x{i:04d}" for i in range(0, 120, 30)] + ["0xddd"])
         floor = self.ids("?mode=floor&page=2")
-        self.assertEqual(floor[0], "0x0076")
+        self.assertEqual(floor[0], "0x0052")
         self.assertIn('href="/discover?mode=floor&amp;status=candidate&amp;page=2">Next',
                       self.client.get("/discover?mode=floor").text)
         self.assertIn('<a class="chip" href="/review/0x0000?mode=budget">Review</a>',
@@ -1287,7 +1330,7 @@ class TriageTest(Writes):
         self.assertNotIn("A one-run path", summary)
         self.assertIn("A one-run path", details)
         for needle in ('<span class="badge t-f">Quiet</span> a realistic way to YES exists, 2/2 '
-                       "news checks found nothing pointing to it, ends in 100 days.",
+                       "news checks found nothing pointing to it, ends in 40 days.",
                        "Both news checks found nothing pointing to YES.",
                        "Run agreement: possible 3 of 3"):
             self.assertIn(needle, summary)

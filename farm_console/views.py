@@ -16,11 +16,9 @@ from farm_db import EventKind, FarmerStatus, resting_order
 from reward_screener import (
     Skip,
     adjusted_mid,
-    budget_cost,
     created_mid,
-    floor_free,
     floor_to_tick,
-    sized_without_budget,
+    planned_budget_cost,
 )
 from reward_screener import score as share_score
 
@@ -195,48 +193,38 @@ def resting(state, slot):
     return Order(*found) if found else None
 
 
-def floor_is_free(market, state):
-    """Whether the naked budget leaves this market's floor bid alone, as the
-    farmer judged it this cycle (reward_farmer.floor_is_free, published on
-    the LONG_BID slot). A row from before the farmer published it falls back
-    to that farmer's rule: the market holds no longshot shares that rest an
-    exit. With no reward minimum on record, any share held counts."""
-    published = (state.slots.get("LONG_BID") or {}).get("floor_free")
-    if published is not None:
-        return bool(published)
-    held = ((state.position or {}).get("farm") or {}).get("long", 0.0)
-    min_size = ((market.metrics.get("market") or {}).get("min_size") if market else None)
-    return floor_free(held, min_size or 1e-9)
-
-
-def long_bid_score(state):
-    """What a share of the longshot bid a market rests scores: the resting
-    order's live score, or the target's while it is being placed."""
-    view = state.slots.get("LONG_BID") or {}
-    if view.get("decision") == "hold":
-        return view.get("live_score") or 0.0
-    return (view.get("target") or {}).get("score") or 0.0
-
-
-def floor_bid(market, state):
-    """The longshot bid a market rests at the floor where its naked budget
-    does not limit it (sized_without_budget), or None."""
+def free_bid(state):
+    """The longshot bid a market rests free of its naked budget, or None. The
+    farmer says each cycle whether the budget leaves the bid alone
+    (reward_farmer.free_of_budget, published on the LONG_BID slot): its price
+    gives a favorite buyer under 5% a year and has passed its test for ten
+    minutes. A row from a farmer that did not say counts the bid against the
+    budget."""
     bid = resting(state, "LONG_BID")
-    free = bid and sized_without_budget(bid.price, long_bid_score(state),
-                                        floor_is_free(market, state))
-    return bid if free else None
+    return bid if bid and (state.slots.get("LONG_BID") or {}).get("budget_free") else None
 
 
-def budget_used(market, state):
+def budget_counted(state):
+    """USD of its naked budget a market's resting longshot bid takes: its
+    cost, or nothing where it is free of the budget (free_bid)."""
+    bid = resting(state, "LONG_BID")
+    return bid.notional if bid and free_bid(state) is None else 0.0
+
+
+def budget_used(state):
     """USD a market has used of its naked budget: longshot shares held, at
-    cost, plus what its resting longshot bid takes of it (budget_cost).
-    farm_state's naked_used_usd is everything at risk, a floor bid included."""
+    cost, plus what its resting longshot bid takes of it (budget_counted).
+    farm_state's naked_used_usd is everything at risk, a free bid included."""
     position = state.position or {}
     held = (position.get("farm", {}).get("long", 0.0)
             * position.get("avg_cost", {}).get("long", 0.0))
-    bid = resting(state, "LONG_BID")
-    return held + (budget_cost(bid.price, bid.size, long_bid_score(state),
-                               floor_is_free(market, state)) if bid else 0.0)
+    return held + budget_counted(state)
+
+
+def years_left(market, now):
+    """Years to a market's end date, which set the return a longshot bid
+    offers; none without an end date."""
+    return fill_cost.years_until(market.end_date, now) if market.end_date else 0.0
 
 
 @dataclass(frozen=True)
@@ -375,10 +363,12 @@ class Card:
     q_balance_pct: float
     # naked_used_usd is everything at risk on the naked leg. budget_used_usd
     # is the part the naked budget limits, which naked_pct is a share of, and
-    # floor_bid_usd the resting floor bid it does not.
+    # free_bid_usd the resting longshot bid it does not. long_return is the
+    # annual return a fill of the resting longshot bid would give the
+    # favorite buyer, as the farmer published it.
     naked_used_usd: float
     budget_used_usd: float
-    floor_bid_usd: float
+    free_bid_usd: float
     naked_pct: float
     position: Optional[dict]
     paused: bool
@@ -390,6 +380,7 @@ class Card:
     economics: Optional[dict] = None
     fav_reason: str = ""
     history: Optional[fill_cost.History] = None
+    long_return: Optional[float] = None
 
 
 def card(market, state, status, now):
@@ -408,14 +399,14 @@ def card(market, state, status, now):
             phase_reason="waiting for farmer", phase_until=None, mid=None,
             book_mid=None, band=None, fav_bid=None, long_bid=None, slots=[], q1=0.0,
             q2=0.0, q_balance_pct=0.0, naked_used_usd=0.0, budget_used_usd=0.0,
-            floor_bid_usd=0.0, naked_pct=0.0, position=None,
+            free_bid_usd=0.0, naked_pct=0.0, position=None,
             paused=market.paused, naked_paused=market.naked_paused, status=market.status,
         )
     fav_bid, long_bid = resting(state, "FAV_BID"), resting(state, "LONG_BID")
     fav_view = state.slots.get("FAV_BID") or {}
     mid = state.mid if state.mid is not None else state.book_mid
     high = max(state.q1, state.q2)
-    used, at_the_floor = budget_used(market, state), floor_bid(market, state)
+    used, free = budget_used(state), free_bid(state)
     return Card(
         condition_id=market.condition_id, name=market_name(market), slug=market.slug,
         mode=metrics.get("plan", {}).get("mode"), fav_outcome=m.get("fav_outcome"),
@@ -430,12 +421,13 @@ def card(market, state, status, now):
         q1=state.q1, q2=state.q2,
         q_balance_pct=round(min(state.q1, state.q2) / high * 100, 1) if high else 0.0,
         naked_used_usd=state.naked_used_usd, budget_used_usd=used,
-        floor_bid_usd=at_the_floor.notional if at_the_floor else 0.0,
+        free_bid_usd=free.notional if free else 0.0,
         naked_pct=round(min(100.0, used / budget * 100), 1) if budget else 0.0,
         position=state.position, paused=market.paused, naked_paused=market.naked_paused,
         status=market.status, economics=fav_view.get("economics"),
         fav_reason=fav_view.get("fav_reason") or "",
         history=fill_cost.history_from_json(fav_view.get("history")),
+        long_return=(state.slots.get("LONG_BID") or {}).get("fill_return"),
     )
 
 
@@ -509,17 +501,12 @@ def totals(snap, now):
         farm, avg = p.get("farm", {}), p.get("avg_cost", {})
         return sum(farm.get(k, 0.0) * avg.get(k, 0.0) for k in ("fav", "long"))
 
-    def counted(cid, state):
-        bid = resting(state, "LONG_BID")
-        free = floor_is_free(snap.markets.get(cid), state)
-        return budget_cost(bid.price, bid.size, long_bid_score(state), free) if bid else 0.0
-
     return Totals(
         quoting=len(quoting),
         approved=sum(m.status == "approved" for m in snap.markets.values()),
         fav_bid_usd=notional("FAV_BID"),
         naked_usd=notional("LONG_BID"),
-        naked_counted_usd=sum(counted(cid, s) for cid, s in snap.states.items()),
+        naked_counted_usd=sum(budget_counted(s) for s in snap.states.values()),
         naked_budget_usd=sum(snap.markets[c].naked_budget_usd or 0.0
                              for c in quoting if c in snap.markets),
         inventory_usd=sum(inventory(s) for s in snap.states.values()),
@@ -567,12 +554,12 @@ def _in_phase(phase, default_reason):
 
 def _budget_bound(snap, now):
     """A budget is bound when it is used up and no longshot bid rests free of
-    it at the floor: that bid balances the favorite bid whatever the budget."""
+    it: that bid balances the favorite bid whatever the budget."""
     for cid, s in snap.states.items():
         market = snap.markets.get(cid)
         budget = (market.naked_budget_usd if market else None) or 0.0
-        used = budget_used(market, s)
-        if budget > 0 and used >= BUDGET_BOUND * budget and floor_bid(market, s) is None:
+        used = budget_used(s)
+        if budget > 0 and used >= BUDGET_BOUND * budget and free_bid(s) is None:
             yield cid, (f"{_name(snap, cid)}: the naked longshot leg uses "
                         f"{usd(used)} of its {usd(budget)} budget, so the "
                         f"favorite bid is trimmed to match.")
@@ -1158,11 +1145,11 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     history = fill_cost.history_from_json(metrics.get("history"))
     if row["p_true"] is None:
         row = {**dict(row), "p_true": book_mid}
-    fm = reward_farmer.farm_market(row, info, cfg)
+    fm = reward_farmer.farm_market(row, info, cfg, now)
     if not isinstance(fm, Skip):
         # A preview has no cycles behind it. It shows the plan the farmer
-        # settles on once the floor's score has held for FLOOR_DWELL_S.
-        fm = fm._replace(floor_steady=True)
+        # settles on once the midpoint has held for FREE_DWELL_S.
+        fm = fm._replace(zones=fm.zones._replace(steady_mid=book_mid))
     if managed:
         note = "The farmer manages this market. Its live orders are on the market page."
     elif isinstance(fm, Skip):
@@ -1256,10 +1243,12 @@ def p_true_start(metrics):
     return None if mid is None else min(max(round(mid * 100), 1), 99)
 
 
-def ev_check(metrics, p_true, budget_text, ev_margin):
+def ev_check(metrics, p_true, budget_text, ev_margin, years_left):
     """What the farmer will do with this p_true (a probability, None while the
     typed percent is invalid) and budget, by its own rule: the favorite bid
-    never prices above floor_to_tick(p_true - ev_margin)."""
+    never prices above floor_to_tick(p_true - ev_margin). The budget is held
+    against what the planned longshot leg takes of it with years_left to the
+    end date (planned_budget_cost)."""
     plan, m = metrics.get("plan"), metrics.get("market", {})
     if p_true is None or not plan:
         return EvCheck("c-warn", [P_TRUE_ERROR])
@@ -1280,7 +1269,7 @@ def ev_check(metrics, p_true, budget_text, ev_margin):
                 "outside the band, so no favorite bid and no reward.")
         tone, lines = "c-warn", [f"Bid capped at {cents(cap)} ({margin}): {then}"]
     budget = _float(budget_text)
-    long_cost = budget_cost(plan["low_price"], plan["low_size"], plan.get("low_score", 0.0))
+    long_cost = planned_budget_cost(metrics, years_left)
     if budget is not None and budget < long_cost - 1e-9:
         tone = "c-warn"
         lines.append(f"Longshot {usd(long_cost)} is over your {usd(budget)} budget: "

@@ -18,19 +18,23 @@ class Term(NamedTuple):
 
 GLOSSARY = {
     # modes and outcomes
-    "mode": Term("Mode", "Floor or budget: whether the longshot bid sits at the 0.1c floor, "
-                         "where the naked budget does not limit it, or higher, within the "
-                         "budget."),
-    "floor": Term("Floor", "The longshot bid sits at 0.1c, where it almost never fills. "
-                           "Where a share there scores at least 0.002 the bid is sized to "
-                           "balance the favorite bid whatever that costs: the naked budget "
-                           "does not limit it. The score must have held there for ten "
-                           "minutes: after one dip under it the budget limits the bid "
-                           "again."),
-    "budget": Term("Budget", "At 0.1c the longshot bid scores nothing, or too little to "
-                             "balance the favorite bid, so it sits higher. That bid is real "
-                             "risk, capped by the market's naked budget, and the favorite "
-                             "bid shrinks to what it balances."),
+    "mode": Term("Mode", "Floor or budget: where the scan planned the longshot bid. Floor is the "
+                         "free zone, at a price where a fill would give a favorite buyer under "
+                         "5% a year, which the naked budget does not limit. Budget is above it, "
+                         "within the budget."),
+    "floor": Term("Floor", "The scan planned the longshot bid in the free zone: at a price where "
+                           "a fill would give a favorite buyer under 5% a year to the end date, "
+                           "0.1c on most markets. Almost no buyer takes that, so where a share "
+                           "there costs at most $0.50 for each unit of its score, the bid is "
+                           "sized to balance the favorite bid whatever that costs: the naked "
+                           "budget does not limit it. The price must have passed that test for "
+                           "ten minutes: after one dip the bid moves to a dearer price that "
+                           "passed throughout, or back under the budget where there is none."),
+    "budget": Term("Budget", "The scan planned the longshot bid where a fill would give a "
+                             "favorite buyer 5% a year or more, because no price in the free "
+                             "zone qualifies. That bid is real risk, capped by the market's "
+                             "naked budget, and the favorite bid shrinks to what it balances. No "
+                             "longshot bid rests where a fill would give over 20% a year."),
     "favorite": Term("Favorite", "The outcome priced at 90c or more. The farmer bids on it and "
                                  "is happy to be filled below your p_true."),
     "longshot": Term("Longshot", "The other outcome. The farmer bids on it only so the "
@@ -97,17 +101,17 @@ GLOSSARY = {
                              "from 1 to 99. The favorite bid "
                              "never goes above p_true minus the EV margin, so any fill is +EV "
                              "by your own estimate."),
-    "naked_budget": Term("Naked budget", "The most USD the longshot side may risk above the "
-                                         "0.1c floor: a resting longshot bid above the floor "
-                                         "plus longshot shares held, at cost. A bid at the "
-                                         "floor is outside it where a share there scores at "
-                                         "least 0.002: it is sized to balance the favorite "
-                                         "bid, at a thousandth of a dollar a share. Once a "
-                                         "longshot bid has filled, the budget limits the "
-                                         "floor too until the shares are sold. A scan "
-                                         "prices every market's longshot bid with the scan's "
-                                         "naked budget, so set it to what you'd approve "
-                                         "with."),
+    "naked_budget": Term("Naked budget", "The most USD the longshot side may risk outside the "
+                                         "free zone: a resting longshot bid whose fill would "
+                                         "give a favorite buyer 5% a year or more, plus longshot "
+                                         "shares held, at cost. A bid offering under 5% a year "
+                                         "is outside the budget where a share costs at most "
+                                         "$0.50 for each unit of its score: it is sized to "
+                                         "balance the favorite bid. Once a longshot bid has "
+                                         "filled, the budget limits every price until the shares "
+                                         "are sold. A scan prices every market's longshot bid "
+                                         "with the scan's naked budget, so set it to what you'd "
+                                         "approve with."),
     "capital_cap": Term("Capital cap", "The most USD this market may tie up on the favorite "
                                        "side: resting favorite bids plus favorite shares held, "
                                        "at cost. The farmer rests the bid size at or under it "
@@ -126,11 +130,10 @@ GLOSSARY = {
     "q1_q2": Term("Q1 / Q2", "Our reward score on each side. Q1 is favorite bids plus "
                              "longshot asks; Q2 is favorite asks plus longshot bids. Above 90c "
                              "only the smaller side pays, so the farmer keeps them equal."),
-    "naked_at_risk": Term("Naked at risk", "USD in resting longshot bids, at the 0.1c floor "
-                                           "and above it. If all of them filled and the "
-                                           "longshot lost, this is what you'd lose. A floor "
-                                           "bid sized without the naked budget does not "
-                                           "count against it."),
+    "naked_at_risk": Term("Naked at risk", "USD in resting longshot bids, in the free zone and "
+                                           "above it. If all of them filled and the longshot "
+                                           "lost, this is what you'd lose. A bid sized without "
+                                           "the naked budget does not count against it."),
     "capital_in_bids": Term("Capital in bids", "USD locked in resting favorite bids."),
     "farm_inventory": Term("Farm inventory", "Shares the farmer bought through fills, above "
                                              "the baseline. Only these are offered back for "
@@ -220,15 +223,17 @@ GLOSSARY = {
     "min_fav": Term("Min favorite mid", "Markets whose favorite trades below this are skipped "
                                         "by the screener and pulled to BELOW_RANGE by the "
                                         "farmer."),
-    "min_low_score": Term("Min longshot score", "The longshot bid never sits above the "
-                                                "cheapest price scoring at least this per "
-                                                "share. Where a 0.1c share scores at least "
-                                                "0.002 the bid sits there, whatever its size "
-                                                "costs. Otherwise it takes the cheapest "
-                                                "price whose size covering the favorite bid "
-                                                "fits the naked budget, or else the price "
-                                                "where the budget buys the most score, and "
-                                                "the favorite bid shrinks to match."),
+    "min_low_score": Term("Min longshot score", "The longshot bid never sits above the cheapest "
+                                                "price scoring at least this per share. It takes "
+                                                "the cheapest price in the free zone, where a "
+                                                "fill gives a favorite buyer under 5% a year, "
+                                                "whose share costs at most $0.50 for each unit "
+                                                "of its score, whatever its size costs. "
+                                                "Otherwise it takes the cheapest price whose "
+                                                "size covering the favorite bid fits the naked "
+                                                "budget, or else the price where the budget buys "
+                                                "the most score, and the favorite bid shrinks to "
+                                                "match."),
     "keep_ratio": Term("Keep ratio", "Keep a resting order while it scores at least this "
                                      "fraction of its target. A favorite bid stays while it "
                                      "earns, at its own price and size, at least this "

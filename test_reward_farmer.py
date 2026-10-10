@@ -12,6 +12,7 @@ import httpx
 import farm_books
 import farm_db
 import reward_farmer
+import reward_screener
 from farm_db import CommandKind
 from reward_farmer import (
     Baseline,
@@ -56,8 +57,10 @@ from fill_cost import DISTANCES, FillCurve, History
 from reward_screener import (
     Levels,
     Read,
+    Zones,
     adjusted_mid,
     fav_bid_candidates,
+    over_max_return,
     round_size_down,
     round_size_up,
 )
@@ -102,14 +105,23 @@ def market(**changes):
         naked_budget_usd=25.0,
         expires_at=NOW + timedelta(days=93),
         capital=500.0,
-        # The floor's score has held: the farmer's tracker says so each cycle.
-        floor_steady=True,
+        # 100 days to the end date, where a longshot bid may rest up to 4.8c
+        # and offers under 5% a year up to 1.3c. No midpoint has been watched,
+        # so the free zone is closed and the naked budget limits every price.
+        zones=Zones(100 / 365.25),
     )
     fields.update(changes)
     return FarmMarket(**fields)
 
 
-# Favorite mid 0.99: the cheapest scoring longshot bid is 0.1c (FLOOR).
+def steady(mid, days=100):
+    """The zones of a market `days` from its end date whose midpoint has held
+    at mid for the dwell: the free zone is open."""
+    return Zones(days / 365.25, mid)
+
+
+# Favorite mid 0.99: the cheapest scoring longshot bid is 0.1c, which 100
+# days out offers a favorite buyer 0.4% a year.
 FLOOR_BOOK = Levels(bids=[(0.985, 1000.0)], asks=[(0.995, 1000.0)], tick=0.001)
 # Favorite mid 0.96: no longshot bid under 0.6c scores and the cheapest scoring
 # 0.10 is 1.7c (BUDGET). Balancing the full favorite bid there costs $35.83.
@@ -233,12 +245,14 @@ class BalancingTest(unittest.TestCase):
         q_one, q_two = q_sums(target)
         self.assertLessEqual(q_one, q_two + 1e-9)
 
-    def test_a_floor_long_bid_over_the_naked_budget_leaves_the_fav_bid_whole(self):
-        # The floor bid costs $0.44. Neither a $0.30 budget nor a $5 one
+    def test_a_free_long_bid_over_the_naked_budget_leaves_the_fav_bid_whole(self):
+        # The 0.1c bid costs $0.44. Neither a $0.30 budget nor a $5 one
         # that 10 longshot shares held at $1 have used up limits it. 10
         # shares are under the 50-share minimum, so no exit rests for them.
-        used_up = market(naked_budget_usd=5.0), Position(long_shares=10.0, long_avg=1.0)
-        for fm, position in ((market(naked_budget_usd=0.3), Position()), used_up):
+        held = steady(0.99)
+        used_up = (market(naked_budget_usd=5.0, zones=held),
+                   Position(long_shares=10.0, long_avg=1.0))
+        for fm, position in ((market(naked_budget_usd=0.3, zones=held), Position()), used_up):
             with self.subTest(budget=fm.naked_budget_usd):
                 target = quotes_at(fm, FLOOR_BOOK, position, CFG, True, 0.979)
                 intents = by_slot(target)
@@ -248,13 +262,13 @@ class BalancingTest(unittest.TestCase):
                 q_one, q_two = q_sums(target)
                 self.assertGreaterEqual(q_two, q_one)
 
-    def test_the_long_bid_stays_at_the_floor_as_the_fav_bid_outgrows_the_budget(self):
+    def test_the_long_bid_stays_at_its_free_price_as_the_fav_bid_outgrows_the_budget(self):
         # $1 buys 1,000 shares at 0.1c, which balance 1,173 favorite shares
-        # at 97.9c. The longshot bid stays at the floor and covers the whole
+        # at 97.9c. The longshot bid stays at 0.1c and covers the whole
         # favorite bid on both sides of that size.
         for capital in (100.0, 1000.0, 1200.0, 20000.0):
             with self.subTest(capital=capital):
-                fm = market(capital=capital, naked_budget_usd=1.0)
+                fm = market(capital=capital, naked_budget_usd=1.0, zones=steady(0.99))
                 target = quotes_at(fm, FLOOR_BOOK, Position(), CFG, True, 0.979)
                 intents = by_slot(target)
                 self.assertEqual(intents[Slot.LONG_BID].price, 0.001)
@@ -262,15 +276,23 @@ class BalancingTest(unittest.TestCase):
                 q_one, q_two = q_sums(target)
                 self.assertGreaterEqual(q_two, q_one)
 
-    def test_a_floor_scoring_under_the_bound_is_limited_by_the_budget(self):
-        # At a 0.9655 midpoint with v 3.5c a 0.1c share scores 0.0018, just
-        # under the 0.002 a floor bid needs to be sized without the budget, and
-        # covering the 523.56 favorite shares $500 buys would take 139,700
-        # of them. The longshot bid rests at 1.1c within its $25, and the
-        # favorite bid is trimmed to match.
+    def test_the_lowest_tick_costing_too_much_gives_way_to_the_next_free_price(self):
+        # At a 0.9655 midpoint with v 3.5c a 0.1c share scores 0.0018, $0.54
+        # for each unit of score, just over the $0.50 a bid sized without
+        # the budget may cost. A 0.2c share scores 0.0051, $0.39 a unit, and
+        # 100 days out offers 0.7% a year: 50,282.71 of them, $100.57, cover
+        # the 523.56 favorite shares $500 buys, on a $25 budget.
         book = Levels(bids=[(0.961, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
-        fm = market(p_true=0.98, naked_budget_usd=25.0)
+        fm = market(p_true=0.98, naked_budget_usd=25.0, zones=steady(0.9655))
         intents = by_slot(quotes_at(fm, book, Position(), CFG, True, 0.955))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.002, 50282.71))
+        self.assertEqual(fav.size, 523.56)
+        self.assertGreaterEqual(low.score * low.size, fav.score * fav.size)
+        # With the free zone closed the longshot bid rests at 1.1c within
+        # its $25, and the favorite bid is trimmed to match.
+        intents = by_slot(quotes_at(fm._replace(zones=Zones(100 / 365.25)), book, Position(),
+                                    CFG, True, 0.955))
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
         self.assertEqual((low.price, low.size), (0.011, 2272.72))
         self.assertLessEqual(low.price * low.size, 25.0)
@@ -278,15 +300,15 @@ class BalancingTest(unittest.TestCase):
         self.assertAlmostEqual(fav.score * fav.size, low.score * low.size,
                                delta=fav.score * 0.01)
 
-    def test_a_filled_floor_bid_does_not_grow_the_next_one(self):
-        # At a 0.9495 midpoint with v 5.5c the floor scores 0.01, and 36,402.87
-        # shares, $36.40, cover a 531.91-share favorite bid at 94c. Once they
-        # fill, their exit at 6c scores 24,900 of Q_one, which a floor bid
-        # sized without the budget would cover with 2.5 million shares. The
-        # budget, less the $36.40 held, limits the floor again: nothing on
-        # $10, the $63.60 left on $100.
+    def test_a_filled_free_bid_does_not_grow_the_next_one(self):
+        # At a 0.9495 midpoint with v 5.5c a 0.1c share scores 0.01, and
+        # 36,402.87 shares, $36.40, cover a 531.91-share favorite bid at 94c.
+        # Once they fill, their exit at 6c scores 24,900 of Q_one, which a
+        # bid sized without the budget would cover with 2.5 million shares.
+        # The budget, less the $36.40 held, limits every price again:
+        # nothing on $10, the $63.60 left on $100.
         book = Levels(bids=[(0.945, 1000.0)], asks=[(0.954, 1000.0)], tick=0.001)
-        fm = market(naked_budget_usd=10.0, v=0.055, p_true=0.98)
+        fm = market(naked_budget_usd=10.0, v=0.055, p_true=0.98, zones=steady(0.9495))
         first = by_slot(quotes_at(fm, book, Position(), CFG, True, 0.94))
         self.assertEqual(first[Slot.FAV_BID].size, 531.91)
         self.assertEqual((first[Slot.LONG_BID].price, first[Slot.LONG_BID].size),
@@ -521,11 +543,11 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(self.long_keep(0.001, round(size - 0.02, 2), exact),
                          "short of the cover needed")
 
-    def test_a_floor_long_bid_covering_over_twice_the_need_stays(self):
+    def test_a_long_bid_at_the_lowest_tick_covering_over_twice_the_need_stays(self):
         # At 0.1c the extra cover costs a few cents of naked budget.
         self.assertIsNone(self.long_keep(0.001, 1400.0))
 
-    def test_a_long_bid_above_the_floor_covering_over_twice_the_need_is_replaced(self):
+    def test_a_budgeted_long_bid_covering_over_twice_the_need_is_replaced(self):
         fm = market(naked_budget_usd=100.0)
         target = plan(fm, BUDGET_BOOK)
         low = by_slot(target)[Slot.LONG_BID]
@@ -534,30 +556,61 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(keep_failure(order, low, target, fm, Position(), CFG),
                          "over twice the cover needed")
 
-    def test_a_floor_long_bid_over_the_naked_budget_stays(self):
+    def test_a_free_long_bid_above_the_lowest_tick_covering_over_twice_the_need_stays(self):
+        # With BUDGET_BOOK's midpoint steady at 0.96 the plan rests its
+        # longshot bid at 1c, the cheapest price costing at most $0.50 a
+        # unit of score there, free of the budget. A tick of mid moves what
+        # a share that near the band edge scores by half, so a bid sized a
+        # tick lower covers over twice the need now. It stays: it is already
+        # bounded by what it cost when it was sized. With the free zone
+        # closed the same bid is one the budget limits, and it goes.
+        fm = market(p_true=0.98, naked_budget_usd=25.0, zones=steady(0.96))
+        target = plan(fm, BUDGET_BOOK)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual(low.price, 0.01)
+        order = live("b", Slot.LONG_BID, low.price, round(low.size * 2.1, 2))
+        self.assertIsNone(keep_failure(order, low, target, fm, Position(), CFG))
+        closed = fm._replace(zones=Zones(100 / 365.25))
+        self.assertEqual(keep_failure(order, low, target, closed, Position(), CFG),
+                         "over twice the cover needed")
+
+    def test_a_free_long_bid_over_the_naked_budget_stays(self):
         # 675.82 shares at 0.1c cost $0.68: over a $0.50 budget, and over a
         # $25 one that 30 longshot shares held at $1 have used up. 30 shares
         # are under the 50-share minimum, so no exit rests for them.
         order = live("b", Slot.LONG_BID, 0.001, 675.82)
         low = self.intents[Slot.LONG_BID]
-        tight = market(naked_budget_usd=0.5)
+        tight = market(naked_budget_usd=0.5, zones=steady(0.99))
         self.assertIsNone(keep_failure(order, low, self.target, tight, Position(), CFG))
         dust = Position(long_shares=30.0, long_avg=1.0)
-        self.assertIsNone(keep_failure(order, low, self.target, self.fm, dust, CFG))
+        held = self.fm._replace(zones=steady(0.99))
+        self.assertIsNone(keep_failure(order, low, self.target, held, dust, CFG))
 
-    def test_a_floor_long_bid_is_held_to_the_budget_while_longshot_shares_await_an_exit(self):
+    def test_a_free_long_bid_drifting_out_of_the_free_zone_goes_back_under_the_budget(self):
+        # 100 days out 0.1c offers 0.4% a year. 7 days out it offers 5.4%,
+        # and the $0.68 bid is over its $0.50 budget.
+        order = live("b", Slot.LONG_BID, 0.001, 675.82)
+        low = self.intents[Slot.LONG_BID]
+        tight = market(naked_budget_usd=0.5, zones=steady(0.99, days=7))
+        self.assertEqual(keep_failure(order, low, self.target, tight, Position(), CFG),
+                         "over the naked budget")
+        self.assertIsNone(keep_failure(order, low, self.target, tight._replace(
+            zones=steady(0.99, days=8)), Position(), CFG))
+
+    def test_a_long_bid_is_held_to_the_budget_while_longshot_shares_await_an_exit(self):
         # 100 longshot shares held rest an exit. At 30c they have used up the
-        # $25, and the budget limits the floor bid as it limits any other. At
+        # $25, and the budget limits the 0.1c bid as it limits any other. At
         # 10c they leave $15, which the $0.68 bid fits.
         order = live("b", Slot.LONG_BID, 0.001, 675.82)
         low = self.intents[Slot.LONG_BID]
+        fm = self.fm._replace(zones=steady(0.99))
         used_up = Position(long_shares=100.0, long_avg=0.3)
-        self.assertEqual(keep_failure(order, low, self.target, self.fm, used_up, CFG),
+        self.assertEqual(keep_failure(order, low, self.target, fm, used_up, CFG),
                          "over the naked budget")
         room_left = Position(long_shares=100.0, long_avg=0.1)
-        self.assertIsNone(keep_failure(order, low, self.target, self.fm, room_left, CFG))
+        self.assertIsNone(keep_failure(order, low, self.target, fm, room_left, CFG))
 
-    def test_a_long_bid_above_the_floor_over_the_naked_budget_is_replaced(self):
+    def test_a_long_bid_outside_the_free_zone_over_the_naked_budget_is_replaced(self):
         # On BUDGET_BOOK the bid rests at 1.4c x 1785.71, all of its $25. A
         # $20 budget is $5 short of it, and so is $25 with 10 longshot shares
         # held at $1.
@@ -575,14 +628,17 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(keep_failure(order, low, target, fm, held, CFG),
                          "over the naked budget")
 
-    def test_a_long_bid_at_the_lowest_price_of_a_coarse_tick_is_held_to_the_budget(self):
-        # On a 1c tick the lowest price is 1c, ten times the floor. 675.82
-        # shares there cost $6.76, over a $5 budget.
+    def test_a_long_bid_on_a_one_cent_tick_is_free_only_far_from_the_end_date(self):
+        # On a 1c tick the lowest price is 1c, where 675.82 shares cost
+        # $6.76, over a $5 budget. 100 days out 1c offers 3.7% a year and the
+        # budget leaves the bid alone. 60 days out it offers 6.3%.
         order = live("b", Slot.LONG_BID, 0.01, 675.82)
-        coarse = market(tick=0.01, naked_budget_usd=5.0)
+        low = self.intents[Slot.LONG_BID]
+        coarse = market(tick=0.01, naked_budget_usd=5.0, zones=steady(0.99))
+        self.assertIsNone(keep_failure(order, low, self.target, coarse, Position(), CFG))
         self.assertEqual(
-            keep_failure(order, self.intents[Slot.LONG_BID], self.target, coarse, Position(),
-                         CFG),
+            keep_failure(order, low, self.target, coarse._replace(zones=steady(0.99, days=60)),
+                         Position(), CFG),
             "over the naked budget")
 
     def test_a_long_bid_up_to_two_ticks_over_the_min_score_price_stays(self):
@@ -1223,9 +1279,9 @@ class SizeChoiceTest(unittest.TestCase):
         self.assertEqual((fav.price, fav.size), (0.955, 124.91))
         self.assertEqual((low.price, low.size), (0.014, 714.28))
 
-    def test_the_naked_budget_does_not_trim_a_bid_balanced_at_the_floor(self):
+    def test_the_naked_budget_does_not_trim_a_bid_balanced_at_a_free_price(self):
         # $0.30 buys 300 longshot shares at 0.1c and the bid needs 675.82.
-        intents = by_slot(plan(market(naked_budget_usd=0.3), FLOOR_BOOK))
+        intents = by_slot(plan(market(naked_budget_usd=0.3, zones=steady(0.99)), FLOOR_BOOK))
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
         self.assertEqual((fav.price, fav.size), (0.985, 507.61))
         self.assertEqual((low.price, low.size), (0.001, 675.82))
@@ -1245,7 +1301,8 @@ class SizeChoiceTest(unittest.TestCase):
             "two days out": (market(end_date=NOW + timedelta(days=2)), FLOOR_BOOK, Position(),
                              CFG, SWEPT),
             "a budget longshot bid": (market(p_true=0.98), BUDGET_BOOK, Position(), CFG, QUIET),
-            "a floor bid over its budget": (market(naked_budget_usd=0.3), FLOOR_BOOK,
+            "a free bid over its budget": (market(naked_budget_usd=0.3, zones=steady(0.99)),
+                                           FLOOR_BOOK,
                                             Position(), CFG, QUIET),
             "trimmed by the budget": (market(p_true=0.98, naked_budget_usd=10.0), BUDGET_BOOK,
                                       Position(), CFG, QUIET),
@@ -1301,31 +1358,39 @@ class RestingBidTest(unittest.TestCase):
 
 
 # Shaped like Pam Bondi's live book on 2026-10-10, v 5.5c, where another
-# maker's 107-share bid came and went and the floor's score crossed
-# FLOOR_MIN_SCORE with it. Here that bid sits one tick over the next: with it
-# the midpoint is 94.65c and a 0.1c longshot share scores 0.00207, and without
-# it the midpoint is 94.6c and the share scores 0.00132. Free of its $13
-# budget, the floor bid is 353,509 shares beside a favorite bid of 93.7c x
-# 1,067.23. Under the budget the bids are 1.6c x 812.5 and 90.9c x 812.5.
+# maker's 107-share bid came and went and what a 0.1c share scores crossed
+# 0.002, $0.50 a unit, with it. Here that bid sits one tick over the next:
+# with it the midpoint is 94.65c and a 0.1c longshot share scores 0.00207,
+# and without it the midpoint is 94.6c and the share scores 0.00132. Free of
+# its $13 budget, the 0.1c bid is 353,509 shares beside a favorite bid of
+# 93.7c x 1,067.23.
 EDGE = market(v=0.055, min_size=100.0, p_true=0.98, naked_budget_usd=13.0, capital=1000.0)
 EDGE_UP = Levels(bids=[(0.937, 107.0), (0.936, 2000.0)], asks=[(0.956, 2000.0)], tick=0.001)
 EDGE_DOWN = Levels(bids=[(0.936, 2000.0)], asks=[(0.956, 2000.0)], tick=0.001)
 # No lead over the best bid, so no bid of ours moves the midpoint.
 EDGE_CFG = CFG._replace(max_lead=0.0)
+# 30 days out only 0.1c to 0.3c offer under 5% a year, and without the
+# 107-share bid none of them costs under $0.50 a unit. Under the budget the
+# bids are 1.4c x 928.57 and 90.7c x 928.57.
+EDGE_NEAR = EDGE._replace(end_date=NOW + timedelta(days=30), zones=Zones(30 / 365.25))
 
 
-def run_cycles(fm, books, steady=None, step_s=5, cfg=EDGE_CFG):
+def current_mid(watch, now):
+    """No dwell: a price is free whenever it passes its test this cycle."""
+    return watch.mids[-1][1]
+
+
+def run_cycles(fm, books, steady=reward_farmer.steady_mid, step_s=5, cfg=EDGE_CFG):
     """The farmer's planning in closed loop over one book a cycle, step_s
-    apart, with its floor tracker: per cycle, the orders replaced and the
-    orders resting after it. steady(since, now) says whether the floor's
-    score has held long enough; the farmer's own test unless given."""
-    steady = steady or reward_farmer.dwelt
-    orders, since, serial, replaced, resting = [], None, 0, [], []
+    apart, with its watch of the midpoint: per cycle, the orders replaced
+    and the orders resting after it. steady(watch, now) is the midpoint a
+    free price must also pass its test at; the farmer's own unless given."""
+    orders, watch, serial, replaced, resting = [], None, 0, [], []
     for n, book in enumerate(books):
         now = NOW + timedelta(seconds=step_s * n)
-        book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
-        since = reward_farmer.steady_since(since, reward_farmer.floor_score(fm, book_mid), now)
-        seen = fm._replace(floor_steady=steady(since, now))
+        watch = reward_farmer.watch_mid(
+            watch, adjusted_mid(book.bids, book.asks, fm.min_size), now)
+        seen = fm._replace(zones=fm.zones._replace(steady_mid=steady(watch, now)))
         target = plan(seen, book, cfg=cfg, resting=orders)
         target = around_kept_bid(target, orders, seen, book, Position(), cfg, True)
         actions = reconcile(target, orders, seen, Position(), cfg)
@@ -1340,63 +1405,84 @@ def run_cycles(fm, books, steady=None, step_s=5, cfg=EDGE_CFG):
     return replaced, resting
 
 
-class FloorDwellTest(unittest.TestCase):
-    """The floor is free of the naked budget only once its score has held at
-    FLOOR_MIN_SCORE on every cycle for FLOOR_DWELL_S."""
+class FreeDwellTest(unittest.TestCase):
+    """A price is free of the naked budget only once it has passed its test
+    on every cycle for FREE_DWELL_S: the test is run at the lowest midpoint
+    of the dwell."""
 
-    def test_the_floor_scores_of_the_two_books(self):
-        self.assertAlmostEqual(reward_farmer.floor_score(EDGE, 0.9465), 0.00207, places=5)
-        self.assertAlmostEqual(reward_farmer.floor_score(EDGE, 0.946), 0.00132, places=5)
-        # The live market's two midpoints.
-        self.assertAlmostEqual(reward_farmer.floor_score(EDGE, 0.948), 0.0053, places=4)
-        self.assertAlmostEqual(reward_farmer.floor_score(EDGE, 0.9455), 0.0007, places=4)
-        self.assertEqual(reward_farmer.floor_score(EDGE, None), 0.0)
+    def test_what_a_share_at_the_lowest_tick_scores_on_the_two_books(self):
+        self.assertAlmostEqual(order_score(Slot.LONG_BID, 0.001, 0.9465, 0.055), 0.00207,
+                               places=5)
+        self.assertAlmostEqual(order_score(Slot.LONG_BID, 0.001, 0.946, 0.055), 0.00132,
+                               places=5)
 
-    def test_the_score_holds_from_its_first_cycle_over_the_bound(self):
-        later = NOW + timedelta(seconds=5)
-        self.assertEqual(reward_farmer.steady_since(None, 0.0053, NOW), NOW)
-        self.assertEqual(reward_farmer.steady_since(NOW, 0.0053, later), NOW)
-        self.assertIsNone(reward_farmer.steady_since(NOW, 0.0007, later))
-        self.assertIsNone(reward_farmer.steady_since(None, 0.0007, later))
+    def test_the_watch_keeps_the_midpoints_of_the_dwell(self):
+        self.assertEqual(reward_farmer.FREE_DWELL_S, 600)
+        watch = reward_farmer.watch_mid(None, 0.948, NOW)
+        self.assertEqual(watch, reward_farmer.MidWatch(NOW, ((NOW, 0.948),)))
+        for seconds in (300, 600, 605):
+            watch = reward_farmer.watch_mid(watch, 0.95, NOW + timedelta(seconds=seconds))
+        # Still watched since the first cycle. That cycle's midpoint is over
+        # ten minutes old and gone.
+        self.assertEqual(watch.since, NOW)
+        self.assertEqual([mid for _, mid in watch.mids], [0.95, 0.95, 0.95])
 
-    def test_the_floor_is_free_once_the_score_has_held_for_the_dwell(self):
-        dwell = timedelta(seconds=reward_farmer.FLOOR_DWELL_S)
-        self.assertEqual(reward_farmer.FLOOR_DWELL_S, 600)
-        self.assertFalse(reward_farmer.dwelt(None, NOW))
-        self.assertFalse(reward_farmer.dwelt(NOW, NOW + dwell - timedelta(seconds=1)))
-        self.assertTrue(reward_farmer.dwelt(NOW, NOW + dwell))
+    def test_a_one_sided_book_ends_the_watch(self):
+        watch = reward_farmer.watch_mid(None, 0.948, NOW)
+        self.assertIsNone(reward_farmer.watch_mid(watch, None, NOW + timedelta(seconds=5)))
+        self.assertIsNone(reward_farmer.watch_mid(None, None, NOW))
 
-    def test_a_floor_not_yet_steady_is_limited_by_the_budget(self):
-        # On FLOOR_BOOK a $0.30 budget buys 300 floor shares, which balance
-        # 352.08 of the 510.72 favorite shares at 97.9c.
-        # A market built from its terms alone has no evidence of a steady score.
-        self.assertIs(FarmMarket._field_defaults["floor_steady"], False)
-        fm = market(naked_budget_usd=0.3, floor_steady=False)
+    def test_the_steady_midpoint_is_the_lowest_of_the_dwell_once_watched_that_long(self):
+        def at(seconds):
+            return NOW + timedelta(seconds=seconds)
+
+        self.assertIsNone(reward_farmer.steady_mid(None, NOW))
+        watch = reward_farmer.watch_mid(None, 0.948, NOW)
+        watch = reward_farmer.watch_mid(watch, 0.9455, at(5))
+        watch = reward_farmer.watch_mid(watch, 0.948, at(10))
+        self.assertIsNone(reward_farmer.steady_mid(watch, at(599)))
+        self.assertEqual(reward_farmer.steady_mid(watch, at(600)), 0.9455)
+        # The dip counts for ten minutes, to the second, and no longer.
+        watch = reward_farmer.watch_mid(watch, 0.947, at(605))
+        self.assertEqual(reward_farmer.steady_mid(watch, at(605)), 0.9455)
+        watch = reward_farmer.watch_mid(watch, 0.949, at(610))
+        self.assertEqual(reward_farmer.steady_mid(watch, at(610)), 0.947)
+
+    def test_a_price_not_yet_steady_is_limited_by_the_budget(self):
+        # On FLOOR_BOOK a $0.30 budget buys 300 shares at 0.1c, which balance
+        # 352.08 of the 510.72 favorite shares at 97.9c. A market read from
+        # its terms has no watch behind it, and its free zone is closed.
+        fm = market(naked_budget_usd=0.3)
+        self.assertIsNone(fm.zones.steady_mid)
         intents = by_slot(quotes_at(fm, FLOOR_BOOK, Position(), CFG, True, 0.979))
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
         self.assertEqual((low.price, low.size), (0.001, 300.0))
         self.assertEqual((fav.price, fav.size), (0.979, 352.08))
-        steady = by_slot(quotes_at(fm._replace(floor_steady=True), FLOOR_BOOK, Position(), CFG,
-                                   True, 0.979))
-        self.assertEqual(steady[Slot.FAV_BID].size, 510.72)
+        held = by_slot(quotes_at(fm._replace(zones=steady(0.99)), FLOOR_BOOK, Position(), CFG,
+                                 True, 0.979))
+        self.assertEqual(held[Slot.FAV_BID].size, 510.72)
 
-    def test_a_floor_bid_over_the_budget_is_replaced_once_the_floor_is_not_steady(self):
-        # 675.82 floor shares cost $0.68 on a $0.50 budget.
-        fm = market(naked_budget_usd=0.5)
+    def test_a_free_bid_over_the_budget_is_replaced_once_its_price_is_not_steady(self):
+        # 675.82 shares at 0.1c cost $0.68 on a $0.50 budget. With the
+        # midpoint at 96c in the last ten minutes a share there scored
+        # nothing.
+        fm = market(naked_budget_usd=0.5, zones=steady(0.99))
         target = plan(fm, FLOOR_BOOK)
         low = by_slot(target)[Slot.LONG_BID]
         order = live("b", Slot.LONG_BID, 0.001, 675.82)
         self.assertIsNone(keep_failure(order, low, target, fm, Position(), CFG))
-        self.assertEqual(
-            keep_failure(order, low, target, fm._replace(floor_steady=False), Position(), CFG),
-            "over the naked budget")
+        for zones in (steady(0.96), Zones(100 / 365.25)):
+            with self.subTest(steady_mid=zones.steady_mid):
+                self.assertEqual(
+                    keep_failure(order, low, target, fm._replace(zones=zones), Position(), CFG),
+                    "over the naked budget")
 
-    def test_a_steady_score_frees_the_floor_and_one_dip_takes_it_back_for_the_dwell(self):
-        # 121 cycles five seconds apart are the ten minutes. The score then
-        # dips for one cycle and holds again for another 121.
+    def test_a_steady_midpoint_frees_the_price_and_one_dip_takes_it_back_for_the_dwell(self):
+        # 121 cycles five seconds apart are the ten minutes. The midpoint
+        # then dips for one cycle and holds again for another 121.
         books = [EDGE_UP] * 122 + [EDGE_DOWN] + [EDGE_UP] * 122
-        replaced, resting = run_cycles(EDGE, books)
-        budgeted = {Slot.FAV_BID: (0.909, 812.5), Slot.LONG_BID: (0.016, 812.5)}
+        replaced, resting = run_cycles(EDGE_NEAR, books)
+        budgeted = {Slot.FAV_BID: (0.907, 928.57), Slot.LONG_BID: (0.014, 928.57)}
         free = {Slot.FAV_BID: (0.937, 1067.23), Slot.LONG_BID: (0.001, 353509.27)}
         # Under the budget until the dwell has passed, then free.
         self.assertEqual(resting[0], budgeted)
@@ -1404,11 +1490,11 @@ class FloorDwellTest(unittest.TestCase):
         self.assertEqual(replaced[120], ["FAV_BID", "LONG_BID"])
         self.assertEqual(resting[120], free)
         self.assertEqual(replaced[121], [])
-        # One cycle under the bound, and the budget limits the floor at once.
+        # One cycle that fails the test, and the budget limits the bid at once.
         self.assertEqual(replaced[122], ["FAV_BID", "LONG_BID"])
         self.assertLessEqual(resting[122][Slot.LONG_BID][0] * resting[122][Slot.LONG_BID][1],
                              13.0)
-        # It stays there until the score has held for the dwell again.
+        # It stays there until the midpoint has held for the dwell again.
         self.assertEqual([r for r in replaced[123:243] if r], [])
         self.assertEqual(resting[242][Slot.LONG_BID], resting[122][Slot.LONG_BID])
         self.assertEqual(replaced[243], ["FAV_BID", "LONG_BID"])
@@ -1416,46 +1502,185 @@ class FloorDwellTest(unittest.TestCase):
         # Only those three changes replaced an order.
         self.assertEqual(sum(1 for r in replaced if r), 3)
 
-    def test_a_flickering_score_never_frees_the_floor_and_replaces_nothing(self):
+    def test_a_flickering_midpoint_never_frees_the_price_and_replaces_nothing(self):
         # The 107-share bid comes and goes every three cycles for half an
         # hour. The plan is the budgeted one throughout, and after the first
         # cycle places it nothing is replaced.
         books = ([EDGE_UP] * 3 + [EDGE_DOWN] * 3) * 60
-        replaced, resting = run_cycles(EDGE, books)
+        replaced, resting = run_cycles(EDGE_NEAR, books)
         self.assertEqual([r for r in replaced if r], [])
         for after in resting:
             price, size = after[Slot.LONG_BID]
             self.assertLessEqual(price * size, 13.0)
-        # With the floor free whenever it scores the bound, as before the
-        # tracker, the favorite bid is replaced on every crossing: 119 times.
-        flapping, _ = run_cycles(EDGE, books, steady=lambda since, now: True)
+        # With the price free whenever it passes its test, the favorite bid
+        # is replaced on every crossing: 119 times.
+        flapping, _ = run_cycles(EDGE_NEAR, books, steady=current_mid)
         self.assertEqual(sum(r.count("FAV_BID") for r in flapping), 119)
 
-    def test_the_tracker_is_seeded_from_the_last_runs_midpoints(self):
+    def test_a_dip_moves_a_far_dated_bid_to_the_cheapest_price_that_held_and_no_further(self):
+        # 100 days out prices up to 1.3c offer under 5% a year. Without the
+        # 107-share bid 0.1c costs $0.76 a unit of score, and 0.4c, at 1.5% a
+        # year, is the cheapest price under $0.50. After a dip the longshot
+        # bid rests there, sized to cover the whole favorite bid, and stays
+        # when 0.1c has passed for the dwell again: a resting bid that covers
+        # is kept over a cheaper target.
+        books = [EDGE_UP] * 122 + [EDGE_DOWN] + [EDGE_UP] * 244
+        replaced, resting = run_cycles(EDGE, books)
+        self.assertEqual(resting[121][Slot.LONG_BID], (0.001, 353509.27))
+        self.assertEqual(resting[122], {Slot.FAV_BID: (0.936, 1068.37),
+                                        Slot.LONG_BID: (0.004, 86537.97)})
+        self.assertEqual([r for r in replaced[123:] if r], [])
+        self.assertEqual(resting[-1], resting[122])
+
+    def test_a_flickering_midpoint_rests_a_far_dated_bid_at_the_price_that_held(self):
+        # The flicker of the test above, 100 days out. Once the ten minutes
+        # are watched the bid goes to 0.4c, which passed on every cycle, and
+        # the longshot bid is never replaced again. The favorite bid is
+        # replaced once more, when the 107-share bid it joined leaves.
+        books = ([EDGE_UP] * 3 + [EDGE_DOWN] * 3) * 60
+        replaced, resting = run_cycles(EDGE, books)
+        self.assertEqual(resting[119][Slot.LONG_BID], (0.016, 812.5))
+        self.assertEqual(replaced[120], ["FAV_BID", "LONG_BID"])
+        self.assertEqual(resting[120][Slot.LONG_BID], (0.004, 73039.11))
+        self.assertEqual([n for n, r in enumerate(replaced) if "LONG_BID" in r], [120])
+        self.assertEqual([n for n, r in enumerate(replaced) if "FAV_BID" in r], [120, 123])
+        self.assertEqual(resting[-1][Slot.FAV_BID], (0.936, 1068.37))
+
+    def test_the_watch_is_seeded_from_the_last_runs_midpoints(self):
         def seeded(mids, last_ago_s=30, gap_s=64):
-            """Samples gap_s apart ending last_ago_s ago, oldest first."""
+            """Samples gap_s apart ending last_ago_s ago, oldest first, and
+            the steady midpoint the watch seeded from them gives now."""
             start = NOW - timedelta(seconds=last_ago_s + gap_s * (len(mids) - 1))
             samples = [(start + timedelta(seconds=gap_s * n), mid) for n, mid in enumerate(mids)]
-            return samples, reward_farmer.seeded_steady_since(samples, EDGE, NOW)
+            watch = reward_farmer.seeded_watch(samples, NOW)
+            return samples, watch, reward_farmer.steady_mid(watch, NOW)
 
-        # Twelve steady minutes: steady since the first sample, so free at once.
-        samples, since = seeded([0.948] * 12)
-        self.assertEqual(since, samples[0][0])
-        self.assertTrue(reward_farmer.dwelt(since, NOW))
-        # One dip five samples ago: steady since the sample after it.
-        samples, since = seeded([0.948] * 7 + [0.9455] + [0.948] * 4)
-        self.assertEqual(since, samples[8][0])
-        self.assertFalse(reward_farmer.dwelt(since, NOW))
-        # Under the bound now, a one-sided book, or no samples: no evidence.
-        self.assertIsNone(seeded([0.948] * 11 + [0.9455])[1])
+        # Twelve steady minutes: watched since the first sample, so steady at once.
+        samples, watch, mid = seeded([0.948] * 12)
+        self.assertEqual(watch.since, samples[0][0])
+        self.assertEqual(mid, 0.948)
+        # One dip five samples ago is the lowest midpoint of the dwell.
+        self.assertEqual(seeded([0.948] * 7 + [0.9455] + [0.948] * 4)[2], 0.9455)
+        # A dip over ten minutes ago no longer counts.
+        self.assertEqual(seeded([0.9455] + [0.948] * 11)[2], 0.948)
+        # A one-sided book now, or no samples: no evidence.
         self.assertIsNone(seeded([0.948] * 11 + [None])[1])
-        self.assertIsNone(reward_farmer.seeded_steady_since([], EDGE, NOW))
+        self.assertIsNone(reward_farmer.seeded_watch([], NOW))
+        # A one-sided book five samples ago: watched only since the sample after.
+        samples, watch, mid = seeded([0.948] * 7 + [None] + [0.948] * 4)
+        self.assertEqual(watch.since, samples[8][0])
+        self.assertIsNone(mid)
         # A last sample over three minutes old vouches for nothing.
         self.assertIsNone(seeded([0.948] * 12, last_ago_s=200)[1])
-        # A gap over three minutes between samples starts the count again.
+        # A gap over three minutes between samples starts the watch again.
         gap = NOW - timedelta(seconds=900), NOW - timedelta(seconds=600)
         samples = [(gap[0], 0.948), (gap[1], 0.948), (NOW - timedelta(seconds=30), 0.948)]
-        self.assertEqual(reward_farmer.seeded_steady_since(samples, EDGE, NOW), samples[2][0])
+        watch = reward_farmer.seeded_watch(samples, NOW)
+        self.assertEqual(watch.since, samples[2][0])
+        self.assertIsNone(reward_farmer.steady_mid(watch, NOW))
+
+
+def days_out(days, **changes):
+    """A market this many days from its end date, as the farmer sees it then."""
+    return market(end_date=NOW + timedelta(days=days), zones=Zones(days / 365.25), **changes)
+
+
+class ReturnLimitTest(unittest.TestCase):
+    """No longshot bid rests where a fill gives the favorite buyer over
+    MAX_RETURN a year. On BUDGET_BOOK the cheapest price scoring 0.10 is
+    1.7c, which offers 23.2% a year 30 days out, and nothing under 0.6c
+    scores."""
+
+    def test_the_long_bid_rests_under_the_limit_and_the_fav_bid_shrinks_to_match(self):
+        far = quotes_at(market(p_true=0.98), BUDGET_BOOK, Position(), CFG, True, 0.949)
+        near = quotes_at(days_out(30, p_true=0.98), BUDGET_BOOK, Position(), CFG, True, 0.949)
+        self.assertEqual(by_slot(far)[Slot.LONG_BID].price, 0.017)
+        low, fav = by_slot(near)[Slot.LONG_BID], by_slot(near)[Slot.FAV_BID]
+        # $25 buys the most score under the limit at 1.4c.
+        self.assertEqual((low.price, low.size), (0.014, 1785.71))
+        self.assertEqual(fav.size, 251.11)
+        self.assertLess(fav.size, by_slot(far)[Slot.FAV_BID].size)
+        q_one, q_two = q_sums(near)
+        self.assertLessEqual(q_one, q_two + 1e-9)
+
+    def test_with_no_price_under_the_limit_neither_bid_rests(self):
+        # 10 days out nothing over 0.4c is allowed.
+        target = quotes_at(days_out(10, p_true=0.98), BUDGET_BOOK, Position(), CFG, True, 0.949)
+        self.assertEqual(target.intents, [])
+
+    def test_the_exits_rest_whatever_the_limit(self):
+        fm = days_out(10, p_true=0.98)
+        long_held = Position(long_shares=200.0, long_avg=0.02)
+        self.assertEqual(set(by_slot(quotes_at(fm, BUDGET_BOOK, long_held, CFG, True, 0.949))),
+                         {Slot.LONG_ASK})
+        fav_held = Position(fav_shares=100.0, fav_avg=0.94)
+        intents = by_slot(quotes_at(fm, BUDGET_BOOK, fav_held, CFG, True, 0.949))
+        self.assertIn(Slot.FAV_ASK, intents)
+        self.assertNotIn(Slot.LONG_BID, intents)
+
+    def test_a_resting_bid_over_the_limit_is_replaced(self):
+        # The net-best favorite bid lifts the midpoint to 0.9625, where the
+        # cheapest price scoring 0.10 is 1.4c. 20 days out that offers 29%.
+        order = live("low", Slot.LONG_BID, 0.014, 1785.71)
+        far = market(p_true=0.98)
+        target = plan(far, BUDGET_BOOK)
+        self.assertIsNone(keep_failure(order, by_slot(target)[Slot.LONG_BID], target, far,
+                                       Position(), CFG))
+        near = days_out(20, p_true=0.98)
+        target = plan(near, BUDGET_BOOK)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual(low.price, 0.009)
+        self.assertEqual(keep_failure(order, low, target, near, Position(), CFG),
+                         "over the return limit")
+        actions = reconcile(target, [order], near, Position(), CFG)
+        self.assertEqual(actions[0], Cancel(("low",)))
+        self.assertIn(Place(low), actions)
+
+    def test_a_bid_drifting_toward_the_end_date_steps_down_and_never_back(self):
+        # One cycle every six hours from 45 days out to 8, on the same book.
+        # The limit falls from 2.2c to 0.4c. Each price the bid rests at is
+        # left once, when it comes to offer over the limit, and never
+        # rested again.
+        orders, serial, rested, over_limit = [], 0, [], 0
+        for step in range(149):
+            days = 45 - step / 4
+            fm = days_out(days, p_true=0.98)
+            target = plan(fm, BUDGET_BOOK, resting=orders)
+            target = around_kept_bid(target, orders, fm, BUDGET_BOOK, Position(), CFG, True)
+            intents = by_slot(target)
+            actions = reconcile(target, orders, fm, Position(), CFG)
+            cancelled = {i for a in actions if isinstance(a, Cancel) for i in a.order_ids}
+            for o in orders:
+                if o.slot is Slot.LONG_BID and o.id in cancelled and Slot.LONG_BID in intents:
+                    why = keep_failure(o, intents[Slot.LONG_BID], target, fm, Position(), CFG)
+                    over_limit += why == "over the return limit"
+            orders = [o for o in orders if o.id not in cancelled]
+            for a in actions:
+                if isinstance(a, Place):
+                    serial += 1
+                    orders.append(live(f"r{serial}", a.intent.slot, a.intent.price,
+                                       a.intent.size))
+            low = next((o.price for o in orders if o.slot is Slot.LONG_BID), None)
+            if low is not None:
+                self.assertFalse(over_max_return(low, days / 365.25), days)
+            if not rested or rested[-1] != low:
+                rested.append(low)
+        prices = [p for p in rested if p is not None]
+        self.assertEqual(prices[0], 0.014)
+        self.assertEqual(prices, sorted(set(prices), reverse=True))
+        self.assertIsNone(rested[-1])
+        self.assertEqual(rested.count(None), 1)
+        self.assertGreaterEqual(over_limit, 3)
+
+    def test_a_market_is_read_with_the_time_its_end_date_leaves(self):
+        row = {"condition_id": CID, "slug": "", "question": "", "p_true": 0.98,
+               "naked_budget_usd": 25.0, "capital_usd": None, "paused": 0, "naked_paused": 0,
+               "end_date": (NOW + timedelta(days=30)).isoformat(),
+               "metrics": json.dumps(METRICS)}
+        fm = reward_farmer.farm_market(row, INFO, CFG, NOW)
+        self.assertAlmostEqual(fm.zones.years_left, 30 / 365.25)
+        self.assertEqual(reward_farmer.farm_market(row, INFO, CFG, NOW + timedelta(days=31))
+                         .zones.years_left, 0.0)
 
 
 class BackoffTest(unittest.TestCase):
@@ -1773,7 +1998,7 @@ class FarmerHarness(unittest.TestCase):
         self.ui = farm_db.open_db(self.path)
         self.addCleanup(self.ui.close)
         farm_db.store_scan(self.ui, [farm_db.ScanRow(
-            CID, "test-market", "Test?", (NOW + timedelta(days=100)).isoformat(), 1.0,
+            CID, "test-market", "Test?", self.end_date().isoformat(), 1.0,
             json.dumps(METRICS),
         )], [CID], NOW, prior=fill_cost.prior_to_json(PRIOR))
         farm_db.approve_market(self.ui, CID, 0.995, 25.0, now=NOW)
@@ -1795,6 +2020,12 @@ class FarmerHarness(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.args = build_parser().parse_args(["--db", self.path, "--interval", "0.01"])
+
+    @staticmethod
+    def end_date(days=100):
+        """An end date this many days from today. The farmer reads the clock,
+        and what a longshot bid may rest at turns on the time left."""
+        return datetime.now(timezone.utc) + timedelta(days=days)
 
     def fake_read(self, http, condition_id, fav_token_id, now, floor):
         """A read of self.history's History and a new tape of self.sweeps."""
@@ -2209,9 +2440,9 @@ class FarmerCycleTest(FarmerHarness):
                          [farm_db.stamp(now - timedelta(days=6))])
 
 
-class FloorDwellFarmerTest(FarmerHarness):
-    """The farmer tracks each market's floor score and seeds it at start. On
-    FLOOR_BOOK a $0.30 budget buys 300 floor shares."""
+class FreeDwellFarmerTest(FarmerHarness):
+    """The farmer watches each market's midpoint and seeds the watch at
+    start. On FLOOR_BOOK a $0.30 budget buys 300 shares at 0.1c."""
 
     def setUp(self):
         super().setUp()
@@ -2228,22 +2459,23 @@ class FloorDwellFarmerTest(FarmerHarness):
 
     def planned(self, farmer):
         """One cycle: the longshot bid target, the favorite bid target's size,
-        and whether the farmer published the floor as free."""
+        and whether the farmer published the longshot bid as free of the
+        naked budget."""
         farmer.cycle()
         slots = self.farm_state()[1]
         low, fav = slots["LONG_BID"]["target"], slots["FAV_BID"]["target"]
         return (low and (low["price"], low["size"]), fav and fav["size"],
-                slots["LONG_BID"]["floor_free"])
+                slots["LONG_BID"]["budget_free"])
 
     def test_a_market_with_no_midpoint_history_starts_under_its_budget(self):
-        # 300 floor shares balance 507 of the 512.82 favorite shares $500 buys
-        # at 97.5c.
+        # 300 shares at 0.1c balance 507 of the 512.82 favorite shares $500
+        # buys at 97.5c.
         low, fav_size, free = self.planned(self.started_farmer())
         self.assertEqual(low, (0.001, 300.0))
         self.assertEqual(fav_size, 507.0)
         self.assertFalse(free)
 
-    def test_a_steady_last_run_frees_the_floor_at_the_first_cycle(self):
+    def test_a_steady_last_run_frees_the_bid_at_the_first_cycle(self):
         self.record_mids([0.99] * 13)
         low, fav_size, free = self.planned(self.started_farmer())
         self.assertEqual(low[0], 0.001)
@@ -2251,28 +2483,57 @@ class FloorDwellFarmerTest(FarmerHarness):
         self.assertEqual(fav_size, round_size_down(500.0 / 0.975))
         self.assertTrue(free)
 
-    def test_a_dip_in_the_last_run_keeps_the_floor_under_its_budget(self):
+    def test_the_farmer_publishes_the_return_the_longshot_bid_offers(self):
+        # The market's row ends 100 days from today, where 0.1c offers a
+        # favorite buyer 0.37% a year.
+        farmer = self.started_farmer()
+        farmer.cycle()
+        low = self.farm_state()[1]["LONG_BID"]
+        self.assertAlmostEqual(low["fill_return"],
+                               reward_screener.fill_return(0.001, 100 / 365.25), places=5)
+        self.assertAlmostEqual(low["fill_return"], 0.0037, places=4)
+
+    def test_a_dip_in_the_last_run_keeps_the_bid_under_its_budget(self):
         self.record_mids([0.99] * 8 + [0.96] + [0.99] * 4)
         low, fav_size, free = self.planned(self.started_farmer())
         self.assertEqual(low, (0.001, 300.0))
         self.assertFalse(free)
 
-    def test_one_cycle_under_the_bound_puts_the_floor_back_under_its_budget(self):
+    def test_one_cycle_under_the_test_puts_the_bid_back_under_its_budget(self):
         self.record_mids([0.99] * 13)
         farmer = self.started_farmer()
         self.assertTrue(self.planned(farmer)[2])
         # BUDGET_BOOK's midpoint is 0.96, where a 0.1c share scores nothing.
         self.book = BUDGET_BOOK
-        self.assertFalse(self.planned(farmer)[2])
+        self.planned(farmer)
         self.book = FLOOR_BOOK
         low, fav_size, free = self.planned(farmer)
         self.assertEqual(low, (0.001, 300.0))
         self.assertFalse(free)
-        # Ten minutes of the score holding, and the floor is free again. The
-        # favorite bid resting is within keep of the best, so nothing moves.
+        # Once that cycle is over ten minutes old the bid is free again.
         managed = farmer.markets[CID]
-        managed.floor_since -= timedelta(seconds=reward_farmer.FLOOR_DWELL_S)
+        ago = timedelta(seconds=reward_farmer.FREE_DWELL_S + 1)
+        managed.mid_watch = reward_farmer.MidWatch(
+            managed.mid_watch.since - ago,
+            tuple((at - ago, mid) for at, mid in managed.mid_watch.mids))
         self.assertTrue(self.planned(farmer)[2])
+
+
+class ReturnLimitFarmerTest(FarmerHarness):
+    def test_the_farmer_reads_the_time_left_from_the_end_date_each_cycle(self):
+        # The market's row ends 100 days from today. With its end date moved
+        # to 20 days from today the 1.4c bid offers over the limit.
+        self.book = BUDGET_BOOK
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[1]["LONG_BID"]["target"]["price"], 0.014)
+        self.ui.execute("UPDATE markets SET end_date = ? WHERE condition_id = ?",
+                        (self.end_date(20).isoformat(), CID))
+        self.ui.commit()
+        farmer.cycle()
+        low = self.farm_state()[1]["LONG_BID"]
+        self.assertEqual(low["target"]["price"], 0.009)
+        self.assertEqual((low["decision"], low["reason"]), ("replace", "over the return limit"))
 
 
 class BuyTapeFarmerTest(FarmerHarness):
@@ -2492,7 +2753,7 @@ class LiveFarmerTest(FarmerHarness):
         super().setUp()
         metrics = {"market": {**METRICS["market"], "fav_token_id": FAV2, "slug": "other-market"}}
         farm_db.store_scan(self.ui, [farm_db.ScanRow(
-            CID2, "other-market", "Other?", (NOW + timedelta(days=100)).isoformat(), 1.0,
+            CID2, "other-market", "Other?", self.end_date().isoformat(), 1.0,
             json.dumps(metrics),
         )], [CID, CID2], NOW)
         farm_db.approve_market(self.ui, CID2, 0.995, 25.0, now=NOW)

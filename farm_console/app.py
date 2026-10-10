@@ -385,7 +385,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
             "queue_mode": mode, "skipped": skipped,
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
             "ev": views.ev_check(market.metrics, forms.parse_p_true(values["p_true"]),
-                                 values["naked_budget"], ev_margin),
+                                 values["naked_budget"], ev_margin,
+                                 views.years_left(market, now)),
             "p_true_start": views.p_true_start(market.metrics),
             "ev_margin": ev_margin, "farmer_capital": effective(conn, "capital"),
             "values": values, "errors": errors or {},
@@ -492,7 +493,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
         with closing(connect()) as conn:
             market = find(conn, condition_id)
             ev = views.ev_check(market.metrics, forms.parse_p_true(p_true), naked_budget,
-                                effective(conn, "ev_margin"))
+                                effective(conn, "ev_margin"), views.years_left(market, clock()))
         return templates.TemplateResponse(request, "partials/review_ev.html", {"ev": ev})
 
     @app.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
