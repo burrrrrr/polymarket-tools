@@ -48,8 +48,11 @@
       </div>
       <div class="stack" style="gap: 6px">
         <span class="lbl">Naked budget{{ tip('naked_budget') }}</span>
-        <span class="mono" style="font-size: 13px">{{ c.naked_used_usd | usd }} / {{ c.budget_usd | usd }}</span>
+        <span class="mono" style="font-size: 13px">{{ c.budget_used_usd | usd }} / {{ c.budget_usd | usd }}</span>
         <div class="bar"><div class="naked" style="width: {{ c.naked_pct }}%"></div></div>
+        {%- if c.floor_bid_usd %}
+        <span class="small muted">{{ c.floor_bid_usd | usd }} at the 0.1c floor, outside the budget</span>
+        {%- endif %}
       </div>
     </div>
     {%- endif %}

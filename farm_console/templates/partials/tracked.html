@@ -11,7 +11,7 @@
         <td class="mono c-fav">{% if m.fav_bid %}{{ m.fav_bid.price | cents }} × {{ m.fav_bid.size | shares }}{% else %}none{% endif %}</td>
         <td class="mono c-long">{% if m.long_bid %}{{ m.long_bid.price | cents }} × {{ m.long_bid.size | shares }}{% else %}none{% endif %}</td>
         <td class="mono">{{ '%.1f' % m.q1 }} / {{ '%.1f' % m.q2 }}</td>
-        <td class="mono">{{ m.naked_used_usd | usd }}<br><span class="small muted">of ${{ '%g' % m.budget_usd }}</span></td>
+        <td class="mono">{{ m.naked_used_usd | usd }}<br><span class="small muted">{{ m.budget_used_usd | usd }} of ${{ '%g' % m.budget_usd }} budget</span></td>
       </tr>
       {%- else %}
       <tr><td colspan="7" class="muted">No approved markets. Approve one from the <a href="/review">review queue</a>.</td></tr>

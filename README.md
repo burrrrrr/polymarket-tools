@@ -468,11 +468,13 @@ the longshot midpoint. Above a 0.90 midpoint Polymarket only pays for
 two-sided liquidity, so the longshot bid exists to make the favorite bid
 score. Each market lands in one of two modes:
 
-- `floor`: the longshot bid scores at 0.2c or less, and the shares that
-  balance the favorite bid there fit the naked budget, so its fill risk is
-  negligible.
+- `floor`: the longshot bid rests at 0.1c. Where a share there scores at
+  least 0.002 the bid is sized to balance the favorite bid whatever that
+  costs. The naked budget does not limit it: a fill there is rare and costs
+  a thousandth of a dollar a share.
 - `budget`: the longshot bid must sit higher to score or to fit the budget.
-  Its capital is naked risk, which you cap per market when you approve it.
+  Its capital is naked risk, which you cap per market when you approve it,
+  and the favorite bid shrinks to what the budget balances.
 
 `reward_farmer.py` reads the approved rows. The screener never changes
 your decisions, so rescanning is always safe.
@@ -528,17 +530,23 @@ Key `scan` options:
 - `--max-lead` (0.005) is the most the favorite bid may sit above the best bid
   already in the book. 0 joins the best bid. The bid also stays one tick under
   the lowest ask.
-- `--naked-budget` (10) is the USD the longshot bid may cost. The longshot
-  bid takes the cheapest price whose size, enough to balance the favorite
-  bid's score and at least the reward minimum, fits this budget. A cheaper
-  bid sits deeper in the book, behind more longshot bids, so it fills less
-  often. Set it to the budget you would approve with, since the farmer prices
-  the bid the same way within the approved budget.
+- `--naked-budget` (10) is the USD a longshot bid above the 0.1c floor may
+  cost. Where a 0.1c share scores at least 0.002 (`FLOOR_MIN_SCORE`), the bid
+  rests there, sized to balance the favorite bid's score whatever that costs,
+  at most $0.50 for each unit of that score.
+  Nearer the band edge the score runs to zero and the size that covers runs
+  to infinity, so there the budget limits the floor too, and the bid takes
+  the cheapest price whose size, enough to balance the favorite bid's score
+  and at least the reward minimum, fits this budget. A cheaper bid sits
+  deeper in the book, behind more longshot bids, so it fills less often. Set
+  it to the budget you would approve with, since the farmer prices the bid
+  the same way with the approved budget.
 - `--min-low-score` (0.10) caps the longshot bid's price. The bid never sits
-  above the cheapest price scoring at least this per share. When no cheaper
-  price balances the favorite bid within the budget, the bid sits at that
-  price, sized to the budget, and the favorite bid shrinks to the score that
-  reaches. A market with no such price gets no longshot bid.
+  above the cheapest price scoring at least this per share. When no price up
+  to that one balances the favorite bid within the budget, the bid sits where
+  the budget buys the most score, sized to the budget, and the favorite bid
+  shrinks to the score that reaches. A market with no such price gets no
+  longshot bid.
 - `--fragile-drop` (0.03) skips a market as a `fragile midpoint` when
   pulling its best bid of at least the reward minimum size would drop the
   midpoint by this much. When that maker leaves, our favorite bid follows the
@@ -578,14 +586,14 @@ farm horizon, so long-dated markets rank higher than short ones with the same
 yield.
 
 `approve` takes your probability that the favorite wins (`--p-true`) and the
-longshot risk budget (`--budget`, default $25). `--capital` sets the most USD
+longshot risk budget above the 0.1c floor (`--budget`, default $25). `--capital` sets the most USD
 the farmer may bid on this market's favorite, in place of the farmer's
 `--capital`.
 Without it, a market keeps the capital it already has, or uses the farmer's
 default if it has none. `approve` warns, but still approves,
 when the planned favorite bid is at or above `--p-true`, because a fill would
-lose money. It also warns when the planned longshot leg costs more than the
-budget.
+lose money. It also warns when a planned longshot leg above the floor costs
+more than the budget.
 
 #### Decided markets
 
@@ -675,9 +683,10 @@ minimum. The reward is a share of the pool, so each further share earns less.
 L grows with Q, because a larger inventory sells more slowly. So the size
 that nets the most can be under the capital, and the farmer rests that size
 at the price where it nets the most. Where the fills of all the capital cost
-nothing, no smaller size nets more. The naked budget is a separate limit: a
-bid it cannot balance shrinks to what it balances, whatever the capital. A
-scan sizes its bid at all of `--capital`.
+nothing, no smaller size nets more. The naked budget is a separate limit
+where the longshot bid sits above the 0.1c floor: a bid it cannot balance
+shrinks to what it balances, whatever the capital. A scan sizes its bid at
+all of `--capital`.
 
 A scan holds no shares and has no p_true, so it values a fill with an
 inventory of the bid alone and the book midpoint as p_true. The farmer's ask
@@ -798,12 +807,23 @@ four slots per market:
 | `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
 | `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
-| `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price whose size, enough to balance Q_one, keeps its cost plus any longshot shares held within the market's approved budget, and never above the cheapest price scoring `--min-low-score`. On a `floor` market that is 0.1c to 0.2c, where it almost never fills. On a `budget` market it rests higher. |
+| `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. On a `floor` market it rests at 0.1c, where it almost never fills, sized to balance Q_one whatever that costs: the approved budget does not limit a bid at the floor. On a `budget` market it rests higher, at the cheapest price whose size, enough to balance Q_one, keeps its cost plus any longshot shares held within the market's approved budget, and never above the cheapest price scoring `--min-low-score`. |
 
 Q_two comes from the covered `FAV_ASK` first, and only the remainder from the
-naked `LONG_BID`. When no price up to the cheapest one scoring
-`--min-low-score` balances Q_one within the budget, the `LONG_BID` sits at
-that price, sized to the budget, and the favorite bid shrinks to match, because score on one side beyond the other earns nothing. Near the
+naked `LONG_BID`. A `LONG_BID` at the 0.1c floor is sized without the budget
+where a share there scores at least 0.002 (`FLOOR_MIN_SCORE` in
+`reward_screener.py`), so the favorite bid is never trimmed for it. That
+bound is on the arithmetic, not the dollars: the size that covers is Q_one
+divided by the score, and at the band edge the score runs to zero. At the
+bound a floor bid costs $0.50 for each unit of score it covers, so at most
+half its score times its size, in dollars, for the favorite bid it balances. Under it
+the budget limits the floor like any other price. Once a longshot
+bid has filled, the budget, less the shares held at cost, limits every price,
+the floor too, until `LONG_ASK` has sold them: the exit adds to Q_one, and a
+floor bid sized to balance it would grow with every fill. When no price up to
+the cheapest one scoring `--min-low-score` balances Q_one within the budget,
+the `LONG_BID` sits at the price where the budget buys the most score, sized
+to the budget, and the favorite bid shrinks to match, because score on one side beyond the other earns nothing. Near the
 edge of the reward band a small move of the midpoint changes the
 `LONG_BID`'s score, and so its size, a lot, so it is replaced more often
 there. At 0.1c that only moves it further back in the queue. A bid smaller than the market's reward minimum size is dropped,
@@ -903,15 +923,19 @@ next farmer starts, so it does not stop that farmer.
 - `--capital` caps each market's favorite exposure. Favorite shares already
   held count against it at cost. The favorite bid rests at the size at or
   under what is left that nets the most.
-- The approved budget caps the naked longshot leg: the resting longshot bid
-  plus longshot shares held, at cost.
+- The approved budget caps the naked longshot leg above the 0.1c floor: a
+  resting longshot bid above the floor plus longshot shares held, at cost. A
+  longshot bid at the floor, where a share scores at least 0.002, is outside
+  it until a longshot bid fills. While the shares from a fill rest an exit,
+  the budget limits the floor too.
 - A longshot fill (your longshot shares went up) prints an `ALERT` and pauses
   the longshot bid for `--naked-cooldown` seconds. Without it, the favorite
   bid shrinks to whatever the covered favorite ask still balances.
 - An order that is still close to its target stays in place. It must sit on
   the current tick, score at least `--keep-ratio` of the target, keep a size
   within -20% and +25% of the target, and stay within the price cap or
-  budget. Otherwise it is replaced. A favorite bid is judged by its net as
+  budget, which a longshot bid resting at the floor is not held to. Otherwise
+  it is replaced. A favorite bid is judged by its net as
   it rests, at its own price and size, instead of its score and the target's
   size. It stays while its price is still a candidate, its net trails the
   best bid's by no more than `1 - --keep-ratio` of it (or $0.02/day, if
@@ -1071,7 +1095,7 @@ Pages:
 
 | Page | Shows | Actions |
 | --- | --- | --- |
-| Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids against the budgets, farm inventory, the screener's $/day estimate, today's earnings), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
+| Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids and the part of them the budgets limit, farm inventory, the screener's $/day estimate, today's earnings), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
 | Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode, text in the question or slug, status, and minimum days to the farmer's cutoff | Run a scan |
 | Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures (gross, fills/day, fill cost and net APR), the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, and capital; reject with a note; retire an approved market; re-approve a retired one |
 | Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, edit p_true and budget, retire |
@@ -1109,8 +1133,9 @@ rows and its funnel in one transaction and never changes your decisions.
   fills come from the history the scan stored and the stored fill prior. A
   market the scan did not read is valued on the prior alone, and the preview
   says so; with no prior stored yet, it says to run a scan. That score is measured against the midpoint
-  the capped bid creates. It also warns when your naked budget is below the
-  planned longshot leg, which the scan priced within its own naked budget.
+  the capped bid creates. It also warns when your naked budget is below a
+  planned longshot leg above the floor, which the scan priced within its own
+  naked budget.
   It uses the effective
   `ev_margin`: your override, else the farmer's last value, else the default.
 - **Pause and naked leg** set `paused` or `naked_paused` to the level the
@@ -1169,7 +1194,8 @@ that show that market reload at once. There is no client-side state and no
 chart JavaScript: the charts are SVG drawn on the server.
 
 The alerts come from a rule table in `farm_console/views.py`: cooldown, below
-range, paused, naked budget at 99% or more, a favorite bid scoring under 0.10,
+range, paused, naked budget 99% or more used with no floor bid resting free
+of it, a favorite bid scoring under 0.10,
 a slot in backoff, a longshot-bid fill in the last 24 hours, and the farmer not
 running. The farmer counts as not running when its last cycle is older than
 three intervals, or when it has stopped.

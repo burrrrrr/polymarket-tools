@@ -78,6 +78,12 @@ def state(cid, phase="QUOTING", reason="", until=None, mid=0.99, naked_used=0.5,
     )
 
 
+def holding_long(shares, avg):
+    """A farm_state position with these longshot shares above the baseline."""
+    return {"wallet": {"fav": 0.0, "long": shares}, "baseline": {"fav": 0.0, "long": 0.0},
+            "farm": {"fav": 0.0, "long": shares}, "avg_cost": {"fav": 0.0, "long": avg}}
+
+
 def status(last_cycle=NOW, interval=5.0, stopped=None, mode="dry"):
     return FarmerStatus(mode, 1, NOW - timedelta(hours=1), last_cycle, interval, False, 1,
                         CONFIG, stopped)
@@ -121,10 +127,49 @@ class AlertRuleTest(unittest.TestCase):
                                     [market(A, "a")])), ["Paused"])
 
     def test_budget_bound_at_99_percent_not_below(self):
-        bound = snap([state(A, naked_used=24.75)], [market(A, "a", budget=25.0)])
-        under = snap([state(A, naked_used=24.7)], [market(A, "a", budget=25.0)])
+        # A longshot bid at 2c: 1,237.5 shares are $24.75 and 1,235 are $24.70.
+        bound = snap([state(A, slots=quoting_slots(long=(0.02, 1237.5)))],
+                     [market(A, "a", budget=25.0)])
+        under = snap([state(A, slots=quoting_slots(long=(0.02, 1235.0)))],
+                     [market(A, "a", budget=25.0)])
         self.assertEqual(kinds(bound), ["Budget bound"])
+        self.assertIn("uses $24.75 of its $25.00 budget", views.alerts(bound, NOW)[0].text)
         self.assertEqual(kinds(under), [])
+
+    def test_a_floor_bid_over_the_budget_is_not_budget_bound(self):
+        # 30,000 shares at 0.1c are $30. The $25 budget does not limit a bid
+        # at the floor.
+        over = state(A, naked_used=30.0, slots=quoting_slots(long=(0.001, 30000.0)))
+        self.assertEqual(kinds(snap([over], [market(A, "a", budget=25.0)])), [])
+
+    def test_a_floor_bid_scoring_under_the_bound_counts_against_the_budget(self):
+        # A floor share scoring 0.0015 is under the 0.002 the farmer needs to
+        # size a floor bid without the budget, so this $25 bid is one the
+        # budget cut short. One scoring 0.007 is free of the budget.
+        slots = quoting_slots(long=(0.001, 25000.0))
+        slots["LONG_BID"]["live_score"] = 0.0015
+        found = views.alerts(snap([state(A, slots=slots)], [market(A, "a", budget=25.0)]), NOW)
+        self.assertEqual([a.kind for a in found], ["Budget bound"])
+        self.assertIn("uses $25.00 of its $25.00 budget", found[0].text)
+        slots["LONG_BID"]["live_score"] = 0.007
+        self.assertEqual(kinds(snap([state(A, slots=slots)], [market(A, "a", budget=25.0)])),
+                         [])
+
+    def test_longshot_shares_held_count_against_the_budget(self):
+        # 20 shares held at $1 and a 2c bid for $5 use the whole $25.
+        above = state(A, position=holding_long(20.0, 1.0),
+                      slots=quoting_slots(long=(0.02, 250.0)))
+        self.assertEqual(kinds(snap([above], [market(A, "a", budget=25.0)])), ["Budget bound"])
+        # 30 shares at $1 are over the $25 but under the 50-share minimum, so
+        # no exit rests for them and the floor bid stays free of the budget.
+        dust = state(A, position=holding_long(30.0, 1.0))
+        self.assertEqual(kinds(snap([dust], [market(A, "a", budget=25.0)])), [])
+        # 60 shares at 50c rest an exit, so the budget limits the floor bid
+        # too: $30 held and its $0.50.
+        exit_rests = snap([state(A, position=holding_long(60.0, 0.5))],
+                          [market(A, "a", budget=25.0)])
+        self.assertEqual(kinds(exit_rests), ["Budget bound"])
+        self.assertIn("uses $30.50 of its $25.00 budget", views.alerts(exit_rests, NOW)[0].text)
 
     def test_low_score_fav_bid_under_ten_percent(self):
         low = snap([state(A, slots=quoting_slots(fav_score=0.065))], [market(A, "a")])
@@ -190,6 +235,7 @@ class TotalsTest(unittest.TestCase):
         self.assertEqual((t.quoting, t.approved), (2, 3))
         self.assertAlmostEqual(t.fav_bid_usd, 0.98 * 100 + 0.90 * 10)
         self.assertAlmostEqual(t.naked_usd, 0.001 * 500 * 2 + 0.02 * 100)
+        self.assertAlmostEqual(t.naked_counted_usd, 0.02 * 100)
         self.assertEqual(t.naked_budget_usd, 55)
         self.assertAlmostEqual(t.inventory_usd, 3 * 6.0 * 0.95)
         self.assertEqual(t.est_daily_usd, 15)
@@ -276,6 +322,24 @@ class CardsTest(unittest.TestCase):
         self.assertEqual([m.kind for m in c.band.marks], ["fav_bid", "mid", "long_bid"])
         self.assertEqual((c.fav_bid.price, c.long_bid.price), (0.98, 0.001))
 
+
+    def test_card_counts_what_the_naked_budget_limits(self):
+        # The farmer publishes everything at risk on the naked leg. A $30
+        # floor bid takes none of the $25 budget. A $10 bid at 2c takes $10,
+        # and 5 longshot shares held at $1 take $5 more. With 60 shares held,
+        # an exit rests and the floor bid counts too.
+        def figures(**shown):
+            c = views.card(market(A, "a", budget=25.0), state(A, **shown), status(), NOW)
+            return c.naked_used_usd, c.budget_used_usd, c.floor_bid_usd, c.naked_pct
+
+        self.assertEqual(figures(naked_used=30.0, slots=quoting_slots(long=(0.001, 30000.0))),
+                         (30.0, 0.0, 30.0, 0.0))
+        self.assertEqual(figures(naked_used=15.0, slots=quoting_slots(long=(0.02, 500.0)),
+                                 position=holding_long(5.0, 1.0)),
+                         (15.0, 15.0, 0.0, 60.0))
+        self.assertEqual(figures(naked_used=40.0, slots=quoting_slots(long=(0.001, 10000.0)),
+                                 position=holding_long(60.0, 0.5)),
+                         (40.0, 40.0, 0.0, 100.0))
 
     def test_card_shows_the_favorite_bid_economics_the_farmer_wrote(self):
         slots = quoting_slots()
@@ -622,6 +686,31 @@ class RoutesTest(Console):
                 self.assertIn("The farmer is not running. It stopped", self.client.get(url).text)
         self.assertIn("figures are from the farmer's last cycle",
                       self.client.get("/partials/overview/kpis").text)
+
+    def test_a_floor_bid_over_the_budget_reads_as_outside_it(self):
+        # 30,000 shares at 0.1c are $30 against alpha's $25 budget.
+        over = state(A, naked_used=30.0, slots=quoting_slots(long=(0.001, 30000.0)))
+        self.publish(states=[over._replace(updated_at=self.now)])
+        self.assertNotIn("Budget bound", self.client.get("/partials/overview/alerts").text)
+        card = self.client.get("/partials/markets").text
+        self.assertIn("$0.00 / $25.00", card)
+        self.assertIn("$30.00 at the 0.1c floor, outside the budget", card)
+        self.assertIn("$0.00 of $25 budget", self.client.get("/partials/overview/tracked").text)
+        self.assertIn("$0.00 of it counts against $25.00 budget",
+                      self.client.get("/partials/overview/kpis").text)
+        self.assertIn("$0.00 of $25.00 budget; the floor bid is outside it",
+                      self.client.get(f"/markets/{A}").text)
+
+    def test_a_bid_above_the_floor_reads_against_the_budget(self):
+        above = state(A, naked_used=10.0, slots=quoting_slots(long=(0.02, 500.0)))
+        self.publish(states=[above._replace(updated_at=self.now)])
+        card = self.client.get("/partials/markets").text
+        self.assertIn("$10.00 / $25.00", card)
+        self.assertNotIn("outside the budget", card)
+        self.assertIn("$10.00 of $25 budget", self.client.get("/partials/overview/tracked").text)
+        self.assertIn("$10.00 of it counts against $25.00 budget",
+                      self.client.get("/partials/overview/kpis").text)
+        self.assertIn('$10.00 of $25.00 budget</span>', self.client.get(f"/markets/{A}").text)
 
     def test_paused_market_shows_alert_and_badge(self):
         self.publish(states=[state(A, "PAUSED", "paused by operator", slots={})

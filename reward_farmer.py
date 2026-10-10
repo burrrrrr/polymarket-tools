@@ -34,16 +34,20 @@ farmer rests on both sides, in four slots per market:
   FAV_ASK   favorite SELL, Q_two, covered by favorite shares. Exits favorite
             inventory above its average cost and frees the capital again.
   LONG_BID  longshot BUY, Q_two, naked. It exists only to make Q_one count.
-            It takes the cheapest price whose size covering the rest of Q_one
-            fits the market's naked_budget_usd, less longshot shares held, but
-            never above the cheapest price scoring --min-low-score: 0.1c-0.2c
-            on a FLOOR market, where it almost never fills, higher on a BUDGET
-            market.
+            On a FLOOR market it rests at 0.1c, where it almost never fills,
+            sized to cover the rest of Q_one whatever that costs: the
+            market's naked_budget_usd does not limit a bid at the floor. On
+            a BUDGET market, where a 0.1c share scores next to nothing, it
+            takes the cheapest price whose covering size fits the budget,
+            less longshot shares held, and never one above the cheapest price
+            scoring --min-low-score. Once a longshot bid has filled, the
+            budget less the shares held limits every price, the floor too,
+            until LONG_ASK has sold them.
 
 Q_two comes from the covered FAV_ASK first and only the remainder from the
-naked LONG_BID. When the budget leaves Q_two short, the favorite bid shrinks
-to match: score on one side beyond the other earns nothing and only ties up
-capital.
+naked LONG_BID. When the budget leaves the LONG_BID short of Q_one, the
+favorite bid shrinks to match: score on one side beyond the other earns
+nothing and only ties up capital.
 
 The farmer never buys at market. Every order is post-only, so any fill is a
 maker fill that captures spread, and every order is GTD, expiring at the
@@ -118,8 +122,8 @@ replacing it on every wiggle of the midpoint. A favorite bid is held to most
 of the best bid's net instead of the score, valued as it rests at its own
 price and size, and the orders that balance it are planned around the bid
 that stays rather than the target. A longshot bid is kept while it covers
-keep_ratio of the score it balances, up to twice it above the floor, at a
-price no higher than target or within two ticks of the min-score price. A
+keep_ratio of the score it balances, up to twice it above the lowest tick,
+at a price no higher than target or within two ticks of the min-score price. A
 favorite ask more than two ticks under its target is replaced although it
 scores more, so it follows a target that rises. Replacing an order loses its queue
 position, costs two API calls, and scores nothing for the ~30 seconds before
@@ -183,12 +187,14 @@ from reward_screener import (
     _make_output_safe,
     adjust_levels,
     adjusted_mid,
+    at_floor,
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
     fetch_levels,
     fetch_read,
     fetch_total_rates,
+    floor_free,
     floor_to_tick,
     get_with_retry,
     load_prior,
@@ -214,9 +220,11 @@ SIZE_LADDER = (1.0, 0.75, 0.5, 0.25, 0.125)
 # An order whose size left this band around the target gets replaced.
 KEEP_SIZE_RANGE = (0.8, 1.25)
 
-# A longshot bid above the floor covering more than this multiple of the score
-# it balances gets replaced, so a kept bid cannot ratchet up to the whole naked
-# budget where a fill costs real money; at 0.1c the extra cover costs cents.
+# A longshot bid above its market's lowest tick covering more than this multiple
+# of the score it balances gets replaced, so a kept bid cannot ratchet up to
+# the whole naked budget where a fill costs real money. At the lowest tick it
+# stays: at 0.1c the extra cover costs cents, and on a 1c tick one tick of
+# mid moves the cover by more than this multiple.
 LONG_COVER_MAX = 2.0
 
 # A longshot bid priced over target stays while it is within this many ticks
@@ -533,7 +541,9 @@ def capital_room(fm, position):
 
 
 def naked_room(fm, position):
-    """USD of longshot bid the budget still allows after longshot shares held."""
+    """USD of longshot bid the budget still allows after longshot shares held,
+    at cost. It does not limit a floor bid while the floor is free of the
+    budget (floor_free)."""
     return max(0.0, fm.naked_budget_usd - position.long_shares * position.long_avg)
 
 
@@ -582,9 +592,12 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     `levels` is the favorite book without our own resting orders. The bid
     starts at fav_size, or at all of capital_room without one. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
-    LONG_BID at the cheapest price that covers the rest within the budget, no
+    LONG_BID, at the floor whatever the rest costs where the floor scores, or
+    else at the cheapest price that covers the rest within the budget, no
     higher than the min_low_score price (longshot_bid), then the favorite bid
-    shrinks to whatever Q_two reached.
+    shrinks to whatever Q_two reached. While longshot shares rest an exit the
+    budget limits the floor too (floor_free), so a filled floor bid cannot
+    grow the next one.
     The LONG_BID is re-derived when the favorite bid is dropped, because the
     cheapest covering price depends on what it must cover. A bid that ends
     below the reward minimum size is dropped, because an order that does not
@@ -640,7 +653,8 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
         if not naked_allowed:
             return None
         return longshot_bid(levels, mid, v, tick, fm.min_size, q_one - q_two_covered,
-                            naked_room(fm, position), cfg.min_low_score)
+                            naked_room(fm, position), cfg.min_low_score,
+                            floor_free(position.long_shares, fm.min_size))
 
     low = long_bid(q_one_exits + fav_score * fav_size)
     q_two = q_two_covered + (low.score * low.size if low else 0.0)
@@ -798,6 +812,10 @@ def keep_failure(order, intent, target, fm, position, cfg):
     replaced only once it covers less than keep_ratio of the need. A bid
     priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
     price scoring min_low_score, the fill-risk bound the plan prices under.
+    The naked budget does not hold a floor bid while the floor is free of it
+    (floor_free). That bid stays whatever it costs, even once its share
+    scores too little for the plan to size a new one without the budget:
+    replacing it only to shrink it would cost 30 seconds of score.
     A favorite ask is judged by score too, but one more than
     ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
     """
@@ -845,7 +863,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "over the capital"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
         return "below the exit floor"
-    if order.slot is Slot.LONG_BID and order.price * order.size_remaining > naked_room(fm, position) + 1e-9:
+    free = at_floor(order.price) and floor_free(position.long_shares, fm.min_size)
+    if order.slot is Slot.LONG_BID and not free and (
+            order.price * order.size_remaining > naked_room(fm, position) + 1e-9):
         return "over the naked budget"
     return None
 

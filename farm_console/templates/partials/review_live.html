@@ -13,7 +13,7 @@
 <div class="note-box small">Enter your p_true to apply the EV cap. Until then the favorite bid is valued at the book midpoint, as the scan values it.</div>
 {%- endif %}
 {%- if budget_missing %}
-<div class="note-box small">Enter a naked budget. Until then the longshot bid is planned with $0, which also stops the favorite bid.</div>
+<div class="note-box small">Enter a naked budget. Until then a longshot bid above the 0.1c floor is planned with $0, which also stops the favorite bid it would balance.</div>
 {%- endif %}
 {%- if l.orders %}
 <div class="scroll">

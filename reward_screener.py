@@ -17,15 +17,17 @@ bid sits at the price where its rewards net of what its fills cost are
 highest (fill_cost.py has the model and the measurements).
 Polymarket only scores the two-sided minimum once the midpoint is above 0.90,
 so the longshot bid exists purely to make the favorite bid count. On a 0.001
-tick a longshot bid at 0.1c-0.2c almost never fills and costs nearly nothing,
-but it only scores if it sits inside the reward band. That splits markets
-into two modes:
+tick a longshot bid at 0.1c almost never fills and costs a thousandth of a
+dollar a share, but it only scores if it sits inside the reward band. That
+splits markets into two modes:
 
-  FLOOR   the longshot bid scores at <= 0.2c, and the size that balances the
-          favorite bid there fits the naked budget; its risk is noise.
+  FLOOR   the longshot bid rests at 0.1c. Where a share there scores at
+          least FLOOR_MIN_SCORE it is sized to balance the favorite bid
+          whatever that costs: the naked budget does not limit it.
   BUDGET  the longshot bid must sit higher to score or to fit the budget, at
           most at the cheapest price scoring min_low_score; the naked risk on
-          that leg is budgeted per market at approval time.
+          that leg is budgeted per market at approval time, and the favorite
+          bid shrinks to what the budget balances.
 
 Reward scoring follows Polymarket's published formula. An order at distance
 s from the adjusted midpoint scores S(v, s) = ((v - s) / v)^2 inside the max
@@ -126,8 +128,19 @@ HISTORY_THREADS = 4
 PRIOR_SAMPLE = 60
 FILLS_COST_TOO_MUCH = "fills cost more than the rewards"
 
-# A longshot bid at or below this price is the FLOOR mode.
-FLOOR_PRICE = 0.002
+# The longshot floor, 0.1c. A longshot bid at or below it is the FLOOR mode,
+# and the naked budget does not limit it where it scores (FLOOR_MIN_SCORE): a
+# fill there is rare and costs a thousandth of a dollar a share. A market on
+# a coarser tick has no floor.
+FLOOR_PRICE = 0.001
+# The least a floor share may score for its bid to be sized without the
+# budget. The covering size is need / score, and at the band edge the score
+# runs to zero (the edge itself scores a float-noise 1e-30). At 0.002 the
+# floor sits 4.5% of the band inside its edge, two to four ticks on the
+# bands in use, and the bid costs at most half a dollar for each unit of
+# score it covers: 0.5 x its score x its size for the favorite bid it
+# balances.
+FLOOR_MIN_SCORE = 0.002
 # The naked budget a scan prices each longshot bid within, and the one a new
 # review and the console's quotable check start with.
 DEFAULT_NAKED_BUDGET = 10.0
@@ -168,10 +181,12 @@ SCAN_HELP = {
     "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
                 "0 joins it",
     "min_low_score": "The longshot bid never sits above the cheapest price scoring this per "
-                     "share, and sits there when no cheaper price covers the favorite bid "
-                     "within the naked budget",
-    "naked_budget": "USD the longshot bid may cost. Each market's longshot bid is priced "
-                    "within it, as the farmer would with this budget approved",
+                     "share. Above the 0.1c floor it takes the cheapest price that covers "
+                     "the favorite bid within the naked budget, or else the price where the "
+                     "budget buys the most score",
+    "naked_budget": "USD a longshot bid above the 0.1c floor may cost. Each market's "
+                    "longshot bid is priced with it, as the farmer would with this budget "
+                    "approved",
     "min_rate": "Minimum daily reward pool in USD",
     "fragile_drop": "Skip a market whose midpoint falls this much once its best bid "
                       "leaves",
@@ -487,26 +502,68 @@ def created_mid(price, best_bid, best_ask):
     return (max(price, best_bid) + best_ask) / 2
 
 
-def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
-    """The naked longshot bid adding `need` to Q_two for at most `room` USD.
-    LongshotBid, or None when need is not positive or nothing fits.
+def at_floor(price):
+    """Whether a longshot bid at price is a floor bid."""
+    return price <= FLOOR_PRICE + 1e-9
+
+
+def floor_free(long_shares, min_size):
+    """Whether the naked budget leaves a market's floor bid alone: while the
+    market holds no longshot shares that rest an exit. A floor bid that
+    filled leaves such shares. Their exit adds to Q_one, and a floor bid
+    sized to balance that would grow with every fill. So the budget, less
+    the shares held at cost, then limits the floor like any other price."""
+    return long_shares < min_size
+
+
+def sized_without_budget(price, share_score, floor_is_free=True):
+    """Whether the naked budget leaves a longshot bid at price alone: a floor
+    bid whose share scores at least FLOOR_MIN_SCORE, while the floor is free
+    of the budget (floor_free)."""
+    return floor_is_free and at_floor(price) and share_score >= FLOOR_MIN_SCORE - 1e-9
+
+
+def budget_cost(price, size, share_score, floor_is_free=True):
+    """USD a longshot bid takes of the naked budget: its cost, or nothing
+    where it is sized without the budget (sized_without_budget)."""
+    return 0.0 if sized_without_budget(price, share_score, floor_is_free) else price * size
+
+
+def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, floor_is_free=True):
+    """The naked longshot bid adding `need` to Q_two. Above the floor it costs
+    at most `room` USD. LongshotBid, or None when need is not positive or
+    nothing fits.
 
     The bid never prices above the ceiling, the cheapest price scoring at
     least min_score. Up to the ceiling it takes the cheapest price whose
-    covering size, round_size_up(need / score) and at least min_size, costs at
-    most room. The cheaper the bid, the deeper it shows on the favorite's ask
-    side and the more No buyers fill ahead of it, so a 0.1c bid scoring 0.02
-    beats a 1.6c bid scoring 0.10. When no price up to the ceiling covers, the
-    bid goes to the price where the size room buys scores the most, ties to
-    the cheaper, and the caller trims the favorite bid to the Q_two that
-    reaches; None when room buys less than min_size there. Score per dollar
-    is U-shaped in price: 0.1c buys ten times the shares of 1c, so near the
-    band edge the floor with the whole room often beats the ceiling (Pfizer,
-    $10 at a 0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c
-    ceiling, 49.8 at 1c). Sitting at the ceiling there made the plan jump
-    between the floor and the ceiling as the need crossed what the floor
-    covers, replacing the bid every few cycles. With no ceiling under the
-    crossing limit there is no bid, even if a lower-scoring price could cover.
+    covering size, round_size_up(need / score) and at least min_size, it may
+    rest. The cheaper the bid, the deeper it shows on the favorite's ask side
+    and the more No buyers fill ahead of it, so a 0.1c bid scoring 0.02 beats
+    a 1.6c bid scoring 0.10.
+
+    A floor bid whose share scores at least FLOOR_MIN_SCORE may rest any size
+    (sized_without_budget): room does not limit it. So there the floor is the
+    bid whatever the need, the price cannot jump as the need grows, and the
+    caller never trims the favorite bid for it. FLOOR_MIN_SCORE bounds the
+    arithmetic, not the dollars: the covering size is need / score, and at
+    the band edge the score runs to zero.
+
+    Every other size must cost at most room: a bid above the floor, a floor
+    bid scoring under FLOOR_MIN_SCORE, and any bid while floor_is_free is
+    false (floor_free: the market holds longshot shares that rest an exit).
+    When no price up to the ceiling covers within room, the bid goes to the
+    price where the size room buys scores the most, ties to the cheaper, and
+    the caller trims the favorite bid to the Q_two that reaches; None when
+    room buys less than min_size there. Score per dollar is U-shaped in
+    price: 0.1c buys ten times the shares of 1c, so near the band edge the
+    floor with the whole room often beats the ceiling (Pfizer, $10 at a
+    0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c ceiling,
+    49.8 at 1c). Sitting at the ceiling there made the plan jump between the
+    floor and the ceiling as the need crossed what the floor covers,
+    replacing the bid every few cycles.
+
+    With no ceiling under the crossing limit there is no bid, even if a
+    lower-scoring price could cover.
 
     Near the band edge a small move of the midpoint changes the score, and so
     the covering size, a lot. The farmer keeps a resting bid while it still
@@ -533,7 +590,7 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score):
     for price, s in scored:
         if s > 0:
             size = max(min_size, round_size_up(need / s))
-            if size * price <= room + 1e-9:
+            if sized_without_budget(price, s, floor_is_free) or size * price <= room + 1e-9:
                 return LongshotBid(price, size, s)
     price, size, s = max(
         ((p, round_size_down(room / p), s) for p, s in scored if s > 0),
@@ -633,10 +690,11 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
 def plan_at(market, levels, config, fav_price):
     """Size our favorite bid at fav_price and price our longshot bid. QuotePlan or Skip.
 
-    The longshot bid is longshot_bid within config.naked_budget, covering the
-    favorite bid's score, as the farmer prices it. When the budget leaves it
-    short, the favorite bid shrinks to match, as the farmer's does: score
-    beyond the smaller side earns nothing.
+    The longshot bid is longshot_bid with config.naked_budget, covering the
+    favorite bid's score, as the farmer prices it with no longshot shares
+    held: at the floor whatever that costs, above it within the budget. When
+    the budget leaves it short, the favorite bid shrinks to match, as the
+    farmer's does: score beyond the smaller side earns nothing.
 
     A favorite bid above the best bid drags the midpoint up toward itself, so
     both legs are scored against the midpoint that includes it (QuotePlan.mid),
@@ -664,7 +722,7 @@ def plan_at(market, levels, config, fav_price):
         low_price=low.price,
         low_size=low.size,
         low_score=low.score,
-        mode=Mode.FLOOR if low.price <= FLOOR_PRICE + 1e-9 else Mode.BUDGET,
+        mode=Mode.FLOOR if at_floor(low.price) else Mode.BUDGET,
     )
 
 
@@ -1603,7 +1661,7 @@ def cmd_approve(args):
             f"Warning: planned favorite bid {plan['fav_bid_price'] * 100:.1f}c is "
             f"at or above p_true {args.p_true * 100:.1f}c; a fill would be -EV"
         )
-    low_capital = plan["low_size"] * plan["low_price"]
+    low_capital = budget_cost(plan["low_price"], plan["low_size"], plan.get("low_score", 0.0))
     if args.budget < low_capital - 1e-9:
         print(
             f"Warning: planned longshot leg ties up ${low_capital:.2f}, above the "
@@ -1678,7 +1736,8 @@ Examples:
     approve.add_argument("--p-true", type=float, required=True,
                          help="Your probability the favorite resolves YES")
     approve.add_argument("--budget", type=float, default=25.0,
-                         help="Naked USD risk allowed on the longshot leg (default: 25)")
+                         help="Naked USD risk allowed on the longshot leg above the 0.1c "
+                              "floor (default: 25)")
     approve.add_argument("--capital", type=float,
                          help="USD behind this market's favorite bid (default: keep the "
                               "current value, else the farmer's --capital)")

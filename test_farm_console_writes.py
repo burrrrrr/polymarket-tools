@@ -18,7 +18,16 @@ from farm_console.app import create_app, utc_now
 from farm_console.remote import Rules
 from farm_db import CommandKind
 from reward_screener import Levels, RewardMarket, ScreenConfig
-from test_farm_console import A, B, C, ORIGIN, Console, settle_total_rates
+from test_farm_console import (
+    A,
+    B,
+    C,
+    ORIGIN,
+    Console,
+    quoting_slots,
+    settle_total_rates,
+    state,
+)
 from test_triage import background, envelope, news
 
 # Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, so the longshot bid
@@ -501,7 +510,8 @@ class ReviewTest(Writes):
         self.assertNotEqual(re.findall(r"FAV_BID ([\d,.]+)</td>", full),
                             re.findall(r"FAV_BID ([\d,.]+)</td>", capped))
         self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
-        self.assertIn("Enter a naked budget", self.live(naked_budget="x"))
+        self.assertIn("Enter a naked budget. Until then a longshot bid above the 0.1c floor is "
+                      "planned with $0", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
         # Capped at 93.0c the bid scores 0.02, and at a 300% hurdle its fills
         # cost less than that earns. A 2.4c margin caps it at 92.6c, where it
@@ -814,7 +824,12 @@ class ReviewTest(Writes):
         self.assertIn(f"Longshot ${cost:,.2f} is over your $5.00 budget",
                       self.ev("0xddd", "97", "5"))
         self.assertNotIn("Longshot", self.ev("0xddd", "97", str(cost)))
-        self.assertIn("over your $0.00 budget", self.ev("0xeee", "99", "0"))
+
+    def test_ev_check_does_not_warn_of_a_budget_under_a_floor_bid(self):
+        # 0xeee plans its longshot bid at the 0.1c floor, which no budget limits.
+        plan = json.loads(self.row("0xeee")["metrics"])["plan"]
+        self.assertEqual(plan["low_price"], 0.001)
+        self.assertNotIn("Longshot", self.ev("0xeee", "99", "0"))
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
         from farm_console.app import utc_now
@@ -1135,7 +1150,9 @@ class NavAndAlertsTest(Writes):
         alerts = self.client.get("/partials/overview/alerts").text
         self.assertIn('<a href="/settings">Farmer status</a>', alerts)
         farm_db.set_approval(self.db, A, 0.99, 0.5, None, now=self.now)
-        self.publish()
+        # A longshot bid of 25 shares at 2c uses the whole $0.50.
+        above = state(A, slots=quoting_slots(long=(0.02, 25.0)))
+        self.publish(states=[above._replace(updated_at=self.now)])
         alerts = self.client.get("/partials/overview/alerts").text
         self.assertIn(f'<a href="/review/{A}">Edit budget</a>', alerts)
 

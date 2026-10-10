@@ -224,6 +224,73 @@ class BalancingTest(unittest.TestCase):
         q_one, q_two = q_sums(target)
         self.assertLessEqual(q_one, q_two + 1e-9)
 
+    def test_a_floor_long_bid_over_the_naked_budget_leaves_the_fav_bid_whole(self):
+        # The floor bid costs $0.44. Neither a $0.30 budget nor a $5 one
+        # that 10 longshot shares held at $1 have used up limits it. 10
+        # shares are under the 50-share minimum, so no exit rests for them.
+        used_up = market(naked_budget_usd=5.0), Position(long_shares=10.0, long_avg=1.0)
+        for fm, position in ((market(naked_budget_usd=0.3), Position()), used_up):
+            with self.subTest(budget=fm.naked_budget_usd):
+                target = quotes_at(fm, FLOOR_BOOK, position, CFG, True, 0.979)
+                intents = by_slot(target)
+                fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+                self.assertEqual((fav.price, fav.size), (0.979, 510.72))
+                self.assertEqual((low.price, low.size), (0.001, 435.17))
+                q_one, q_two = q_sums(target)
+                self.assertGreaterEqual(q_two, q_one)
+
+    def test_the_long_bid_stays_at_the_floor_as_the_fav_bid_outgrows_the_budget(self):
+        # $1 buys 1,000 shares at 0.1c, which balance 1,173 favorite shares
+        # at 97.9c. The longshot bid stays at the floor and covers the whole
+        # favorite bid on both sides of that size.
+        for capital in (100.0, 1000.0, 1200.0, 20000.0):
+            with self.subTest(capital=capital):
+                fm = market(capital=capital, naked_budget_usd=1.0)
+                target = quotes_at(fm, FLOOR_BOOK, Position(), CFG, True, 0.979)
+                intents = by_slot(target)
+                self.assertEqual(intents[Slot.LONG_BID].price, 0.001)
+                self.assertEqual(intents[Slot.FAV_BID].size, round_size_down(capital / 0.979))
+                q_one, q_two = q_sums(target)
+                self.assertGreaterEqual(q_two, q_one)
+
+    def test_a_floor_scoring_under_the_bound_is_limited_by_the_budget(self):
+        # At a 0.9655 midpoint with v 3.5c a 0.1c share scores 0.0018, just
+        # under the 0.002 a floor bid needs to be sized without the budget, and
+        # covering the 523.56 favorite shares $500 buys would take 139,700
+        # of them. The longshot bid rests at 1.1c within its $25, and the
+        # favorite bid is trimmed to match.
+        book = Levels(bids=[(0.961, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+        fm = market(p_true=0.98, naked_budget_usd=25.0)
+        intents = by_slot(quotes_at(fm, book, Position(), CFG, True, 0.955))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.011, 2272.72))
+        self.assertLessEqual(low.price * low.size, 25.0)
+        self.assertEqual(fav.size, 500.73)
+        self.assertAlmostEqual(fav.score * fav.size, low.score * low.size,
+                               delta=fav.score * 0.01)
+
+    def test_a_filled_floor_bid_does_not_grow_the_next_one(self):
+        # At a 0.9495 midpoint with v 5.5c the floor scores 0.01, and 36,402.87
+        # shares, $36.40, cover a 531.91-share favorite bid at 94c. Once they
+        # fill, their exit at 6c scores 24,900 of Q_one, which a floor bid
+        # sized without the budget would cover with 2.5 million shares. The
+        # budget, less the $36.40 held, limits the floor again: nothing on
+        # $10, the $63.60 left on $100.
+        book = Levels(bids=[(0.945, 1000.0)], asks=[(0.954, 1000.0)], tick=0.001)
+        fm = market(naked_budget_usd=10.0, v=0.055, p_true=0.98)
+        first = by_slot(quotes_at(fm, book, Position(), CFG, True, 0.94))
+        self.assertEqual(first[Slot.FAV_BID].size, 531.91)
+        self.assertEqual((first[Slot.LONG_BID].price, first[Slot.LONG_BID].size),
+                         (0.001, 36402.87))
+        filled = Position(long_shares=36402.87, long_avg=0.001)
+        after = by_slot(quotes_at(fm, book, filled, CFG, True, 0.94))
+        self.assertEqual(set(after), {Slot.LONG_ASK})
+        self.assertGreater(after[Slot.LONG_ASK].score * after[Slot.LONG_ASK].size, 24000.0)
+        roomy = by_slot(quotes_at(fm._replace(naked_budget_usd=100.0), book, filled, CFG, True,
+                                  0.94))
+        self.assertEqual((roomy[Slot.LONG_BID].price, roomy[Slot.LONG_BID].size),
+                         (0.001, 63597.13))
+
     def test_short_budget_never_lifts_long_bid_above_the_min_score_price(self):
         # From $10.24 up, a price between 2.1c and 3.9c would balance the full
         # favorite bid within the budget. The bid stays at 1.7c, the cheapest
@@ -458,6 +525,57 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(keep_failure(order, low, target, fm, Position(), CFG),
                          "over twice the cover needed")
 
+    def test_a_floor_long_bid_over_the_naked_budget_stays(self):
+        # 675.82 shares at 0.1c cost $0.68: over a $0.50 budget, and over a
+        # $25 one that 30 longshot shares held at $1 have used up. 30 shares
+        # are under the 50-share minimum, so no exit rests for them.
+        order = live("b", Slot.LONG_BID, 0.001, 675.82)
+        low = self.intents[Slot.LONG_BID]
+        tight = market(naked_budget_usd=0.5)
+        self.assertIsNone(keep_failure(order, low, self.target, tight, Position(), CFG))
+        dust = Position(long_shares=30.0, long_avg=1.0)
+        self.assertIsNone(keep_failure(order, low, self.target, self.fm, dust, CFG))
+
+    def test_a_floor_long_bid_is_held_to_the_budget_while_longshot_shares_await_an_exit(self):
+        # 100 longshot shares held rest an exit. At 30c they have used up the
+        # $25, and the budget limits the floor bid as it limits any other. At
+        # 10c they leave $15, which the $0.68 bid fits.
+        order = live("b", Slot.LONG_BID, 0.001, 675.82)
+        low = self.intents[Slot.LONG_BID]
+        used_up = Position(long_shares=100.0, long_avg=0.3)
+        self.assertEqual(keep_failure(order, low, self.target, self.fm, used_up, CFG),
+                         "over the naked budget")
+        room_left = Position(long_shares=100.0, long_avg=0.1)
+        self.assertIsNone(keep_failure(order, low, self.target, self.fm, room_left, CFG))
+
+    def test_a_long_bid_above_the_floor_over_the_naked_budget_is_replaced(self):
+        # On BUDGET_BOOK the bid rests at 1.4c x 1785.71, all of its $25. A
+        # $20 budget is $5 short of it, and so is $25 with 10 longshot shares
+        # held at $1.
+        fm = market(p_true=0.98, naked_budget_usd=25.0)
+        target = plan(fm, BUDGET_BOOK)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.014, 1785.71))
+        order = live("b", Slot.LONG_BID, low.price, low.size)
+        self.assertIsNone(keep_failure(order, low, target, fm, Position(), CFG))
+        self.assertEqual(
+            keep_failure(order, low, target, fm._replace(naked_budget_usd=20.0), Position(),
+                         CFG),
+            "over the naked budget")
+        held = Position(long_shares=10.0, long_avg=1.0)
+        self.assertEqual(keep_failure(order, low, target, fm, held, CFG),
+                         "over the naked budget")
+
+    def test_a_long_bid_at_the_lowest_price_of_a_coarse_tick_is_held_to_the_budget(self):
+        # On a 1c tick the lowest price is 1c, ten times the floor. 675.82
+        # shares there cost $6.76, over a $5 budget.
+        order = live("b", Slot.LONG_BID, 0.01, 675.82)
+        coarse = market(tick=0.01, naked_budget_usd=5.0)
+        self.assertEqual(
+            keep_failure(order, self.intents[Slot.LONG_BID], self.target, coarse, Position(),
+                         CFG),
+            "over the naked budget")
+
     def test_a_long_bid_up_to_two_ticks_over_the_min_score_price_stays(self):
         # At a 0.9355 midpoint with v 6.5c the cheapest longshot price scoring
         # 0.1 is 2.1c, and the plan covers at 1.4c. A bid placed when the mid
@@ -533,20 +651,21 @@ class ReconcileTest(unittest.TestCase):
             "outside the bid candidates")
 
     def test_a_bid_the_budget_cannot_balance_is_held_to_what_it_balances(self):
-        # A $0.30 naked budget trims the favorite bid to what the floor bid
-        # covers, so the plan rests 225.33 shares at 98.5c and 324.48 at the
-        # target's 98.0c, and 98.5c nets within a cent of the best.
-        fm = market(naked_budget_usd=0.3)
+        # On BUDGET_BOOK a $10 naked budget trims the favorite bid to what
+        # the longshot bid above the floor covers, so the plan rests 124.91
+        # shares at the target's 95.5c and 131.68 at 95.4c, and 95.4c nets
+        # within 3% of the best.
+        fm = market(p_true=0.98, naked_budget_usd=10.0)
 
         def keep(size):
-            order = live("a", Slot.FAV_BID, 0.985, size)
-            target = plan(fm, FLOOR_BOOK, resting=[order])
+            order = live("a", Slot.FAV_BID, 0.954, size)
+            target = plan(fm, BUDGET_BOOK, resting=[order])
             fav = by_slot(target)[Slot.FAV_BID]
-            self.assertEqual((fav.price, fav.size), (0.98, 324.48))
+            self.assertEqual((fav.price, fav.size), (0.955, 124.91))
             return keep_failure(order, fav, target, fm, Position(), CFG)
 
-        self.assertIsNone(keep(225.33))
-        self.assertEqual(keep(324.48), "size out of range")
+        self.assertIsNone(keep(131.68))
+        self.assertEqual(keep(170.0), "size out of range")
 
     def test_a_bid_over_the_capital_is_replaced(self):
         # $500 buys 507.61 shares at 98.5c. A bid a quarter over the capital
@@ -1086,13 +1205,21 @@ class SizeChoiceTest(unittest.TestCase):
         best = self.chosen(POOL._replace(min_size=1100.0))
         self.assertEqual((best.price, best.size), (0.964, 1556.01))
 
-    def test_the_naked_budget_still_trims_the_bid(self):
-        # $0.30 buys 300 longshot shares at 0.1c, which balance 324.48
-        # favorite shares at 98.0c whatever size the bid starts at.
+    def test_the_naked_budget_still_trims_a_bid_balanced_above_the_floor(self):
+        # On BUDGET_BOOK $10 buys 714.28 longshot shares at 1.4c, which
+        # balance 124.91 favorite shares at 95.5c whatever size the bid
+        # starts at. $500 buys 523.56.
+        intents = by_slot(plan(market(p_true=0.98, naked_budget_usd=10.0), BUDGET_BOOK))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((fav.price, fav.size), (0.955, 124.91))
+        self.assertEqual((low.price, low.size), (0.014, 714.28))
+
+    def test_the_naked_budget_does_not_trim_a_bid_balanced_at_the_floor(self):
+        # $0.30 buys 300 longshot shares at 0.1c and the bid needs 675.82.
         intents = by_slot(plan(market(naked_budget_usd=0.3), FLOOR_BOOK))
         fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
-        self.assertEqual((fav.price, fav.size), (0.98, 324.48))
-        self.assertEqual((low.price, low.size), (0.001, 300.0))
+        self.assertEqual((fav.price, fav.size), (0.985, 507.61))
+        self.assertEqual((low.price, low.size), (0.001, 675.82))
 
     def test_a_tie_goes_to_the_smaller_size(self):
         # Every size earns the whole $100 pool and no fill costs anything.
@@ -1109,8 +1236,10 @@ class SizeChoiceTest(unittest.TestCase):
             "two days out": (market(end_date=NOW + timedelta(days=2)), FLOOR_BOOK, Position(),
                              CFG, SWEPT),
             "a budget longshot bid": (market(p_true=0.98), BUDGET_BOOK, Position(), CFG, QUIET),
-            "trimmed by the budget": (market(naked_budget_usd=0.3), FLOOR_BOOK, Position(), CFG,
-                                      QUIET),
+            "a floor bid over its budget": (market(naked_budget_usd=0.3), FLOOR_BOOK,
+                                            Position(), CFG, QUIET),
+            "trimmed by the budget": (market(p_true=0.98, naked_budget_usd=10.0), BUDGET_BOOK,
+                                      Position(), CFG, QUIET),
             "Mistral": (MISTRAL, MISTRAL_BOOK, Position(), MISTRAL_CFG, QUIET),
             "Newsom on a $100 pool": (NEWSOM, NEWSOM_BOOK, Position(), CFG, QUIET),
             "Newsom in a thin book": (POOL, NEWSOM_BOOK, Position(), CFG, QUIET),
