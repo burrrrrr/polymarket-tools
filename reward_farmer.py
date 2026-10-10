@@ -149,13 +149,21 @@ Usage:
   python reward_farmer.py --db scratch.db --once
   python reward_farmer.py --live               # sign and post real orders
   python reward_farmer.py --live --keep-orders # Ctrl+C leaves orders resting
+  python reward_farmer.py --live --key-stdin   # the wallet key is piped in
+
+A live run reads the wallet key from the environment or the Bitwarden vault,
+as polymarket.keys describes, and asks for the vault's master password when
+the vault is locked. --key-stdin reads the key itself from one line of
+standard input instead, for a machine with no vault.
 """
 
 import argparse
+import getpass
 import json
 import math
 import os
 import signal
+import sys
 import threading
 import time
 from collections import deque
@@ -2456,13 +2464,9 @@ def heartbeat(client, stop):
         stop.wait(HEARTBEAT_S)
 
 
-def run(args):
-    cfg = config_from(args)
-    client = None
-    if args.live:
-        from config import create_client, load_config
-        client = create_client(load_config())
-    farmer = Farmer(args, cfg, client)
+def run(args, client=None):
+    """Farm until stopped. client is the authenticated CLOB client of a live run."""
+    farmer = Farmer(args, config_from(args), client)
     if not farmer.user:
         log("Error: POLYMARKET_FUNDER_ADDRESS is not set; positions cannot be read")
         raise SystemExit(1)
@@ -2505,9 +2509,6 @@ def run(args):
         raise
     finally:
         farmer.shutdown(reason, cancel)
-        if args.live:
-            from key_loader import cleanup_key_source
-            cleanup_key_source()
 
 
 def config_from(args):
@@ -2546,6 +2547,9 @@ Examples:
     parser.add_argument("--db", default="farm.db", help="SQLite file (default: farm.db)")
     parser.add_argument("--live", action="store_true",
                         help="Sign and post real orders (default: dry run)")
+    parser.add_argument("--key-stdin", action="store_true",
+                        help="Live only: read the wallet key from one line of standard input, "
+                             "not from the environment or Bitwarden")
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     stopping = parser.add_mutually_exclusive_group()
     stopping.add_argument(
@@ -2601,11 +2605,42 @@ Examples:
     return parser
 
 
-def main():
-    _make_output_safe()
+def connect(args):
+    """An authenticated client for a live run, or None after saying why there is none."""
+    # Imported here because the console imports this module and holds no key.
+    from polymarket import client as polymarket_client
+    from polymarket import keys
+
+    try:
+        return polymarket_client.connect(read_key(args.key_stdin))
+    except (keys.KeyUnavailable, polymarket_client.ConfigError) as e:
+        log(f"Error: {e}")
+        return None
+
+
+def read_key(from_stdin):
+    from polymarket import keys
+
+    if not from_stdin:
+        return keys.load_private_key(lambda: getpass.getpass("Bitwarden master password: "))
+    key = sys.stdin.readline().strip()
+    if not key:
+        raise keys.KeyUnavailable("no key arrived on standard input")
+    return key
+
+
+def main(argv=None):
     load_dotenv(Path(__file__).parent / ".env")
-    run(build_parser().parse_args())
+    _make_output_safe()
+    args = build_parser().parse_args(argv)
+    client = None
+    if args.live:
+        client = connect(args)
+        if client is None:
+            return 1
+    run(args, client)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

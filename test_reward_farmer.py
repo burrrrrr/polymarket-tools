@@ -3036,11 +3036,8 @@ class LiveFarmerTest(FarmerHarness):
         args = build_parser().parse_args(["--db", self.path, "--interval", "0.01", "--live",
                                           *flags])
         with mock.patch.dict(os.environ, {"POLYMARKET_FUNDER_ADDRESS": "0xme"}), \
-                mock.patch("config.load_config"), \
-                mock.patch("config.create_client", return_value=self.client), \
-                mock.patch("key_loader.cleanup_key_source"), \
                 mock.patch.object(reward_farmer.time, "sleep", sleep):
-            reward_farmer.run(args)
+            reward_farmer.run(args, self.client)
 
     def stop_command(self, payload=None):
         def stop():

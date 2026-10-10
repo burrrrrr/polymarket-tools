@@ -27,11 +27,17 @@ Usage:
 
 import argparse
 import csv
+import getpass
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
+from dotenv import load_dotenv
 from py_clob_client_v2.clob_types import OrdersScoringParams
 
+from polymarket import client as polymarket_client
+from polymarket import keys
 from reward_farmer import log
 
 SCORING_BATCH = 50
@@ -75,11 +81,7 @@ def summarize(seen, poll_s):
               f"{lives[0]:.0f}s to {lives[-1]:.0f}s (median {lives[len(lives) // 2]:.0f}s)")
 
 
-def run(args):
-    from config import create_client, load_config
-    from key_loader import cleanup_key_source
-
-    client = create_client(load_config())
+def run(args, client):
     seen = {}
     first_poll = True
     end = time.time() + args.minutes * 60
@@ -106,8 +108,6 @@ def run(args):
             time.sleep(max(0.0, args.poll - (time.time() - started)))
     except KeyboardInterrupt:
         pass
-    finally:
-        cleanup_key_source()
 
     summarize(seen, args.poll)
     if args.csv:
@@ -125,13 +125,22 @@ def run(args):
         log(f"Wrote {len(seen)} orders to {args.csv}")
 
 
-def main():
+def main(argv=None):
+    load_dotenv(Path(__file__).parent / ".env")
     parser = argparse.ArgumentParser(description="Report how soon placed orders start scoring.")
     parser.add_argument("--minutes", type=float, default=10.0)
     parser.add_argument("--poll", type=float, default=2.0, help="seconds between polls")
     parser.add_argument("--csv", help="write one row per order seen")
-    run(parser.parse_args())
+    args = parser.parse_args(argv)
+    try:
+        key = keys.load_private_key(lambda: getpass.getpass("Bitwarden master password: "))
+        client = polymarket_client.connect(key)
+    except (keys.KeyUnavailable, polymarket_client.ConfigError) as e:
+        log(f"Error: {e}")
+        return 1
+    run(args, client)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
