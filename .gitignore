@@ -15,5 +15,10 @@ farm.db
 farm.db-wal
 farm.db-shm
 
+# Book snapshots the farmer records beside farm.db
+farm_books.db
+farm_books.db-wal
+farm_books.db-shm
+
 # raw data from the 2026-10-07 unlisted-gap scoring check
 scoring_watch.csv

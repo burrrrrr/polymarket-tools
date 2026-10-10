@@ -2,12 +2,14 @@ import json
 import os
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 import httpx
 
+import farm_books
 import farm_db
 import reward_farmer
 from farm_db import CommandKind
@@ -1682,6 +1684,76 @@ class BuyTapeFarmerTest(FarmerHarness):
                 self.assertEqual(farmer.histories.read[CID], Read(read.history, None))
                 farmer.cycle()
                 self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
+
+
+class BookRecordingTest(FarmerHarness):
+    """Each quoting market's favorite book goes to farm_books.db beside
+    farm.db, off the trading loop."""
+
+    def recorded(self):
+        conn = farm_books.open_books(farm_books.books_path(self.path))
+        try:
+            return farm_books.read_books(conn, CID)
+        finally:
+            conn.close()
+
+    def test_a_quoting_market_records_its_book_once_an_interval(self):
+        farmer = self.started_farmer()
+        self.addCleanup(farmer.books.close)
+        farmer.cycle()
+        farmer.cycle()
+        farmer.books.drain()
+        [sample] = self.recorded()
+        self.assertEqual((sample.mid, sample.bids, sample.asks, sample.ours),
+                         (0.99, ((0.985, 1000.0),), ((0.995, 1000.0),), ()))
+
+    def test_a_sample_holds_our_resting_orders(self):
+        farmer = self.started_farmer()
+        self.addCleanup(farmer.books.close)
+        with mock.patch.object(farm_books, "BOOK_SAMPLE_S", 0):
+            farmer.cycle()
+            farmer.cycle()
+        farmer.books.drain()
+        later = self.recorded()[-1]
+        self.assertEqual([(slot, price) for slot, price, _ in later.ours],
+                         [("FAV_BID", 0.975), ("LONG_BID", 0.001)])
+
+    def test_a_failing_book_write_warns_and_the_cycles_carry_on(self):
+        farmer = self.started_farmer()
+        self.addCleanup(farmer.books.close)
+        failing = mock.Mock(side_effect=farm_books.sqlite3.OperationalError("disk I/O error"))
+        with mock.patch.object(farm_books, "record", failing):
+            farmer.cycle()
+            farmer.books.drain()
+            farmer.cycle()
+        failing.assert_called_once()
+        warnings = [c.args[0] for c in reward_farmer.log.call_args_list
+                    if c.args[0].startswith("Warning: recording books")]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("disk I/O error", warnings[0])
+        _, slots = self.farm_state()
+        self.assertEqual(slots["FAV_BID"]["decision"], "hold")
+
+    def test_a_stalled_book_write_never_holds_up_a_cycle(self):
+        farmer = self.started_farmer()
+        writing, release = threading.Event(), threading.Event()
+
+        def stall(conn, samples):
+            writing.set()
+            release.wait(10)
+
+        with mock.patch.object(farm_books, "record", stall),                 mock.patch.object(farm_books, "BOOK_SAMPLE_S", 0):
+            farmer.books.start()
+            farmer.cycle()
+            self.assertTrue(writing.wait(10))
+            started = time.monotonic()
+            farmer.cycle()
+            farmer.cycle()
+            elapsed = time.monotonic() - started
+            release.set()
+            farmer.stop.set()
+            farmer.books.join(10)
+        self.assertLess(elapsed, 5)
 
 
 CID2, FAV2, LONG2 = "0xc0nd2", "fav-token-2", "long-token-2"

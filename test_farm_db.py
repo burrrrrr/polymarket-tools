@@ -2,9 +2,12 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
+import farm_books
 import farm_db
 from farm_db import CommandKind
 from reward_farmer import FarmConfig
@@ -448,6 +451,80 @@ class BuysTest(ScratchDb):
 
     def test_a_database_with_no_tape_saved_reads_as_empty(self):
         self.assertEqual(farm_db.read_buys(self.open()), {})
+
+
+class BookSamplesTest(ScratchDb):
+    """farm_books.db, the favorite books the farmer records beside farm.db."""
+
+    BIDS = ((0.985, 1000.0), (0.95, 20.0), (0.93, 500.0))
+    ASKS = ((0.995, 1000.0), (0.999, 300760.54))
+    OURS = (("FAV_BID", 0.985, 507.61), ("LONG_BID", 0.001, 675.82))
+
+    def sample(self, at=NOW, cid="0xa"):
+        return farm_books.sample(cid, at, 0.99, self.BIDS, self.ASKS, self.OURS)
+
+    def books(self):
+        conn = farm_books.open_books(farm_books.books_path(self.path))
+        self.addCleanup(conn.close)
+        return conn
+
+    def recorder(self, path=None):
+        warn = mock.Mock()
+        recorder = farm_books.BookRecorder(path or farm_books.books_path(self.path),
+                                           threading.Event(), warn)
+        self.addCleanup(recorder.close)
+        return recorder, warn
+
+    def test_the_file_sits_beside_farm_db(self):
+        self.assertEqual(farm_books.books_path(self.path),
+                         os.path.join(os.path.dirname(self.path), "farm_books.db"))
+
+    def test_a_sample_reads_back_with_the_levels_near_the_mid_and_our_orders(self):
+        conn = self.books()
+        farm_books.record(conn, [self.sample(), self.sample(cid="0xb")])
+        [read] = farm_books.read_books(conn, "0xa")
+        # The 93c bid is 6c under the 99c mid, past the 5c depth.
+        self.assertEqual(read, farm_books.BookSample(
+            "0xa", NOW, 0.99, self.BIDS[:2], self.ASKS, self.OURS))
+        self.assertEqual(len(farm_books.read_books(conn)), 2)
+
+    def test_prune_drops_samples_older_than_the_kept_days(self):
+        conn = self.books()
+        kept = farm_books.BOOK_KEPT_DAYS
+        farm_books.record(conn, [self.sample(NOW - timedelta(days=kept + 1)),
+                                 self.sample(NOW - timedelta(days=kept - 1))])
+        self.assertEqual(farm_books.prune(conn, NOW), 1)
+        self.assertEqual([s.at for s in farm_books.read_books(conn, "0xa")],
+                         [NOW - timedelta(days=kept - 1)])
+
+    def test_the_recorder_writes_what_was_put_and_prunes_once_it_opens(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        conn = self.books()
+        farm_books.record(conn, [self.sample(now - timedelta(days=farm_books.BOOK_KEPT_DAYS + 1))])
+        recorder, warn = self.recorder()
+        recorder.put([self.sample(now)])
+        recorder.put([self.sample(now + timedelta(minutes=5))])
+        recorder.drain()
+        self.assertEqual([s.at for s in farm_books.read_books(conn, "0xa")],
+                         [now, now + timedelta(minutes=5)])
+        warn.assert_not_called()
+
+    def test_a_write_that_fails_warns_and_drops_the_batch(self):
+        recorder, warn = self.recorder(os.path.join(self.path, "no", "such", "farm_books.db"))
+        recorder.put([self.sample()])
+        recorder.drain()
+        warn.assert_called_once()
+        self.assertRegex(warn.call_args.args[0], r"^Warning: recording books to .* failed")
+        recorder.drain()
+        warn.assert_called_once()
+
+    def test_a_full_queue_drops_the_batch_with_a_warning(self):
+        recorder, warn = self.recorder()
+        for _ in range(farm_books.QUEUE_BATCHES + 1):
+            recorder.put([self.sample()])
+        warn.assert_called_once()
+        recorder.put([])
+        warn.assert_called_once()
 
 
 FR, US = "2027-french-presidential-election", "2028-us-presidential-election"

@@ -51,6 +51,9 @@ a busy timeout, and every column has exactly one writer process:
                   prompt v3 an ok row holds a verdict; p_true, p_low and
                   p_high are left from v1 and v2 rows.
 
+The farmer also records quoting books to farm_books.db beside this file,
+which no other process writes (farm_books.py owns it).
+
 Controls a human can repeat or a crash can interrupt (pause, resume, retire,
 cancel-all) are level-triggered columns on markets, not commands: the farmer
 reads the level every cycle and converges to it, however many times it was

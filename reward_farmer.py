@@ -83,7 +83,9 @@ settings that override its command-line config, and any stop command, so a
 change in the console takes effect within one interval. It publishes what it
 is doing to farm_state, farmer_status, farm_events, and (one sample per market
 per minute) farm_mids, in dry run and live alike; only live mode writes to
-markets (retirement, baselines).
+markets (retirement, baselines). Each quoting market's favorite book goes to
+farm_books.db beside farm.db every five minutes, on a thread of its own (see
+farm_books.py).
 
 Stopping cancels the live orders on the managed markets, whether by a stop
 command, Ctrl+C, SIGTERM, or a crash; only a finished --once run leaves them
@@ -148,6 +150,7 @@ from typing import NamedTuple, Optional
 import httpx
 from dotenv import load_dotenv
 
+import farm_books
 import farm_db
 import fill_cost
 from exit_value import TAPE_ROWS_FARMER, tape_from_json, tape_to_json
@@ -245,6 +248,8 @@ MID_SAMPLE_S = 60
 # farm_mids read back this far for the mid before a fill.
 FILL_MID_LOOKBACK_S = 600
 HEARTBEAT_S = 5
+# Stopping waits this long for the book recorder to write its last batch.
+BOOKS_JOIN_S = 10
 
 # A rejected place waits this long before the slot tries again, doubling on
 # each further rejection up to the cap.
@@ -1448,6 +1453,7 @@ class Managed:
         self.sim_orders = []
         self.snapshot = None
         self.mid_sampled_at = None
+        self.book_sampled_at = None
         self.last_summary = None
 
 
@@ -1475,6 +1481,7 @@ class Farmer:
         self.setting_errors = {}
         self.events = []
         self.mids = []
+        self.book_samples = []
         self.scoring = {}
         self.positions_at = self.rewards_at = self.resolutions_at = 0.0
         self.resolutions = {}
@@ -1486,6 +1493,7 @@ class Farmer:
         self.total_rates = TotalRates(self.stop)
         self.infos = MarketInfos(self.stop, fetch_market_infos)
         self.histories = Histories(self.stop, fetch_read)
+        self.books = farm_books.BookRecorder(farm_books.books_path(args.db), self.stop, log)
         self.saved_tapes = {}
         self.prior = fill_cost.DEFAULT_PRIOR
         self.user = os.getenv("POLYMARKET_FUNDER_ADDRESS")
@@ -1509,6 +1517,8 @@ class Farmer:
         if stopped_at is None:
             states = [m.snapshot for m in self.markets.values() if m.snapshot]
             self.save_tapes()
+            self.books.put(self.book_samples)
+            self.book_samples = []
         status = farm_db.FarmerStatus(
             mode="live" if self.live else "dry",
             pid=os.getpid(),
@@ -1597,6 +1607,7 @@ class Farmer:
             log(f"Warning: writing the stop to {self.args.db} failed ({e})")
         self.db.close()
         self.http.close()
+        self.books.join(BOOKS_JOIN_S)
 
     def read_controls(self, now):
         """Commands, settings, the fill prior, and approved markets, re-read
@@ -1949,6 +1960,13 @@ class Farmer:
                 or (now - managed.mid_sampled_at).total_seconds() >= MID_SAMPLE_S):
             managed.mid_sampled_at = now
             self.mids.append(mid_sample(managed.snapshot))
+        if managed.state.phase is Phase.QUOTING and plan.book_mid is not None and (
+                managed.book_sampled_at is None
+                or (now - managed.book_sampled_at).total_seconds() >= farm_books.BOOK_SAMPLE_S):
+            managed.book_sampled_at = now
+            self.book_samples.append(farm_books.sample(
+                fm.condition_id, now, plan.book_mid, plan.levels.bids, plan.levels.asks,
+                [(o.slot.name, o.price, o.size_remaining) for o in plan.orders]))
         if managed.state.phase is Phase.RETIRED:
             self.retire(managed)
 
@@ -2247,6 +2265,7 @@ def run(args):
         # itself, and only one thread may write each.
         threading.Thread(target=farmer.infos.run, daemon=True).start()
         threading.Thread(target=farmer.histories.run, daemon=True).start()
+        farmer.books.start()
         while True:
             started = time.monotonic()
             try:
