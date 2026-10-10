@@ -10,7 +10,9 @@ import httpx
 
 import reward_farmer
 import reward_screener
-from reward_screener import CLOB_HOST, GAMMA_HOST, parse_levels, parse_time
+from polymarket import books
+from polymarket.gamma import request_markets
+from polymarket.parse import parse_time
 
 RULES_TTL = timedelta(minutes=10)
 # The Gamma market record holds the reward terms and tick, which rarely change;
@@ -30,11 +32,10 @@ class Rules(NamedTuple):
 def fetch_rules(condition_id):
     """The market's Rules; Gamma lists a closed market only when asked for closed ones."""
     with httpx.Client() as http:
-        for closed in ({}, {"closed": "true"}):
-            resp = http.get(f"{GAMMA_HOST}/markets",
-                            params={"condition_ids": condition_id, **closed}, timeout=TIMEOUT_S)
-            resp.raise_for_status()
-            entry = next((e for e in resp.json() or []
+        for closed in (None, True):
+            entries = request_markets(http, [condition_id], closed, TIMEOUT_S, limit=False,
+                                      retries=0)
+            entry = next((e for e in entries
                           if isinstance(e, dict) and e.get("conditionId") == condition_id), None)
             if entry is not None:
                 return Rules(entry.get("description") or "",
@@ -72,11 +73,9 @@ def fetch_info(condition_id):
 
 
 def fetch_book(token_id):
-    """The token's live book as reward_screener.Levels."""
+    """The token's live book as polymarket.books.Levels."""
     with httpx.Client() as http:
-        resp = http.get(f"{CLOB_HOST}/book", params={"token_id": token_id}, timeout=TIMEOUT_S)
-        resp.raise_for_status()
-        return parse_levels(resp.json())
+        return books.fetch_book(http, token_id, timeout=TIMEOUT_S)
 
 
 def fetch_total_rates():

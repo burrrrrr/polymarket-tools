@@ -17,7 +17,8 @@ from farm_console import forms, remote, views
 from farm_console.app import create_app, utc_now
 from farm_console.remote import Rules
 from farm_db import CommandKind
-from reward_screener import Levels, RewardMarket, ScreenConfig
+from polymarket.books import Levels
+from reward_screener import RewardMarket, ScreenConfig
 from test_farm_console import (
     A,
     B,

@@ -1,3 +1,4 @@
+import contextlib
 import json
 import os
 import re
@@ -522,6 +523,19 @@ def settle_total_rates():
             thread.join(10)
 
 
+@contextlib.contextmanager
+def remote_api(respond):
+    """Answer the requests of remote's own client with respond(request); the requests."""
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return respond(request)
+    client = httpx.Client(transport=httpx.MockTransport(handle))
+    with mock.patch.object(remote.httpx, "Client", return_value=client):
+        yield requests
+
+
 class FetchRulesTest(unittest.TestCase):
     def fetch(self, open_entries, closed_entries):
         """(fetch_rules' Rules or LookupError, whether each Gamma query asked for closed)."""
@@ -552,6 +566,42 @@ class FetchRulesTest(unittest.TestCase):
     def test_a_market_gamma_never_lists_raises(self):
         error, _ = self.fetch([], [])
         self.assertIsInstance(error, LookupError)
+
+    def test_each_query_names_the_market_alone_and_waits_the_console_timeout(self):
+        with remote_api(lambda request: httpx.Response(200, json=[])) as requests:
+            with self.assertRaises(LookupError):
+                remote.fetch_rules("0xa")
+        self.assertEqual([(r.method, r.url.path, dict(r.url.params)) for r in requests],
+                         [("GET", "/markets", {"condition_ids": "0xa"}),
+                          ("GET", "/markets", {"condition_ids": "0xa", "closed": "true"})])
+        self.assertEqual({r.extensions["timeout"]["read"] for r in requests}, {remote.TIMEOUT_S})
+
+    def test_a_rate_limited_query_raises_at_once_without_a_retry(self):
+        limited = httpx.Response(429, headers={"retry-after": "1"})
+        with remote_api(lambda request: limited) as requests, mock.patch("time.sleep") as sleep:
+            with self.assertRaises(httpx.HTTPStatusError):
+                remote.fetch_rules("0xa")
+        self.assertEqual(len(requests), 1)
+        sleep.assert_not_called()
+
+
+class FetchBookTest(unittest.TestCase):
+    BOOK = {"asset_id": "tok", "tick_size": "0.001",
+            "bids": [{"price": "0.95", "size": "100"}, {"price": "0.96", "size": "0"}],
+            "asks": [{"price": "0.98", "size": "30"}, {"price": "0.97", "size": "10"}]}
+
+    def test_a_book_is_read_by_token_id_within_the_console_timeout(self):
+        with remote_api(lambda request: httpx.Response(200, json=self.BOOK)) as requests:
+            levels = remote.fetch_book("tok")
+        self.assertEqual(tuple(levels), ([(0.95, 100.0)], [(0.97, 10.0), (0.98, 30.0)], 0.001))
+        self.assertEqual([(r.method, r.url.path, dict(r.url.params),
+                           r.extensions["timeout"]["read"]) for r in requests],
+                         [("GET", "/book", {"token_id": "tok"}, remote.TIMEOUT_S)])
+
+    def test_a_refused_read_raises(self):
+        with remote_api(lambda request: httpx.Response(404)):
+            with self.assertRaises(httpx.HTTPStatusError):
+                remote.fetch_book("tok")
 
 
 class Console(unittest.TestCase):

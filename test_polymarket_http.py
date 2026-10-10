@@ -49,6 +49,13 @@ class GetWithRetryTests(unittest.TestCase):
         self.assertEqual(len(seen), 4)
         self.assertEqual(sleep.call_count, 3)
 
+    def test_with_no_retries_a_429_raises_at_once(self):
+        http, seen = self.answering(httpx.Response(429, headers={"retry-after": "2"}))
+        with mock.patch("time.sleep") as sleep, self.assertRaises(httpx.HTTPStatusError):
+            get_with_retry(http, "https://clob.test/x", None, 5, retries=0)
+        self.assertEqual(len(seen), 1)
+        sleep.assert_not_called()
+
     def test_any_other_failure_raises_without_a_retry(self):
         http, seen = self.answering(httpx.Response(500))
         with mock.patch("time.sleep") as sleep, self.assertRaises(httpx.HTTPStatusError):

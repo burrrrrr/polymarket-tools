@@ -32,9 +32,9 @@ from typing import NamedTuple, Optional
 import httpx
 
 import farm_db
-import reward_screener
 import triage
 from farm_console import remote
+from polymarket.hosts import GAMMA_HOST
 
 WORKERS = 4
 NEAR = triage.Verdict.NEAR_IMPOSSIBLE.value
@@ -61,7 +61,7 @@ def fetch_resolution(condition_id):
     """The market's Resolution. Gamma lists a closed market only when asked
     for closed ones, and then only closed ones."""
     with httpx.Client() as http:
-        resp = http.get(f"{reward_screener.GAMMA_HOST}/markets",
+        resp = http.get(f"{GAMMA_HOST}/markets",
                         params={"condition_ids": condition_id, "closed": "true"},
                         timeout=remote.TIMEOUT_S)
         resp.raise_for_status()

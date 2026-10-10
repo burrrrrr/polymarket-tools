@@ -50,6 +50,26 @@ def fetch_book(http, token_id, timeout=20):
     return parse_levels(resp.json())
 
 
+def request_books(http, token_ids, timeout=20):
+    """The entries of one /books request for these tokens, at most
+    BOOKS_REQUEST_LIMIT of them, as the CLOB sent them. Raises when the request
+    fails.
+
+    A caller that carries on without a failed request catches around this and
+    reads the entries with parse_books.
+    """
+    resp = http.post(f"{CLOB_HOST}/books", json=[{"token_id": t} for t in token_ids],
+                     timeout=timeout)
+    resp.raise_for_status()
+    return resp.json() or []
+
+
+def parse_books(entries):
+    """{token_id: Levels} of /books entries. An entry that names no token is left out."""
+    return {str(entry["asset_id"]): parse_levels(entry)
+            for entry in entries if isinstance(entry, dict) and entry.get("asset_id")}
+
+
 def fetch_books(http, token_ids, timeout=20):
     """{token_id: Levels}, from one /books request for each BOOKS_REQUEST_LIMIT tokens.
 
@@ -57,15 +77,8 @@ def fetch_books(http, token_ids, timeout=20):
     which does not expire. A token the CLOB does not know is absent from the
     result. Raises when any request fails.
     """
-    def fetch(chunk):
-        resp = http.post(f"{CLOB_HOST}/books", json=[{"token_id": t} for t in chunk],
-                         timeout=timeout)
-        resp.raise_for_status()
-        return resp.json() or []
-
     books = {}
-    for entries in in_chunks(fetch, token_ids, BOOKS_REQUEST_LIMIT):
-        for entry in entries:
-            if isinstance(entry, dict) and entry.get("asset_id"):
-                books[str(entry["asset_id"])] = parse_levels(entry)
+    for entries in in_chunks(lambda chunk: request_books(http, chunk, timeout), token_ids,
+                             BOOKS_REQUEST_LIMIT):
+        books.update(parse_books(entries))
     return books

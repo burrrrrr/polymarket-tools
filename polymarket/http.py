@@ -8,16 +8,18 @@ import httpx
 
 from polymarket.parse import as_float
 
+# The data API answers about one read in thirty with a 429 and Retry-After: 1,
+# even at one read every two seconds.
 RATE_LIMIT_RETRIES = 3
 RATE_LIMIT_WAIT_MAX_S = 5.0
 CHUNK_THREADS = 8
 
 
-def get_with_retry(http, url, params, timeout):
-    """GET, waiting out a 429 up to RATE_LIMIT_RETRIES times; raises on a failed read."""
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
+def get_with_retry(http, url, params, timeout, retries=RATE_LIMIT_RETRIES):
+    """GET, waiting out a 429 up to retries times; raises on a failed read."""
+    for attempt in range(retries + 1):
         resp = http.get(url, params=params, timeout=timeout)
-        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
+        if resp.status_code != 429 or attempt == retries:
             break
         time.sleep(min(as_float(resp.headers.get("retry-after")) or 1.0, RATE_LIMIT_WAIT_MAX_S))
     resp.raise_for_status()

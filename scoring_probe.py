@@ -32,13 +32,11 @@ from datetime import datetime
 
 from py_clob_client_v2.clob_types import OrdersScoringParams
 
+from reward_farmer import log
+
 SCORING_BATCH = 50
 # Age buckets, in seconds since first seen, for when a fresh order first scored.
 BUCKETS = (5, 15, 30, 60, 120)
-
-
-def log(message):
-    print(f"[{datetime.now():%H:%M:%S}] {message}", flush=True)
 
 
 def scoring_of(client, order_ids):

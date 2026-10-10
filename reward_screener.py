@@ -76,7 +76,6 @@ import argparse
 import base64
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -91,10 +90,11 @@ import httpx
 import exit_value
 import farm_db
 import fill_cost
-
-CLOB_HOST = os.getenv("POLYMARKET_HOST", "https://clob.polymarket.com")
-GAMMA_HOST = os.getenv("POLYMARKET_GAMMA_HOST", "https://gamma-api.polymarket.com")
-DATA_API_HOST = os.getenv("POLYMARKET_DATA_API_HOST", "https://data-api.polymarket.com")
+from polymarket.books import BOOKS_REQUEST_LIMIT, Levels, parse_books, request_books
+from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
+from polymarket.hosts import CLOB_HOST, DATA_API_HOST
+from polymarket.http import chunks, get_with_retry
+from polymarket.parse import as_float, parse_time
 
 # Cursor values the CLOB uses to start and end a paginated listing.
 FIRST_CURSOR = "MA=="
@@ -110,14 +110,6 @@ REWARDS_STRIDE = 400
 REWARDS_THREADS = 8
 REWARDS_ATTEMPTS = 3
 
-# Most tokens /books accepts in one request; 501 is refused as too large.
-BOOKS_REQUEST_LIMIT = 500
-# Most condition ids Gamma /markets resolves in one request.
-GAMMA_REQUEST_LIMIT = 100
-# The data API answers about one read in thirty with a 429 and Retry-After: 1,
-# even at one read every two seconds.
-RATE_LIMIT_RETRIES = 3
-RATE_LIMIT_WAIT_MAX_S = 5.0
 # /trades pages; past 2,000 rows of a market it returns nothing.
 TRADES_PAGE = 1000
 TRADES_PAGES = 2
@@ -267,14 +259,6 @@ class RewardMarket(NamedTuple):
     tags: tuple = ()
     event_slug: Optional[str] = None
     event_title: Optional[str] = None
-
-
-class Levels(NamedTuple):
-    """One token's book: bids high to low, asks low to high, (price, size)."""
-
-    bids: list
-    asks: list
-    tick: Optional[float] = None
 
 
 class LongshotBid(NamedTuple):
@@ -919,23 +903,6 @@ def assess(market, levels, config, now, prior, history=None):
 # External data -> domain types
 # ---------------------------------------------------------------------------
 
-def parse_time(value):
-    if not value:
-        return None
-    try:
-        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
 def in_excluded_category(tags, excluded):
     """Whether a listing's tags put it in any of the excluded CATEGORIES."""
     lowered = {str(t).lower() for t in tags or ()}
@@ -956,13 +923,13 @@ def screen_listing(item, total_rates, config, now):
         return Skip("excluded category")
 
     rewards = item.get("rewards") or {}
-    v = (_float(rewards.get("max_spread")) or 0) / 100
+    v = (as_float(rewards.get("max_spread")) or 0) / 100
     if v <= 0:
         return Skip("no max spread")
     rate = total_rates.get(item.get("condition_id"))
     if rate is None:
         rate = sum(
-            _float(r.get("rewards_daily_rate")) or 0
+            as_float(r.get("rewards_daily_rate")) or 0
             for r in rewards.get("rates") or []
         )
     if rate <= 0 or rate < config.min_rate:
@@ -977,8 +944,8 @@ def screen_listing(item, total_rates, config, now):
     tokens = [t for t in item.get("tokens") or [] if t.get("token_id")]
     if len(tokens) != 2:
         return Skip("not binary")
-    fav = max(tokens, key=lambda t: _float(t.get("price")) or 0)
-    if (_float(fav.get("price")) or 0) < config.min_fav - PREFILTER_SLACK:
+    fav = max(tokens, key=lambda t: as_float(t.get("price")) or 0)
+    if (as_float(fav.get("price")) or 0) < config.min_fav - PREFILTER_SLACK:
         return Skip("favorite too cheap")
 
     return RewardMarket(
@@ -987,29 +954,13 @@ def screen_listing(item, total_rates, config, now):
         question=item.get("question") or "",
         end_date=end_date,
         neg_risk=bool(item.get("neg_risk")),
-        tick=_float(item.get("minimum_tick_size")) or 0.01,
+        tick=as_float(item.get("minimum_tick_size")) or 0.01,
         fav_token_id=str(fav["token_id"]),
         fav_outcome=fav.get("outcome") or "",
         rate_per_day=rate,
         v=v,
-        min_size=_float(rewards.get("min_size")) or 0,
+        min_size=as_float(rewards.get("min_size")) or 0,
         tags=tuple(str(t) for t in item.get("tags") or ()),
-    )
-
-
-def parse_levels(entry):
-    def side(raw, descending):
-        levels = []
-        for level in raw or []:
-            price, size = _float(level.get("price")), _float(level.get("size"))
-            if price is not None and size is not None and size > 0:
-                levels.append((price, size))
-        return sorted(levels, reverse=descending)
-
-    return Levels(
-        bids=side(entry.get("bids"), descending=True),
-        asks=side(entry.get("asks"), descending=False),
-        tick=_float(entry.get("tick_size")),
     )
 
 
@@ -1029,7 +980,7 @@ def parse_gamma(entry):
     events = [e for e in entry.get("events") or [] if isinstance(e, dict)]
     event = events[0] if events else {}
     return GammaInfo(
-        volume24hr=_float(entry.get("volume24hr")),
+        volume24hr=as_float(entry.get("volume24hr")),
         holding_rewards=holding if isinstance(holding, bool) else None,
         end_date=parse_time(entry.get("endDate")),
         neg_risk=neg_risk if isinstance(neg_risk, bool) else None,
@@ -1095,8 +1046,8 @@ def parse_trade(row):
         return None
     side = str(row.get("side") or "").upper()
     tx, asset = str(row.get("transactionHash") or ""), str(row.get("asset") or "")
-    size, price = _float(row.get("size")), _float(row.get("price"))
-    at = _float(row.get("timestamp"))
+    size, price = as_float(row.get("size")), as_float(row.get("price"))
+    at = as_float(row.get("timestamp"))
     if (not tx or not asset or side not in ("BUY", "SELL") or size is None or not size > 0
             or price is None or not 0 < price < 1 or at is None or not at > 0):
         return None
@@ -1254,14 +1205,10 @@ def fetch_total_rates(http):
     those draw bots into mispriced books, and some listed ones pay nothing."""
     rates = {}
     for item in fetch_rewards_listing(http):
-        rate = _float(item.get("total_daily_rate"))
+        rate = as_float(item.get("total_daily_rate"))
         if item.get("condition_id") and item.get("rewards_config") and rate is not None:
             rates[item["condition_id"]] = rate
     return rates
-
-
-def _chunks(items, size):
-    return [items[i:i + size] for i in range(0, len(items), size)]
 
 
 def fetch_levels(http, token_ids, timeout=20):
@@ -1271,63 +1218,40 @@ def fetch_levels(http, token_ids, timeout=20):
     """
     def fetch(chunk):
         try:
-            resp = http.post(
-                f"{CLOB_HOST}/books",
-                json=[{"token_id": t} for t in chunk],
-                timeout=timeout,
-            )
-            resp.raise_for_status()
-            return resp.json() or []
+            return request_books(http, chunk, timeout)
         except Exception as e:
             print(f"  Warning: /books chunk of {len(chunk)} failed ({e})")
             return []
 
-    chunks = _chunks(list(dict.fromkeys(token_ids)), BOOKS_REQUEST_LIMIT)
+    parts = chunks(list(dict.fromkeys(token_ids)), BOOKS_REQUEST_LIMIT)
     books = {}
-    if not chunks:
+    if not parts:
         return books
-    with ThreadPoolExecutor(min(len(chunks), 8)) as pool:
-        for entries in pool.map(fetch, chunks):
-            for entry in entries:
-                if isinstance(entry, dict) and entry.get("asset_id"):
-                    books[str(entry["asset_id"])] = parse_levels(entry)
+    with ThreadPoolExecutor(min(len(parts), 8)) as pool:
+        for entries in pool.map(fetch, parts):
+            books.update(parse_books(entries))
     return books
 
 
 def fetch_gamma(http, condition_ids, timeout=20):
     """{condition_id: GammaInfo}; a failed chunk just leaves its markets bare."""
     def fetch(chunk):
-        params = [("condition_ids", c) for c in chunk]
-        params.append(("limit", str(len(chunk))))
         try:
-            resp = http.get(f"{GAMMA_HOST}/markets", params=params, timeout=timeout)
-            resp.raise_for_status()
-            return resp.json() or []
+            return request_markets(http, chunk, timeout=timeout, retries=0)
         except Exception as e:
             print(f"  Warning: Gamma chunk of {len(chunk)} failed ({e})")
             return []
 
-    chunks = _chunks(list(condition_ids), GAMMA_REQUEST_LIMIT)
+    parts = chunks(list(condition_ids), GAMMA_REQUEST_LIMIT)
     info = {}
-    if not chunks:
+    if not parts:
         return info
-    with ThreadPoolExecutor(min(len(chunks), 8)) as pool:
-        for entries in pool.map(fetch, chunks):
+    with ThreadPoolExecutor(min(len(parts), 8)) as pool:
+        for entries in pool.map(fetch, parts):
             for entry in entries:
                 if isinstance(entry, dict) and entry.get("conditionId"):
                     info[entry["conditionId"]] = parse_gamma(entry)
     return info
-
-
-def get_with_retry(http, url, params, timeout):
-    """GET, waiting out a 429 up to RATE_LIMIT_RETRIES times; raises on a failed read."""
-    for attempt in range(RATE_LIMIT_RETRIES + 1):
-        resp = http.get(url, params=params, timeout=timeout)
-        if resp.status_code != 429 or attempt == RATE_LIMIT_RETRIES:
-            break
-        time.sleep(min(_float(resp.headers.get("retry-after")) or 1.0, RATE_LIMIT_WAIT_MAX_S))
-    resp.raise_for_status()
-    return resp
 
 
 def fetch_trades(http, condition_id, taker_only, cutoff, timeout=20):
@@ -1348,7 +1272,7 @@ def fetch_trades(http, condition_id, taker_only, cutoff, timeout=20):
         ).json()
         got = got if isinstance(got, list) else []
         rows.extend(got)
-        times.extend(t for t in (_float(r.get("timestamp")) for r in got if isinstance(r, dict))
+        times.extend(t for t in (as_float(r.get("timestamp")) for r in got if isinstance(r, dict))
                      if t is not None)
         if len(got) < TRADES_PAGE or min(times, default=cutoff) < cutoff:
             return rows, cutoff
@@ -1368,7 +1292,7 @@ def fetch_mids(http, token_id, start, end, timeout=20):
         ).json()
         for point in (data.get("history") if isinstance(data, dict) else None) or []:
             if isinstance(point, dict):
-                t, p = _float(point.get("t")), _float(point.get("p"))
+                t, p = as_float(point.get("t")), as_float(point.get("p"))
                 if t is not None and p is not None:
                     mids.add((t, p))
     return sorted(mids)

@@ -184,19 +184,17 @@ from py_clob_client_v2.clob_types import (
     PostOrdersV2Args,
 )
 
+from polymarket.books import Levels
+from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
+from polymarket.hosts import DATA_API_HOST
+from polymarket.http import RATE_LIMIT_RETRIES, chunks, get_with_retry
+from polymarket.parse import as_float, parse_time
 from reward_screener import (
-    DATA_API_HOST,
-    GAMMA_HOST,
-    GAMMA_REQUEST_LIMIT,
-    RATE_LIMIT_RETRIES,
-    Levels,
     Outlook,
     QuoteValue,
     Read,
     Skip,
     Zones,
-    _chunks,
-    _float,
     _make_output_safe,
     adjust_levels,
     adjusted_mid,
@@ -209,11 +207,9 @@ from reward_screener import (
     fill_return,
     floor_to_tick,
     free_zone_open,
-    get_with_retry,
     load_prior,
     longshot_bid,
     over_max_return,
-    parse_time,
     q_min,
     resolution_signal,
     round_size_down,
@@ -1344,9 +1340,9 @@ def naked_used(position, orders):
 def parse_market_info(entry):
     return MarketInfo(
         token_ids=tuple(str(t) for t in json.loads(entry.get("clobTokenIds") or "[]") if t),
-        v=(_float(entry.get("rewardsMaxSpread")) or 0) / 100,
-        min_size=_float(entry.get("rewardsMinSize")) or 0,
-        tick=_float(entry.get("orderPriceMinTickSize")) or 0.01,
+        v=(as_float(entry.get("rewardsMaxSpread")) or 0) / 100,
+        min_size=as_float(entry.get("rewardsMinSize")) or 0,
+        tick=as_float(entry.get("orderPriceMinTickSize")) or 0.01,
         neg_risk=bool(entry.get("negRisk")),
         accepting_orders=bool(entry.get("acceptingOrders")),
         closed=bool(entry.get("closed")),
@@ -1413,8 +1409,9 @@ def parse_open_order(entry, fm):
     role = fm.role_of(token_id)
     if role is None or side not in (BUY, SELL):
         return None
-    price = _float(entry.get("price"))
-    remaining = (_float(entry.get("original_size")) or 0) - (_float(entry.get("size_matched")) or 0)
+    price = as_float(entry.get("price"))
+    remaining = ((as_float(entry.get("original_size")) or 0)
+                 - (as_float(entry.get("size_matched")) or 0))
     if price is None or not entry.get("id"):
         return None
     return LiveOrder(
@@ -1438,12 +1435,9 @@ def fetch_market_infos(http, condition_ids, timeout=20):
     each chunk is read twice, open and closed.
     """
     infos = {}
-    for chunk in _chunks(list(condition_ids), GAMMA_REQUEST_LIMIT):
-        for closed in ("false", "true"):
-            params = [("condition_ids", c) for c in chunk]
-            params += [("closed", closed), ("limit", str(len(chunk)))]
-            entries = get_with_retry(http, f"{GAMMA_HOST}/markets", params, timeout).json()
-            for entry in entries or []:
+    for chunk in chunks(list(condition_ids), GAMMA_REQUEST_LIMIT):
+        for closed in (False, True):
+            for entry in request_markets(http, chunk, closed, timeout):
                 if isinstance(entry, dict) and entry.get("conditionId"):
                     infos[str(entry["conditionId"])] = parse_market_info(entry)
     return infos
@@ -1459,7 +1453,7 @@ def fetch_holdings(http, user, timeout=30):
             timeout,
         ).json() or []
         for p in page:
-            size, avg = _float(p.get("size")), _float(p.get("avgPrice"))
+            size, avg = as_float(p.get("size")), as_float(p.get("avgPrice"))
             if p.get("asset") and size is not None:
                 holdings[str(p["asset"])] = (size, avg or 0.0)
         if len(page) < POSITIONS_PAGE:
@@ -1475,7 +1469,7 @@ def parse_reward_percentages(resp):
     """
     if not isinstance(resp, dict):
         raise ValueError(f"expected an object, got {type(resp).__name__}")
-    parsed = {str(k): _float(v) for k, v in resp.items()}
+    parsed = {str(k): as_float(v) for k, v in resp.items()}
     return {k: v for k, v in parsed.items() if v is not None}
 
 
@@ -1489,11 +1483,11 @@ def parse_earnings(entries):
         raise ValueError(f"expected a list, got {type(entries).__name__}")
     totals, skipped = {}, 0
     for e in entries:
-        earned = _float(e.get("earnings")) if isinstance(e, dict) else None
+        earned = as_float(e.get("earnings")) if isinstance(e, dict) else None
         if earned is None or not e.get("condition_id"):
             skipped += 1
             continue
-        rate = _float(e.get("asset_rate"))
+        rate = as_float(e.get("asset_rate"))
         cid = str(e["condition_id"])
         totals[cid] = totals.get(cid, 0.0) + earned * (1.0 if rate is None else rate)
     return totals, skipped
@@ -2329,7 +2323,7 @@ class Farmer:
                                   f"  sign {i.slot.name} failed on {fm.label}: {e}",
                                   fm.condition_id, i.slot)
         accepted = []
-        for chunk in _chunks(signed, POST_BATCH_LIMIT):
+        for chunk in chunks(signed, POST_BATCH_LIMIT):
             try:
                 responses = self.client.post_orders(
                     [PostOrdersV2Args(order=o, orderType=OrderType.GTD) for _, _, o in chunk],

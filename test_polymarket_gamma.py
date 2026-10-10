@@ -3,11 +3,19 @@ No request leaves the process."""
 
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 import httpx
 
 from polymarket import gamma
-from polymarket.gamma import Market, decode_list, fetch_markets, market_names, search
+from polymarket.gamma import (
+    Market,
+    decode_list,
+    fetch_markets,
+    market_names,
+    request_markets,
+    search,
+)
 
 
 def client(handler):
@@ -38,6 +46,57 @@ class Gamma:
         pool = self.closed_ids if params.get("closed") == "true" else self.open_ids
         found = [{"conditionId": c, "question": f"Q {c[-4:]}"} for c in ids if c in pool]
         return httpx.Response(200, json=found[:int(params.get("limit", 20))])
+
+
+class RequestMarketsTests(unittest.TestCase):
+    def test_one_request_names_every_id_then_the_closed_filter_then_the_count_as_the_limit(self):
+        api = Gamma(open_ids=[cid(1)], closed_ids=[cid(2)])
+        http = client(api)
+        self.assertEqual(request_markets(http, [cid(1), cid(2)]),
+                         [{"conditionId": cid(1), "question": "Q 0001"}])
+        request_markets(http, [cid(1), cid(2)], closed=True)
+        request_markets(http, [cid(1)], closed=False)
+        both = [("condition_ids", cid(1)), ("condition_ids", cid(2))]
+        self.assertEqual([p.multi_items() for p in api.requests], [
+            both + [("limit", "2")],
+            both + [("closed", "true"), ("limit", "2")],
+            [("condition_ids", cid(1)), ("closed", "false"), ("limit", "1")]])
+
+    def test_without_a_limit_the_request_names_the_ids_and_the_closed_filter_alone(self):
+        api = Gamma(open_ids=[cid(1)])
+        http = client(api)
+        request_markets(http, [cid(1)], limit=False)
+        request_markets(http, [cid(1)], closed=True, limit=False)
+        self.assertEqual([p.multi_items() for p in api.requests], [
+            [("condition_ids", cid(1))], [("condition_ids", cid(1)), ("closed", "true")]])
+
+    def test_the_answer_comes_back_as_gamma_sent_it_within_the_timeout(self):
+        timeouts = []
+
+        def handler(request):
+            timeouts.append(request.extensions["timeout"]["read"])
+            return httpx.Response(200, json=[{"conditionId": cid(1)}, "noise"])
+
+        self.assertEqual(request_markets(client(handler), [cid(1)], timeout=7),
+                         [{"conditionId": cid(1)}, "noise"])
+        self.assertEqual(timeouts, [7])
+
+    def test_a_429_is_waited_out_unless_the_caller_asks_for_no_retries(self):
+        statuses = [429, 200, 429]
+        http = client(lambda request: httpx.Response(statuses.pop(0), json=[],
+                                                     headers={"retry-after": "2"}))
+        with mock.patch("time.sleep") as sleep:
+            self.assertEqual(request_markets(http, [cid(1)]), [])
+            with self.assertRaises(httpx.HTTPStatusError):
+                request_markets(http, [cid(1)], retries=0)
+        self.assertEqual([c.args for c in sleep.call_args_list], [(2.0,)])
+        self.assertEqual(statuses, [])
+
+    def test_a_failed_request_raises_and_a_null_answer_is_no_entries(self):
+        with self.assertRaises(httpx.HTTPStatusError):
+            request_markets(client(Gamma(fail_when=lambda ids: True)), [cid(1)])
+        http = client(lambda request: httpx.Response(200, content=b"null"))
+        self.assertEqual(request_markets(http, [cid(1)]), [])
 
 
 class FetchMarketsTests(unittest.TestCase):

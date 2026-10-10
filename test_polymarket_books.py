@@ -6,9 +6,17 @@ import unittest
 
 import httpx
 
-import reward_screener
 from polymarket import books
-from polymarket.books import Levels, best_ask, best_bid, fetch_book, fetch_books, parse_levels
+from polymarket.books import (
+    Levels,
+    best_ask,
+    best_bid,
+    fetch_book,
+    fetch_books,
+    parse_books,
+    parse_levels,
+    request_books,
+)
 
 ENTRIES = [
     {"asset_id": "1", "tick_size": "0.01",
@@ -40,16 +48,15 @@ class ParseLevelsTests(unittest.TestCase):
         self.assertEqual(parse_levels(ENTRIES[1]), Levels(bids=[(0.4, 7.0)], asks=[], tick=None))
         self.assertEqual(parse_levels(ENTRIES[2]), Levels(bids=[], asks=[], tick=None))
 
-    def test_every_entry_parses_as_the_screener_parses_it(self):
-        for entry in ENTRIES:
-            with self.subTest(entry=entry):
-                self.assertEqual(tuple(parse_levels(entry)),
-                                 tuple(reward_screener.parse_levels(entry)))
+    def test_numbers_parse_like_strings_and_a_missing_side_or_unreadable_tick_is_empty(self):
+        self.assertEqual(parse_levels(ENTRIES[3]),
+                         Levels(bids=[(0.2, 3.0)], asks=[(0.8, 2.5)], tick=0.001))
+        self.assertEqual(parse_levels(ENTRIES[4]), Levels(bids=[], asks=[], tick=None))
+        self.assertEqual(parse_levels(ENTRIES[5]), Levels(bids=[], asks=[], tick=None))
 
-    def test_levels_has_the_screeners_fields_and_default(self):
-        self.assertEqual(Levels._fields, reward_screener.Levels._fields)
+    def test_levels_are_bids_asks_and_a_tick_that_defaults_to_none(self):
+        self.assertEqual(Levels._fields, ("bids", "asks", "tick"))
         self.assertEqual(Levels([], []), Levels([], [], None))
-        self.assertEqual(tuple(Levels([], [])), tuple(reward_screener.Levels([], [])))
 
     def test_best_prices_are_the_touch_or_none_on_an_empty_side(self):
         levels = parse_levels(ENTRIES[0])
@@ -72,6 +79,40 @@ class FetchBookTests(unittest.TestCase):
     def test_a_refused_read_raises(self):
         with self.assertRaises(httpx.HTTPStatusError):
             fetch_book(client(lambda request: httpx.Response(404)), "1")
+
+
+class RequestBooksTests(unittest.TestCase):
+    def test_one_request_asks_for_every_token_and_returns_the_entries_unparsed(self):
+        seen = []
+
+        def handler(request):
+            seen.append((request.method, str(request.url), json.loads(request.content),
+                         request.extensions["timeout"]["read"]))
+            return httpx.Response(200, json=[book_entry("1"), "noise"])
+
+        self.assertEqual(request_books(client(handler), ["1", "2"], timeout=7),
+                         [book_entry("1"), "noise"])
+        self.assertEqual(seen, [("POST", f"{books.CLOB_HOST}/books",
+                                 [{"token_id": "1"}, {"token_id": "2"}], 7)])
+
+    def test_a_refused_request_raises(self):
+        with self.assertRaises(httpx.HTTPStatusError):
+            request_books(client(lambda request: httpx.Response(502)), ["1"])
+
+    def test_a_null_answer_is_no_entries(self):
+        http = client(lambda request: httpx.Response(200, content=b"null"))
+        self.assertEqual(request_books(http, ["1"]), [])
+
+
+class ParseBooksTests(unittest.TestCase):
+    def test_each_book_is_keyed_by_its_token_and_an_entry_naming_no_token_is_left_out(self):
+        entries = [book_entry("1"), "noise", {"bids": []}, None, {**ENTRIES[0], "asset_id": 2}]
+        self.assertEqual(parse_books(entries), {"1": parse_levels(book_entry("1")),
+                                                "2": parse_levels(ENTRIES[0])})
+
+    def test_a_book_that_does_not_parse_raises(self):
+        with self.assertRaises(AttributeError):
+            parse_books([{"asset_id": "1", "bids": ["not a level"]}])
 
 
 class FetchBooksTests(unittest.TestCase):

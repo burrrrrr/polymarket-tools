@@ -6,9 +6,10 @@ from datetime import datetime
 from typing import NamedTuple, Optional
 
 from polymarket.hosts import GAMMA_HOST
-from polymarket.http import get_with_retry, in_chunks
+from polymarket.http import RATE_LIMIT_RETRIES, get_with_retry, in_chunks
 from polymarket.parse import as_float, parse_time
 
+# Most condition ids Gamma /markets resolves in one request.
 GAMMA_REQUEST_LIMIT = 100
 SEARCH_LIMIT_PER_TYPE = 20
 
@@ -41,6 +42,25 @@ def decode_list(value):
     return value if isinstance(value, list) else []
 
 
+def request_markets(http, condition_ids, closed=None, timeout=20, *, limit=True,
+                    retries=RATE_LIMIT_RETRIES):
+    """The entries of one /markets request for these ids, at most
+    GAMMA_REQUEST_LIMIT of them, as Gamma sent them. Raises when the request
+    fails.
+
+    closed is as in fetch_markets. limit=False sends no limit, for a request
+    that names one market. A 429 is waited out up to retries times. A caller
+    that carries on without a failed request catches around this.
+    """
+    params = [("condition_ids", c) for c in condition_ids]
+    if closed is not None:
+        params.append(("closed", "true" if closed else "false"))
+    if limit:
+        # Without a limit Gamma caps a response at 20 markets.
+        params.append(("limit", str(len(condition_ids))))
+    return get_with_retry(http, f"{GAMMA_HOST}/markets", params, timeout, retries).json() or []
+
+
 def fetch_markets(http, condition_ids, closed=None, timeout=20):
     """Gamma's entry for each of these markets, GAMMA_REQUEST_LIMIT ids a request.
 
@@ -49,13 +69,7 @@ def fetch_markets(http, condition_ids, closed=None, timeout=20):
     any request fails.
     """
     def fetch(chunk):
-        params = [("condition_ids", c) for c in chunk]
-        if closed is not None:
-            params.append(("closed", "true" if closed else "false"))
-        # Without a limit Gamma caps a response at 20 markets.
-        params.append(("limit", str(len(chunk))))
-        entries = get_with_retry(http, f"{GAMMA_HOST}/markets", params, timeout).json() or []
-        return [e for e in entries if isinstance(e, dict)]
+        return [e for e in request_markets(http, chunk, closed, timeout) if isinstance(e, dict)]
 
     return [e for entries in in_chunks(fetch, condition_ids, GAMMA_REQUEST_LIMIT) for e in entries]
 

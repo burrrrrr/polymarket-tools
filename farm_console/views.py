@@ -19,6 +19,7 @@ from reward_screener import (
     adjusted_mid,
     created_mid,
     floor_to_tick,
+    human_volume,
     planned_budget_cost,
 )
 from reward_screener import score as share_score
@@ -1014,15 +1015,6 @@ class DiscoverRow:
 
 def mode_tone(mode):
     return "t-b" if (mode or "").lower() == "budget" else "t-f"
-
-
-def human_volume(value):
-    if value is None:
-        return "--"
-    for unit, size in (("M", 1e6), ("k", 1e3)):
-        if value >= size:
-            return f"{value / size:.1f}{unit}"
-    return f"{value:.0f}"
 
 
 def discover_row(rank, market, status, now):

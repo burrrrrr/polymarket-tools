@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest import mock
@@ -16,8 +17,8 @@ import reward_screener
 import fill_cost
 from exit_value import BuyTape, Piece, Sweep
 from fill_cost import DISTANCES, FillCurve, History, Hit
+from polymarket.books import Levels
 from reward_screener import (
-    Levels,
     Mode,
     Outlook,
     Read,
@@ -1103,6 +1104,121 @@ class FetchReadTest(unittest.TestCase):
             reads = reward_screener.fetch_reads(http, [MARKET], HISTORY_NOW, 0.90)
         self.assertEqual(reads, {})
         self.assertIn("test-market", printed.call_args.args[0])
+
+
+def books_api(fail_when=lambda tokens: False, gate=None):
+    """An httpx client whose /books answers with a book for each token asked for,
+    or a 502 when fail_when(tokens), once gate lets it; and its requests."""
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        tokens = [item["token_id"] for item in json.loads(request.content)]
+        if gate is not None:
+            gate.wait()
+        if fail_when(tokens):
+            return httpx.Response(502)
+        return httpx.Response(200, json=[
+            {"asset_id": t, "tick_size": "0.001", "bids": [{"price": "0.95", "size": "100"}],
+             "asks": [{"price": "0.97", "size": "40"}]} for t in tokens])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+class FetchLevelsTest(unittest.TestCase):
+    TOKENS = [str(n) for n in range(1201)]
+    BOOK = Levels(bids=[(0.95, 100.0)], asks=[(0.97, 40.0)], tick=0.001)
+
+    def test_each_token_is_asked_for_once_in_posts_of_at_most_500(self):
+        http, calls = books_api()
+        books = reward_screener.fetch_levels(http, self.TOKENS + self.TOKENS[:10])
+        asked = [[item["token_id"] for item in json.loads(c.content)] for c in calls]
+        self.assertEqual(sorted(len(tokens) for tokens in asked), [201, 500, 500])
+        self.assertEqual(sorted(t for tokens in asked for t in tokens), sorted(self.TOKENS))
+        self.assertEqual({(c.method, c.url.path, c.extensions["timeout"]["read"]) for c in calls},
+                         {("POST", "/books", 20)})
+        self.assertEqual(books, dict.fromkeys(self.TOKENS, self.BOOK))
+
+    def test_a_failed_chunk_is_reported_and_the_other_chunks_are_kept(self):
+        http, _ = books_api(fail_when=lambda tokens: "700" in tokens)
+        with mock.patch("builtins.print") as printed:
+            books = reward_screener.fetch_levels(http, self.TOKENS)
+        self.assertEqual(sorted(books), sorted(self.TOKENS[:500] + self.TOKENS[1000:]))
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("  Warning: /books chunk of 500 failed (Server error '502 Bad Gateway'",
+                      printed.call_args.args[0])
+
+    def test_the_chunks_are_read_at_the_same_time(self):
+        http, _ = books_api(gate=threading.Barrier(3, timeout=5))
+        with mock.patch("builtins.print"):
+            books = reward_screener.fetch_levels(http, self.TOKENS)
+        self.assertEqual(len(books), len(self.TOKENS))
+
+    def test_no_tokens_sends_no_request(self):
+        http, calls = books_api()
+        self.assertEqual((reward_screener.fetch_levels(http, []), calls), ({}, []))
+
+
+def gamma_markets_api(fail_when=lambda ids: False, status=500, gate=None):
+    """An httpx client whose Gamma /markets answers with a record for each id
+    asked for, or status when fail_when(ids), once gate lets it; and its requests."""
+    calls = []
+
+    def handle(request):
+        calls.append(request)
+        ids = request.url.params.get_list("condition_ids")
+        if gate is not None:
+            gate.wait()
+        if fail_when(ids):
+            return httpx.Response(status, headers={"retry-after": "1"})
+        return httpx.Response(200, json=[{"conditionId": c, "slug": f"slug-{c}"} for c in ids])
+
+    return httpx.Client(transport=httpx.MockTransport(handle)), calls
+
+
+class FetchGammaTest(unittest.TestCase):
+    IDS = [f"0x{n:03x}" for n in range(250)]
+
+    def test_ids_are_read_in_chunks_of_a_hundred_each_with_its_size_as_the_limit(self):
+        http, calls = gamma_markets_api()
+        info = reward_screener.fetch_gamma(http, self.IDS)
+        asked = [c.url.params for c in calls]
+        self.assertEqual(sorted(len(p.get_list("condition_ids")) for p in asked), [50, 100, 100])
+        for params in asked:
+            self.assertEqual(params["limit"], str(len(params.get_list("condition_ids"))))
+            self.assertNotIn("closed", params)
+        self.assertEqual({(c.method, c.url.path, c.extensions["timeout"]["read"]) for c in calls},
+                         {("GET", "/markets", 20)})
+        self.assertEqual({cid: i.slug for cid, i in info.items()},
+                         {cid: f"slug-{cid}" for cid in self.IDS})
+
+    def test_a_failed_chunk_is_reported_and_leaves_its_markets_bare(self):
+        http, _ = gamma_markets_api(fail_when=lambda ids: self.IDS[120] in ids)
+        with mock.patch("builtins.print") as printed:
+            info = reward_screener.fetch_gamma(http, self.IDS)
+        self.assertEqual(sorted(info), sorted(self.IDS[:100] + self.IDS[200:]))
+        self.assertEqual(len(printed.call_args_list), 1)
+        self.assertIn("  Warning: Gamma chunk of 100 failed (Server error '500 Internal Server "
+                      "Error'", printed.call_args.args[0])
+
+    def test_a_rate_limited_chunk_fails_at_once_without_a_retry(self):
+        http, calls = gamma_markets_api(fail_when=lambda ids: True, status=429)
+        with mock.patch("time.sleep") as sleep, mock.patch("builtins.print") as printed:
+            info = reward_screener.fetch_gamma(http, self.IDS[:3])
+        self.assertEqual((info, len(calls)), ({}, 1))
+        sleep.assert_not_called()
+        self.assertIn("  Warning: Gamma chunk of 3 failed (Client error '429 Too Many Requests'",
+                      printed.call_args.args[0])
+
+    def test_the_chunks_are_read_at_the_same_time(self):
+        http, _ = gamma_markets_api(gate=threading.Barrier(3, timeout=5))
+        with mock.patch("builtins.print"):
+            info = reward_screener.fetch_gamma(http, self.IDS)
+        self.assertEqual(len(info), len(self.IDS))
+
+    def test_no_ids_sends_no_request(self):
+        http, calls = gamma_markets_api()
+        self.assertEqual((reward_screener.fetch_gamma(http, []), calls), ({}, []))
 
 
 REWARD_ROWS = [(f"0x{n:04d}", n % 7 + 1) for n in range(2000)]

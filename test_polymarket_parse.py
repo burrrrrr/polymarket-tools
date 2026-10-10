@@ -1,9 +1,8 @@
 """Tests for polymarket.parse: the loosely typed values the APIs send."""
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-import reward_screener
 from polymarket.parse import as_float, parse_time
 
 
@@ -24,11 +23,19 @@ class ParseTimeTests(unittest.TestCase):
         self.assertEqual(parse_time("2026-11-03T12:00:00Z"), expected)
         self.assertEqual(parse_time("2026-11-03T12:00:00"), expected)
 
-    def test_it_reads_every_value_as_the_screener_does(self):
-        for value in ("2026-11-03T12:00:00Z", "2026-11-03T12:00:00+02:00", "2026-11-03",
-                      "2026-11-03 12:00:00", "", None, "soon", 0, 20261103):
+    def test_an_offset_is_kept_and_a_date_alone_is_midnight_utc(self):
+        self.assertEqual(parse_time("2026-11-03T12:00:00+02:00"),
+                         datetime(2026, 11, 3, 12, 0, tzinfo=timezone(timedelta(hours=2))))
+        midnight = datetime(2026, 11, 3, tzinfo=timezone.utc)
+        self.assertEqual(parse_time("2026-11-03"), midnight)
+        self.assertEqual(parse_time(20261103), midnight)
+        self.assertEqual(parse_time("2026-11-03 12:00:00"),
+                         datetime(2026, 11, 3, 12, 0, tzinfo=timezone.utc))
+
+    def test_an_empty_or_unreadable_value_is_none(self):
+        for value in ("", None, "soon", 0):
             with self.subTest(value=value):
-                self.assertEqual(parse_time(value), reward_screener.parse_time(value))
+                self.assertIsNone(parse_time(value))
 
 
 if __name__ == "__main__":
