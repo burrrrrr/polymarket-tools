@@ -235,6 +235,18 @@ class ValueQuoteTest(unittest.TestCase):
         self.assertAlmostEqual(fast.loss_per_share, 0.94 - 0.98 * (0.75 + 0.25 / 1.4), places=6)
         self.assertGreater(fast.net_per_day, held.net_per_day)
 
+    def test_a_fill_sold_at_an_exit_ask_is_worth_that_ask(self):
+        # Plague: a 96.8c bid on a 99c favorite 0.228 years out, whose sweeps
+        # exit 1.191 times a day. Sold at p_true a fill gains 0.31c a share;
+        # sold at the 98.1c ask it loses 0.36c.
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.968, 100.0), 96.8, 0.99)
+        plague = outlook(curve(0.5, exit_per_day=1.191), years=0.228)
+        at_p_true = reward_screener.value_quote(*quote, plague)
+        at_ask = reward_screener.value_quote(*quote, plague, exit_price=0.981)
+        self.assertAlmostEqual(at_p_true.loss_per_share, -0.0031, places=4)
+        self.assertAlmostEqual(at_ask.loss_per_share, 0.0036, places=4)
+        self.assertEqual(at_ask.fills_per_day, at_p_true.fills_per_day)
+
     def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
                                             5.0, 0.98, outlook(curve(1e6)))

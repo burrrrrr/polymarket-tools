@@ -796,6 +796,84 @@ class ExitPricingTest(unittest.TestCase):
         self.assertEqual(opensi_ask(held=OPENSI_HELD._replace(fav_avg=0.97)), 0.975)
 
 
+class AskKeepTest(unittest.TestCase):
+    """OpenSI's exit targets 95.8c, off the 94.8c mid before its fill; a
+    cheaper ask scores more against the 92.5c mid, so score alone keeps it."""
+
+    def setUp(self):
+        self.target = quotes_at(OPENSI, OPENSI_BOOK, OPENSI_HELD, CFG, True, None,
+                                fill_mid=0.948)
+        self.intent = by_slot(self.target)[Slot.FAV_ASK]
+
+    def order(self, price):
+        return live("a", Slot.FAV_ASK, price, self.intent.size)
+
+    def keep(self, price):
+        return keep_failure(self.order(price), self.intent, self.target, OPENSI, OPENSI_HELD,
+                            CFG)
+
+    def test_an_ask_resting_well_under_the_target_is_replaced(self):
+        self.assertEqual(self.intent.price, 0.958)
+        self.assertEqual(self.keep(0.947), "below the target price")
+        actions = reconcile(self.target, [self.order(0.947)], OPENSI, OPENSI_HELD, CFG)
+        placed = [a.intent for a in actions if isinstance(a, Place)]
+        self.assertEqual(actions[0], Cancel(("a",)))
+        self.assertEqual([(i.slot, i.price) for i in placed], [(Slot.FAV_ASK, 0.958)])
+
+    def test_an_ask_within_two_ticks_under_the_target_stays(self):
+        self.assertIsNone(self.keep(0.956))
+        self.assertEqual(self.keep(0.955), "below the target price")
+
+    def test_an_ask_over_the_target_is_judged_by_its_score(self):
+        self.assertIsNone(self.keep(0.961))
+        self.assertEqual(self.keep(0.962), "score below keep ratio")
+
+
+# Plague's shape: a 99c favorite 0.228 years out with a 97.05c mid, whose
+# sweeps are back at the mid in under a day.
+PLAGUE = market(p_true=0.99, end_date=NOW + timedelta(days=0.228 * 365.25))
+PLAGUE_BOOK = Levels(bids=[(0.970, 1000.0), (0.960, 5000.0)],
+                     asks=[(0.971, 1000.0), (0.990, 5000.0)], tick=0.001)
+PLAGUE_FILLS = QUIET._replace(exit_per_day=1.191)
+
+
+def plague_bid_value(position=Position(), fm=PLAGUE, fill_mid=None, price=0.968):
+    outlook = market_outlook(fm, None, None, PRIOR, CFG, NOW)._replace(fills=PLAGUE_FILLS)
+    target = target_orders(fm, PLAGUE_BOOK, position, CFG, True, outlook, fill_mid=fill_mid)
+    return target.fav.curve[price]
+
+
+def sold_at(exit_price):
+    """What a Plague share is worth today when it exits at exit_price."""
+    return fill_cost.share_value(0.99, exit_price, 1.191, 0.228, CFG.hurdle_rate,
+                                 CFG.stuck_share)
+
+
+class FillValueTest(unittest.TestCase):
+    """A favorite bid's fill is valued at the favorite ask the farmer would
+    rest for the inventory the fill leaves it holding, not at p_true."""
+
+    def test_a_fill_sells_at_the_ask_off_the_mid_it_found(self):
+        # 97.05c + 1c: a 96.8c fill is worth 96.44c today and costs 0.36c a
+        # share, where selling at p_true it would gain 0.31c.
+        value = plague_bid_value()
+        self.assertAlmostEqual(sold_at(0.981), 0.9644, places=4)
+        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.981))
+        self.assertAlmostEqual(value.loss_per_share, 0.0036, places=4)
+
+    def test_a_fill_mid_above_the_book_mid_anchors_the_exit(self):
+        value = plague_bid_value(fill_mid=0.975)
+        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.985))
+
+    def test_the_exit_floor_takes_the_cost_blended_over_the_fill(self):
+        # 1,000 shares at 98.5c rest their ask at 99.0c; 1,048.55 more at
+        # 96.8c blend the cost to 97.63c, flooring the exit at 98.2c.
+        held = Position(fav_shares=1000.0, fav_avg=0.985)
+        value = plague_bid_value(held, PLAGUE._replace(capital=2000.0))
+        self.assertEqual(value.size, 1048.55)
+        self.assertAlmostEqual(value.loss_per_share, 0.968 - sold_at(0.982))
+
+
 class BackoffTest(unittest.TestCase):
     def test_delay_doubles_to_the_cap(self):
         delays, backoff = [], None
@@ -1777,6 +1855,34 @@ class LiveFarmerTest(FarmerHarness):
         flagged = [(e["kind"], e["condition_id"], e["slot"]) for e in self.events()
                    if e["kind"] in ("REJECT", "BACKOFF")]
         self.assertEqual(flagged, [("REJECT", CID2, "FAV_BID"), ("BACKOFF", CID2, "FAV_BID")])
+
+    def favorite_asks_with_balance(self, balance):
+        """The sizes of the favorite asks a cycle rests when the data API says
+        51.76 shares are held and the CLOB's balance read does `balance`."""
+        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        reward_farmer.fetch_holdings.return_value = {FAV: (51.76, 0.95)}
+
+        def balance_allowance(params):
+            if params.token_id == FAV:
+                return balance()
+            return {"balance": "10000000000"}
+
+        self.client.get_balance_allowance.side_effect = balance_allowance
+        self.started_farmer(client=self.client).cycle()
+        return [o["original_size"] for o in self.resting.values()
+                if o["asset_id"] == FAV and o["side"] == "SELL"]
+
+    def test_a_favorite_ask_is_sized_to_the_shares_the_clob_holds(self):
+        # The data API books fills to the cent: it said 51.76 while the CLOB
+        # held 51.757576, and rejected the 51.76 ask for want of balance.
+        self.assertEqual(self.favorite_asks_with_balance(lambda: {"balance": "51757576"}),
+                         ["51.75"])
+
+    def test_a_failed_balance_read_rests_the_planned_ask(self):
+        def down():
+            raise httpx.ConnectError("down")
+
+        self.assertEqual(self.favorite_asks_with_balance(down), ["51.76"])
 
     def test_a_failed_batch_alerts_each_market_in_it_with_its_own_count(self):
         self.client.post_orders.side_effect = httpx.ConnectError("down")

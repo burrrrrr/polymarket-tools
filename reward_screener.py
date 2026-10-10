@@ -598,17 +598,18 @@ def fav_bid_candidates(levels, v, tick, min_size, max_lead, cap=None):
     return prices
 
 
-def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook):
+def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook,
+                exit_price=None):
     """What a configuration of our quotes earns per day, net of what its fills cost.
 
     levels is the favorite book without our orders, mid the midpoint once our
     quotes join it, my_q our Q_min there, and bid the favorite bid's (price,
     size), or None. The reward is our share of the pool against
-    competing_score. A fill of the favorite bid loses
-    fill_cost.loss_per_share against p_true over its fill_cost.hold_discount,
-    and the whole bid fills each time a sweep reaches past its distance below
-    mid: a sweep would find our bid in the book, so mid is the one our quotes
-    create.
+    competing_score. A fill of the favorite bid loses its price less
+    fill_cost.share_value, the exiting share sold at exit_price, or at p_true
+    without one, and the whole bid fills each time a sweep reaches past its
+    distance below mid: a sweep would find our bid in the book, so mid is the
+    one our quotes create.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
@@ -621,9 +622,9 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
         capital_usd=capital_usd,
         reward_per_day=reward,
         fills_per_day=size * outlook.fills.per_day(mid - price),
-        loss_per_share=fill_cost.loss_per_share(price, p_true, fill_cost.hold_discount(
-            outlook.fills.exit_per_day, outlook.years_left, outlook.hurdle_rate,
-            outlook.stuck_share)),
+        loss_per_share=price - fill_cost.share_value(
+            p_true, exit_price, outlook.fills.exit_per_day, outlook.years_left,
+            outlook.hurdle_rate, outlook.stuck_share),
     )
 
 

@@ -7,11 +7,12 @@ the mid mostly recovers to where the sweep found it within days, so a share
 mostly exits after an exponential hold T of rate lambda a year, cut short at
 resolution Y years out. A share in stuck_share q never exits: the mid falls
 under min_fav and the ask is pulled, or the market collapses, and it is held
-to resolution. With delta = ln(1 + r), a share bought at b and worth p_true
-loses L = b - p_true * D today, where hold_discount
-D = (1 - q) * E[exp(-delta * min(T, Y))] + q * exp(-delta * Y). On a
-short-dated market, or one whose fills exit fast, L is negative and fills are
-welcome.
+to resolution. With delta = ln(1 + r), a share bought at b that exits at the
+ask a and is worth p_true at resolution loses L = b - share_value today,
+share_value = (1 - q) * a * E[exp(-delta * min(T, Y))]
++ q * p_true * exp(-delta * Y); without an ask, a is p_true and share_value
+is p_true times hold_discount. On a short-dated market, or one whose fills
+exit fast, L can be negative and fills are welcome.
 
 A bid fills when a sweep reaches past it: taker trades hitting favorite bids
 in one burst, whose deepest fill trades below the bid. A market's History
@@ -83,9 +84,17 @@ def hold_discount(exit_per_day, years, hurdle_rate, stuck_share):
     return (1 - stuck_share) * exiting + stuck_share * math.exp(-delta * years)
 
 
-def loss_per_share(price, p_true, discount):
-    """What a share bought at price costs today, against p_true times its hold_discount."""
-    return price - p_true * discount
+def share_value(p_true, exit_price, exit_per_day, years, hurdle_rate, stuck_share):
+    """What a filled share is worth today at the hurdle rate: the exiting
+    share sells at exit_price after hold_discount's hold, the stuck share is
+    worth p_true at resolution. exit_price None sells at p_true, and an ask
+    over p_true is credited at p_true: the hold is the mid's recovery, and
+    asks sell far slower than that, so a fill never looks worth more than
+    p_true."""
+    exit_price = p_true if exit_price is None else min(exit_price, p_true)
+    exiting = hold_discount(exit_per_day, years, hurdle_rate, 0.0)
+    held = math.exp(-math.log1p(hurdle_rate) * years)
+    return (1 - stuck_share) * exit_price * exiting + stuck_share * p_true * held
 
 
 def years_until(end_date, now):

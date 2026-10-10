@@ -20,10 +20,10 @@ from fill_cost import (
     history_from_json,
     history_to_json,
     hold_discount,
-    loss_per_share,
     make_history,
     prior_from_json,
     prior_to_json,
+    share_value,
     years_until,
 )
 
@@ -47,8 +47,7 @@ class LossTest(unittest.TestCase):
         # A year out at 40%: 0.97 / 1.4 = 0.692857 today.
         self.assertAlmostEqual(hold_discount(0.0, 1.0, 0.40, 0.25), 1 / 1.4)
         self.assertAlmostEqual(hold_discount(0.5, 1.0, 0.40, 1.0), 1 / 1.4)
-        self.assertAlmostEqual(loss_per_share(0.95, 0.97, hold_discount(0.0, 1.0, 0.40, 0.25)),
-                               0.95 - 0.97 / 1.4)
+        self.assertAlmostEqual(share_value(0.97, None, 0.0, 1.0, 0.40, 0.25), 0.97 / 1.4)
 
     def test_a_fast_exit_with_nothing_stuck_is_barely_discounted(self):
         self.assertAlmostEqual(hold_discount(1e6, 1.0, 0.40, 0.0), 1.0, places=6)
@@ -65,7 +64,25 @@ class LossTest(unittest.TestCase):
         self.assertAlmostEqual(hold_discount(0.2, 1.0, 0.0, 0.25), 1.0)
 
     def test_a_short_dated_fill_below_the_discounted_value_is_welcome(self):
-        self.assertLess(loss_per_share(0.95, 0.99, hold_discount(0.0, 2 / 365.25, 0.40, 1.0)), 0)
+        self.assertLess(0.95 - share_value(0.99, None, 0.0, 2 / 365.25, 0.40, 1.0), 0)
+
+    def test_an_exiting_share_is_worth_the_ask_it_sells_at(self):
+        # Plague, 0.228 years out, exiting 1.191 times a day: three quarters
+        # sell at the 98.1c ask with almost no wait, the stuck quarter is worth
+        # 99c at resolution, 92.6% of it today.
+        self.assertAlmostEqual(share_value(0.99, 0.981, 1.191, 0.228, 0.40, 0.25), 0.9644,
+                               places=4)
+        self.assertAlmostEqual(share_value(0.99, None, 1.191, 0.228, 0.40, 0.25),
+                               0.99 * hold_discount(1.191, 0.228, 0.40, 0.25))
+        self.assertAlmostEqual(share_value(0.99, 0.99, 1.191, 0.228, 0.40, 0.25),
+                               0.99 * hold_discount(1.191, 0.228, 0.40, 0.25))
+
+    def test_an_ask_over_p_true_is_credited_at_p_true(self):
+        # Bardella valued its exit at a 96c ask against a 92c p_true: the ask's
+        # sales come on the mid-recovery clock, which sells far slower than it
+        # says, so a fill must not look worth more than p_true.
+        self.assertAlmostEqual(share_value(0.92, 0.96, 1.191, 0.228, 0.40, 0.25),
+                               share_value(0.92, None, 1.191, 0.228, 0.40, 0.25))
 
     def test_years_run_to_the_end_date_and_never_go_negative(self):
         self.assertAlmostEqual(years_until(NOW + timedelta(days=365.25), NOW), 1.0)

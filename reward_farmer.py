@@ -17,8 +17,9 @@ farmer rests on both sides, in four slots per market:
 
   FAV_BID   favorite BUY, Q_one, uses cash. A fill holds capital until
             FAV_ASK sells it, or to resolution for the --stuck-share that
-            never sells, so it costs the price less p_true discounted at the
-            hurdle rate over that hold. The bid rests at the price in the
+            never sells, so it costs the price less, discounted at the
+            hurdle rate over that hold, the ask the fill would leave resting
+            or p_true for the stuck share. The bid rests at the price in the
             band whose rewards net of expected fills (from the market's fill
             history, shrunk toward the last scan's cross-market prior) are
             highest, never above p_true minus a margin, and only when that
@@ -113,7 +114,9 @@ of the best price's net instead of the score and to the size planned at its
 own price, and the orders that balance it are planned around the bid that
 stays rather than the target. A longshot bid is kept while it covers
 keep_ratio of the score it balances, up to twice it above the floor, at a
-price no higher than target or within two ticks of the min-score price. Replacing an order loses its queue
+price no higher than target or within two ticks of the min-score price. A
+favorite ask more than two ticks under its target is replaced although it
+scores more, so it follows a target that rises. Replacing an order loses its queue
 position, costs two API calls, and scores nothing for the ~30 seconds before
 Polymarket starts scoring the new order, so this hysteresis matters.
 
@@ -211,6 +214,11 @@ LONG_COVER_MAX = 2.0
 # of the cheapest price scoring min_low_score, which moves a tick with each
 # tick of mid: the cheapest covering price swings with a two-tick wobble.
 LONG_PRICE_SLACK_TICKS = 2
+
+# A favorite ask priced under target stays while it is within this many
+# ticks of it: the target moves a tick with each tick of mid, and a cheaper
+# ask out-scores it, so score alone never lifts an ask to a dearer target.
+ASK_PRICE_SLACK_TICKS = 2
 
 # The CLOB lists some orders one size step (0.01 share) under the size placed,
 # so a cover check exact to the share would replace them every cycle.
@@ -649,14 +657,28 @@ def market_outlook(fm, total_rates, history, prior, cfg, now):
                    cfg.stuck_share)
 
 
-def value_of(target, fm, levels, outlook):
-    """value_quote of a planned set of orders, its favorite bid included."""
+def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
+    """The favorite ask the farmer would rest once `bid` fills: on the
+    inventory with the bid's shares added at its price, anchored at the mid
+    before the fill, the book's now, or fill_mid when higher, as
+    plan_fav_ask_price takes them. None if that ask would cross."""
+    book_mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
+    shares = position.fav_shares + bid.size
+    filled = position._replace(fav_shares=shares, fav_avg=(
+        position.fav_shares * position.fav_avg + bid.size * bid.price) / shares)
+    return plan_fav_ask_price(fm, levels, book_mid, filled, cfg, fill_mid)
+
+
+def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
+    """value_quote of a planned set of orders, its favorite bid included, a
+    fill sold at its fill_exit_price."""
     by = {i.slot: i for i in target.intents}
     bid = by.get(Slot.FAV_BID)
     capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
+    exit_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
-                       bid and (bid.price, bid.size), capital, fm.p_true, outlook)
+                       bid and (bid.price, bid.size), capital, fm.p_true, outlook, exit_price)
 
 
 def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False,
@@ -676,7 +698,7 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     base = quotes_at(fm, levels, position, cfg, naked_allowed, None, fill_mid=fill_mid)
     if base.mid is None:
         return base._replace(fav=FavChoice(reason="one-sided book"))
-    baseline = value_of(base, fm, levels, outlook).net_per_day
+    baseline = value_of(base, fm, levels, position, cfg, outlook, fill_mid).net_per_day
     if not outlook.fills.from_history and not bid_without_history:
         return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline, "no fill history yet"))
 
@@ -685,7 +707,8 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
                                     ev_cap(fm, cfg)):
         plan = quotes_at(fm, levels, position, cfg, naked_allowed, price, fill_mid=fill_mid)
         if any(i.slot is Slot.FAV_BID for i in plan.intents):
-            plans[price], curve[price] = plan, value_of(plan, fm, levels, outlook)
+            plans[price], curve[price] = plan, value_of(plan, fm, levels, position, cfg,
+                                                        outlook, fill_mid)
     if not curve:
         return base._replace(fav=FavChoice(None, EMPTY_CURVE, baseline,
                                            "no scoring favorite bid"))
@@ -719,6 +742,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
     replaced only once it covers less than keep_ratio of the need. A bid
     priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
     price scoring min_low_score, the fill-risk bound the plan prices under.
+    A favorite ask is judged by score too, but one more than
+    ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
     """
     low, high = KEEP_SIZE_RANGE
     size = intent.size
@@ -748,6 +773,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
             return "short of the cover needed"
         if order.price > fm.tick + 1e-9 and covers > LONG_COVER_MAX * need + 1e-9:
             return "over twice the cover needed"
+    elif order.slot is Slot.FAV_ASK and order.price < (
+            intent.price - ASK_PRICE_SLACK_TICKS * fm.tick - 1e-9):
+        return "below the target price"
     elif order_score(order.slot, order.price, target.mid, fm.v) < (
             cfg.keep_ratio * intent.score - 1e-12):
         return "score below keep ratio"
@@ -2044,7 +2072,7 @@ class Farmer:
             expiration = int(fm.expires_at.timestamp())
             for a in p.actions:
                 if isinstance(a, Place):
-                    i = a.intent
+                    i = a.intent if a.intent.side == BUY else self.sellable(fm, a.intent)
                     try:
                         order = self.client.create_order(
                             OrderArgsV2(token_id=i.token_id, price=i.price, size=i.size,
@@ -2082,6 +2110,20 @@ class Farmer:
                 else:
                     accepted.append((fm, i))
         return accepted
+
+    def sellable(self, fm, intent):
+        """The ask sized to the shares the CLOB holds of its token: the data
+        API books each fill to the cent, so its position can overstate them.
+        As planned when the balance cannot be read."""
+        try:
+            resp = self.client.get_balance_allowance(BalanceAllowanceParams(
+                asset_type=AssetType.CONDITIONAL, token_id=intent.token_id))
+            held = round_size_down(int(resp["balance"]) / 1e6)
+        except Exception as e:
+            log(f"Warning: {intent.slot.name} balance on {fm.label} unavailable ({e}); "
+                f"placing as planned")
+            return intent
+        return intent._replace(size=min(intent.size, held))
 
     def refresh_tick(self, fm, token_ids):
         """Re-read the market's CLOB info when the client's cached tick for a
