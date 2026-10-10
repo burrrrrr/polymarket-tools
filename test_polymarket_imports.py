@@ -20,7 +20,7 @@ MODULES = [f"polymarket.{os.path.basename(path)[:-3]}" for path in SOURCES
            if not path.endswith("__init__.py")]
 
 KEYLESS = ["polymarket.books", "polymarket.gamma", "polymarket.feed", "polymarket.region",
-           "polymarket.hosts", "polymarket.http", "polymarket.parse"]
+           "polymarket.hosts", "polymarket.http", "polymarket.parse", "polymarket.orders"]
 KEYED = ("polymarket.keys", "polymarket.client", "py_clob_client_v2")
 OUTSIDE_PREFIXES = ("reward_", "farm_")
 OUTSIDE = {"tools", "config", "key_loader", "bitwarden_loader", "dotenv", "tick_watch", "restore",

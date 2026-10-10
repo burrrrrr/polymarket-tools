@@ -96,7 +96,7 @@ def routes(ctx):
         now = ctx.clock()
         market = ctx.find(conn, condition_id)
         return ctx.templates.TemplateResponse(request, "review.html", {
-            "chrome": views.chrome(ctx.snapshot(conn, now), now), "now": now, "page": "review",
+            "chrome": ctx.chrome(ctx.snapshot(conn, now), now), "now": now, "page": "review",
             **review_context(conn, market, now, **kw)}, status_code=status_code)
 
     @router.get("/review")

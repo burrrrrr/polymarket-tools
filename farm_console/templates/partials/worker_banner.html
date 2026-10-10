@@ -1,0 +1,4 @@
+{%- set worker = chrome.worker -%}
+{%- if not worker.running -%}
+<div class="banner" role="status"><span class="badge t-r" style="flex: none">Not running</span><span>{{ worker.message }}{% if worker.configured %} Start it in a terminal: <span class="mono">python -m tools --db {{ tools_db }}</span>{% endif %}</span></div>
+{%- endif -%}

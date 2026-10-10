@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% from "_macros.html" import region, token_field, field_error %}
+{% block title %}Orders{% endblock %}
+{% block content %}
+<header>
+  <h1>Orders</h1>
+  <p class="sub">Snapshots of every open order on the account, taken by the worker. The console holds no key, so it only queues the job.</p>
+</header>
+{%- if chrome.worker.configured %}
+{%- if refused %}<div class="notice" role="alert">{{ refused }}</div>{% endif %}
+
+<form class="panel pad stack" method="post" action="/orders/snapshot" style="gap: 12px">
+  {{ token_field() }}
+  <h2>Take a snapshot</h2>
+  <div class="actions">
+    <label class="grow-field"><span class="sr">Note (optional)</span><input class="inp" name="note" value="{{ note or '' }}" placeholder="Note (optional)" autocomplete="off" {{ 'aria-invalid="true"' | safe if errors and errors.get('note') }}></label>
+    <button class="btn btn-strong" type="submit">Take snapshot</button>
+  </div>
+  {{ field_error(errors or {}, 'note') }}
+  <span class="hint">The worker lists the open orders and stores them with their market names. A listing that fails stores nothing.</span>
+</form>
+
+{% call region("/partials/orders/job", "sse:job, sse:status") %}{% include "partials/orders_job.html" %}{% endcall %}
+
+{% call region("/partials/orders/snapshots", "sse:job") %}{% include "partials/orders_snapshots.html" %}{% endcall %}
+{%- endif %}
+{% endblock %}

@@ -12,7 +12,8 @@ from ..context import as_json, region_template
 
 OVERVIEW_REGIONS = {"kpis": "partials/kpis.html", "alerts": "partials/alerts.html",
                     "tracked": "partials/tracked.html", "events": "partials/events.html"}
-CHROME_REGIONS = {"status": "partials/status.html", "banner": "partials/banner.html"}
+CHROME_REGIONS = {"status": "partials/status.html", "banner": "partials/banner.html",
+                  "worker-banner": "partials/worker_banner.html"}
 
 
 def routes(ctx):
@@ -51,6 +52,6 @@ def routes(ctx):
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
             snap, vm = overview_vm(conn, now)
-        return as_json({"chrome": views.chrome(snap, now), "overview": vm})
+        return as_json({"chrome": ctx.chrome(snap, now), "overview": vm})
 
     return router

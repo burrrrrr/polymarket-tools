@@ -177,6 +177,17 @@ def parse_cancel_all(form):
     return {}
 
 
+SNAPSHOT_NOTE_MAX = 200
+
+
+def parse_snapshot_note(form):
+    """(the note of a snapshot, trimmed and possibly empty; errors by field)."""
+    note = (form.get("note") or "").strip()
+    if len(note) > SNAPSHOT_NOTE_MAX:
+        return None, {"note": f"A note is at most {SNAPSHOT_NOTE_MAX} characters."}
+    return note, {}
+
+
 TRIAGE_BATCH_DEFAULT = 20
 TRIAGE_BATCH = Bound(1, 100)
 

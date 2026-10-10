@@ -65,7 +65,7 @@ def routes(ctx):
             limit=views.DISCOVER_PAGE, offset=(filters.page - 1) * views.DISCOVER_PAGE)
         values = values or scan_values(conn)
         return ctx.templates.TemplateResponse(request, "discover.html", {
-            "chrome": views.chrome(snap, now), "now": now, "page": "discover",
+            "chrome": ctx.chrome(snap, now), "now": now, "page": "discover",
             "vm": views.discover_page(filters, markets, total, snap.status, now),
             "funnel": farm_db.load_scan_funnel(conn), "job": ctx.scanner.job,
             "fields": forms.SCAN_FIELDS, "values": values, "errors": errors or {},

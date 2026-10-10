@@ -21,6 +21,11 @@ farm_books.db
 farm_books.db-wal
 farm_books.db-shm
 
+# The order tools' database, which the console and the worker share
+tools.db
+tools.db-wal
+tools.db-shm
+
 # raw data from the 2026-10-07 unlisted-gap scoring check
 scoring_watch.csv
 

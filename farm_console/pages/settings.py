@@ -34,7 +34,7 @@ def routes(ctx):
                           triage_error=None, **kw):
         now = ctx.clock()
         return ctx.templates.TemplateResponse(request, "settings.html", {
-            "chrome": views.chrome(ctx.snapshot(conn, now), now), "now": now, "page": "settings",
+            "chrome": ctx.chrome(ctx.snapshot(conn, now), now), "now": now, "page": "settings",
             "notice": notice, "cancel_error": cancel_error, "mutes": farm_db.read_mutes(conn),
             "triage_auto": farm_db.load_triage_auto(conn), "triage_error": triage_error,
             **settings_context(conn, now, **kw)}, status_code=status_code)

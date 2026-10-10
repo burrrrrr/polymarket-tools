@@ -1,4 +1,5 @@
-"""What every page of the console shares. Reads go through farm_db, derivation through views."""
+"""What every page of the console shares. Reads go through farm_db and tools.db,
+derivation through views."""
 
 from contextlib import closing
 from datetime import timedelta
@@ -12,6 +13,7 @@ from fastapi.templating import Jinja2Templates
 import farm_db
 import reward_farmer
 from farm_db import EventKind
+from tools import db as tools_db
 
 from . import glossary, remote, security, views
 from .scan import ScanRunner
@@ -31,13 +33,14 @@ class Context:
 
     create_app builds one and hands it to each page's routes(ctx). token is the
     console token the templates put in every form. The other arguments are
-    create_app's own.
+    create_app's own; tools_db is the path of tools.db, or None.
     """
 
     def __init__(self, db_path, token, clock, *, poll_s, max_polls, scan, fetch_rules,
                  fetch_position, fetch_info, fetch_book, fetch_total_rates, run_triage,
-                 fetch_page, funder):
+                 fetch_page, funder, tools_db):
         self.db_path = db_path
+        self.tools_db = tools_db
         self.clock = clock
         self.poll_s = poll_s
         self.max_polls = max_polls
@@ -49,7 +52,8 @@ class Context:
                      "number_text", "human_volume"):
             self.templates.env.filters[name] = getattr(views, name)
         self.templates.env.globals.update(
-            PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE, token=token,
+            PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE, JOB_TONE=views.JOB_TONE,
+            token=token, tools_db=tools_db,
             TOKEN_FIELD=security.TOKEN_FIELD, TOKEN_HEADER=security.TOKEN_HEADER,
             CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
             polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
@@ -67,6 +71,21 @@ class Context:
 
     def connect(self):
         return farm_db.open_db(self.db_path)
+
+    def connect_tools(self):
+        """A connection to tools.db; 404 for a console started without one."""
+        if self.tools_db is None:
+            raise HTTPException(404, views.NO_WORKER.message)
+        return tools_db.open_db(self.tools_db)
+
+    def worker(self, now):
+        if self.tools_db is None:
+            return views.NO_WORKER
+        with closing(self.connect_tools()) as conn:
+            return views.worker_liveness(tools_db.read_worker_status(conn), now)
+
+    def chrome(self, snap, now):
+        return views.chrome(snap, now, self.worker(now))
 
     def _record_paying(self, rates):
         with closing(self.connect()) as conn:
@@ -86,9 +105,9 @@ class Context:
             counts=farm_db.status_counts(conn),
         )
 
-    def render(self, request, template, now, snap, **context):
+    def render(self, request, template, now, snap, status_code=200, **context):
         return self.templates.TemplateResponse(request, template, {
-            "chrome": views.chrome(snap, now), "now": now, **context})
+            "chrome": self.chrome(snap, now), "now": now, **context}, status_code=status_code)
 
     def find(self, conn, condition_id):
         found = farm_db.read_markets(conn, (condition_id,))

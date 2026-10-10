@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block title %}Snapshot {{ snapshot.id }}{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div>
+    <h1>Snapshot {{ snapshot.id }}</h1>
+    <p class="sub">Taken {{ snapshot.taken_at | stamp_local }} · {{ '{:,}'.format(snapshot.orders) }} order{{ '' if snapshot.orders == 1 else 's' }}{% if snapshot.note %} · {{ snapshot.note }}{% endif %}{% if snapshot.source %} · imported from {{ snapshot.source }}{% endif %}</p>
+  </div>
+  <div class="actions"><a class="btn" href="/orders">All snapshots</a></div>
+</header>
+<section class="panel pad-table">
+  <div class="scroll">
+    <table class="tbl tight">
+      <thead><tr><th>Market</th><th>Outcome</th><th>Side</th><th>Price</th><th>Size</th><th>Matched</th><th>Expiration</th></tr></thead>
+      <tbody>
+        {%- for o in orders %}
+        <tr>{% if o.market_name %}<td class="wrap">{{ o.market_name }}</td>{% else %}<td class="wrap mono muted">{{ o.order.market }}</td>{% endif %}<td>{{ o.order.outcome }}</td><td class="mono">{{ o.order.side.value }}</td><td class="mono">{{ o.order.price | cents }}</td><td class="mono">{{ o.order.size | shares }}</td><td class="mono">{{ o.order.size_matched | shares }}</td><td class="mono">{{ o.order.expiration | stamp_local if o.order.expiration else 'GTC' }}</td></tr>
+        {%- else %}
+        <tr><td colspan="7" class="muted">No orders were open.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

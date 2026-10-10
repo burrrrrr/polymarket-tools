@@ -1,0 +1,20 @@
+{%- if job %}
+<section class="panel pad stack" style="gap: 8px">
+  <div class="page-head">
+    <h2>Snapshot job {{ job.id }}</h2>
+    <span class="badge {{ JOB_TONE[job.state] }}">{{ job.state.value }}</span>
+  </div>
+  <span class="mono small c-mut">queued {{ job.created_at | stamp_local }}{% if job.started_at %} · started {{ job.started_at | clock }}{% endif %}{% if job.finished_at %} · finished {{ job.finished_at | clock }}{% endif %}</span>
+  {%- if job.params.note %}<span class="small muted">Note: {{ job.params.note }}</span>{% endif %}
+  {%- if job.state.value == 'queued' and not chrome.worker.running %}
+  <span class="small c-warn">It waits for the worker, which is not running.</span>
+  {%- endif %}
+  {%- if job.error %}<span class="field-error" role="alert">{{ job.error }}</span>{% endif %}
+  {%- for line in log %}
+  <div class="mono feed"><span class="t">{{ line.at | clock }}</span><span>{{ line.message }}</span></div>
+  {%- endfor %}
+  {%- for s in snapshots if s.job_id == job.id %}
+  <a class="small" href="/orders/snapshots/{{ s.id }}">Open snapshot {{ s.id }}</a>
+  {%- endfor %}
+</section>
+{%- endif %}

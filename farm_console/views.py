@@ -1,7 +1,8 @@
 """
-View models of the farm console: pure functions from farm.db reads to what a
-page shows. Every derived number, alert, and class name is decided here, so
-the templates only lay values out and the JSON API serves the same objects.
+View models of the farm console: pure functions from farm.db and tools.db reads
+to what a page shows. Every derived number, alert, and class name is decided
+here, so the templates only lay values out and the JSON API serves the same
+objects.
 """
 
 import json
@@ -21,6 +22,8 @@ from reward_screener import (
     planned_budget_cost,
 )
 from reward_screener import score as share_score
+from tools import db as tools_db
+from tools.db import JobState
 
 from .forms import P_TRUE_ERROR
 
@@ -39,6 +42,8 @@ LOG_PAGE = 50
 PHASE_TONE = {"QUOTING": "t-q", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
               "PAUSED": "t-n", "UNREWARDED": "t-n", "RETIRED": "t-r", WAITING: "t-n"}
 SLOT_TONE = {"FAV_BID": "t-f", "FAV_ASK": "t-f", "LONG_BID": "t-b", "LONG_ASK": "t-b"}
+JOB_TONE = {JobState.QUEUED: "t-n", JobState.RUNNING: "t-c", JobState.DONE: "t-q",
+            JobState.FAILED: "t-r"}
 KIND_TEXT_TONE = {
     EventKind.PHASE: "c-warn", EventKind.BACKOFF: "c-warn", EventKind.RETIRE: "c-warn",
     EventKind.ALERT: "c-bad", EventKind.REJECT: "c-bad",
@@ -160,17 +165,55 @@ def liveness(status, now):
 
 
 @dataclass(frozen=True)
+class WorkerLiveness:
+    """Whether the order tools' worker is running, the sidebar's label for it,
+    and the banner text when it is not. configured is False for a console
+    started with no tools.db."""
+
+    configured: bool
+    running: bool
+    keyed: Optional[bool]
+    last_beat_at: Optional[datetime]
+    label: str
+    message: str
+
+
+NO_WORKER = WorkerLiveness(False, False, None, None, "not configured",
+                           "The worker database is not configured. Start the console with "
+                           "--tools-db to use the order tools.")
+
+
+def worker_liveness(status, now):
+    """The WorkerLiveness of a tools.db worker_status row, or of none."""
+    if status is None:
+        return WorkerLiveness(True, False, None, None, "never ran",
+                              "The worker has never run against this database.")
+    label = "keyed" if status.keyed else "no key"
+    if tools_db.is_running(status, now):
+        return WorkerLiveness(True, True, status.keyed, status.last_beat_at, label, "")
+    if status.stopped_at is not None:
+        message = f"It stopped {span((now - status.stopped_at).total_seconds())} ago."
+    else:
+        ago = span((now - status.last_beat_at).total_seconds())
+        message = f"Its last heartbeat was {ago} ago."
+    return WorkerLiveness(True, False, status.keyed, status.last_beat_at, f"{label} · stopped",
+                          f"The worker is not running. {message}")
+
+
+@dataclass(frozen=True)
 class Chrome:
-    """The layout around every page: the farmer status and the nav counts."""
+    """The layout around every page: the farmer's and the worker's status and
+    the nav counts."""
 
     liveness: Liveness
     candidates: int
     quoting: int
+    worker: WorkerLiveness = NO_WORKER
 
 
-def chrome(snap, now):
+def chrome(snap, now, worker=NO_WORKER):
     return Chrome(liveness(snap.status, now), snap.counts.get("candidate", 0),
-                  sum(s.phase == "QUOTING" for s in snap.states.values()))
+                  sum(s.phase == "QUOTING" for s in snap.states.values()), worker)
 
 
 @dataclass(frozen=True)

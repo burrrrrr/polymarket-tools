@@ -28,13 +28,19 @@
     <a href="/review" class="{{ 'on' if page == 'review' }}">Review queue <span class="badge t-n count">{{ chrome.candidates }}</span></a>
     <a href="/markets" class="{{ 'on' if page == 'markets' }}">Live markets <span class="badge t-q count">{{ chrome.quoting }}</span></a>
     <a href="/activity" class="{{ 'on' if page == 'activity' }}">Activity</a>
+    <a href="/orders" class="{{ 'on' if page == 'orders' }}">Orders</a>
     <a href="/settings" class="{{ 'on' if page == 'settings' }}">Settings</a>
     <div class="status">
       {% call region("/partials/chrome/status", "sse:cycle, sse:status, every 15s") %}{% include "partials/status.html" %}{% endcall %}
     </div>
   </nav>
   <main>
+    {#- A tool page depends on the worker, so its banner is the worker's. #}
+    {%- if process == 'worker' %}
+    {% call region("/partials/chrome/worker-banner", "sse:status, every 15s") %}{% include "partials/worker_banner.html" %}{% endcall %}
+    {%- else %}
     {% call region("/partials/chrome/banner", "sse:cycle, sse:status, every 15s") %}{% include "partials/banner.html" %}{% endcall %}
+    {%- endif %}
     {% block content %}{% endblock %}
   </main>
 </div>

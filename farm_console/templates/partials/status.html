@@ -1,8 +1,20 @@
 {%- set live = chrome.liveness -%}
-<div class="panel" style="padding: 12px; display: flex; flex-direction: column; gap: 6px">
-  <div style="display: flex; align-items: center; gap: 8px">
-    <span class="dot" style="background: {{ ('#F2A3A3' if live.mode == 'LIVE' else '#F2C14E') if live.running else '#6B7480' }}"></span>
-    <span style="font-size: 13px; font-weight: 500">Farmer · {{ live.mode or 'never ran' }}{% if not live.running and live.mode %} · stopped{% endif %}</span>
+{%- set worker = chrome.worker -%}
+<div class="panel" style="padding: 12px; display: flex; flex-direction: column; gap: 10px">
+  <div style="display: flex; flex-direction: column; gap: 6px">
+    <div style="display: flex; align-items: center; gap: 8px">
+      <span class="dot" style="background: {{ ('#F2A3A3' if live.mode == 'LIVE' else '#F2C14E') if live.running else '#6B7480' }}"></span>
+      <span style="font-size: 13px; font-weight: 500">Farmer · {{ live.mode or 'never ran' }}{% if not live.running and live.mode %} · stopped{% endif %}</span>
+    </div>
+    <div class="mono small muted">{% if live.interval_s %}cycle {{ '%g' % live.interval_s }}s · {% endif %}last {{ live.last_cycle_at | clock }}</div>
   </div>
-  <div class="mono small muted">{% if live.interval_s %}cycle {{ '%g' % live.interval_s }}s · {% endif %}last {{ live.last_cycle_at | clock }}</div>
+  <div style="display: flex; flex-direction: column; gap: 6px">
+    <div style="display: flex; align-items: center; gap: 8px">
+      <span class="dot" style="background: {{ ('#F2A3A3' if worker.keyed else '#F2C14E') if worker.running else '#6B7480' }}"></span>
+      <span style="font-size: 13px; font-weight: 500">Worker · {{ worker.label }}</span>
+    </div>
+    {%- if worker.configured %}
+    <div class="mono small muted">beat {{ worker.last_beat_at | clock }}</div>
+    {%- endif %}
+  </div>
 </div>
