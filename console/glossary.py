@@ -140,13 +140,15 @@ GLOSSARY = {
                                              "sale."),
     "baseline": Term("Baseline", "Shares you already held when the farmer started managing "
                                  "this market. The farmer never sells them."),
-    "rate_now": Term("Rate now", "The rewards the farmer expects this cycle: its share of "
-                                 "the market's pool against the live book, at the orders it "
-                                 "chose. Only quoting markets count, one without a favorite "
-                                 "bid at 0. Refreshes every cycle; per hour is per day ÷ "
-                                 "24."),
-    "earned_today": Term("Earned today", "Rewards Polymarket has credited today. Paid daily "
-                                         "at midnight UTC; live mode only."),
+    "rate_now": Term("Rate now", "Polymarket's live scoring share of each quoting market's "
+                                 "pool. In dry run, or before the first share arrives, the "
+                                 "farmer's modeled share stands in; it runs low. Only "
+                                 "quoting markets count, one without a favorite bid at 0. "
+                                 "Per hour is per day ÷ 24."),
+    "earned_today": Term("Earned today", "Rewards Polymarket has credited today in every "
+                                         "market the wallet earns in, split into farmer-"
+                                         "managed and other. Paid daily at midnight UTC; "
+                                         "live mode only."),
     "earned_total": Term("Total earned", "Every reward Polymarket has credited, summed over "
                                          "each day the farmer fetched from the earnings "
                                          "API. Live mode only."),

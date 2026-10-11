@@ -66,7 +66,7 @@ def quoting_slots(fav=(0.98, 100.0), long=(0.001, 500.0), fav_score=0.5, free=Fa
 
 
 def state(cid, phase="QUOTING", reason="", until=None, mid=0.99, naked_used=0.5,
-          slots=None, backoff=None, position=None):
+          slots=None, backoff=None, position=None, scoring_pct=None):
     return FarmState(
         condition_id=cid, updated_at=NOW, phase=phase, phase_reason=reason,
         phase_until=until, book_mid=mid, mid=mid, q1=50.0, q2=50.0, capital_usd=500.0,
@@ -79,7 +79,7 @@ def state(cid, phase="QUOTING", reason="", until=None, mid=0.99, naked_used=0.5,
         book={"bids": [{"price": 0.98, "size": 200.0, "ours": 100.0},
                        {"price": 0.97, "size": 300.0, "ours": 0.0}],
               "asks": [{"price": 0.999, "size": 500.0, "ours": 500.0}]},
-        naked_paused_until=None, backoff=backoff or {}, scoring_pct=None,
+        naked_paused_until=None, backoff=backoff or {}, scoring_pct=scoring_pct,
     )
 
 
@@ -246,7 +246,8 @@ class TotalsTest(unittest.TestCase):
              state(C, "COOLDOWN", slots=cancelled)],
             [market(A, "a", budget=25, est=10), market(B, "b", budget=30, est=5),
              market(C, "c", budget=50, est=100)],
-            rewards=[("2026-10-04", A, 1.5), ("2026-10-04", B, 0.5), ("2026-10-03", A, 9.0)],
+            rewards=[("2026-10-04", A, 1.5), ("2026-10-04", B, 0.5), ("2026-10-03", A, 9.0),
+                     ("2026-10-04", "0xmanual", 3.0)],
         )
         t = views.totals(s, NOW)
         self.assertEqual((t.quoting, t.approved), (2, 3))
@@ -256,14 +257,16 @@ class TotalsTest(unittest.TestCase):
         self.assertEqual(t.naked_budget_usd, 55)
         self.assertAlmostEqual(t.inventory_usd, 3 * 6.0 * 0.95)
         self.assertEqual(t.est_daily_usd, 15)
-        self.assertEqual(t.earned_today_usd, 2.0)
+        # The wallet also earns in a market the farmer does not manage.
+        self.assertEqual((t.earned_today.farmer_usd, t.earned_today.other_usd,
+                          t.earned_today.total_usd), (2.0, 3.0, 5.0))
 
     def test_place_counts_its_target_and_no_rewards_is_none(self):
         placing = quoting_slots()
         placing["FAV_BID"] = slot("place", None, (0.96, 50.0, 0.5))
         t = views.totals(snap([state(A, slots=placing)], [market(A, "a")]), NOW)
         self.assertAlmostEqual(t.fav_bid_usd, 48.0)
-        self.assertIsNone(t.earned_today_usd)
+        self.assertIsNone(t.earned_today)
 
     def test_live_rate_counts_quoting_economics_only(self):
         def with_economics(reward):
@@ -275,11 +278,35 @@ class TotalsTest(unittest.TestCase):
         no_fav_bid = state(B)
         paused = state(C, "PAUSED", "paused by operator", slots=with_economics(7.0))
         cooling = state("0xddd", "COOLDOWN", slots=with_economics(9.0))
-        self.assertEqual([views.live_daily(s) for s in (quoting, no_fav_bid, paused, cooling)],
+        markets = [market(A, "a"), market(B, "b"), market(C, "c"), market("0xddd", "d")]
+        self.assertEqual([views.live_daily(s, market(s.condition_id, "m"))
+                          for s in (quoting, no_fav_bid, paused, cooling)],
                          [4.8, 0.0, None, None])
-        t = views.totals(snap([quoting, no_fav_bid, paused, cooling]), NOW)
+        t = views.totals(snap([quoting, no_fav_bid, paused, cooling], markets), NOW)
         self.assertAlmostEqual(t.live_daily_usd, 4.8)
         self.assertAlmostEqual(t.live_hourly_usd, 0.2)
+
+    def test_live_rate_is_the_scoring_share_of_the_pool_when_polymarket_reports_one(self):
+        # The scan saw a $100/day pool. The farmer's model says $4.80 but
+        # Polymarket says we score 6% of the pool, which is what it pays.
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": 4.8}
+        scored = state(A, slots=slots, scoring_pct=6.0)
+        self.assertAlmostEqual(views.live_daily(scored, market(A, "a")), 6.0)
+        # Without a share (dry run, or the first minutes quoting) the model
+        # stands, and without economics too the rate is 0.
+        self.assertEqual(views.live_daily(state(A, slots=slots), market(A, "a")), 4.8)
+        self.assertEqual(views.live_daily(state(A, scoring_pct=None), market(A, "a")), 0.0)
+        # A share with no pool to apply it to falls back the same way.
+        self.assertEqual(views.live_daily(scored, None), 4.8)
+        # A share is not an earning rate unless the market is quoting.
+        for phase in ("PAUSED", "COOLDOWN"):
+            with self.subTest(phase=phase):
+                idle = state(B, phase, slots=slots, scoring_pct=6.0)
+                self.assertIsNone(views.live_daily(idle, market(B, "b")))
+        t = views.totals(snap([scored, state(B, "PAUSED", slots=slots, scoring_pct=6.0)],
+                              [market(A, "a"), market(B, "b")]), NOW)
+        self.assertAlmostEqual(t.live_daily_usd, 6.0)
 
 
 class RewardsTabTest(unittest.TestCase):
@@ -299,6 +326,30 @@ class RewardsTabTest(unittest.TestCase):
         self.assertIsNone(tab.rows[2].rate_hourly_usd)
         self.assertEqual((tab.total_usd, tab.live_daily_usd, tab.quoting), (13.5, 2.4, 2))
         self.assertIsNone(views.rewards_tab(snap([state(A)]), {}, NOW).total_usd)
+
+    def test_realised_ratio_compares_farmer_markets_only_with_the_estimate(self):
+        # The estimate covers the quoting market alone, so the week's $70 from
+        # a market the owner trades by hand stays out of the ratio. The
+        # 7-day tile still counts it, and today's tile shows the split.
+        s = snap([state(A)], [market(A, "a", est=10.0)],
+                 rewards=[("2026-10-04", A, 2.0), ("2026-10-02", A, 12.0),
+                          ("2026-10-04", "0xmanual", 10.0), ("2026-10-01", "0xmanual", 60.0)])
+        tab = views.rewards_tab(s, {A: 14.0, "0xmanual": 70.0}, NOW)
+        self.assertAlmostEqual(tab.realised_ratio, 14.0 / 7 / 10.0)
+        self.assertEqual(tab.week_usd, 84.0)
+        self.assertEqual((tab.earned_today.farmer_usd, tab.earned_today.other_usd), (2.0, 10.0))
+        self.assertIsNone(views.rewards_tab(snap([state(A)], [market(A, "a")]), {}, NOW)
+                          .earned_today)
+
+    def test_rows_rate_the_scoring_share_of_the_pool(self):
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": 2.4}
+        s = snap([state(A, slots=slots, scoring_pct=6.0), state(B, slots=slots)],
+                 [market(A, "a"), market(B, "b")])
+        tab = views.rewards_tab(s, {}, NOW)
+        self.assertEqual([(r.condition_id, r.rate_daily_usd) for r in tab.rows],
+                         [(A, 6.0), (B, 2.4)])
+        self.assertAlmostEqual(tab.live_daily_usd, 8.4)
 
 
 class BandStripTest(unittest.TestCase):
@@ -704,6 +755,27 @@ class RoutesTest(Console):
         text = self.client.get("/partials/overview/kpis").text
         self.assertIn("$5.00/day", text)
         self.assertIn("$0.21/hr live · screener $10.00", text)
+
+    def test_the_rewards_kpi_uses_the_scoring_share_once_polymarket_reports_one(self):
+        slots = quoting_slots()
+        slots["FAV_BID"]["economics"] = ECONOMICS
+        self.publish(states=[state(A, slots=slots, scoring_pct=6.0)._replace(updated_at=self.now)])
+        text = self.client.get("/partials/overview/kpis").text
+        self.assertIn("$6.00/day", text)
+        self.assertNotIn("$5.00/day", text)
+        rows = self.client.get("/partials/activity?tab=rewards").text
+        self.assertIn('<td class="mono">$0.25</td><td class="mono">$6.00</td>'
+                      '<td class="mono">$10.00</td><td class="mono">6.00%</td>', rows)
+        self.assertIn('<span class="mono value">$6.00/day</span>', rows)
+
+    def test_earned_today_splits_farmer_markets_from_the_rest_of_the_wallet(self):
+        farm_db.store_rewards(self.db, self.now.strftime("%Y-%m-%d"),
+                              {A: 1.25, "0xmanual": 3.0}, self.now)
+        for url in ("/partials/overview/kpis", "/partials/activity?tab=rewards"):
+            with self.subTest(url=url):
+                text = self.client.get(url).text
+                self.assertIn('<span class="mono value">$4.25</span>', text)
+                self.assertIn("$1.25 farmer markets · $3.00 other", text)
 
     def test_the_rewards_tab_shows_each_market_rate_and_total_earned(self):
         slots = quoting_slots()

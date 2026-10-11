@@ -1,11 +1,17 @@
 <section class="stack" style="gap: 16px">
   <div class="tiles">
     <div class="panel tile"><span class="lbl">Earning now{{ tip('rate_now') }}</span><span class="mono value">{{ vm.live_daily_usd | usd }}/day</span><span class="note">{{ vm.live_hourly_usd | usd }}/hr over {{ vm.quoting }} quoting market{{ '' if vm.quoting == 1 else 's' }}</span></div>
-    <div class="panel tile"><span class="lbl">Earned today{{ tip('earned_today') }}</span><span class="mono value">{{ vm.today_usd | usd if vm.today_usd is not none else 'n/a' }}</span><span class="note">{{ 'from the earnings API, UTC day' if vm.today_usd is not none else ('in dry run' if vm.mode != 'LIVE' else 'not fetched yet') }}</span></div>
-    <div class="panel tile"><span class="lbl">Last 7 days</span><span class="mono value">{{ vm.week_usd | usd if vm.week_usd is not none else 'n/a' }}</span><span class="note">from the earnings API</span></div>
+    <div class="panel tile"><span class="lbl">Earned today{{ tip('earned_today') }}</span>
+      {%- if vm.earned_today is none %}
+      <span class="mono value">n/a</span><span class="note">{{ 'in dry run' if vm.mode != 'LIVE' else 'not fetched yet' }}</span>
+      {%- else %}
+      <span class="mono value">{{ vm.earned_today.total_usd | usd }}</span><span class="note">{{ vm.earned_today.farmer_usd | usd }} farmer markets · {{ vm.earned_today.other_usd | usd }} other, UTC day</span>
+      {%- endif %}
+    </div>
+    <div class="panel tile"><span class="lbl">Last 7 days</span><span class="mono value">{{ vm.week_usd | usd if vm.week_usd is not none else 'n/a' }}</span><span class="note">every market, from the earnings API</span></div>
     <div class="panel tile"><span class="lbl">Total earned{{ tip('earned_total') }}</span><span class="mono value">{{ vm.total_usd | usd if vm.total_usd is not none else 'n/a' }}</span><span class="note">{{ 'all recorded days, from the earnings API' if vm.total_usd is not none else ('in dry run' if vm.mode != 'LIVE' else 'not fetched yet') }}</span></div>
     <div class="panel tile"><span class="lbl">Screener estimate{{ tip('est_daily') }}</span><span class="mono value">{{ vm.est_daily_usd | usd }}/day</span><span class="note">{{ vm.quoting }} quoting market{{ '' if vm.quoting == 1 else 's' }}</span></div>
-    <div class="panel tile"><span class="lbl">Realised vs estimate</span><span class="mono value">{{ '%.0f%%' % (vm.realised_ratio * 100) if vm.realised_ratio is not none else 'n/a' }}</span><span class="note">7-day average per day over the estimate</span></div>
+    <div class="panel tile"><span class="lbl">Realised vs estimate</span><span class="mono value">{{ '%.0f%%' % (vm.realised_ratio * 100) if vm.realised_ratio is not none else 'n/a' }}</span><span class="note">7-day average per day in farmer markets over the estimate</span></div>
   </div>
   <div class="panel pad stack">
     <h2>Daily rewards by market</h2>

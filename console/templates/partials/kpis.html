@@ -9,10 +9,10 @@
   <div class="panel tile"><span class="lbl">Farm inventory{{ tip('farm_inventory') }}</span><span class="mono value">{{ t.inventory_usd | usd }}</span><span class="note">shares above baseline, at avg cost</span></div>
   <div class="panel tile"><span class="lbl">Est. rewards{{ tip('rate_now') }}</span><span class="mono value">{{ t.live_daily_usd | usd }}/day</span><span class="note">{{ t.live_hourly_usd | usd }}/hr live · screener {{ t.est_daily_usd | usd }}{{ tip('est_daily') }}</span></div>
   <div class="panel tile"><span class="lbl">Earned today{{ tip('earned_today') }}</span>
-    {%- if t.earned_today_usd is none %}
+    {%- if t.earned_today is none %}
     <span class="mono value">n/a</span><span class="note">{{ 'in dry run' if vm.mode != 'LIVE' else 'not fetched yet' }}</span>
     {%- else %}
-    <span class="mono value">{{ t.earned_today_usd | usd }}</span><span class="note">from the rewards API</span>
+    <span class="mono value">{{ t.earned_today.total_usd | usd }}</span><span class="note">{{ t.earned_today.farmer_usd | usd }} farmer markets · {{ t.earned_today.other_usd | usd }} other</span>
     {%- endif %}
   </div>
 </section>

@@ -499,14 +499,41 @@ def markets_page(snap, phase, now):
 # Overview
 # ---------------------------------------------------------------------------
 
-def live_daily(state):
-    """The reward $/day the farmer modeled this cycle against the live pool and
-    book, 0.0 quoting without a favorite bid, or None when not quoting: a
-    paused market's economics are only a preview."""
+def live_daily(state, market):
+    """The reward $/day a quoting market pays now: Polymarket's scoring share
+    of the pool the scan recorded, or while either is missing (dry run, the
+    first minutes quoting) the farmer's model, which runs low. 0.0 quoting
+    without a favorite bid, None when not quoting: a paused market's
+    economics are only a preview."""
     if state.phase != "QUOTING":
         return None
+    pool = market.metrics.get("market", {}).get("rate_per_day") if market else None
+    if state.scoring_pct is not None and pool is not None:
+        return state.scoring_pct / 100 * pool
     economics = (state.slots.get("FAV_BID") or {}).get("economics")
     return economics["reward_per_day"] if economics else 0.0
+
+
+@dataclass(frozen=True)
+class Earned:
+    """Rewards credited over some days, split by whether the farmer manages
+    the market: the wallet also earns in markets the owner quotes by hand."""
+
+    farmer_usd: float
+    other_usd: float
+
+    @property
+    def total_usd(self):
+        return self.farmer_usd + self.other_usd
+
+
+def earned(rows, managed):
+    """rows are (condition_id, usd); None when there are none."""
+    rows = list(rows)
+    if not rows:
+        return None
+    return Earned(sum(usd for cid, usd in rows if cid in managed),
+                  sum(usd for cid, usd in rows if cid not in managed))
 
 
 @dataclass(frozen=True)
@@ -522,7 +549,7 @@ class Totals:
     inventory_usd: float
     est_daily_usd: float
     live_daily_usd: float
-    earned_today_usd: Optional[float]
+    earned_today: Optional[Earned]
 
     @property
     def live_hourly_usd(self):
@@ -532,7 +559,6 @@ class Totals:
 def totals(snap, now):
     quoting = [cid for cid, s in snap.states.items() if s.phase == "QUOTING"]
     today = now.strftime("%Y-%m-%d")
-    earned = [usd for date, _, usd in snap.rewards if date == today]
 
     def notional(slot):
         orders = (resting(s, slot) for s in snap.states.values())
@@ -554,8 +580,10 @@ def totals(snap, now):
         inventory_usd=sum(inventory(s) for s in snap.states.values()),
         est_daily_usd=sum(snap.markets[c].metrics.get("est_daily_usd", 0.0)
                           for c in quoting if c in snap.markets),
-        live_daily_usd=sum(live_daily(s) or 0.0 for s in snap.states.values()),
-        earned_today_usd=sum(earned) if earned else None,
+        live_daily_usd=sum(live_daily(s, snap.markets.get(c)) or 0.0
+                           for c, s in snap.states.items()),
+        earned_today=earned(((cid, usd) for date, cid, usd in snap.rewards if date == today),
+                            snap.states),
     )
 
 
@@ -837,12 +865,14 @@ class RewardRow:
 @dataclass(frozen=True)
 class RewardsTab:
     mode: Optional[str]
-    today_usd: Optional[float]
+    earned_today: Optional[Earned]
     week_usd: Optional[float]
     total_usd: Optional[float]
     est_daily_usd: float
     live_daily_usd: float
     quoting: int
+    # The estimate covers the farmer's quoting markets, so the ratio's
+    # numerator is the week's earnings in managed markets only.
     realised_ratio: Optional[float]
     rows: list
     daily: list
@@ -865,7 +895,7 @@ def rewards_tab(snap, earned_totals, now):
     cids = dict.fromkeys([*snap.states, *by_market, *earned_totals])
     rows = sorted((RewardRow(
         cid, _name(snap, cid),
-        live_daily(snap.states[cid]) if cid in snap.states else None,
+        live_daily(snap.states[cid], snap.markets.get(cid)) if cid in snap.states else None,
         snap.markets[cid].metrics.get("est_daily_usd") if cid in snap.markets else None,
         snap.states[cid].scoring_pct if cid in snap.states else None,
         *by_market.get(cid, (0.0, 0.0)),
@@ -873,9 +903,12 @@ def rewards_tab(snap, earned_totals, now):
     ) for cid in cids), key=lambda r: (r.rate_daily_usd is None, -(r.rate_daily_usd or 0.0),
                                        -r.total_usd))
     t = totals(snap, now)
-    week = sum(r.week_usd for r in rows) if snap.rewards else None
-    ratio = week / 7 / t.est_daily_usd if week is not None and t.est_daily_usd else None
-    return RewardsTab(liveness(snap.status, now).mode, t.earned_today_usd, week,
+    week = (earned(((r.condition_id, r.week_usd) for r in rows), snap.states)
+            if snap.rewards else None)
+    ratio = (week.farmer_usd / 7 / t.est_daily_usd
+             if week is not None and t.est_daily_usd else None)
+    return RewardsTab(liveness(snap.status, now).mode, t.earned_today,
+                      week.total_usd if week is not None else None,
                       sum(earned_totals.values()) if earned_totals else None,
                       t.est_daily_usd, t.live_daily_usd, t.quoting, ratio, rows, snap.rewards)
 
