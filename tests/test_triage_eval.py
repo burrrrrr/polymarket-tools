@@ -16,9 +16,9 @@ import httpx
 from analysis import triage_eval
 from analysis.triage_eval import Resolution
 from farm import farm_db, triage
-from farm_console.remote import Rules
+from console.remote import Rules
 from polymarket.hosts import GAMMA_HOST
-from test_farm_console_writes import BUDGET_BOOK, FLOOR_BOOK, V3_RESULT, assessed_row
+from test_console_writes import BUDGET_BOOK, FLOOR_BOOK, V3_RESULT, assessed_row
 from test_triage import background, envelope, news
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

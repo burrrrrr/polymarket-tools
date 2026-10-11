@@ -88,7 +88,7 @@ JSON_VERSION = 2
 # followed it, the ask priced as the farmer prices it and a buy at or above
 # it selling. The 30-day "sold >=" column of section 4 of replay.txt, 5,078
 # bids on 169 markets, from
-#   python handoff\exit-pricing\replay\replay.py --out handoff\exit-pricing\replay --reps 2000
+#   python work\exit-pricing\replay\replay.py --out work\exit-pricing\replay --reps 2000
 # whose replay_rows.csv has one row per bid, size, horizon and fill rule: the
 # mean of `sold` over the rows of a size with H 30 and rule at-or-above. The
 # same column has 2,000 shares at 0.309, where the line through SOLD says

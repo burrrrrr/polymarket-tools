@@ -9,11 +9,11 @@ from urllib.parse import quote
 
 from fastapi.testclient import TestClient
 
-from farm_console.app import create_app
-from farm_console.pages import stream
+from console.app import create_app
+from console.pages import stream
 from polymarket.books import Levels
 from polymarket.gamma import Market
-from test_farm_console import ORIGIN, Console
+from test_console import ORIGIN, Console
 from test_polymarket_imports import loaded_by
 from tools import db
 from tools.db import Reason, Sample, Settlement, WatchState
@@ -348,7 +348,7 @@ class StreamTest(Sniper):
 
 class ImportTest(unittest.TestCase):
     def test_the_console_loads_the_picker_and_no_sniper_worker_keys_or_client(self):
-        loaded = loaded_by(["farm_console.app"])
+        loaded = loaded_by(["console.app"])
         self.assertIn("tools.picker", loaded)
         self.assertEqual([name for name in loaded if name in KEYED_BY_THIS_BUILD], [])
 

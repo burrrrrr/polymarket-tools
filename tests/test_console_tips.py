@@ -6,12 +6,12 @@ from unittest import mock
 
 import jinja2
 
-from farm_console import forms, glossary, views
-from farm_console.glossary import GLOSSARY, Term
-from test_farm_console import A
-from test_farm_console_writes import FakeRemote, Writes
+from console import forms, glossary, views
+from console.glossary import GLOSSARY, Term
+from test_console import A
+from test_console_writes import FakeRemote, Writes
 
-TEMPLATES = Path(__file__).parent.parent / "farm_console" / "templates"
+TEMPLATES = Path(__file__).parent.parent / "console" / "templates"
 TIP = re.compile(r'<button type="button" class="tip" aria-label="([^"]*)" data-tip="([^"]*)">'
                  r'</button>')
 

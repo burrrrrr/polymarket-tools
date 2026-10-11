@@ -15,7 +15,7 @@ MODULES = [f"polymarket.{os.path.basename(path)[:-3]}" for path in SOURCES
 KEYLESS = ["polymarket.books", "polymarket.gamma", "polymarket.feed", "polymarket.region",
            "polymarket.hosts", "polymarket.http", "polymarket.parse", "polymarket.orders"]
 KEYED = ("polymarket.keys", "polymarket.client", "py_clob_client_v2")
-OUTSIDE = {"farm", "analysis", "farm_console", "tools", "data_dir", "dotenv"}
+OUTSIDE = {"farm", "analysis", "console", "tools", "data_dir", "dotenv"}
 TERMINAL_CALLS = {"print", "input", "getpass", "exit", "quit", "load_dotenv"}
 
 

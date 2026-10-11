@@ -29,10 +29,8 @@ tools.db
 tools.db-wal
 tools.db-shm
 
-# raw data from the 2026-10-07 unlisted-gap scoring check
-scoring_watch.csv
+# Each effort's handoff notes, plans, scripts and run output, local only
+work/
 
-# handoff notes and scratch output, local only
-handoff/
-qq
+# What `python -m analysis.scoring_probe --csv scoring.csv` writes
 scoring.csv

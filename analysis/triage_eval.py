@@ -34,7 +34,7 @@ from dotenv import load_dotenv
 
 import data_dir
 from farm import farm_db, triage
-from farm_console import remote
+from console import remote
 from polymarket.gamma import request_markets
 
 WORKERS = 4

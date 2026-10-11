@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 
 from farm import farm_db, triage
-from farm_console.remote import Rules
+from console.remote import Rules
 
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
 QUESTION = "Will the US confirm that aliens exist before 2027?"

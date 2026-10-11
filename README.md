@@ -7,7 +7,7 @@ worker that runs two order tools from that console.
   stores them in `farm.db` for you to approve or reject.
 - `farm/reward_farmer.py` rests post-only orders on the approved markets to
   earn those rewards. It is a dry run unless you pass `--live`.
-- `python -m farm_console` serves a local web console. It shows what the
+- `python -m console` serves a local web console. It shows what the
   farmer does, and it is where you run scans, approve markets, and control
   the farmer. It holds no wallet key.
 - `python -m tools` runs the worker. It holds the wallet key and does what the
@@ -27,7 +27,7 @@ Contents:
 - [Safety](#safety)
 - [Reward screener](#reward-screener)
 - [Reward farmer](#reward-farmer)
-- [Farm console](#farm-console)
+- [Console](#console)
 - [Orders page](#orders-page)
 - [Sniper page](#sniper-page)
 - [Tests](#tests)
@@ -56,7 +56,7 @@ browser --HTTP--> console (no key) --rows--> tools.db <--rows-- worker (key)
 | --- | --- | --- | --- |
 | Screener | `python -m farm.reward_screener` | Never | Reads Polymarket's public APIs. Writes its scan to `farm.db`. |
 | Farmer | `python -m farm.reward_farmer` | Only with `--live` | Reads your decisions, settings, and commands from `farm.db` every cycle and writes what it does there. Records books to `farm_books.db`. With `--live` it posts and cancels orders. |
-| Console | `python -m farm_console` | Never | Serves HTTP on `127.0.0.1`. Reads and writes `farm.db` and `tools.db`. Reads the public APIs for a scan, the Review page, and the Sniper search. |
+| Console | `python -m console` | Never | Serves HTTP on `127.0.0.1`. Reads and writes `farm.db` and `tools.db`. Reads the public APIs for a scan, the Review page, and the Sniper search. |
 | Worker | `python -m tools` | Yes, unless `--no-key` | Reads the jobs and the watches the console wrote to `tools.db` and writes the results there. Posts the orders of a restore and of a watch. |
 
 The console steers the farmer and the worker only by writing rows. The farmer
@@ -67,8 +67,8 @@ The worker is a process of its own for three reasons:
 
 - A console restart does not stop an armed watch or a restore in progress.
 - The wallet key stays out of the process that parses HTTP.
-  `tests/test_farm_console_orders.py` and
-  `tests/test_farm_console_sniper.py` fail if importing the console loads
+  `tests/test_console_orders.py` and
+  `tests/test_console_sniper.py` fail if importing the console loads
   `polymarket.keys`, `polymarket.client`, or the worker.
 - The sniper does not share Python's interpreter lock with scans and the
   console's event stream.
@@ -126,8 +126,8 @@ tools/               the keyed worker
   sniper.py          fire each armed watch once
   picker.py          rank a market search for the Sniper page
 
-farm_console/        the web console
-  __main__.py        the entry point: python -m farm_console
+console/        the web console
+  __main__.py        the entry point: python -m console
   app.py             wires the pages together
   context.py         what every page shares
   security.py        the request guard
@@ -159,7 +159,7 @@ pip install -e ".[dev]"
 The code runs from the checkout, and the install brings only the
 dependencies. Run every command in this file from the repository root, so
 that Python finds the `farm`, `analysis`, `polymarket`, `tools`, and
-`farm_console` packages.
+`console` packages.
 
 Two outside programs are optional. The Bitwarden CLI (`bw`) is needed only
 when the wallet key comes from a Bitwarden vault. The `claude` CLI is needed
@@ -173,9 +173,17 @@ only for the screen in `farm/triage.py`.
    cp .env.example .env
    ```
 
-2. Set `POLYMARKET_FUNDER_ADDRESS` in `.env` to the address that holds your
+2. Make the data folder. The example file sets `POLYMARKET_DATA_DIR=data`,
+   and no program makes the folder. See
+   [Where the databases live](#where-the-databases-live).
+
+   ```bash
+   mkdir data
+   ```
+
+3. Set `POLYMARKET_FUNDER_ADDRESS` in `.env` to the address that holds your
    funds and positions.
-3. Decide where the wallet key comes from. See
+4. Decide where the wallet key comes from. See
    [Where the wallet key comes from](#where-the-wallet-key-comes-from).
 
 The farmer, the screener, the console, the worker, the scoring probe, and
@@ -193,7 +201,7 @@ line in `.env`.
 | `POLYMARKET_PRIVATE_KEY` | No | The wallet's private key, when you keep it in the environment. |
 | `BW_POLYMARKET_ITEM_ID` | No | The id of the Bitwarden item whose note is the key. |
 | `BW_POLYMARKET_ITEM_NAME` | No | A name to search the vault for, when you set no id. The first item found is used. |
-| `POLYMARKET_DATA_DIR` | No | The directory where the farmer, the console, and the worker keep their databases. See [Where the databases live](#where-the-databases-live). |
+| `POLYMARKET_DATA_DIR` | No | The directory where the farmer, the console, and the worker keep their databases. `.env.example` sets it to `data`. See [Where the databases live](#where-the-databases-live). |
 
 An EOA wallet (`POLYMARKET_SIGNATURE_TYPE=0`) must approve Polymarket's
 exchange contracts to spend its collateral and its conditional tokens before
@@ -261,7 +269,7 @@ therefore agree wherever you start each one.
 - You can set `POLYMARKET_DATA_DIR` in `.env` or in the real environment. A
   relative value is taken from the repository root, so
   `POLYMARKET_DATA_DIR=data` names the `data/` folder of the checkout, which
-  Git ignores.
+  Git ignores. `.env.example` sets this value.
 - The directory must exist. No program creates it, because a mistyped
   directory would start every process on empty databases. A program that
   cannot find it prints `POLYMARKET_DATA_DIR is not a directory` with the
@@ -282,7 +290,7 @@ A usual session has three terminals, each in the repository root:
 
 ```bash
 python -m farm.reward_farmer  # the farmer, a dry run
-python -m farm_console       # the console, on http://127.0.0.1:8787
+python -m console       # the console, on http://127.0.0.1:8787
 python -m tools              # the worker, with the key
 ```
 
@@ -316,13 +324,13 @@ first live run.
 ### Console
 
 ```bash
-python -m farm_console                          # port 8787
-python -m farm_console --port 8788              # another port
-python -m farm_console --db scratch.db --tools-db scratch-tools.db
+python -m console                          # port 8787
+python -m console --port 8788              # another port
+python -m console --db scratch.db --tools-db scratch-tools.db
 ```
 
-It prints `Farm console on http://127.0.0.1:8787 reading <farm.db> and
-<tools.db>` and serves until Ctrl+C. See [Farm console](#farm-console).
+It prints `Console on http://127.0.0.1:8787 reading <farm.db> and
+<tools.db>` and serves until Ctrl+C. See [Console](#console).
 
 ### Worker
 
@@ -1095,9 +1103,9 @@ whose response fields Polymarket does not document. The farmer reads them
 defensively, logs a warning when the shape does not match, and keeps
 farming.
 
-## Farm console
+## Console
 
-`farm_console` is a local web console for the reward farmer and the order
+`console` is a local web console for the reward farmer and the order
 tools. It shows what the farmer is doing, live, and it is where you run scans,
 approve markets, and control the farmer. Every change it makes to the farm
 goes through `farm_db` into `farm.db`, and the farmer picks it up on its next
@@ -1105,14 +1113,14 @@ cycle. Its **Orders** and **Sniper** pages queue work for the worker through
 `tools.db` (see [Orders page](#orders-page) and [Sniper page](#sniper-page)).
 
 ```bash
-python -m farm_console                        # port 8787
-python -m farm_console --db scratch.db        # another farm database
-python -m farm_console --tools-db scratch-tools.db   # another worker database
-python -m farm_console --port 8788            # another port
+python -m console                        # port 8787
+python -m console --db scratch.db        # another farm database
+python -m console --tools-db scratch-tools.db   # another worker database
+python -m console --port 8788            # another port
 ```
 
 Then open http://127.0.0.1:8787. Run it from the repository root (or with
-the repository on `PYTHONPATH`) so Python can find the `farm_console`
+the repository on `PYTHONPATH`) so Python can find the `console`
 package. `--db` defaults to `farm.db`, the production database, and
 `--tools-db` to `tools.db`, both in the data directory (see
 [Where the databases live](#where-the-databases-live)). A relative `--db` or
@@ -1221,7 +1229,7 @@ reachable from your own machine, and only by its own pages:
   only record a candidate's `rewards_active` as Polymarket reports it. No
   request can choose that value.
 
-`farm_console/security.py` holds all of these checks, as a middleware in
+`console/security.py` holds all of these checks, as a middleware in
 front of every route.
 
 ### Live updates
@@ -1238,7 +1246,7 @@ arrives, using htmx and its SSE extension. After a market control, the regions
 that show that market reload at once. There is no client-side state and no
 chart JavaScript: the charts are SVG drawn on the server.
 
-The alerts come from a rule table in `farm_console/views.py`: cooldown, below
+The alerts come from a rule table in `console/views.py`: cooldown, below
 range, paused, naked budget 99% or more used with no longshot bid resting free
 of it, a favorite bid scoring under 0.10,
 a slot in backoff, a longshot-bid fill in the last 24 hours, and the farmer not
@@ -1261,7 +1269,7 @@ the queue keeps every candidate where it is. If Gamma or the data API is
 unreachable, that panel says so and offers a retry; the rest of the page still
 works.
 
-htmx 2.0.11 and htmx-ext-sse 2.2.4 are vendored in `farm_console/static/`, so
+htmx 2.0.11 and htmx-ext-sse 2.2.4 are vendored in `console/static/`, so
 the console works offline except for the IBM Plex fonts, which fall back to
 system fonts, and the Review page's rules and holdings. To upgrade, download
 `dist/htmx.min.js` from the `htmx.org` package and `dist/sse.min.js` from the
@@ -1273,12 +1281,12 @@ Each term on the console that is not self-explanatory, such as naked budget,
 Q1 / Q2, a phase or a slot name, has an info button after it. Hover over it or
 Tab to it to see what the term means. Escape closes the explanation.
 
-`farm_console/glossary.py` holds every explanation, so edit them there. The
+`console/glossary.py` holds every explanation, so edit them there. The
 Settings and scan parameters take their explanations from it too. A template
 shows a term's button with `{{ tip('naked_budget') }}`, and an unknown key fails
-the page instead of rendering an empty tip. `farm_console/static/tips.js`, with
+the page instead of rendering an empty tip. `console/static/tips.js`, with
 no dependencies, shows one tooltip on the page body, so a scrolling table never
-clips it. `tests/test_farm_console_tips.py` fails when a template uses a key the
+clips it. `tests/test_console_tips.py` fails when a template uses a key the
 glossary lacks, or when the glossary has an entry no page uses.
 
 

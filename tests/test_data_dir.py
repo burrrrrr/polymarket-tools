@@ -37,11 +37,11 @@ class PathTests(unittest.TestCase):
         self.assertEqual(self.paths(), (self.dir / "farm.db", self.dir / "tools.db"))
 
     def test_a_relative_directory_is_taken_from_the_repo_and_not_from_where_it_is_run(self):
-        os.environ[data_dir.VARIABLE] = "farm_console"
+        os.environ[data_dir.VARIABLE] = "console"
         self.addCleanup(os.chdir, os.getcwd())
         os.chdir(self.dir)
-        self.assertEqual(self.paths(), (ROOT / "farm_console" / "farm.db",
-                                        ROOT / "farm_console" / "tools.db"))
+        self.assertEqual(self.paths(), (ROOT / "console" / "farm.db",
+                                        ROOT / "console" / "tools.db"))
 
     def test_the_old_snapshot_files_are_in_snapshots_in_the_same_directory(self):
         self.assertEqual(Path(data_dir.snapshots_path()), ROOT / "snapshots")

@@ -1,5 +1,5 @@
 """
-View models of the farm console: pure functions from farm.db and tools.db reads
+View models of the console: pure functions from farm.db and tools.db reads
 to what a page shows. Every derived number, alert, and class name is decided
 here, so the templates only lay values out and the JSON API serves the same
 objects.

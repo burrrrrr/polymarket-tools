@@ -10,11 +10,11 @@ from unittest import mock
 from fastapi.testclient import TestClient
 
 from farm import farm_db
-from farm_console import views
-from farm_console.app import create_app
-from farm_console.pages import stream
+from console import views
+from console.app import create_app
+from console.pages import stream
 from polymarket.orders import OpenOrder, Side
-from test_farm_console import A, B, C, ORIGIN, Console
+from test_console import A, B, C, ORIGIN, Console
 from test_polymarket_imports import loaded_by
 from tools import db
 from tools.db import JobKind, JobState, RestoreAction
@@ -535,7 +535,7 @@ class StreamTest(Orders):
 
 class ImportTest(unittest.TestCase):
     def test_the_console_loads_no_keys_no_client_and_no_worker(self):
-        loaded = loaded_by(["farm_console.app"])
+        loaded = loaded_by(["console.app"])
         self.assertIn("tools.db", loaded)
         self.assertEqual([name for name in loaded if name in KEYED_BY_THIS_BUILD], [])
 

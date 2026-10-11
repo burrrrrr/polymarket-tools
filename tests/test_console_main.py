@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from farm_console import __main__ as entry_point
+from console import __main__ as entry_point
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -44,7 +44,7 @@ class StartTests(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.dict(os.environ))
             os.environ.pop("POLYMARKET_DATA_DIR", None)
-            stack.enter_context(mock.patch.object(sys, "argv", ["farm_console", *argv]))
+            stack.enter_context(mock.patch.object(sys, "argv", ["console", *argv]))
             stack.enter_context(mock.patch.object(entry_point, "create_app", fakes.create_app))
             stack.enter_context(mock.patch("uvicorn.run", fakes.serve))
             self.load_dotenv = stack.enter_context(mock.patch.object(

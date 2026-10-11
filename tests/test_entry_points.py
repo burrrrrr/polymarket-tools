@@ -15,7 +15,7 @@ STARTS = {
                "reward_farmer.run = lambda *args, **kwargs: None\n"
                "reward_farmer.main(['--db', os.path.join(sys.argv[1], 'farm.db')])\n"),
     "console": ("import uvicorn\n"
-                "from farm_console import __main__ as console\n"
+                "from console import __main__ as console\n"
                 "uvicorn.run = console.create_app = lambda *args, **kwargs: None\n"
                 "sys.argv[1:] = ['--db', os.path.join(sys.argv[1], 'farm.db')]\n"
                 "console.main()\n"),

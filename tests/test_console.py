@@ -14,8 +14,8 @@ from fastapi.testclient import TestClient
 
 from farm import farm_db, fill_cost
 from farm.farm_db import Event, EventKind, FarmerStatus, FarmState, MarketRecord, MidSample
-from farm_console import charts, remote, views
-from farm_console.app import create_app
+from console import charts, remote, views
+from console.app import create_app
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 ORIGIN = "http://127.0.0.1:8787"

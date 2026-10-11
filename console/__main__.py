@@ -1,5 +1,5 @@
 """
-Run the farm console: python -m farm_console [--db PATH] [--tools-db PATH] [--port 8787]
+Run the console: python -m console [--db PATH] [--tools-db PATH] [--port 8787]
 
 --db defaults to farm.db, the production database, and --tools-db to tools.db,
 the database the console shares with the order tools' worker (python -m
@@ -11,7 +11,7 @@ It binds 127.0.0.1 only, never a public interface. The console has no login,
 and it controls real orders through farm.db (pausing, retiring, settings,
 stopping the farmer), so anyone who could reach the port could move money.
 Reach it from another machine through an SSH tunnel, not by changing the bind
-address. farm_console.security guards it against other web pages in the same
+address. console.security guards it against other web pages in the same
 browser.
 """
 
@@ -24,15 +24,15 @@ import uvicorn
 from dotenv import load_dotenv
 
 import data_dir
-from farm_console.app import DEFAULT_PORT, create_app
+from console.app import DEFAULT_PORT, create_app
 
 HOST = "127.0.0.1"
 REPO = Path(__file__).parent.parent
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="python -m farm_console",
-                                     description="Local web console for the reward farmer.")
+    parser = argparse.ArgumentParser(prog="python -m console",
+                                     description="Local web console for the reward farmer and the order tools.")
     parser.add_argument("--db", help="SQLite file, the production database (default: farm.db "
                                      f"{data_dir.LOCATION_HELP})")
     parser.add_argument("--tools-db", help="SQLite file shared with the worker (default: "
@@ -48,7 +48,7 @@ def main():
         return 1
     app = create_app(farm_db, port=args.port, funder=os.getenv("POLYMARKET_FUNDER_ADDRESS"),
                      tools_db=tools_db)
-    print(f"Farm console on http://{HOST}:{args.port} reading {farm_db} and {tools_db}",
+    print(f"Console on http://{HOST}:{args.port} reading {farm_db} and {tools_db}",
           flush=True)
     uvicorn.run(app, host=HOST, port=args.port, log_level="warning",
                 timeout_graceful_shutdown=1)

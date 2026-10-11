@@ -11,11 +11,11 @@ from fastapi.testclient import TestClient
 from farm import farm_db, fill_cost, reward_farmer, reward_screener, triage
 from farm.farm_db import CommandKind
 from farm.reward_screener import RewardMarket, ScreenConfig
-from farm_console import forms, remote, views
-from farm_console.app import create_app, utc_now
-from farm_console.remote import Rules
+from console import forms, remote, views
+from console.app import create_app, utc_now
+from console.remote import Rules
 from polymarket.books import Levels
-from test_farm_console import (
+from test_console import (
     A,
     B,
     C,
@@ -360,7 +360,7 @@ class ReviewTest(Writes):
     def app_kwargs(self):
         self.remote = FakeRemote()
         self.clock = [None]
-        from farm_console.app import utc_now
+        from console.app import utc_now
 
         def clock():
             return self.clock[0] or utc_now()
@@ -546,7 +546,7 @@ class ReviewTest(Writes):
                                                  r"bid pays: best net -\$\d+\.\d\d/day at 92\.6c\.")
 
     def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
-        from farm_console.app import utc_now
+        from console.app import utc_now
         start = utc_now()
         self.clock[0] = start
         self.live()
@@ -652,7 +652,7 @@ class ReviewTest(Writes):
         self.assertNotIn("Wouldn't quote now", self.live("0xeee"))
 
     def test_skip_goes_to_the_next_candidate_the_farmer_would_quote(self):
-        from farm_console.app import utc_now
+        from console.app import utc_now
         start = utc_now()
         self.clock[0] = start
         self.remote.books["tok-0xeee"] = FALLEN_BOOK
@@ -667,7 +667,7 @@ class ReviewTest(Writes):
 
     def rewards_end_for(self, *cids):
         """A loaded total listing that drops cids."""
-        from farm_console.app import utc_now
+        from console.app import utc_now
         every = [r[0] for r in self.db.execute("SELECT condition_id FROM markets")]
         self.remote.total_rates = {cid: 5.0 for cid in every
                                    if cid not in cids}
@@ -709,7 +709,7 @@ class ReviewTest(Writes):
         self.assertEqual(self.row(A)["rewards_active"], 1)
 
     def test_listing_the_queue_refreshes_stale_totals(self):
-        from farm_console.app import utc_now
+        from console.app import utc_now
         start = utc_now()
         for i, (url, ended, queue) in enumerate((("/review", "0xddd", ["0xeee", "0xfff"]),
                                                  ("/discover", "0xeee", ["0xddd", "0xfff"]))):
@@ -870,7 +870,7 @@ class ReviewTest(Writes):
         self.assertIn(warning, self.client.get("/review/0xeee").text)
 
     def test_rules_are_cached_for_ten_minutes_and_failures_offer_retry(self):
-        from farm_console.app import utc_now
+        from console.app import utc_now
         start = utc_now()
         self.clock[0] = start
         text = self.client.get("/partials/review/0xddd/rules").text

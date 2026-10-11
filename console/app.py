@@ -39,7 +39,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     search_markets and fetch_books are the Sniper page's reads of Gamma and
     the CLOB.
     """
-    app = FastAPI(title="Farm console", docs_url=None, redoc_url=None)
+    app = FastAPI(title="Console", docs_url=None, redoc_url=None)
     app.state.token = token = security.new_token()
     app.add_middleware(security.Guard, port=port, token=token)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
