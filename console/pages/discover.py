@@ -4,7 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from farm import farm_db, reward_screener, triage
+from farm import farm_db, reward_screener
 
 from .. import forms, views
 from ..context import form_of, see_other
@@ -39,11 +39,10 @@ def routes(ctx):
 
     def triage_status(conn):
         queue = farm_db.candidate_queue(conn)
-        done = farm_db.triaged_ids(conn, triage.PROMPT_VERSION)
+        done = farm_db.triaged_ids(conn)
         return {"triage_running": len(ctx.triager.running()),
                 "triage_waiting": len(ctx.triager.pending()),
-                "triage_done": sum(c in done for c in queue), "triage_queue": len(queue),
-                "prompt_version": triage.PROMPT_VERSION}
+                "triage_done": sum(c in done for c in queue), "triage_queue": len(queue)}
 
     def discover_response(request, conn, filters, status_code=200, values=None, errors=None,
                           refused=None, triage_note=None):

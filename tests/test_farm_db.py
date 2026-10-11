@@ -35,8 +35,8 @@ CREATE TABLE markets (
 )
 """
 
-# The triage table as prompts v1 and v2 stored their estimates.
-PRE_VERDICT_TRIAGE = """
+# The triage table as it was while each row carried a prompt version.
+VERSIONED_TRIAGE = """
 CREATE TABLE triage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     condition_id TEXT NOT NULL,
@@ -51,8 +51,10 @@ CREATE TABLE triage (
     result TEXT,
     error TEXT,
     duration_s REAL,
-    cost_usd REAL
-)
+    cost_usd REAL,
+    verdict TEXT
+);
+CREATE INDEX triage_market ON triage (condition_id, prompt_version, at);
 """
 
 NEW_TABLES = {"farm_state", "farmer_status", "farm_events", "settings", "commands",
@@ -668,55 +670,67 @@ class MuteTest(ScratchDb):
 
 
 class TriageTest(ScratchDb):
-    RESULT = {"verdict": "near_impossible", "why": [], "runs": [], "news": []}
+    RESULT = {"verdict": "near_impossible", "why": [], "runs": [],
+              "brief": {"searches": [], "state": "", "facts": []}}
 
-    def test_store_and_read_the_latest_row_of_a_version(self):
+    def test_store_and_read_the_latest_row(self):
         conn = self.open()
         self.assertIsNone(farm_db.latest_triage(conn, "0xa"))
-        farm_db.store_triage(conn, "0xa", NOW, 1, "sonnet", result=self.RESULT, book_mid=0.94,
+        farm_db.store_triage(conn, "0xa", NOW, "sonnet", result=self.RESULT, book_mid=0.94,
                              duration_s=55.0, cost_usd=0.16)
-        farm_db.store_triage(conn, "0xa", NOW + timedelta(minutes=1), 1, "sonnet",
+        farm_db.store_triage(conn, "0xa", NOW + timedelta(minutes=1), "sonnet",
                              error="TriageError: timed out", duration_s=240.0)
-        farm_db.store_triage(conn, "0xb", NOW + timedelta(minutes=2), 1, "sonnet",
+        farm_db.store_triage(conn, "0xb", NOW + timedelta(minutes=2), "sonnet",
                              result={**self.RESULT, "verdict": "needs_human"})
         latest = farm_db.latest_triage(conn, "0xa")
         self.assertEqual((latest.status, latest.error, latest.verdict, latest.result),
                          ("error", "TriageError: timed out", None, None))
         ok, = farm_db.read_triage(conn, ("0xa",), status="ok")
-        self.assertEqual((ok.at, ok.verdict, ok.book_mid, ok.result, ok.duration_s,
+        self.assertEqual((ok.at, ok.model, ok.verdict, ok.book_mid, ok.result, ok.duration_s,
                           ok.cost_usd),
-                         (NOW, "near_impossible", 0.94, self.RESULT, 55.0, 0.16))
+                         (NOW, "sonnet", "near_impossible", 0.94, self.RESULT, 55.0, 0.16))
         self.assertEqual(farm_db.latest_triage(conn, "0xb").verdict, "needs_human")
-        self.assertIsNone(farm_db.latest_triage(conn, "0xa", prompt_version=2))
 
-    def test_a_triage_table_from_before_verdicts_gains_the_column_and_keeps_its_rows(self):
+    def versioned_db(self):
         conn = sqlite3.connect(self.path)
-        conn.execute(PRE_VERDICT_TRIAGE)
+        conn.executescript(VERSIONED_TRIAGE)
         conn.execute("INSERT INTO triage (condition_id, at, prompt_version, model, status, "
-                     "p_true, result) VALUES ('0xa', ?, 2, 'sonnet', 'ok', 0.95, '{}')",
+                     "verdict, result) VALUES ('0xa', ?, 5, 'sonnet', 'ok', 'quiet', '{}')",
                      (NOW.isoformat(),))
         conn.commit()
         conn.close()
-        conn = self.open()
-        old, = farm_db.read_triage(conn)
-        self.assertEqual((old.prompt_version, old.verdict, old.result), (2, None, {}))
-        farm_db.store_triage(conn, "0xa", NOW + timedelta(minutes=1), 3, "sonnet",
-                             result=self.RESULT)
-        self.assertEqual(farm_db.latest_triage(conn, "0xa").verdict, "near_impossible")
 
-    def test_triaged_ids_counts_only_ok_rows_of_that_version(self):
+    def test_opening_drops_a_triage_table_that_carries_prompt_versions(self):
+        self.versioned_db()
         conn = self.open()
-        farm_db.store_triage(conn, "0xa", NOW, 1, "sonnet", result=self.RESULT)
-        farm_db.store_triage(conn, "0xb", NOW, 2, "sonnet", result=self.RESULT)
-        farm_db.store_triage(conn, "0xc", NOW, 2, "sonnet", error="boom")
-        self.assertEqual(farm_db.triaged_ids(conn, 1), {"0xa"})
-        self.assertEqual(farm_db.triaged_ids(conn, 2), {"0xb"})
+        self.assertEqual(farm_db.read_triage(conn), [])
+        self.assertEqual([r["name"] for r in conn.execute("PRAGMA table_info(triage)")],
+                         ["id", "condition_id", "at", "model", "status", "book_mid", "result",
+                          "error", "duration_s", "cost_usd", "verdict"])
+        indexed = [r["name"] for r in conn.execute("PRAGMA index_info(triage_market)")]
+        self.assertEqual(indexed, ["condition_id", "at"])
+
+    def test_opening_again_keeps_the_rows_stored_since_the_drop(self):
+        self.versioned_db()
+        farm_db.store_triage(self.open(), "0xa", NOW, "sonnet", result=self.RESULT)
+        for _ in range(2):
+            kept, = farm_db.read_triage(self.open())
+            self.assertEqual((kept.condition_id, kept.result), ("0xa", self.RESULT))
+
+    def test_triaged_ids_counts_only_ok_rows(self):
+        conn = self.open()
+        farm_db.store_triage(conn, "0xa", NOW, "sonnet", result=self.RESULT)
+        farm_db.store_triage(conn, "0xb", NOW, "sonnet", error="boom")
+        farm_db.store_triage(conn, "0xc", NOW, "sonnet", error="boom")
+        farm_db.store_triage(conn, "0xc", NOW + timedelta(minutes=1), "sonnet",
+                             result=self.RESULT)
+        self.assertEqual(farm_db.triaged_ids(conn), {"0xa", "0xc"})
 
     def test_a_row_has_a_result_or_an_error(self):
         conn = self.open()
         for kw in ({}, {"result": self.RESULT, "error": "boom"}):
             with self.subTest(kw=kw), self.assertRaises(ValueError):
-                farm_db.store_triage(conn, "0xa", NOW, 1, "sonnet", **kw)
+                farm_db.store_triage(conn, "0xa", NOW, "sonnet", **kw)
         self.assertEqual(farm_db.read_triage(conn), [])
 
 

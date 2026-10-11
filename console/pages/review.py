@@ -217,20 +217,15 @@ def routes(ctx):
             "condition_id": condition_id, "rules": found, "error": error})
 
     def triage_panel(request, condition_id):
-        """The latest screen of this prompt version, else an older row marked
-        stale."""
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
             market = ctx.find(conn, condition_id)
-            row = (farm_db.latest_triage(conn, condition_id, triage.PROMPT_VERSION)
-                   or farm_db.latest_triage(conn, condition_id))
-        stale = row is not None and row.prompt_version != triage.PROMPT_VERSION
-        screen = (triage.from_result(row.result)
-                  if row is not None and row.status == "ok" and not stale else None)
+            row = farm_db.latest_triage(conn, condition_id)
+        screen = triage.from_result(row.result) if row is not None and row.status == "ok" else None
         end = market.end_date.date() if market.end_date else None
         days_left = triage.days_until(end, now.date())
         return ctx.templates.TemplateResponse(request, "partials/review_triage.html", {
-            "condition_id": condition_id, "row": row, "stale": stale, "s": screen,
+            "condition_id": condition_id, "row": row, "s": screen,
             "d": screen and triage.digest(screen, days_left), "quiet_days": triage.QUIET_DAYS,
             "now": now, "running": condition_id in ctx.triager.running(),
             "waiting": condition_id in ctx.triager.pending()})

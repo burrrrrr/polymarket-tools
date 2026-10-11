@@ -33,7 +33,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     max_polls ends /stream after that many polls, so a test can read it to the
     end; None streams until the client leaves. scan and the fetch_ functions
     reach the network, run_triage calls Claude and fetch_page reads the pages
-    its news check cites; funder is the wallet address whose holdings the
+    its news search cites; funder is the wallet address whose holdings the
     Review page shows. tools_db is the path of the tools.db the console shares
     with the worker; with None the order tools say they are not configured.
     search_markets and fetch_books are the Sniper page's reads of Gamma and

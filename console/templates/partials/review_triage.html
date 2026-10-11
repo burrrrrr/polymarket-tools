@@ -5,45 +5,39 @@
 <div id="triage" class="stack" style="gap: 10px"{% if busy %} hx-get="/partials/review/{{ cid }}/triage" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
   <div class="actions">
     {%- if running %}
-    <span class="small muted" role="status" style="flex: 1 1 280px"><span class="dot pulse"></span> Claude is reading the rules three times, then searching recent news twice unless that leaves the market to you. This takes a minute or two.</span>
+    <span class="small muted" role="status" style="flex: 1 1 280px"><span class="dot pulse"></span> Claude is searching the news once for this market's event, then judging three times whether YES is near impossible. This takes a few minutes.</span>
     {%- elif waiting %}
     <span class="small muted" role="status" style="flex: 1 1 280px">Waiting for a free Claude worker.</span>
     {%- elif row is none %}
-    <span class="small muted" style="flex: 1 1 280px">Not screened yet. Claude checks three times, without the web, whether YES is near impossible under the rules. If it is, or the market ends within {{ quiet_days }} days, Claude then searches recent news twice, independently, for anything pointing toward YES.</span>
-    {%- elif stale %}
-    <span class="small muted" style="flex: 1 1 280px">Stale: triaged with prompt v{{ row.prompt_version }}. Rerun.</span>
+    <span class="small muted" style="flex: 1 1 280px">Not screened yet. Claude searches the news once for this market's event, then judges three times, from the rules and that search, whether YES is near impossible. A market it does not find near impossible is quiet when it ends within {{ quiet_days }} days and nothing in the news points toward YES.</span>
     {%- elif row.status == 'error' %}
     <span class="c-bad small" role="alert" style="flex: 1 1 280px">Claude's screen failed: {{ row.error }}</span>
     {%- else %}
     {%- set tone, label = badges[s.verdict.value] %}
     <span style="flex: 1 1 280px"><span class="badge {{ tone }}">{{ label }}</span> {{ d.reason }}</span>
     {%- endif %}
-    <button class="btn" type="button" hx-post="/review/{{ cid }}/triage" hx-target="#triage" hx-swap="outerHTML"{{ ' disabled' if busy }}>{{ 'Ask Claude' if row is none else ('Retry' if row.status == 'error' and not stale else 'Rerun') }}</button>
+    <button class="btn" type="button" hx-post="/review/{{ cid }}/triage" hx-target="#triage" hx-swap="outerHTML"{{ ' disabled' if busy }}>{{ 'Ask Claude' if row is none else ('Retry' if row.status == 'error' else 'Rerun') }}</button>
   </div>
   {%- if s %}
-  {%- if s.why[1:] and not d.developments %}
-  <ul class="small">{% for w in s.why[1:] %}<li>{{ w }}</li>{% endfor %}</ul>
+  {%- if d.also %}
+  <ul class="small">{% for w in d.also %}<li>{{ w }}</li>{% endfor %}</ul>
   {%- endif %}
-  {%- if d.developments %}
+  {%- if s.runs %}
   <div class="stack" style="gap: 4px">
     <span class="lbl">What's happened</span>
+    <p class="small" style="margin: 0">{{ s.brief.state }}</p>
     <ul class="small">
-      {%- for v in d.developments %}
-      <li>{% if v.date %}<span class="muted mono">{{ v.date }}</span> {% endif %}{{ v.text }}
-        {%- if v.sourced %} <a href="{{ v.url }}" target="_blank" rel="noopener noreferrer">source ↗</a>{% endif %}
-        {%- if v.verified is none %} <span class="muted">couldn't check</span>
-        {%- elif v.verified %} <span class="c-good">verified on the page</span>
-        {%- else %} <span class="c-warn">not found on the page</span>{% endif %}
-        {%- if v.checks | length > 1 %} <span class="muted">both checks</span>{% endif %}</li>
+      {%- for f in d.facts %}
+      <li>{% if f.date %}<span class="muted mono">{{ f.date }}</span> {% endif %}{% if f.toward_yes %}<span class="badge t-c">toward YES</span> {% endif %}{{ f.text }}
+        {%- if f.sourced %} <a href="{{ f.url }}" target="_blank" rel="noopener noreferrer">source ↗</a>{% endif %}
+        {%- if f.verified is none %} <span class="muted">couldn't check the quote</span>
+        {%- elif f.verified %} <span class="c-good">quote found on the page</span>
+        {%- else %} <span class="c-warn">quote not on the page</span>{% endif %}</li>
+      {%- else %}
+      <li class="muted">The news search reported no facts.</li>
       {%- endfor %}
     </ul>
   </div>
-  {%- elif s.news and s.verdict.value != 'needs_human' %}
-  <span class="small">Both news checks found nothing pointing to YES.</span>
-  {%- elif not s.news and s.runs %}
-  <span class="small muted">News not checked.</span>
-  {%- endif %}
-  {%- if s.runs %}
   <div class="stack" style="gap: 4px">
     <span class="lbl">Realistic ways to YES</span>
     <ul class="small">
@@ -56,9 +50,8 @@
     </ul>
   </div>
   <span class="small">Run agreement: {{ d.agreement }}</span>
-  {%- endif %}
   <details>
-  <summary class="small">Run and news check details</summary>
+  <summary class="small">Run and search details</summary>
   <div class="stack" style="gap: 10px; margin-top: 8px">
   {%- for r in s.runs %}
   <div class="stack" style="gap: 4px">
@@ -75,28 +68,12 @@
     </ul>
   </div>
   {%- endfor %}
-  {%- for n in s.news %}
-  <div class="stack" style="gap: 4px">
-    <span class="lbl">News check {{ loop.index }}/{{ loop.length }}</span>
-    <p class="small" style="margin: 0">{{ n.summary }}</p>
-    <ul class="small">
-      {%- for i in n.items %}
-      <li>{{ i.text }}{% if i.date %} <span class="muted mono">{{ i.date }}</span>{% endif %}
-        {%- if i.sourced %} <a href="{{ i.url }}" target="_blank" rel="noopener noreferrer">source ↗</a>{% endif %}
-        {%- if i.verified is none %} <span class="muted">couldn't check the page</span>
-        {%- elif i.verified %} <span class="c-good">quote found on the page</span>
-        {%- else %} <span class="c-warn">quote not on the page</span>{% endif %}</li>
-      {%- else %}
-      <li class="muted">Nothing found.</li>
-      {%- endfor %}
-    </ul>
-    <span class="small muted">Searched: {{ n.searches | join('; ') or 'nothing' }}</span>
-  </div>
-  {%- endfor %}
+  <span class="small muted">Searched: {{ s.brief.searches | join('; ') or 'nothing' }}</span>
   </div>
   </details>
   {%- endif %}
-  {%- if row is not none and not stale %}
-  <span class="small muted">{{ row.model }}, prompt v{{ row.prompt_version }} · {{ (now - row.at).total_seconds() | span }} ago{% if row.duration_s is not none %} · took {{ row.duration_s | span }}{% endif %}{% if row.cost_usd is not none %} · ${{ '%.2f' % row.cost_usd }}{% endif %}</span>
+  {%- endif %}
+  {%- if row is not none %}
+  <span class="small muted">{{ row.model }} · {{ (now - row.at).total_seconds() | span }} ago{% if row.duration_s is not none %} · took {{ row.duration_s | span }}{% endif %}{% if row.cost_usd is not none %} · ${{ '%.2f' % row.cost_usd }}{% endif %}</span>
   {%- endif %}
 </div>

@@ -5,6 +5,7 @@ import time
 import unittest
 from dataclasses import replace
 from datetime import timedelta
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
@@ -25,7 +26,7 @@ from test_console import (
     settle_total_rates,
     state,
 )
-from test_triage import background, envelope, news
+from test_triage import brief_output, envelope, judge_output
 
 # Favorite mid 0.96, tick 0.001: no longshot bid under 0.6c scores, which 40 days out
 # offers a favorite buyer over 5% a year, so the longshot bid sits at the cheapest price
@@ -1215,19 +1216,18 @@ class NavAndAlertsTest(Writes):
         self.assertIn(f'<a href="/review/{A}">Edit budget</a>', alerts)
 
 
-
 def settle_triage():
     for thread in threading.enumerate():
         if thread.name == "console-triage":
             thread.join(10)
 
 
-# A background answer that quotes FakeRemote's rules, so every run counts.
+# A judge answer that quotes FakeRemote's rules, so every run counts.
 DELTA_PATH = {"path": "delta happens", "rule_quote": "Yes if delta happens", "realistic": False}
 
 
 class FakeClaude:
-    """run_triage: answers each step once gate is set; output, when set,
+    """run_triage: answers each call once gate is set; output, when set,
     replaces every answer (an exception is raised)."""
 
     def __init__(self):
@@ -1243,10 +1243,17 @@ class FakeClaude:
         self.gate.wait(5)
         if isinstance(self.output, Exception):
             raise self.output
-        return envelope(background(paths=(DELTA_PATH,)) if step is triage.BACKGROUND else news())
+        return envelope(brief_output() if step is triage.BRIEF
+                        else judge_output(paths=(DELTA_PATH,)))
+
+    def briefed(self):
+        """The questions each brief call listed."""
+        return [re.findall(r"^\d+\. (.+\?)$", prompt, re.MULTILINE)
+                for step, prompt in self.calls if step == "brief"]
 
     def questions(self):
-        return {re.search(r"Question: (.+)", p).group(1) for _, p in self.calls}
+        return {re.search(r"Question: (.+)", prompt).group(1)
+                for step, prompt in self.calls if step == "judge"}
 
 
 def yes_path(quote_ok=True, realistic=False):
@@ -1254,21 +1261,18 @@ def yes_path(quote_ok=True, realistic=False):
                           realistic, quote_ok)
 
 
-def screen_of(runs, news, days_left=100):
-    return triage.Screen(*triage.decide(triage.background_route(runs, days_left), news), runs,
-                         news)
+def judged(answer="near_impossible", settled=True, path=None, reason="Absurd."):
+    return triage.JudgeRun(answer, settled, (path or yes_path(),), reason)
 
 
-CLEAN = triage.NewsCheck((), False, (), "Nothing new.")
+NO_NEWS = triage.Brief(("aliens confirmed 2026", "UAP hearing"), "No confirmation is scheduled.",
+                       ())
 
 
 def folded(panel):
     """The triage panel's summary, and what its collapsed details hold."""
     summary, _, rest = panel.partition("<details>")
     return summary, rest.partition("</details>")[0]
-# A prompt v3 result: one news check stored as an object, not a list.
-V3_RESULT = {"verdict": "near_impossible", "why": [], "runs": [], "news": {
-    "searches": ["old search"], "found": False, "items": [], "summary": "Old summary."}}
 
 
 class TriageTest(Writes):
@@ -1287,149 +1291,116 @@ class TriageTest(Writes):
         return self.client.get(f"/partials/review/{cid}/triage").text
 
     def store(self, cid, screen=None):
-        run = triage.BackgroundRun("near_impossible", True, (yes_path(),), "Absurd.")
-        screen = screen or screen_of((run,) * 3, (CLEAN,) * 2)
-        farm_db.store_triage(self.db, cid, self.now, triage.PROMPT_VERSION, "sonnet",
-                             result=triage.to_result(screen), book_mid=0.96, duration_s=54.0,
-                             cost_usd=0.16)
+        screen = screen or triage.decide((judged(),) * 3, NO_NEWS, 100)
+        farm_db.store_triage(self.db, cid, self.now, "sonnet", result=triage.to_result(screen),
+                             book_mid=0.96, duration_s=54.0, cost_usd=0.16)
 
     def test_review_page_loads_the_triage_panel(self):
         page = self.client.get("/review/0xddd").text
         self.assertIn('hx-get="/partials/review/0xddd/triage" hx-trigger="load"', page)
         self.assertNotIn("Claude triage (planned)", page)
-        self.assertIn("Not screened yet.", self.panel())
-        self.assertIn(">Ask Claude</button>", self.panel())
+        text = self.panel()
+        for needle in ("Not screened yet. Claude searches the news once for this market's event, "
+                       "then judges three times", "ends within 45 days", ">Ask Claude</button>"):
+            self.assertIn(needle, text)
         self.assertEqual(self.claude.calls, [])
 
-    def test_a_near_impossible_row_sums_up_and_folds_the_runs_and_news_checks_away(self):
-        runs = tuple(triage.BackgroundRun("near_impossible", True, (yes_path(),),
-                                          f"Reason {i}.") for i in (1, 2, 3))
-        self.store("0xddd", screen_of(runs, (
-            triage.NewsCheck(("aliens confirmed 2026", "UAP hearing"), False, (),
-                             "No sign of it."),
-            triage.NewsCheck(("disclosure act",), False, (), "Still nothing."))))
+    def test_a_near_impossible_row_sums_up_and_folds_the_runs_and_searches_away(self):
+        self.store("0xddd", triage.decide(
+            tuple(judged(reason=f"Reason {i}.") for i in (1, 2, 3)), NO_NEWS, 100))
         text = self.panel()
         summary, details = folded(text)
-        for needle in ('<span class="badge t-q">Near impossible</span> 3/3 runs found no '
-                       "realistic way to YES and 2/2 news checks found nothing.",
-                       "Both news checks found nothing pointing to YES.",
+        for needle in ('<span class="badge t-q">Near impossible</span> 3/3 runs found YES near '
+                       "impossible given the news search.", "No confirmation is scheduled.",
+                       "The news search reported no facts.",
                        "No run found a realistic way to YES; the ways they listed are in the "
                        "details.",
                        "Run agreement: near impossible 3 of 3"):
             self.assertIn(needle, summary)
-        self.assertEqual(details.count("Nothing found."), 2)
         for needle in ("Run 1", "Run 3", "Reason 2.", '"a statement by the President counts"',
-                       "News check 1/2", "No sign of it.",
-                       "Searched: aliens confirmed 2026; UAP hearing", "News check 2/2",
-                       "Still nothing.", "Searched: disclosure act"):
+                       "Searched: aliens confirmed 2026; UAP hearing"):
             self.assertIn(needle, details)
             self.assertNotIn(needle, summary)
-        for needle in (f"sonnet, prompt v{triage.PROMPT_VERSION} ·", "took 54s", "$0.16",
-                       ">Rerun</button>"):
+        for needle in ("sonnet ·", "took 54s", "$0.16", ">Rerun</button>"):
             self.assertIn(needle, text)
-        for absent in ("Needs human", "not in the rules", "realistic</span>", "Use p_true",
-                       "p_true", 'class="ev', "Stale", "every 3s", "News not checked."):
+        for absent in ("Needs human", "not in the rules", "realistic</span>", "p_true",
+                       'class="ev', "prompt v", "Stale", "every 3s", "toward YES"):
             self.assertNotIn(absent, text)
 
-    def test_a_quiet_row_says_why_and_when_the_market_ends(self):
-        runs = (triage.BackgroundRun("possible", True, (yes_path(realistic=True),),
-                                     "Plausible."),
-                triage.BackgroundRun("possible", True, (yes_path(False, realistic=True),),
-                                     "Plausible."),
-                triage.BackgroundRun("possible", True, (
-                    triage.YesPath("A one-run path", "", False, True),), "Plausible."))
-        self.store("0xddd", screen_of(runs, (CLEAN,) * 2, days_left=30))
+    def test_a_quiet_row_says_when_the_market_ends_and_lists_a_fact_pointing_away(self):
+        runs = (judged("possible", path=yes_path(realistic=True), reason="Plausible."),
+                judged("possible", path=yes_path(False, realistic=True), reason="Plausible."),
+                judged("possible", path=triage.YesPath("A one-run path", "", False, True),
+                       reason="Plausible."))
+        away = triage.Fact("The hearing was cancelled", "q", "https://example.org/a", None,
+                           False, True)
+        self.store("0xddd", triage.decide(runs, NO_NEWS._replace(facts=(away,)), 30))
         summary, details = folded(self.panel())
         self.assertIn('<li>The President says so <span class="muted">2 of 3 runs</span> '
                       '<span class="c-warn">quote not in the rules</span></li>', summary)
         self.assertNotIn("A one-run path", summary)
         self.assertIn("A one-run path", details)
-        for needle in ('<span class="badge t-f">Quiet</span> a realistic way to YES exists, 2/2 '
-                       "news checks found nothing pointing to it, ends in 40 days.",
-                       "Both news checks found nothing pointing to YES.",
+        for needle in ('<span class="badge t-f">Quiet</span> nothing in the news search points '
+                       "to YES, ends in 40 days.", "<li>The hearing was cancelled",
                        "Run agreement: possible 3 of 3"):
             self.assertIn(needle, summary)
-        self.assertEqual(details.count("Nothing found."), 2)
-        for absent in ("Near impossible", "Needs human"):
+        for absent in ("Near impossible", "Needs human", "toward YES"):
             self.assertNotIn(absent, summary + details)
 
-    def test_news_items_need_a_human_and_each_shows_once_with_its_checks_and_links(self):
-        runs = (triage.BackgroundRun("near_impossible", True, (yes_path(),), "r"),) * 3
-
-        def item(text, url, verified, date="2026-05-01"):
-            return triage.NewsItem(text, "q", url, date, verified)
-        self.store("0xddd", screen_of(runs, (
-            triage.NewsCheck(("s",), True, (
-                item("Found one", "https://example.org/a/?utm_source=feed", False),), "One."),
-            triage.NewsCheck(("s",), True, (
-                item("Found it again", "https://Example.org/a#top", True),
-                item("Missed one", "https://example.org/b", False, "2026-06-01"),
-                item("Unread one", "javascript:alert(1)", None, None)), "A hearing."))))
+    def test_facts_show_newest_first_with_their_source_quote_check_and_those_toward_yes(self):
+        def fact(text, url, verified, toward_yes, date):
+            return triage.Fact(text, "q", url, date, toward_yes, verified)
+        brief = triage.Brief(("s",), "A hearing is set for June.", (
+            fact("Found one", "https://example.org/a?x=1", True, True, "2026-05-01"),
+            fact("Missed one", "https://example.org/b", False, False, "2026-06-01"),
+            fact("Unread one", "javascript:alert(1)", None, True, None)))
+        self.store("0xddd", triage.decide((judged("possible"),) * 3, brief, 100))
         text = self.panel()
         summary, details = folded(text)
-        self.assertIn('<span class="badge t-n">Needs human</span> 3 news developments point '
-                      "toward YES.", summary)
-        self.assertEqual(summary.count("Found one"), 1)
-        self.assertNotIn("Found it again", summary)
-        self.assertEqual(summary.count("both checks"), 1)
+        for needle in ('<span class="badge t-n">Needs human</span> 2 news facts point toward '
+                       "YES.", "A hearing is set for June.",
+                       "<li>0 of 3 runs near impossible</li>",
+                       "<li>ends in 100 days, past the 45-day quiet window</li>",
+                       '<li><span class="badge t-c">toward YES</span> Unread one <span '
+                       "class=\"muted\">couldn't check the quote</span></li>",
+                       '<span class="c-warn">quote not on the page</span>'):
+            self.assertIn(needle, summary)
         self.assertEqual(
-            re.findall(r'<li><span class="muted mono">([-\d]+)</span> (\w+ \w+)', summary),
-            [("2026-06-01", "Missed one"), ("2026-05-01", "Found one")])
-        self.assertRegex(summary, r"Found one[^<]*<a href=\"https://example.org/a/\?utm_source="
-                                  r'feed" target="_blank"[^>]*>source ↗</a>\s*<span '
-                                  r'class="c-good">verified on the page</span>\s*<span '
-                                  r'class="muted">both checks</span></li>')
-        self.assertIn("<li>Unread one <span class=\"muted\">couldn't check</span></li>", summary)
-        self.assertIn('<span class="c-warn">not found on the page</span>', summary)
-        for needle in ("Found it again", "quote found on the page", "quote not on the page",
-                       "couldn't check the page"):
-            self.assertIn(needle, details)
+            re.findall(r'<li><span class="muted mono">([-\d]+)</span> (?:<span class="badge '
+                       r't-c">(toward YES)</span> )?(\w+ \w+)', summary),
+            [("2026-06-01", "", "Missed one"), ("2026-05-01", "toward YES", "Found one")])
+        self.assertRegex(summary, r'Found one\s*<a href="https://example.org/a\?x=1" '
+                                  r'target="_blank"[^>]*>source ↗</a>\s*<span class="c-good">'
+                                  r"quote found on the page</span></li>")
+        self.assertEqual(summary.count('<span class="badge t-c">toward YES</span>'), 2)
         self.assertNotIn("recent news:", text)
         self.assertNotIn("javascript:", text)
+        self.assertIn("Searched: s", details)
 
-    def test_a_split_background_shows_why_and_a_quote_not_in_the_rules(self):
-        runs = (triage.BackgroundRun("near_impossible", True, (yes_path(),), "r"),
-                triage.BackgroundRun("near_impossible", True, (yes_path(False),), "r"),
-                triage.BackgroundRun("unsure", False, (yes_path(),), "Can't tell."))
-        self.store("0xddd", screen_of(runs, ()))
+    def test_split_runs_show_why_and_a_quote_not_in_the_rules(self):
+        runs = (judged(reason="r"), judged(path=yes_path(False), reason="r"),
+                judged("unsure", False, reason="Can't tell."))
+        self.store("0xddd", triage.decide(runs, NO_NEWS, 100))
         summary, details = folded(self.panel())
-        for needle in ('<span class="badge t-n">Needs human</span> background 1 of 3 near '
+        for needle in ('<span class="badge t-n">Needs human</span> 1 of 3 runs near '
                        "impossible.", "<li>run 2 quoted words not in the rules</li>",
                        f"<li>{triage.NEWS_CANT_SETTLE}</li>".replace("'", "&#39;"),
+                       "<li>ends in 100 days, past the 45-day quiet window</li>",
                        "No run found a realistic way to YES; the ways they listed are in the "
-                       "details.", "News not checked.", "Run agreement: near impossible 2 of 3, unsure 1"):
+                       "details.", "Run agreement: near impossible 2 of 3, unsure 1"):
             self.assertIn(needle, summary)
-        self.assertNotIn("<li>background 1 of 3", summary)
+        self.assertNotIn("<li>1 of 3 runs", summary)
         for needle in ('<span class="c-warn">not in the rules</span>', "news can't settle it",
                        "Can&#39;t tell."):
             self.assertIn(needle, details)
 
     def test_blank_rules_need_a_human_with_nothing_to_sum_up(self):
         self.store("0xddd", triage.RULES_UNAVAILABLE)
-        summary, details = folded(self.panel())
-        self.assertIn('<span class="badge t-n">Needs human</span> rules unavailable.', summary)
-        for absent in ("Ways to YES", "Run agreement", "News not checked", "found nothing"):
-            self.assertNotIn(absent, summary)
-
-    def test_an_older_prompt_versions_row_says_stale_and_nothing_else(self):
-        with self.db:
-            self.db.execute(
-                "INSERT INTO triage (condition_id, at, prompt_version, model, status, p_true, "
-                "p_low, p_high, result) VALUES ('0xddd', ?, 2, 'sonnet', 'ok', 0.99, 0.9, "
-                "0.995, ?)", (self.now.isoformat(), json.dumps({"summary": "Old summary."})))
         text = self.panel()
-        self.assertIn("Stale: triaged with prompt v2. Rerun.", text)
-        self.assertIn(">Rerun</button>", text)
-        for absent in ("Old summary.", "99.0%", "sonnet", "badge", "Run 1"):
+        self.assertIn('<span class="badge t-n">Needs human</span> rules unavailable.', text)
+        for absent in ("Ways to YES", "Run agreement", "What's happened", "What&#39;s happened",
+                       "news search", "Searched", "<details>"):
             self.assertNotIn(absent, text)
-
-    def test_a_prompt_v3_row_with_its_single_news_check_says_stale(self):
-        farm_db.store_triage(self.db, "0xddd", self.now, 3, "sonnet", result=V3_RESULT)
-        resp = self.client.get("/partials/review/0xddd/triage")
-        self.assertEqual(resp.status_code, 200)
-        self.assertIn("Stale: triaged with prompt v3. Rerun.", resp.text)
-        for absent in ("Old summary.", "old search", "News check", "badge"):
-            self.assertNotIn(absent, resp.text)
 
     def test_post_queues_once_polls_until_done_and_stores_the_screen(self):
         self.claude.gate.clear()
@@ -1444,32 +1415,27 @@ class TriageTest(Writes):
         self.assertNotIn("every 3s", text)
         self.assertIn("Near impossible", text)
         self.assertEqual(sorted(step for step, _ in self.claude.calls),
-                         ["background"] * 3 + ["news"] * 2)
+                         ["brief"] + ["judge"] * 3)
         self.assertIn("Resolves to Yes if delta happens.", self.claude.calls[0][1])
-        row = farm_db.latest_triage(self.db, "0xddd", triage.PROMPT_VERSION)
+        row = farm_db.latest_triage(self.db, "0xddd")
         self.assertEqual((row.status, row.verdict, row.book_mid),
                          ("ok", "near_impossible",
                           json.loads(self.row("0xddd")["metrics"])["book_mid"]))
         self.assertEqual(self.post("/review/0xnone/triage").status_code, 404)
 
     def test_a_failed_screen_shows_the_error_and_a_retry(self):
-        self.claude.output = triage.TriageError("claude (news) did not finish within 420s")
+        self.claude.output = triage.TriageError("claude (brief) did not finish within 900s")
         self.post("/review/0xddd/triage")
         settle_triage()
         text = self.panel()
-        self.assertIn("Claude's screen failed: TriageError: claude (news) did not finish "
-                      "within 420s", text)
+        self.assertIn("Claude's screen failed: TriageError: claude (brief) did not finish "
+                      "within 900s", text)
         self.assertIn(">Retry</button>", text)
         self.assertEqual(farm_db.latest_triage(self.db, "0xddd").status, "error")
 
-    def test_batch_sends_only_queued_candidates_without_a_current_row(self):
+    def test_batch_sends_only_queued_candidates_without_an_ok_row(self):
         self.store("0xddd")
-        with self.db:
-            self.db.execute("INSERT INTO triage (condition_id, at, prompt_version, model, "
-                            "status, result) VALUES ('0xeee', ?, 2, 'sonnet', 'ok', '{}')",
-                            (self.now.isoformat(),))
-        farm_db.store_triage(self.db, "0xfff", self.now, triage.PROMPT_VERSION, "sonnet",
-                             error="boom")
+        farm_db.store_triage(self.db, "0xfff", self.now, "sonnet", error="boom")
         self.assertEqual(self.post("/triage/batch", n="0").status_code, 422)
         resp = self.post("/triage/batch", n="5")
         self.assertEqual((resp.status_code, resp.headers["location"]),
@@ -1478,9 +1444,49 @@ class TriageTest(Writes):
         self.assertEqual(self.claude.questions(), {"echo?", "foxtrot?"})
         page = self.client.get(resp.headers["location"]).text
         self.assertIn("Sent 2 candidates to Claude.", page)
-        self.assertIn(f"3 of 3 queued candidates screened with prompt v{triage.PROMPT_VERSION}.",
-                      page)
+        self.assertIn("3 of 3 queued candidates screened.", page)
+        self.assertNotIn("prompt v", page)
         self.assertEqual(self.post("/triage/batch").headers["location"], "/discover?triaged=0")
+
+    def briefs_asked(self, n):
+        for _ in range(200):
+            if len(self.claude.briefed()) == n:
+                return
+            time.sleep(0.02)
+        self.fail(f"Claude was asked for {len(self.claude.briefed())} briefs, not {n}")
+
+    def test_a_worker_takes_the_queued_markets_of_one_event_together(self):
+        french = {"event_slug": FR, "event_title": "2027 French presidential election"}
+        farm_db.store_scan(self.db, [
+            assessed_row("0xddd", "delta", BUDGET_BOOK, self.now, 30.0, days=40, **french),
+            assessed_row("0xeee", "echo", FLOOR_BOOK, self.now, 20.0, **french),
+        ], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
+        runner = self.app.state.triage
+        self.claude.gate.clear()
+        self.post("/triage/batch", n="5")
+        self.briefs_asked(2)
+        self.assertEqual((runner.running(), runner.pending()),
+                         ({"0xddd", "0xeee", "0xfff"}, frozenset()))
+        self.assertIn("every 3s", self.panel("0xeee"))
+        self.assertIn("Claude is searching the news", self.panel("0xeee"))
+        self.claude.gate.set()
+        settle_triage()
+        self.assertEqual(sorted(self.claude.briefed()), [["delta?", "echo?"], ["foxtrot?"]])
+        self.assertIn("Event: 2027 French presidential election",
+                      "".join(p for step, p in self.claude.calls if step == "brief"))
+        self.assertEqual(runner.running(), frozenset())
+        self.assertEqual(farm_db.triaged_ids(self.db), {"0xddd", "0xeee", "0xfff"})
+
+    def test_a_batch_that_blows_up_leaves_nothing_running_and_the_runner_working(self):
+        runner = self.app.state.triage
+        with mock.patch.object(triage, "screen_and_store", side_effect=RuntimeError("boom")):
+            self.post("/triage/batch", n="5")
+            settle_triage()
+        self.assertEqual((runner.running(), runner.pending()), (frozenset(), frozenset()))
+        self.assertIsNone(farm_db.latest_triage(self.db, "0xddd"))
+        self.post("/review/0xddd/triage")
+        settle_triage()
+        self.assertEqual(farm_db.latest_triage(self.db, "0xddd").verdict, "near_impossible")
 
     def scanned(self):
         for _ in range(200):

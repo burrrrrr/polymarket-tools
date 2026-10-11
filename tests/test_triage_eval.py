@@ -18,35 +18,38 @@ from analysis.triage_eval import Resolution
 from farm import farm_db, triage
 from console.remote import Rules
 from polymarket.hosts import GAMMA_HOST
-from test_console_writes import BUDGET_BOOK, FLOOR_BOOK, V3_RESULT, assessed_row
-from test_triage import background, envelope, news
+from test_console_writes import BUDGET_BOOK, FLOOR_BOOK, assessed_row
+from test_triage import brief_output, envelope, judge_output
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NOW = datetime(2026, 10, 9, 12, 0, tzinfo=timezone.utc)
-QUOTED ={"path": "It happens", "rule_quote": "Yes if it happens", "realistic": False}
-CLEAN = triage.NewsCheck((), False, (), "q")
+QUOTED = {"path": "It happens", "rule_quote": "Yes if it happens", "realistic": False}
+NO_NEWS = triage.Brief((), "Nothing new.", ())
 
 
 class StubClaude:
-    """run_triage answering by question: near-impossible questions get three
-    agreeing runs and quiet news, the rest an unsure run among them."""
+    """run_triage whose briefs report no facts and whose judges answer by
+    question: near impossible for those in near, unsure for the rest."""
 
     def __init__(self, near):
         self.near = set(near)
-        self.asked = []
+        self.briefed = []
+        self.judged = []
         self._lock = threading.Lock()
 
     def __call__(self, step, prompt):
+        if step is triage.BRIEF:
+            with self._lock:
+                self.briefed.append(re.findall(r"^\d+\. (.+\?)$", prompt, re.MULTILINE))
+            return envelope(brief_output())
         question = re.search(r"Question: (.+)", prompt).group(1)
         with self._lock:
-            self.asked.append((step.name, question))
-        if step is triage.NEWS:
-            return envelope(news())
-        return envelope(background("near_impossible" if question in self.near else "unsure",
-                                   paths=(QUOTED,)))
+            self.judged.append(question)
+        return envelope(judge_output("near_impossible" if question in self.near else "unsure",
+                                     paths=(QUOTED,)))
 
     def questions(self):
-        return {q for _, q in self.asked}
+        return set(self.judged)
 
 
 def rules(condition_id):
@@ -54,7 +57,7 @@ def rules(condition_id):
 
 
 def run(answer="near_impossible", quote_ok=True):
-    return triage.BackgroundRun(answer, True, (triage.YesPath("p", "q", False, quote_ok),), "r")
+    return triage.JudgeRun(answer, True, (triage.YesPath("p", "q", False, quote_ok),), "r")
 
 
 class EvalTest(unittest.TestCase):
@@ -75,11 +78,9 @@ class EvalTest(unittest.TestCase):
             assessed_row("0xfff", "foxtrot", FLOOR_BOOK, NOW, 10.0),
         ], ["0xddd", "0xeee", "0xfff"], NOW)
 
-    def store(self, cid, runs=(run(),) * 3, news=(CLEAN,) * 2, days_left=100):
-        screen = triage.Screen(*triage.decide(triage.background_route(runs, days_left), news),
-                               runs, news)
-        farm_db.store_triage(self.db, cid, NOW, triage.PROMPT_VERSION, "sonnet",
-                             result=triage.to_result(screen), book_mid=0.97)
+    def store(self, cid, runs=(run(),) * 3, brief=NO_NEWS, days_left=100):
+        farm_db.store_triage(self.db, cid, NOW, "sonnet", book_mid=0.97,
+                             result=triage.to_result(triage.decide(runs, brief, days_left)))
 
     def fav(self, cid):
         return farm_db.read_markets(self.db, (cid,))[0].metrics["market"]["fav_outcome"]
@@ -147,26 +148,45 @@ class ScreenTest(EvalTest):
                          [("0xggg", "near_impossible", "True"),
                           ("0xddd", "near_impossible", "False"),
                           ("0xeee", "needs_human", "True")])
-        self.assertEqual((rows[0]["background"], rows[0]["news"], rows[2]["news"]),
-                         ("near_impossible/near_impossible/near_impossible", "0/2 found",
-                          "skipped"))
+        self.assertEqual((rows[0]["runs"], rows[0]["news"]),
+                         ("near_impossible/near_impossible/near_impossible", "0/0 toward YES"))
         self.assertIn("Unknown condition id: 0xnope", printed)
-        self.assertIn("background 0 of 3 near impossible", printed)
-        self.assertIn("news 0/2 found", printed)
+        self.assertIn("0 of 3 runs near impossible", printed)
+        self.assertIn("news 0/0 toward YES", printed)
         self.assertIn("3 markets: 2 near impossible, 0 quiet, 1 needs human, 0 errors. "
                       "Screened 2 now for $0.32", printed)
         self.assertEqual(code, 0)
         self.main("screen", "--ids", ids, "--n", "2", run=claude)
-        self.assertEqual(len(claude.asked), 8)
+        self.assertEqual((len(claude.briefed), len(claude.judged)), (2, 6))
 
-    def test_the_news_column_counts_the_checks_that_found_something(self):
+    def test_markets_of_one_event_share_a_brief_and_its_cost(self):
+        event = {"event_slug": "greek-letters", "event_title": "Greek letters"}
+        farm_db.store_scan(self.db, [
+            assessed_row("0xddd", "delta", BUDGET_BOOK, NOW, 30.0, **event),
+            assessed_row("0xfff", "foxtrot", FLOOR_BOOK, NOW, 10.0, **event),
+        ], ["0xddd", "0xeee", "0xfff"], NOW)
+        claude = StubClaude({"delta?", "echo?", "foxtrot?"})
+        _, printed, rows = self.main("screen", "--n", "3", run=claude)
+        self.assertEqual(sorted(claude.briefed), [["delta?", "foxtrot?"], ["echo?"]])
+        self.assertEqual([(r["condition_id"], r["verdict"]) for r in rows],
+                         [("0xddd", "near_impossible"), ("0xeee", "near_impossible"),
+                          ("0xfff", "near_impossible")])
+        for row, cost in zip(rows, (0.14, 0.16, 0.14)):
+            self.assertAlmostEqual(float(row["cost_usd"]), cost)
+        self.assertIn("Screened 3 now for $0.44", printed)
+
+    def test_the_news_column_counts_the_facts_pointing_toward_yes(self):
         ids = os.path.join(os.path.dirname(self.path), "ids.txt")
         with open(ids, "w", encoding="utf-8") as f:
-            f.write("0xddd\n")
-        self.store("0xddd", news=(CLEAN, CLEAN._replace(found=True)))
+            f.write("0xddd\n0xeee\n")
+        self.store("0xddd", brief=NO_NEWS._replace(facts=(
+            triage.Fact("t", "q", "https://a.org", None, True, None),
+            triage.Fact("u", "q", "https://b.org", None, False, None))))
+        farm_db.store_triage(self.db, "0xeee", NOW, "sonnet",
+                             result=triage.to_result(triage.RULES_UNAVAILABLE))
         _, printed, rows = self.main("screen", "--ids", ids)
-        self.assertEqual(rows[0]["news"], "1/2 found")
-        self.assertIn("news 1/2 found", printed)
+        self.assertEqual([r["news"] for r in rows], ["1/2 toward YES", "not searched"])
+        self.assertIn("news 1/2 toward YES", printed)
 
     def test_a_quiet_screen_shows_on_its_line_and_in_the_count(self):
         ids = os.path.join(os.path.dirname(self.path), "ids.txt")
@@ -251,31 +271,29 @@ class QuietOutcomesTest(EvalTest):
 
 
 class GroundingTest(EvalTest):
-    def item(self, url, verified):
-        return triage.NewsItem("t", "q", url, None, verified)
+    def brief(self, *sources):
+        return NO_NEWS._replace(facts=tuple(triage.Fact("t", "q", url, None, False, verified)
+                                            for url, verified in sources))
 
-    def test_counts_quotes_and_items_of_every_news_check_and_fails_on_a_circular_source(self):
-        self.store("0xddd", runs=(run(), run(quote_ok=False), run()), news=())
-        self.store("0xeee", news=(
-            triage.NewsCheck(("s",), True, (self.item("https://a.org", True),
-                                            self.item("https://b.org", True)), "s"),
-            triage.NewsCheck(("s",), True, (self.item("https://c.org", False),
-                                            self.item("https://polymarket.com/e", None)), "s")))
-        farm_db.store_triage(self.db, "0xfff", NOW, 3, "sonnet", result=V3_RESULT)
-        farm_db.store_triage(self.db, "0xfff", NOW, triage.PROMPT_VERSION, "sonnet",
-                             error="boom")
+    def test_counts_quotes_and_each_fact_of_an_event_once_and_fails_on_a_circular_source(self):
+        self.store("0xddd", runs=(run(), run(quote_ok=False), run()))
+        event = self.brief(("https://a.org", True), ("https://b.org", True),
+                           ("https://c.org", False), ("https://polymarket.com/e", None))
+        self.store("0xeee", brief=event)
+        self.store("0xfff", brief=event._replace(
+            facts=tuple(f._replace(toward_yes=True) for f in event.facts)))
+        farm_db.store_triage(self.db, "0xggg", NOW, "sonnet", error="boom")
         code, printed, rows = self.main("grounding")
-        self.assertIn("6 rule quotes over 2 screens; 83% verbatim.", printed)
-        self.assertIn("4 news items: 50% verified, 25% unverified, 25% unreadable.", printed)
-        self.assertIn("FAIL circular sources: 1 news items cite a prediction market", printed)
-        self.assertEqual(sum(r["circular"] == "True" for r in rows), 1)
+        self.assertIn("9 rule quotes over 3 screens; 89% verbatim.", printed)
+        self.assertIn("4 news facts: 50% verified, 25% unverified, 25% unreadable.", printed)
+        self.assertIn("FAIL circular sources: 1 news facts cite a prediction market", printed)
+        self.assertEqual(sum(r["kind"] == "news" for r in rows), 8)
         self.assertEqual(code, 1)
 
     def test_no_circular_source_passes(self):
-        self.store("0xddd", news=(CLEAN, triage.NewsCheck((), True, (
-            self.item("https://a.org", True),), "s")))
+        self.store("0xddd", brief=self.brief(("https://a.org", True)))
         code, printed, _ = self.main("grounding")
-        self.assertIn("PASS circular sources: 0 news items", printed)
+        self.assertIn("PASS circular sources: 0 news facts", printed)
         self.assertEqual(code, 0)
 
 

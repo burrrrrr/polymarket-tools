@@ -47,9 +47,9 @@ a busy timeout, and every column has exactly one writer process:
   mutes           console. Events and tags whose candidates the review
                   queue and Discover leave out.
   triage          console or analysis/triage_eval.py, append-only. One row per
-                  Claude triage of a market, its result or its error. From
-                  prompt v3 an ok row holds a verdict; p_true, p_low and
-                  p_high are left from v1 and v2 rows.
+                  Claude screen of a market: its verdict and result, or its
+                  error. open_db drops the table as it was while each row
+                  carried a prompt version, whose rows nothing reads now.
 
 The farmer also records quoting books to farm_books.db beside this file,
 which no other process writes (farm/farm_books.py owns it).
@@ -210,12 +210,8 @@ CREATE TABLE IF NOT EXISTS triage (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     condition_id TEXT NOT NULL,
     at TEXT NOT NULL,
-    prompt_version INTEGER NOT NULL,
     model TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('ok', 'error')),
-    p_true REAL,
-    p_low REAL,
-    p_high REAL,
     book_mid REAL,
     result TEXT,
     error TEXT,
@@ -223,7 +219,7 @@ CREATE TABLE IF NOT EXISTS triage (
     cost_usd REAL,
     verdict TEXT
 );
-CREATE INDEX IF NOT EXISTS triage_market ON triage (condition_id, prompt_version, at);
+CREATE INDEX IF NOT EXISTS triage_market ON triage (condition_id, at);
 """
 
 # Columns added after their table's first release, so open_db can bring an
@@ -236,12 +232,14 @@ ADDED_COLUMNS = {
         ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
         ("capital_usd", "REAL"),
     ),
-    "triage": (("verdict", "TEXT"),),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
 # an unknown setting on every start.
 RETIRED_SETTINGS = ("fav_target_score", "depth_haircut", "fill_lookback_days",
                     "sweep_prior_weight", "stuck_share")
+# A triage table with this column holds screens in a shape farm/triage.py no
+# longer reads, so open_db drops the table and SCHEMA creates it anew.
+RETIRED_TRIAGE_COLUMN = "prompt_version"
 
 
 def stamp(dt):
@@ -254,6 +252,9 @@ def open_db(path):
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_S * 1000}")
+    if any(row["name"] == RETIRED_TRIAGE_COLUMN
+           for row in conn.execute("PRAGMA table_info(triage)")):
+        conn.execute("DROP TABLE IF EXISTS triage")
     conn.executescript(SCHEMA)
     with conn:
         for table, columns in ADDED_COLUMNS.items():
@@ -1249,13 +1250,11 @@ def read_reward_totals(conn):
 
 class TriageRecord(NamedTuple):
     """A triage row. result is farm/triage.py's JSON of an ok row and verdict the
-    verdict it holds (None before prompt v3); error says why an error row has
-    neither."""
+    verdict it holds; error says why an error row has neither."""
 
     id: int
     condition_id: str
     at: datetime
-    prompt_version: int
     model: str
     status: str
     verdict: Optional[str]
@@ -1266,49 +1265,44 @@ class TriageRecord(NamedTuple):
     cost_usd: Optional[float]
 
 
-def store_triage(conn, condition_id, now, prompt_version, model, *, result=None, error=None,
-                 book_mid=None, duration_s=None, cost_usd=None):
+def store_triage(conn, condition_id, now, model, *, result=None, error=None, book_mid=None,
+                 duration_s=None, cost_usd=None):
     """Append an ok row (result, a dict with a verdict) or an error row
     (error); exactly one of them is given."""
     if (result is None) == (error is None):
         raise ValueError("a triage row has a result or an error, not both or neither")
     with conn:
         return conn.execute(
-            "INSERT INTO triage (condition_id, at, prompt_version, model, status, verdict, "
-            "book_mid, result, error, duration_s, cost_usd) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (condition_id, stamp(now), prompt_version, model,
-             "ok" if result is not None else "error", result and result["verdict"], book_mid,
-             _json(result), error, duration_s, cost_usd),
+            "INSERT INTO triage (condition_id, at, model, status, verdict, book_mid, result, "
+            "error, duration_s, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (condition_id, stamp(now), model, "ok" if result is not None else "error",
+             result and result["verdict"], book_mid, _json(result), error, duration_s, cost_usd),
         ).lastrowid
 
 
-def read_triage(conn, condition_ids=(), prompt_version=None, status=None, limit=1000):
+def read_triage(conn, condition_ids=(), status=None, limit=1000):
     """Triage rows newest first, each filter applied only when given."""
     ids, where, params = list(condition_ids), [], []
     if ids:
         where.append(f"condition_id IN ({', '.join('?' * len(ids))})")
         params.extend(ids)
-    for clause, value in (("prompt_version = ?", prompt_version), ("status = ?", status)):
-        if value is not None:
-            where.append(clause)
-            params.append(value)
+    if status is not None:
+        where.append("status = ?")
+        params.append(status)
     sql = "SELECT * FROM triage" + (" WHERE " + " AND ".join(where) if where else "")
     rows = conn.execute(sql + " ORDER BY at DESC, id DESC LIMIT ?", params + [limit])
-    return [TriageRecord(r["id"], r["condition_id"], _time(r["at"]), r["prompt_version"],
-                         r["model"], r["status"], r["verdict"], r["book_mid"],
-                         _load(r["result"]), r["error"], r["duration_s"],
-                         r["cost_usd"]) for r in rows]
+    return [TriageRecord(r["id"], r["condition_id"], _time(r["at"]), r["model"], r["status"],
+                         r["verdict"], r["book_mid"], _load(r["result"]), r["error"],
+                         r["duration_s"], r["cost_usd"]) for r in rows]
 
 
-def latest_triage(conn, condition_id, prompt_version=None):
-    """The market's newest triage row, of that prompt version when given, or None."""
-    found = read_triage(conn, (condition_id,), prompt_version, limit=1)
+def latest_triage(conn, condition_id):
+    """The market's newest triage row, or None."""
+    found = read_triage(conn, (condition_id,), limit=1)
     return found[0] if found else None
 
 
-def triaged_ids(conn, prompt_version):
-    """The condition ids with an ok triage row of this prompt version."""
+def triaged_ids(conn):
+    """The condition ids with an ok triage row."""
     return frozenset(r[0] for r in conn.execute(
-        "SELECT DISTINCT condition_id FROM triage WHERE status = 'ok' AND prompt_version = ?",
-        (prompt_version,)))
+        "SELECT DISTINCT condition_id FROM triage WHERE status = 'ok'"))

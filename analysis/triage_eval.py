@@ -3,20 +3,19 @@ Evaluate Claude's screen before trusting it (triage.auto_top_n stays 0 until
 these gates pass).
 
   screen     the markets in --ids (one condition id per line) and the top --n
-             queued candidates: screens each with no ok row of this prompt
-             version, WORKERS at a time
+             queued candidates: screens those with no ok row, the markets of
+             an event together under one news search, WORKERS events at a time
   outcomes   screened markets now closed: each verdict against whether the
              favorite won
-  grounding  stored screens: rule quotes found in the rules, news quotes
-             found on their pages, news citing a prediction market
+  grounding  stored screens: rule quotes found in the rules, the news search's
+             quotes found on their pages, facts citing a prediction market
   retro      rejected markets still paying and open: which screen near
              impossible or quiet, to reconsider
   hindsight  rejected markets now closed: whether the favorite won, with an
              approximate reward missed and loss avoided
 
-Each reuses the stored ok rows of the current triage.PROMPT_VERSION, writes a
-CSV to --out and prints a summary; outcomes and grounding print PASS or FAIL
-per gate.
+Each reuses the stored ok rows, writes a CSV to --out and prints a summary;
+outcomes and grounding print PASS or FAIL per gate.
 """
 
 import argparse
@@ -82,16 +81,22 @@ def share(k, n):
     return f"{k / n:.0%}" if n else "n/a"
 
 
-def current_screens(path, ids, screen_one):
-    """{condition_id: (TriageRecord, screened now)}: each market's ok row of
-    this prompt version, screening the markets with none WORKERS at a time
-    through screen_one(conn, condition_id), each on its own connection."""
-    def one(cid):
+def current_screens(path, ids, screen_batch):
+    """{condition_id: (TriageRecord, screened now)}: each market's newest ok
+    row, screening the markets with none in event batches, WORKERS at a time,
+    through screen_batch(conn, condition_ids), each on its own connection."""
+    with closing(farm_db.open_db(path)) as conn:
+        stored = {t.condition_id: t for cid in ids
+                  for t in farm_db.read_triage(conn, (cid,), "ok", limit=1)}
+        batches = [[m.condition_id for m in batch]
+                   for batch in triage.read_batches(conn, [i for i in ids if i not in stored])]
+
+    def screened(batch):
         with closing(farm_db.open_db(path)) as conn:
-            found = farm_db.read_triage(conn, (cid,), triage.PROMPT_VERSION, "ok", limit=1)
-            return (found[0], False) if found else (screen_one(conn, cid), True)
+            return screen_batch(conn, batch)
     with ThreadPoolExecutor(WORKERS) as pool:
-        return dict(zip(ids, pool.map(one, ids)))
+        fresh = {t.condition_id: t for rows in pool.map(screened, batches) for t in rows}
+    return {i: (stored[i], False) if i in stored else (fresh[i], True) for i in ids}
 
 
 def in_latest_scan(conn, statuses):
@@ -101,28 +106,28 @@ def in_latest_scan(conn, statuses):
 
 
 def news_text(s):
-    if not s.news:
-        return "skipped"
-    return f"{sum(n.found or bool(n.items) for n in s.news)}/{len(s.news)} found"
+    if s.brief == triage.NO_BRIEF:
+        return "not searched"
+    return f"{sum(f.toward_yes for f in s.brief.facts)}/{len(s.brief.facts)} toward YES"
 
 
-def screen(conn, path, ids, n, screen_one):
+def screen(conn, path, ids, n, screen_batch):
     wanted = list(dict.fromkeys([*ids, *farm_db.candidate_queue(conn)[:n]]))
     markets = {m.condition_id: m for m in farm_db.read_markets(conn, wanted)}
     lines = [f"Unknown condition id: {i}" for i in wanted if i not in markets]
     rows = []
     for cid, (t, fresh) in current_screens(path, [i for i in wanted if i in markets],
-                                           screen_one).items():
+                                           screen_batch).items():
         s = triage.from_result(t.result) if t.status == "ok" else None
         rows.append({"condition_id": cid, "question": markets[cid].question,
                      "verdict": t.verdict or "error",
-                     "background": "/".join(r.answer for r in s.runs) if s else "",
+                     "runs": "/".join(r.answer for r in s.runs) if s else "",
                      "news": news_text(s) if s else "", "why": "; ".join(s.why) if s else "",
                      "error": t.error or "", "screened_now": fresh,
                      "duration_s": None if t.duration_s is None else round(t.duration_s),
                      "cost_usd": t.cost_usd})
     for r in rows:
-        lines.append(f"{r['verdict']:15} {r['background'] or '-':45} news {r['news'] or '-':9} "
+        lines.append(f"{r['verdict']:15} {r['runs'] or '-':45} news {r['news'] or '-':14} "
                      f"{r['question'][:70]} | {r['why'] or r['error']}")
     fresh = [r for r in rows if r["screened_now"]]
     seconds = [r["duration_s"] for r in fresh if r["duration_s"] is not None]
@@ -132,13 +137,13 @@ def screen(conn, path, ids, n, screen_one):
         f"{sum(r['verdict'] == HUMAN for r in rows)} needs human, "
         f"{sum(r['verdict'] == 'error' for r in rows)} errors. Screened {len(fresh)} now for "
         f"${sum(r['cost_usd'] or 0 for r in fresh):.2f}"
-        + (f", median {statistics.median(seconds):.0f}s each." if seconds else "."))
+        + (f", median {statistics.median(seconds):.0f}s a batch." if seconds else "."))
     return Report(rows, lines)
 
 
 def latest_screens(conn):
     latest = {}
-    for t in farm_db.read_triage(conn, prompt_version=triage.PROMPT_VERSION, status="ok"):
+    for t in farm_db.read_triage(conn, status="ok"):
         latest.setdefault(t.condition_id, t)
     return latest
 
@@ -191,32 +196,33 @@ def grounding(conn):
             rows.append({**base, "kind": "rule quote", "text": p.path, "quote": p.rule_quote,
                          "url": "", "check": "verbatim" if p.quote_ok else "not in the rules",
                          "circular": False})
-        for item in (item for n in s.news for item in n.items):
-            rows.append({**base, "kind": "news", "text": item.text, "quote": item.quote,
-                         "url": item.url, "check": CHECKS[item.verified],
-                         "circular": item.circular})
+        for fact in s.brief.facts:
+            rows.append({**base, "kind": "news", "text": fact.text, "quote": fact.quote,
+                         "url": fact.url, "check": CHECKS[fact.verified],
+                         "circular": fact.circular})
     quotes = [r for r in rows if r["kind"] == "rule quote"]
-    news = [r for r in rows if r["kind"] == "news"]
+    # Every market of an event stores the event's facts, so a fact counts once.
+    news = list({(r["url"], r["quote"]): r for r in rows if r["kind"] == "news"}.values())
     verbatim = sum(r["check"] == "verbatim" for r in quotes)
     counts = {c: sum(r["check"] == c for r in news) for c in CHECKS.values()}
     circular = sum(r["circular"] for r in news)
     lines = [f"{len(quotes)} rule quotes over {len({r['condition_id'] for r in rows})} "
              f"screens; {share(verbatim, len(quotes))} verbatim.",
-             f"{len(news)} news items: "
+             f"{len(news)} news facts: "
              + ", ".join(f"{share(k, len(news))} {c}" for c, k in counts.items()) + ".",
              gate("circular sources", bool(rows) and circular == 0,
-                  f"{circular} news items cite a prediction market or forecast")]
+                  f"{circular} news facts cite a prediction market or forecast")]
     return Report(rows, lines)
 
 
-def retro(conn, path, n, screen_one, resolve=fetch_resolution):
+def retro(conn, path, n, screen_batch, resolve=fetch_resolution):
     markets = []
     for m in in_latest_scan(conn, ("rejected",)):
         if len(markets) == n:
             break
         if m.rewards_active and not resolve(m.condition_id).closed:
             markets.append(m)
-    screens = current_screens(path, [m.condition_id for m in markets], screen_one)
+    screens = current_screens(path, [m.condition_id for m in markets], screen_batch)
     rows = []
     for m in markets:
         t, _ = screens[m.condition_id]
@@ -311,15 +317,15 @@ def main(argv=None, run=triage.run_claude, fetch_rules=remote.fetch_rules,
         parser.error(str(e))
     now = clock()
 
-    def screen_one(conn, condition_id):
-        return triage.screen_and_store(conn, condition_id, now, fetch_rules, run, fetch_page)
+    def screen_batch(conn, condition_ids):
+        return triage.screen_and_store(conn, condition_ids, now, fetch_rules, run, fetch_page)
 
     with closing(farm_db.open_db(args.db)) as conn:
         report = {
-            "screen": lambda: screen(conn, args.db, read_ids(args.ids), args.n, screen_one),
+            "screen": lambda: screen(conn, args.db, read_ids(args.ids), args.n, screen_batch),
             "outcomes": lambda: outcomes(conn, resolve),
             "grounding": lambda: grounding(conn),
-            "retro": lambda: retro(conn, args.db, args.n, screen_one, resolve),
+            "retro": lambda: retro(conn, args.db, args.n, screen_batch, resolve),
             "hindsight": lambda: hindsight(conn, resolve),
         }[args.command]()
     write_csv(args.out, report.rows)
