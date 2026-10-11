@@ -1,0 +1,48 @@
+#!/bin/bash
+# Start the keyed units with a wallet key typed once.
+#
+#   sudo polymarket-start                      farmer and worker
+#   sudo polymarket-start polymarket-worker    the units named
+#
+# The key goes from the prompt into a file on /run, which is memory, and the
+# units read it as their standard input. It is never an argument or an
+# environment variable, so no process listing, journal or shell history has it.
+set -euo pipefail
+
+KEY_DIR=/run/polymarket
+KEY_FILE=$KEY_DIR/key
+WATCH_SECONDS=10
+
+units=("$@")
+[ ${#units[@]} -gt 0 ] || units=(polymarket-farmer polymarket-worker)
+
+[ "$(id -u)" -eq 0 ] || { echo "Run it as root: sudo polymarket-start" >&2; exit 1; }
+
+trap 'rm -f "$KEY_FILE"' EXIT
+trap 'exit 130' INT TERM HUP
+
+install -d -m 0700 -o polymarket -g polymarket "$KEY_DIR"
+install -m 0400 -o polymarket -g polymarket /dev/null "$KEY_FILE"
+
+IFS= read -rs -p "Wallet private key: " key
+echo
+[ -n "$key" ] || { echo "No key entered. Nothing started." >&2; exit 1; }
+printf '%s\n' "$key" > "$KEY_FILE"
+unset key
+
+since=$(date +%s)
+# Type=exec: start returns once each process is running with the key file
+# already open as its standard input, so the file can go now.
+systemctl start "${units[@]}" || true
+rm -f "$KEY_FILE"
+
+sleep "$WATCH_SECONDS"
+status=0
+for unit in "${units[@]}"; do
+    state=$(systemctl is-active "$unit" || true)
+    [ "$state" = active ] || status=1
+    echo
+    echo "== $unit: $state"
+    journalctl --unit "$unit" --since "@$since" --lines 15 --no-pager --output cat
+done
+exit $status

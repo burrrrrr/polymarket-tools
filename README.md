@@ -30,6 +30,7 @@ Each tool has a page of its own.
 | [Console](docs/console.md) | The pages, the decisions and controls, the request checks, and the live updates |
 | [Orders page](docs/orders.md) | Snapshots of your open orders, and how a restore places the ones that went missing |
 | [Sniper page](docs/sniper.md) | Tick-change watches, the guard, and how a watch ends |
+| [Deploy to a server](docs/deploy.md) | One cloud VM for the farmer, the worker, and the console: creating it, typing the key at each start, moving the databases, and what is not verified yet |
 
 This page covers what the tools share:
 

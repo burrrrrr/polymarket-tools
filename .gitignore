@@ -10,9 +10,12 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Virtual environment, and what an editable install leaves
+# Virtual environment, here and in infra/, and what an editable install leaves
 .venv/
 *.egg-info/
+
+# A Pulumi stack's settings in infra/, which hold the operator's SSH public key
+Pulumi.*.yaml
 
 # Reward screener database, and SQLite's WAL sidecar files
 farm.db

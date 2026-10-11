@@ -1,0 +1,3 @@
+# These files run on Linux and are edited on Windows, where a checkout would
+# otherwise give them CRLF line endings that bash and systemd reject.
+infra/** text eol=lf

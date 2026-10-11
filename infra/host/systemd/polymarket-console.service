@@ -1,0 +1,26 @@
+[Unit]
+Description=Polymarket tools console on 127.0.0.1:8787
+Wants=network-online.target
+After=network-online.target
+# On a root disk whose data disk failed to mount, the console would work on empty databases.
+RequiresMountsFor=/var/lib/polymarket
+
+[Service]
+# Not the user of the farmer and the worker: see bootstrap.sh.
+User=polymarket-console
+UMask=0007
+WorkingDirectory=/opt/polymarket-tools
+EnvironmentFile=/etc/polymarket/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket-tools/.venv/bin/python -m console
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polymarket
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

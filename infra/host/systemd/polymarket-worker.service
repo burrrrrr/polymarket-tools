@@ -1,0 +1,30 @@
+[Unit]
+Description=Polymarket order tools worker, keyed
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/var/lib/polymarket
+
+# No [Install] section and Restart=no: the wallet key exists only while
+# polymarket-start runs, so this unit cannot start at boot or after a crash.
+[Service]
+Type=exec
+User=polymarket
+UMask=0007
+WorkingDirectory=/opt/polymarket-tools
+EnvironmentFile=/etc/polymarket/env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/polymarket-tools/.venv/bin/python -m tools --key-stdin
+StandardInput=file:/run/polymarket/key
+Restart=no
+# The worker finishes its running job on SIGTERM before it exits.
+TimeoutStopSec=120
+# A crash must not put the key on a disk: no core file, and nothing of the
+# process's memory in a dump that a crash handler takes instead.
+LimitCORE=0
+CoredumpFilter=0
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/polymarket
+ProtectHome=yes
+PrivateTmp=yes

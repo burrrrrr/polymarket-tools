@@ -1,0 +1,7 @@
+name: polymarket-tools
+description: One VM that runs the reward farmer, the worker and the console
+runtime:
+  name: python
+  options:
+    toolchain: pip
+    virtualenv: .venv
