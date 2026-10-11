@@ -1,0 +1,43 @@
+#!/bin/sh
+# Rejects a commit message that narrates. Each clone turns it on once with
+# git config core.hooksPath .githooks
+
+max_subject=72
+max_body_words=60
+areas='farmer|screener|triage|console|tools|polymarket|analysis|infra|docs|tests|repo'
+
+msg=$(sed -e '/^# -* >8 -*$/,$d' -e '/^#/d' "$1")
+subject=$(printf '%s\n' "$msg" | sed -n '1p')
+
+case "$subject" in
+	Merge\ *|Revert\ *|fixup!\ *|squash!\ *|amend!\ *) exit 0 ;;
+esac
+
+fail() {
+	cat >&2 <<EOF
+commit-msg: $1
+
+Subject: "area: what changed", at most $max_subject characters.
+Areas: $(printf '%s' "$areas" | tr '|' ' ').
+Body: optional, at most $max_body_words words. Say why the change was needed and
+what the diff cannot show. Leave out test output, measurements, replays and
+file-by-file tours. Those belong in the reply to the user, not in git.
+EOF
+	exit 1
+}
+
+printf '%s\n' "$subject" | grep -Eq "^($areas): [^ ]" ||
+	fail "the subject does not start with a known area and a colon"
+
+[ "${#subject}" -le "$max_subject" ] ||
+	fail "the subject is ${#subject} characters"
+
+[ -z "$(printf '%s\n' "$msg" | sed -n '2p')" ] ||
+	fail "the line after the subject is not blank"
+
+words=$(printf '%s\n' "$msg" | sed '1d' |
+	grep -Eiv '^(co-authored-by|signed-off-by): ' | wc -w)
+[ "$words" -le "$max_body_words" ] ||
+	fail "the body is $words words"
+
+exit 0

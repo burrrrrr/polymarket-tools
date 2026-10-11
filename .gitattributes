@@ -1,3 +1,6 @@
 # These files run on Linux and are edited on Windows, where a checkout would
 # otherwise give them CRLF line endings that bash and systemd reject.
 infra/** text eol=lf
+
+# Git runs the hook with sh on every platform, and sh rejects CRLF too.
+.githooks/** text eol=lf

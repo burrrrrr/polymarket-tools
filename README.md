@@ -388,6 +388,16 @@ The tests never touch the network and never hold a real key. Each one works
 in its own temporary directory, with fake clients where the code would talk
 to Polymarket.
 
+## Commit messages
+
+```bash
+git config core.hooksPath .githooks  # once in each clone
+```
+
+`.githooks/commit-msg` then rejects a commit whose subject is not
+`area: what changed` in at most 72 characters, or whose body is over 60
+words. The hook lists the areas on its `areas` line.
+
 ## Troubleshooting
 
 ### The farmer or the worker does not start
