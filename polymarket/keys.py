@@ -1,4 +1,5 @@
-"""The wallet's private key, from the environment or from the Bitwarden vault.
+"""The wallet's private key, from the environment, the Bitwarden vault, or
+standard input.
 
 This module never prompts, prints or exits: the entry point that owns a
 terminal passes ask_password and shows what KeyUnavailable says. The vault's
@@ -81,6 +82,35 @@ def load_private_key(ask_password, bw=run_bw):
     finally:
         _lock(bw)
     return key
+
+
+def read_stdin_key(stream):
+    """The private key: the first line of stream, the process's standard input.
+
+    The stream's descriptor then reads the null device. A file that held the
+    key stays readable through a descriptor still open on it, even once it is
+    deleted: on Linux any process of the same user can open /proc/<pid>/fd/0.
+    A stream with no descriptor is left as it is.
+
+    Raises KeyUnavailable when the line is empty.
+    """
+    key = stream.readline().strip()
+    _point_at_null(stream)
+    if not key:
+        raise KeyUnavailable("no key arrived on standard input")
+    return key
+
+
+def _point_at_null(stream):
+    try:
+        descriptor = stream.fileno()
+    except OSError:
+        return
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, descriptor)
+    finally:
+        os.close(null)
 
 
 def _lock(bw):

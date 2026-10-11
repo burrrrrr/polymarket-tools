@@ -1,10 +1,12 @@
+import io
 import json
 import os
+import tempfile
 import unittest
 from unittest import mock
 
 from polymarket import keys
-from polymarket.keys import BwResult, KeyUnavailable, load_private_key, run_bw
+from polymarket.keys import BwResult, KeyUnavailable, load_private_key, read_stdin_key, run_bw
 
 KEY = "0x" + "c0ffee" * 10 + "abcd"
 PASSWORD = "correct horse battery staple"
@@ -215,6 +217,39 @@ class VaultKeyTests(KeysTestCase):
             self.assertNotIn(PASSWORD, args)
             self.assertNotEqual(session, PASSWORD)
             self.assertEqual(stdin, PASSWORD if args[0] == "unlock" else None)
+
+
+class StdinKeyTests(unittest.TestCase):
+    def key_file(self, text):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "key")
+        with open(path, "w") as file:
+            file.write(text)
+        stream = open(path)
+        self.addCleanup(stream.close)
+        return path, stream
+
+    def test_the_key_is_the_first_line(self):
+        _, stream = self.key_file(f"  {KEY}\nnot the key\n")
+        self.assertEqual(read_stdin_key(stream), KEY)
+
+    def test_the_descriptor_no_longer_leads_to_the_file_that_held_the_key(self):
+        path, stream = self.key_file(f"{KEY}\n")
+        read_stdin_key(stream)
+        self.assertFalse(os.path.samestat(os.fstat(stream.fileno()), os.stat(path)))
+        self.assertEqual(os.read(stream.fileno(), 100), b"")
+
+    def test_an_empty_line_is_no_key_and_the_descriptor_is_still_let_go(self):
+        path, stream = self.key_file("\nnot the key\n")
+        with self.assertRaises(KeyUnavailable):
+            read_stdin_key(stream)
+        self.assertFalse(os.path.samestat(os.fstat(stream.fileno()), os.stat(path)))
+
+    def test_a_stream_with_no_descriptor_keeps_its_other_lines(self):
+        stream = io.StringIO(f"{KEY}\nnot the key\n")
+        self.assertEqual(read_stdin_key(stream), KEY)
+        self.assertEqual(stream.read(), "not the key\n")
 
 
 class RunBwTests(unittest.TestCase):

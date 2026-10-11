@@ -2698,10 +2698,7 @@ def read_key(from_stdin):
 
     if not from_stdin:
         return keys.load_private_key(lambda: getpass.getpass("Bitwarden master password: "))
-    key = sys.stdin.readline().strip()
-    if not key:
-        raise keys.KeyUnavailable("no key arrived on standard input")
-    return key
+    return keys.read_stdin_key(sys.stdin)
 
 
 def main(argv=None):
