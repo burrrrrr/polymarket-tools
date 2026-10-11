@@ -1055,6 +1055,94 @@ class AskKeepTest(unittest.TestCase):
         self.assertEqual(self.keep(0.962), "score below keep ratio")
 
 
+# Qatar's shape once both its bids had filled and no favorite bid paid: the
+# longshot exit shows in the favorite book as a bid, and 5.8c is the 94.2c
+# best bid, a tick under the lowest ask.
+QATAR = market(v=0.045, p_true=0.98, naked_budget_usd=10.0)
+QATAR_BOOK = Levels(bids=[(0.942, 631.0), (0.94, 32.0), (0.939, 1031.5), (0.938, 50.0)],
+                    asks=[(0.943, 5.0), (0.944, 5.0), (0.945, 5.0), (0.95, 16.0),
+                          (0.951, 550.0)], tick=0.001)
+QATAR_HELD = Position(fav_shares=266.08, fav_avg=0.9412, long_shares=303.02, long_avg=0.033)
+
+
+class LongAskKeepTest(unittest.TestCase):
+    """Qatar's exit rested at 6.2c, a 93.8c bid behind 1,694 shares, for 11
+    minutes while its target was 5.8c: it scored 0.81 of the target."""
+
+    def keep(self, price, book=QATAR_BOOK):
+        target = quotes_at(QATAR, book, QATAR_HELD, CFG, False, None)
+        order = live("a", Slot.LONG_ASK, price, QATAR_HELD.long_shares)
+        return (keep_failure(order, by_slot(target)[Slot.LONG_ASK], target, QATAR, QATAR_HELD,
+                             CFG),
+                reconcile(target, [order], QATAR, QATAR_HELD, CFG))
+
+    def test_an_exit_resting_behind_the_target_is_replaced(self):
+        failure, actions = self.keep(0.062)
+        self.assertEqual(failure, "above the target price")
+        placed = [a.intent for a in actions if isinstance(a, Place)]
+        self.assertEqual(actions[0], Cancel(("a",)))
+        self.assertIn((Slot.LONG_ASK, 0.058), [(i.slot, i.price) for i in placed])
+
+    def test_an_exit_one_tick_behind_the_target_is_replaced(self):
+        self.assertEqual(self.keep(0.059)[0], "above the target price")
+
+    def test_an_exit_at_the_target_stays(self):
+        self.assertIsNone(self.keep(0.058)[0])
+
+    def test_an_exit_ahead_of_a_target_that_fell_back_stays(self):
+        fell = QATAR_BOOK._replace(bids=[(0.936, 631.0)] + QATAR_BOOK.bids[1:])
+        target = quotes_at(QATAR, fell, QATAR_HELD, CFG, False, None)
+        self.assertEqual(by_slot(target)[Slot.LONG_ASK].price, 0.059)
+        self.assertIsNone(self.keep(0.058, fell)[0])
+
+    def test_an_exit_stays_when_the_bid_it_leads_falls_two_ticks(self):
+        """It rests at 6.0c, half a cent over a 93.5c best bid that wobbles
+        to 93.3c and back. The plan's midpoint at 93.3c is under the order,
+        which scored nothing there, and following the target both ways
+        replaced it on every wobble."""
+        wobbled = Levels(bids=[(0.933, 600.0), (0.93, 1000.0)], asks=[(0.941, 500.0)],
+                         tick=0.001)
+        target = quotes_at(QATAR, wobbled, QATAR_HELD, CFG, False, None)
+        self.assertEqual(by_slot(target)[Slot.LONG_ASK].price, 0.062)
+        failure, actions = self.keep(0.060, wobbled)
+        self.assertIsNone(failure)
+        self.assertFalse([a for a in actions if isinstance(a, Cancel)])
+
+
+# Qatar's favorite risen to 97.4c: the front of the queue is a 97.4c bid, a
+# 2.6c longshot ask, under the 3.3c the shares cost.
+RALLIED_BOOK = Levels(bids=[(0.972, 600.0), (0.97, 1000.0)], asks=[(0.975, 500.0)], tick=0.001)
+
+
+class LongExitFloorTest(unittest.TestCase):
+    """The longshot exit sells for a profit or waits: never under the
+    shares' average cost plus min_capture, 3.8c on Qatar's 3.3c."""
+
+    def exit_price(self, held=QATAR_HELD, fav_price=None):
+        target = quotes_at(QATAR, RALLIED_BOOK, held, CFG, fav_price is not None, fav_price)
+        return by_slot(target)[Slot.LONG_ASK].price
+
+    def test_the_exit_rests_at_the_floor_when_the_front_is_under_it(self):
+        self.assertEqual(self.exit_price(), 0.038)
+
+    def test_a_cost_between_ticks_rounds_the_floor_up(self):
+        self.assertEqual(self.exit_price(QATAR_HELD._replace(long_avg=0.0334)), 0.039)
+
+    def test_the_floor_holds_at_the_mirror_of_a_favorite_bid(self):
+        self.assertEqual(self.exit_price(fav_price=0.972), 0.038)
+
+    def test_an_exit_resting_under_the_floor_is_replaced(self):
+        target = quotes_at(QATAR, RALLIED_BOOK, QATAR_HELD, CFG, False, None)
+        order = live("a", Slot.LONG_ASK, 0.026, QATAR_HELD.long_shares)
+        self.assertEqual(
+            keep_failure(order, by_slot(target)[Slot.LONG_ASK], target, QATAR, QATAR_HELD, CFG),
+            "below the exit floor")
+        actions = reconcile(target, [order], QATAR, QATAR_HELD, CFG)
+        placed = [a.intent for a in actions if isinstance(a, Place)]
+        self.assertEqual(actions[0], Cancel(("a",)))
+        self.assertIn((Slot.LONG_ASK, 0.038), [(i.slot, i.price) for i in placed])
+
+
 # Newsom's shape: a 98c favorite 0.228 years out with a 97.4c mid and $2,000
 # behind its bid. SURE is the same market held to be worth 99c, over the ask
 # a fill would leave resting.

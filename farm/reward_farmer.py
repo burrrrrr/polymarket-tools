@@ -30,7 +30,8 @@ farmer rests on both sides, in four slots per market:
             is read it does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
-            favorite bid so it scores the same.
+            favorite bid so it scores the same, and never under its average
+            cost plus --min-capture: it sells for a profit or waits.
   FAV_ASK   favorite SELL, Q_two, covered by favorite shares. Exits favorite
             inventory above its average cost and frees the capital again.
   LONG_BID  longshot BUY, Q_two, naked. It exists only to make Q_one count.
@@ -137,7 +138,10 @@ limits it above the lowest tick,
 at a price no higher than target or within two ticks of the min-score price,
 and not once its price has come to offer more than MAX_RETURN a year. A
 favorite ask more than two ticks under its target is replaced although it
-scores more, so it follows a target that rises. Replacing an order loses its queue
+scores more, so it follows a target that rises. A longshot ask priced over
+its target is replaced at once, and one priced under it always stays: its
+fills are wanted, and the bids priced ahead of it in the favorite book fill
+first. Replacing an order loses its queue
 position, costs two API calls, and scores nothing for the ~30 seconds before
 Polymarket starts scoring the new order, so this hysteresis matters.
 
@@ -581,6 +585,11 @@ def exit_floor(position, fm, cfg):
     return ceil_to_tick(position.fav_avg + cfg.min_capture, fm.tick)
 
 
+def long_exit_floor(position, fm, cfg):
+    """Lowest price a LONG_ASK may sell at: average cost plus the capture."""
+    return ceil_to_tick(position.long_avg + cfg.min_capture, fm.tick)
+
+
 def capital_room(fm, position):
     """USD of favorite bid the capital still allows after favorite shares held, at cost."""
     return max(0.0, fm.capital - position.fav_shares * position.fav_avg)
@@ -671,13 +680,17 @@ def mirror(price, tick):
     return round(1 - price, tick_decimals(tick))
 
 
-def plan_long_ask_price(fm, levels, fav_price, cfg):
+def plan_long_ask_price(fm, levels, fav_price, position, cfg):
     """Longshot ask at the mirror of the favorite bid, or of the highest one allowed
     when there is none; None when the book leaves no favorite bid to mirror. With no
-    favorite bid the exit takes the most fill-prone price: its fills are wanted."""
+    favorite bid the exit takes the most fill-prone price: its fills are wanted.
+    Never under long_exit_floor: a dearer longshot ask is a lower bid in the
+    favorite book, so the floor cannot make it cross."""
     if fav_price is None:
         fav_price = fav_ceiling(levels, fm.tick, fm.min_size, cfg.max_lead)
-    return None if fav_price is None else mirror(fav_price, fm.tick)
+    if fav_price is None:
+        return None
+    return max(mirror(fav_price, fm.tick), long_exit_floor(position, fm, cfg))
 
 
 def plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid=None):
@@ -736,7 +749,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
         fav_bid = fav_price, fav_size
     long_ask = fav_ask = None
     if position.long_shares >= fm.min_size:
-        long_ask = plan_long_ask_price(fm, levels, fav_price, cfg)
+        long_ask = plan_long_ask_price(fm, levels, fav_price, position, cfg)
     if position.fav_shares >= fm.min_size:
         fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid)
 
@@ -945,6 +958,14 @@ def keep_failure(order, intent, target, fm, position, cfg):
     target that replaces it is priced by the same zones in the same cycle.
     A favorite ask is judged by score too, but one more than
     ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
+    A longshot ask is judged by price alone. Priced over target it is
+    replaced however close its score: in the favorite book it is a bid, and
+    every bid above it fills first, so the new order's place in the queue is
+    ahead of the one given up. Priced under target it is ahead already and
+    stays, whatever it scores against a midpoint planned without it. So the
+    order only moves toward the front, and a target that wobbles moves it
+    once, to its lowest, and no more. One under long_exit_floor is replaced
+    all the same: a further longshot fill can lift the cost over it.
     """
     low, high = KEEP_SIZE_RANGE
     size = intent.size
@@ -980,6 +1001,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
     elif order.slot is Slot.FAV_ASK and order.price < (
             intent.price - ASK_PRICE_SLACK_TICKS * fm.tick - 1e-9):
         return "below the target price"
+    elif order.slot is Slot.LONG_ASK:
+        if order.price > intent.price + 1e-9:
+            return "above the target price"
     elif order_score(order.slot, order.price, target.mid, fm.v) < (
             cfg.keep_ratio * intent.score - 1e-12):
         return "score below keep ratio"
@@ -992,6 +1016,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
             high * capital_room(fm, position) + 1e-9):
         return "over the capital"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
+        return "below the exit floor"
+    if order.slot is Slot.LONG_ASK and order.price < (
+            long_exit_floor(position, fm, cfg) - 1e-9):
         return "below the exit floor"
     if (order.slot is Slot.LONG_BID
             and order.price * order.size_remaining > naked_room(fm, position) + 1e-9
@@ -2585,7 +2612,7 @@ Examples:
         ("--max-lead", float, 0.005, "Most the favorite bid may sit above the best bid "
                                      "already in the book. 0 joins it"),
         ("--ask-offset", float, 0.01, "Favorite ask distance above the midpoint"),
-        ("--min-capture", float, 0.005, "Favorite ask minimum above average cost"),
+        ("--min-capture", float, 0.005, "Favorite and longshot ask minimum above average cost"),
         ("--ev-margin", float, 0.02, "Favorite bid maximum is p_true minus this"),
         ("--min-fav", float, 0.90, "Stop quoting below this favorite midpoint"),
         ("--min-low-score", float, 0.10, "The longshot bid never sits above the cheapest "

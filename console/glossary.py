@@ -216,7 +216,7 @@ GLOSSARY = {
                                  "the best bid."),
     "ask_offset": Term("Ask offset", "How far above the midpoint the favorite exit (FAV_ASK) "
                                      "sits, in price."),
-    "min_capture": Term("Min capture", "The favorite exit never sells below average cost "
+    "min_capture": Term("Min capture", "No exit, favorite or longshot, sells below average cost "
                                        "plus this, in price."),
     "ev_margin": Term("EV margin", "The favorite bid never goes above p_true minus this, so "
                                    "every fill keeps at least this much edge."),

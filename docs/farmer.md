@@ -64,7 +64,7 @@ four slots per market:
 | Slot | Order | Side | Purpose |
 | --- | --- | --- | --- |
 | `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](pricing.md#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
-| `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same. |
+| `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same, and never under their average cost plus `--min-capture`. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
 | `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price that balances Q_one, 0.1c on most markets, and never where a fill would give a favorite buyer over 20% a year. [The longshot bid](pricing.md#the-longshot-bid) has the rule. |
 
@@ -186,7 +186,9 @@ next farmer starts, so it does not stop that farmer.
   more), it beats the orders without it, the naked budget still balances at
   least 80% of it, and it is no more than 25% over the capital left. This
   keeps queue position and avoids churning orders on every small move of the
-  midpoint.
+  midpoint. A longshot ask is judged by its price instead of its score. One
+  priced over its target is replaced, because the bids ahead of it in the
+  favorite book fill first. One priced under its target stays.
 - An order the CLOB rejects, such as a post-only cross or an unfunded bid,
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
@@ -244,7 +246,7 @@ it does not manage.
 | `--capital` | 500 | Most USD a market's favorite bid may be, held favorite shares included at cost. The farmer rests the size at or under it that nets the most |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
-| `--min-capture` | 0.005 | Favorite ask minimum above its average cost |
+| `--min-capture` | 0.005 | Favorite ask and longshot ask minimum above the shares' average cost |
 | `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this |
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
