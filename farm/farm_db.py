@@ -57,8 +57,9 @@ which no other process writes (farm/farm_books.py owns it).
 Controls a human can repeat or a crash can interrupt (pause, resume, retire,
 cancel-all) are level-triggered columns on markets, not commands: the farmer
 reads the level every cycle and converges to it, however many times it was
-set and whether or not the farmer was running. Only stopping the farmer is
-an edge, and it is a command.
+set and whether or not the farmer was running. Stopping the farmer and
+ending a market's cooldown are edges, and each is a command: a cooldown
+lives only in the running farmer, so there is no level to converge to.
 
 Times are ISO 8601 UTC strings to the second, so they sort as text.
 """
@@ -763,7 +764,11 @@ def _get_json(conn, key):
 # ---------------------------------------------------------------------------
 
 class CommandKind(Enum):
+    """STOP's payload may hold keep_orders; END_COOLDOWN's holds the market's
+    condition_id."""
+
     STOP = "stop"
+    END_COOLDOWN = "end_cooldown"
 
 
 class Command(NamedTuple):
@@ -818,7 +823,7 @@ def latest_command(conn, kind):
 
 
 def expire_commands(conn, now):
-    """Consume commands sent while no farmer ran, so a stale stop is not obeyed."""
+    """Consume commands sent while no farmer ran, so a stale one is not obeyed."""
     with conn:
         return conn.execute(
             "UPDATE commands SET consumed_at = ?, "

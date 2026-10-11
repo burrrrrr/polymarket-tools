@@ -401,6 +401,12 @@ class ControlsTest(ScratchDb):
         self.assertEqual(results[second], "stopping")
         self.assertEqual(farm_db.pending_commands(conn), [])
 
+    def test_an_end_cooldown_command_names_its_market(self):
+        conn = self.open()
+        sent = farm_db.send_command(conn, CommandKind.END_COOLDOWN, NOW, {"condition_id": "0xa"})
+        self.assertEqual(farm_db.pending_commands(conn),
+                         [farm_db.Command(sent, "end_cooldown", {"condition_id": "0xa"})])
+
 
 class PublishTest(ScratchDb):
     def state(self, cid):

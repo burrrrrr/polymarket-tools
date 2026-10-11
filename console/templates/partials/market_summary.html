@@ -14,7 +14,7 @@
       {%- if vm.status != 'approved' %}<span class="badge t-r">{{ vm.status }}</span>{% endif %}
     </div>
     <div class="actions">
-      {{ market_controls(c.condition_id, c.name, c.status, c.paused, c.naked_paused, long=True) }}
+      {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused, long=True) }}
     </div>
   </header>
 

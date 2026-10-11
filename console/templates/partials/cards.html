@@ -65,7 +65,7 @@
       {{ polymarket_link(c.slug, "btn") }}
     </div>
     <div class="actions">
-      {{ market_controls(c.condition_id, c.name, c.status, c.paused, c.naked_paused) }}
+      {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused) }}
     </div>
   </article>
 {%- else %}

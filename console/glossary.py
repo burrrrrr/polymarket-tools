@@ -192,7 +192,8 @@ GLOSSARY = {
     "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
                                  "threshold within the drop window). The ask is the price "
                                  "at which the favorite's asks add up to three reward "
-                                 "minimums. All orders are pulled until the cooldown ends."),
+                                 "minimums. All orders are pulled until the cooldown ends "
+                                 "or you end it with End cooldown."),
     "BELOW_RANGE": Term("Below range", "The favorite's midpoint is below the minimum. All "
                                        "orders are pulled until it recovers 0.5c above it."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "

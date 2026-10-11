@@ -314,6 +314,24 @@ class MarketControlTest(Writes):
         self.assertEqual(self.post("/markets/0xnope/paused", value="1").status_code, 404)
         self.assertEqual(self.snapshot_markets(), before)
 
+    def test_end_cooldown_sends_the_farmer_a_command_naming_the_market(self):
+        resp = self.post(f"/markets/{A}/end-cooldown")
+        self.assertEqual((resp.status_code, resp.headers["HX-Trigger"]), (200, "controls"))
+        self.assertEqual([(c.kind, c.payload) for c in farm_db.pending_commands(self.db)],
+                         [("end_cooldown", {"condition_id": A})])
+        self.assertEqual(self.post("/markets/0xnope/end-cooldown").status_code, 404)
+        self.assertEqual(len(farm_db.pending_commands(self.db)), 1)
+
+    def test_the_end_cooldown_button_shows_only_while_the_market_cools_down(self):
+        button = f'hx-post="/markets/{A}/end-cooldown" hx-swap="none">End cooldown</button>'
+        pages = ("/partials/markets", f"/markets/{A}")
+        for url in pages:
+            self.assertNotIn("end-cooldown", self.client.get(url).text)
+        cooling = state(A, "COOLDOWN", "ask drop", until=self.now + timedelta(minutes=10))
+        self.publish(states=[cooling._replace(updated_at=self.now)])
+        for url in pages:
+            self.assertEqual(self.client.get(url).text.count(button), 1)
+
 
 class FakeRemote:
     def __init__(self):

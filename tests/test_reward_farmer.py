@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import tempfile
@@ -1668,19 +1669,30 @@ class HistoriesTest(unittest.TestCase):
 
     def setUp(self):
         self.fetch = mock.Mock(return_value=self.READ)
-        self.histories = reward_farmer.Histories(threading.Event(), self.fetch)
+        self.at = NOW
+        self.stop = threading.Event()
+        self.histories = reward_farmer.Histories(self.stop, self.fetch, lambda: self.at)
         self.histories.wanted = {"0xc0nd": self.WANT}
         patcher = mock.patch.object(reward_farmer, "log")
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def refresh_at(self, *seconds):
-        """Refresh at each NOW + seconds; the read after each."""
+        """Refresh with the clock at each NOW + seconds; the read after each."""
         seen = []
         for s in seconds:
-            self.histories.refresh(None, NOW + timedelta(seconds=s))
+            self.at = NOW + timedelta(seconds=s)
+            self.histories.refresh(None)
             seen.append(self.histories.read.get("0xc0nd"))
         return seen
+
+    def reads(self):
+        """(market, time) of each read so far, in order."""
+        return [(c.args[1], c.args[3]) for c in self.fetch.call_args_list]
+
+    def want(self, *cids):
+        self.histories.wanted = {cid: reward_farmer.Want(f"fav-{cid}", 0.90, cid)
+                                 for cid in cids}
 
     def test_a_wanted_market_is_read_at_once_then_hourly(self):
         self.refresh_at(0, 5, 3599, 3600)
@@ -1715,6 +1727,51 @@ class HistoriesTest(unittest.TestCase):
         self.histories.wanted = {"0xc0nd": self.WANT._replace(floor=0.92)}
         self.refresh_at(5)
         self.assertEqual([c.args[4] for c in self.fetch.call_args_list], [0.90, 0.92])
+
+    def test_each_read_has_its_own_time_and_is_next_due_an_hour_after_it(self):
+        def ten_minutes(*args):
+            self.at += timedelta(minutes=10)
+            return self.READ
+
+        self.want("a", "b")
+        self.fetch.side_effect = ten_minutes
+        self.refresh_at(0)
+        self.assertEqual(self.reads(), [("a", NOW), ("b", NOW + timedelta(minutes=10))])
+        self.fetch.side_effect = None
+        self.refresh_at(3599, 3600, 4199)
+        self.assertEqual(self.reads()[2:], [("a", NOW + timedelta(seconds=3600))])
+        self.refresh_at(4200)
+        self.assertEqual(self.reads()[3:], [("b", NOW + timedelta(seconds=4200))])
+
+    def test_unread_markets_are_read_before_read_ones_each_in_the_order_wanted(self):
+        self.want("a", "b")
+        self.refresh_at(0)
+        self.want("b", "d", "a", "c")
+        self.refresh_at(3600)
+        self.assertEqual([cid for cid, _ in self.reads()[2:]], ["d", "c", "b", "a"])
+
+    def test_a_market_wanted_during_a_pass_is_read_in_that_pass(self):
+        def want_d(http, cid, *rest):
+            if cid == "a":
+                self.want("a", "b", "c", "d")
+            return self.READ
+
+        self.want("a", "b", "c")
+        self.refresh_at(0)
+        self.fetch.side_effect = want_d
+        self.refresh_at(3600)
+        self.assertEqual([cid for cid, _ in self.reads()[3:]], ["a", "d", "b", "c"])
+
+    def test_a_stop_ends_the_pass(self):
+        def stop(*args):
+            self.stop.set()
+            return self.READ
+
+        self.want("a", "b")
+        self.fetch.side_effect = stop
+        self.refresh_at(0)
+        self.assertEqual([cid for cid, _ in self.reads()], ["a"])
+        self.assertEqual(list(self.histories.read), ["a"])
 
 
 CID = "0xc0nd"
@@ -1868,9 +1925,12 @@ class FarmerHarness(unittest.TestCase):
         self.history = mock.Mock(return_value=NO_SWEEPS)
         self.sweeps = ()
         self.book = FLOOR_BOOK
+        self.read_at = NOW
         for name, fake in (
             ("fetch_market_infos", self.infos),
             ("fetch_read", self.fake_read),
+            ("Histories", functools.partial(reward_farmer.Histories,
+                                            clock=lambda: self.read_at)),
             ("fetch_holdings", mock.Mock(return_value={})),
             ("fetch_levels", self.fake_levels),
             ("fetch_total_rates", mock.Mock(return_value={})),
@@ -1905,7 +1965,7 @@ class FarmerHarness(unittest.TestCase):
         self.addCleanup(farmer.db.close)
         farmer.start()
         if read_histories:
-            farmer.histories.refresh(farmer.http, NOW)
+            farmer.histories.refresh(farmer.http)
         return farmer
 
     def query(self, sql, *params):
@@ -2189,6 +2249,44 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(after, ("COOLDOWN", "ask drop", {}))
         self.assertIn("PHASE", [kind for kind, _ in events])
 
+    def test_an_end_cooldown_command_quotes_again_and_the_same_drop_does_not_cool_down(self):
+        self.infos.return_value = {CID: INFO._replace(v=0.085, min_size=20.0)}
+        farmer = self.started_farmer()
+        fallen = MISTRAL_BOOK._replace(asks=[(0.967, 150.0)] + MISTRAL_BOOK.asks[1:])
+        for self.book in (MISTRAL_BOOK, fallen):
+            farmer.cycle()
+        self.assertEqual(self.farm_state()[0]["phase"], "COOLDOWN")
+        before = self.last_event_id()
+
+        farm_db.send_command(self.ui, CommandKind.END_COOLDOWN, NOW, {"condition_id": CID})
+        for _ in range(2):
+            farmer.cycle()
+            row, slots = self.farm_state()
+            self.assertEqual((row["phase"], row["phase_until"]), ("QUOTING", None))
+            self.assertIsNotNone(slots["FAV_BID"]["target"])
+        phases = [e for e in self.events(before) if e["kind"] == "PHASE"]
+        self.assertEqual([(e["condition_id"], json.loads(e["data"])) for e in phases],
+                         [(CID, {"from": "COOLDOWN", "to": "QUOTING",
+                                 "reason": "ended by operator", "until": None})])
+        self.assertIn("ended by operator", phases[0]["message"])
+        command = self.query("SELECT * FROM commands")[0]
+        self.assertEqual(command["result"], "cooldown ended")
+        self.assertIsNotNone(command["consumed_at"])
+
+    def test_an_end_cooldown_command_for_a_market_not_cooling_down_changes_nothing(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        before = self.last_event_id()
+        for cid in (CID, "0xnope"):
+            farm_db.send_command(self.ui, CommandKind.END_COOLDOWN, NOW, {"condition_id": cid})
+        farmer.cycle()
+        self.assertEqual(self.events(before), [])
+        self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+        commands = self.query("SELECT * FROM commands ORDER BY id")
+        self.assertEqual([c["result"] for c in commands],
+                         ["not in cooldown", "market not managed"])
+        self.assertNotIn(None, [c["consumed_at"] for c in commands])
+
     def test_a_dust_ask_far_below_does_not_cool_down(self):
         dusted = MISTRAL_BOOK._replace(asks=[(0.95, 5.0)] + MISTRAL_BOOK.asks)
         (_, after), _ = self.replay(MISTRAL_BOOK, dusted)
@@ -2222,7 +2320,7 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(self.history.call_count, 0)
         self.assertEqual(farmer.histories.wanted,
                          {CID: reward_farmer.Want(FAV, CFG.min_fav, "test-market")})
-        farmer.histories.refresh(farmer.http, NOW)
+        farmer.histories.refresh(farmer.http)
         farmer.cycle()
         self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
 
@@ -2247,8 +2345,12 @@ class FarmerCycleTest(FarmerHarness):
         fav = self.first_bid_on_stored_history(self.stored(60))
         self.assertEqual((fav["decision"], fav["target"]["price"]), ("place", 0.975))
 
-    def test_a_restart_ignores_a_stored_history_older_than_its_refresh(self):
+    def test_a_restart_quotes_on_a_stored_history_a_minute_overdue_for_its_refresh(self):
         fav = self.first_bid_on_stored_history(self.stored(reward_farmer.HISTORY_S + 60))
+        self.assertEqual((fav["decision"], fav["target"]["price"]), ("place", 0.975))
+
+    def test_a_restart_ignores_a_stored_history_older_than_the_seed_limit(self):
+        fav = self.first_bid_on_stored_history(self.stored(reward_farmer.HISTORY_SEED_S + 60))
         self.assertEqual((fav["decision"], fav["reason"]), ("none", "no fill history yet"))
 
     def test_a_restart_ignores_a_missing_or_malformed_stored_history(self):
@@ -2410,7 +2512,8 @@ class BuyTapeFarmerTest(FarmerHarness):
         for _ in range(3):
             farmer.cycle()
         self.assertEqual(self.save.call_count, 1)
-        farmer.histories.refresh(farmer.http, NOW + timedelta(seconds=reward_farmer.HISTORY_S))
+        self.read_at = NOW + timedelta(seconds=reward_farmer.HISTORY_S)
+        farmer.histories.refresh(farmer.http)
         farmer.cycle()
         farmer.cycle()
         self.assertEqual(self.save.call_count, 2)
@@ -2425,7 +2528,8 @@ class BuyTapeFarmerTest(FarmerHarness):
         now = datetime.now(timezone.utc)
         self.history.return_value = NO_SWEEPS._replace(read_at=now)
         first = self.started_farmer(read_histories=False)
-        first.histories.refresh(first.http, now)
+        self.read_at = now
+        first.histories.refresh(first.http)
         first.cycle()
         first.shutdown("test", cancel=False)
         self.history.reset_mock()
@@ -2445,7 +2549,7 @@ class BuyTapeFarmerTest(FarmerHarness):
 
     def test_a_history_without_a_fresh_tape_still_seeds_and_bids(self):
         stale = tape_to_json(BuyTape(self.sweeps, datetime.now(timezone.utc) - timedelta(
-            seconds=reward_farmer.HISTORY_S + 60), NOW.timestamp() - 86400), TAPE_ROWS_FARMER)
+            seconds=reward_farmer.HISTORY_SEED_S + 60), NOW.timestamp() - 86400), TAPE_ROWS_FARMER)
         for tape in (None, stale, {"v": 99}):
             with self.subTest(tape=tape and tape["v"]):
                 with mock.patch.object(farm_db, "read_buys",
@@ -2746,6 +2850,15 @@ class LiveFarmerTest(FarmerHarness):
         alerts = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "ALERT"]
         self.assertEqual(alerts, [(CID, "post of 2 orders failed on test-market: down"),
                                   (CID2, "post of 2 orders failed on other-market: down")])
+
+    def test_histories_are_wanted_of_the_quoting_markets_first(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.assertEqual(list(farmer.histories.wanted), [CID, CID2])
+        farm_db.set_paused(self.ui, CID, True)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(list(farmer.histories.wanted), [CID2, CID])
 
     def test_a_cycle_lists_every_open_order_once_and_holds_each_markets_orders(self):
         farmer = self.started_farmer(client=self.client)

@@ -47,12 +47,16 @@ net -$0.12/day at 93.8c`.
 
 A thread beside the main loop reads each approved market's fill history, so a
 cycle never waits on those reads. It reads a market as soon as the farmer
-manages it, then every hour, and again at once when `min_fav` changes. A
-failed read keeps the last history and is retried after two minutes. Until a
-market's first history lands, the farmer places no favorite bid there, and
-only the exits rest. A read that found no midpoints counts as no history. The
-farmer values fills on the fill prior the last scan stored, read again every
-cycle.
+manages it, then every hour, and again at once when `min_fav` changes. It
+reads one market at a time: the markets with no history yet first, and the
+markets that are quoting before the rest. The hour runs from each market's
+own read, not from the start of the pass. A failed read keeps the last
+history and is retried after two minutes. A restart keeps the histories the
+last run stored that are under 70 minutes old, so a market whose hourly read
+was a few minutes late keeps its favorite bid. Until a market's first history
+lands, the farmer places no favorite bid there, and only the exits rest. A
+read that found no midpoints counts as no history. The farmer values fills on
+the fill prior the last scan stored, read again every cycle.
 
 ## The four slots
 
@@ -82,11 +86,13 @@ Each market is in one of six states:
 - `COOLDOWN`: the favorite's ask fell by `--drop-threshold` within
   `--drop-window` seconds. The ask is the price at which the favorite's asks
   add up to three reward minimums, so one minimum-size lot that comes and
-  goes on a thin book does not move it. All orders come
-  down for `--cooldown` seconds. A falling offer is sellers repricing the
-  favorite down. Only the ask counts, because a bid that leaves looks the same
-  whether it was cancelled or sold into. When a bid leaves, the farmer keeps
-  quoting and re-plans against the bids that remain.
+  goes on a thin book does not move it. All orders come down for `--cooldown`
+  seconds, or until an `end_cooldown` command ends the cooldown (see
+  [Pausing, settings, and stopping](#pausing-settings-and-stopping)). A
+  falling offer is sellers repricing the favorite down. Only the ask counts,
+  because a bid that leaves looks the same whether it was cancelled or sold
+  into. When a bid leaves, the farmer keeps quoting and re-plans against the
+  bids that remain.
 - `BELOW_RANGE`: the midpoint is below `--min-fav`. All orders come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
 - `PAUSED`: you set `paused = 1` on the market. All orders come down. When
@@ -159,6 +165,19 @@ To stop the farmer, insert a `stop` row into `commands`. The farmer reads it
 on its next cycle, stamps `consumed_at` and `result`, and shuts down the same
 way as on Ctrl+C. A stop sent while no farmer runs is marked expired when the
 next farmer starts, so it does not stop that farmer.
+
+To end a market's cooldown early, insert an `end_cooldown` row into
+`commands` with the payload `{"condition_id": "<id>"}`. This is a command and
+not a column because a cooldown lives only in the running farmer, and a
+restart clears it. On its next cycle the farmer sets a market in `COOLDOWN`
+back to `QUOTING`, logs a `PHASE` event that says the operator ended it, and
+forgets the asks it saw before, so the drop that started the cooldown cannot
+start it again. A further drop still can. The market then goes through the
+other lifecycle checks in the same cycle, so it can land in `BELOW_RANGE`,
+`PAUSED`, `UNREWARDED`, or `RETIRED` instead. For a market that is not in
+`COOLDOWN`, or that the farmer does not manage, the farmer changes nothing
+and writes the reason in `result`. Like a stop, the command is marked expired
+if no farmer was running when it was sent.
 
 ## Safety mechanisms
 

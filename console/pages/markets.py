@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
 
 from farm import farm_db
-from farm.farm_db import EventKind
+from farm.farm_db import CommandKind, EventKind
 
 from .. import charts, views
 from ..context import CONTROLS_EVENT, as_json, form_of, region_template
@@ -116,6 +116,14 @@ def routes(ctx):
         with closing(ctx.connect()) as conn:
             ctx.find(conn, condition_id)
             farm_db.set_naked_paused(conn, condition_id, paused)
+        return changed()
+
+    @router.post("/markets/{condition_id}/end-cooldown")
+    async def end_cooldown(request: Request, condition_id: str):
+        with closing(ctx.connect()) as conn:
+            ctx.find(conn, condition_id)
+            farm_db.send_command(conn, CommandKind.END_COOLDOWN, ctx.clock(),
+                                 {"condition_id": condition_id})
         return changed()
 
     @router.post("/markets/{condition_id}/retire")

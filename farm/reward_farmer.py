@@ -300,6 +300,10 @@ MARKET_INFO_TICK_S = 5
 HISTORY_S = 3600
 HISTORY_RETRY_S = 120
 HISTORY_TICK_S = 15
+# A restart takes a stored history up to this old: past HISTORY_S, because a
+# market is due the moment its hour is up and the reader, one market at a
+# time, can be minutes behind.
+HISTORY_SEED_S = HISTORY_S + 600
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
@@ -1582,27 +1586,37 @@ class Histories:
     even if seeded, again every HISTORY_S, and at once when what is wanted of
     it changes. A failed read keeps the last one and retries after
     HISTORY_RETRY_S.
+
+    The order of wanted is the order of reading, the markets with no read yet
+    first: a pass over every market takes minutes, and the main loop lists
+    the markets it is quoting first. Each read is made and stamped at its own
+    time, so it is next due HISTORY_S after it, not after its pass began.
     """
 
-    def __init__(self, stop, fetch):
+    def __init__(self, stop, fetch, clock=lambda: datetime.now(timezone.utc)):
         self.wanted = {}
         self.read = {}
         self._due = {}
         self._stop = stop
         self._fetch = fetch
+        self._clock = clock
 
-    def refresh(self, http, now):
-        """Read every wanted market that is due, one at a time, publishing
-        read after each, and forget the markets no longer wanted."""
-        wanted = self.wanted
-        self.read = {cid: h for cid, h in self.read.items() if cid in wanted}
-        self._due = {cid: due for cid, due in self._due.items() if cid in wanted}
-        for cid, want in wanted.items():
-            if self._stop.is_set():
+    def refresh(self, http):
+        """Read the wanted markets that are due, one at a time, until none
+        is, publishing read after each, and forget the markets no longer
+        wanted. wanted is looked at afresh before each read."""
+        while not self._stop.is_set():
+            wanted, now = self.wanted, self._clock()
+            self.read = {cid: h for cid, h in self.read.items() if cid in wanted}
+            self._due = {cid: due for cid, due in self._due.items() if cid in wanted}
+            due_now = [cid for cid, want in wanted.items()
+                       if cid not in self._due or now >= self._due[cid][0]
+                       or self._due[cid][1] != want]
+            if not due_now:
                 return
-            due, read_for = self._due.get(cid, (now, want))
-            if now < due and read_for == want:
-                continue
+            # min takes the first of equals, which keeps wanted's order.
+            cid = min(due_now, key=lambda cid: cid in self.read)
+            want = wanted[cid]
             try:
                 read = self._fetch(http, cid, want.fav_token_id, now, want.floor)
             except Exception as e:
@@ -1615,7 +1629,7 @@ class Histories:
     def run(self):
         with httpx.Client() as http:
             while not self._stop.is_set():
-                self.refresh(http, datetime.now(timezone.utc))
+                self.refresh(http)
                 self._stop.wait(HISTORY_TICK_S)
 
 
@@ -1826,7 +1840,7 @@ class Farmer:
         until the reader gets round to it. A history seeds without a tape."""
 
         def fresh(read):
-            return read is not None and now - read.read_at < timedelta(seconds=HISTORY_S)
+            return read is not None and now - read.read_at < timedelta(seconds=HISTORY_SEED_S)
 
         stored, tapes = farm_db.read_farm_states(self.db), farm_db.read_buys(self.db)
         histories = {cid: fill_cost.history_from_json(
@@ -1874,6 +1888,8 @@ class Farmer:
                                   "ALERT: keeping orders, but the heartbeat stops with the "
                                   "farmer and Polymarket cancels them within about 10s")
                 result = "stopping, keeping orders" if self.keep_orders else "stopping"
+            elif command.kind == farm_db.CommandKind.END_COOLDOWN.value:
+                result = self.end_cooldown((command.payload or {}).get("condition_id"))
             else:
                 result = f"unknown command {command.kind!r}"
             farm_db.consume_command(self.db, command.id, result, now)
@@ -1881,6 +1897,24 @@ class Farmer:
         self.apply_settings(*farm_db.load_settings(self.db))
         self.prior = load_prior(self.db)
         self.reload(now)
+
+    def end_cooldown(self, condition_id):
+        """Send a market in COOLDOWN back to quoting, as the operator asked;
+        the result for the command. The cycle's other checks still apply."""
+        managed = self.markets.get(condition_id)
+        if managed is None:
+            return "market not managed"
+        if managed.state.phase is not Phase.COOLDOWN:
+            return "not in cooldown"
+        previous, managed.state = managed.state, State(Phase.QUOTING)
+        # The asks from before the drop would start the same cooldown again.
+        managed.recent_asks.clear()
+        self.emit(EventKind.PHASE,
+                  f"{managed.fm.label}: {previous} -> {managed.state}, ended by operator",
+                  condition_id,
+                  data={"from": previous.phase.value, "to": managed.state.phase.value,
+                        "reason": "ended by operator", "until": None})
+        return "cooldown ended"
 
     def apply_settings(self, values, errors):
         for key, error in sorted(errors.items() - self.setting_errors.items()):
@@ -1935,10 +1969,13 @@ class Farmer:
                 managed.fm, managed.info = fm, info
         if self.live and added:
             self.prewarm(added)
-        # Quoting or not, so a market that starts quoting has its history already.
+        # Quoting or not, so a market that starts quoting has its history
+        # already, but the quoting ones first: the reader takes them in order.
+        quoting_first = sorted(self.active(),
+                               key=lambda m: m.state.phase is not Phase.QUOTING)
         self.histories.wanted = {m.fm.condition_id: Want(m.fm.fav_token_id, self.cfg.min_fav,
                                                          m.fm.label)
-                                 for m in self.active()}
+                                 for m in quoting_first}
 
     def prewarm(self, fms):
         """Read each market's CLOB info, which the client caches per token.
