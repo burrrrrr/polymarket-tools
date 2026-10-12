@@ -103,8 +103,10 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                after the farmer saw it unapproved starts over from QUOTING
                with fresh runtime state, through the same checks.
 
-Every state but QUOTING and SOLE_BID wants no orders, so the same reconcile step that
-maintains quotes also cancels them. Separately, a longshot fill (longshot
+Every state but QUOTING and SOLE_BID wants no bids, so the same reconcile step that
+maintains quotes also cancels them. COOLDOWN, BELOW_RANGE and UNREWARDED leave
+the two exits resting, priced as in any plan: they only sell inventory, at or
+over its exit floor. PAUSED and RETIRED take down every order. Separately, a longshot fill (longshot
 shares went up) pauses the naked LONG_BID for --naked-cooldown seconds, and
 with it the favorite bid it was balancing; markets.naked_paused does the same
 for as long as a human leaves it set.
@@ -535,6 +537,12 @@ class Phase(Enum):
     PAUSED = "PAUSED"
     UNREWARDED = "UNREWARDED"
     RETIRED = "RETIRED"
+
+
+# The phases that take the bids down and leave the exits resting: a sale of
+# inventory at or over its exit floor buys nothing and frees its capital,
+# whatever stopped the quoting. A pause and a retirement take down every order.
+EXITS_REST = (Phase.COOLDOWN, Phase.BELOW_RANGE, Phase.UNREWARDED)
 
 
 class State(NamedTuple):
@@ -2473,6 +2481,9 @@ class Farmer:
                                      self.cfg).phase is Phase.QUOTING)
         if managed.state.phase is Phase.SOLE_BID:
             target = sole
+        elif managed.state.phase in EXITS_REST:
+            target = quotes_at(fm, book, managed.position, self.cfg, False, None,
+                               fill_mid=managed.fill_mid)
         elif managed.state.phase is Phase.QUOTING or previewing:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),

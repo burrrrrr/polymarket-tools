@@ -3091,6 +3091,42 @@ class ExitFarmerTest(FarmerHarness):
         self.book = self.FALLEN
         self.assertEqual(self.ask_target(farmer), 0.975)
 
+    def resting_after(self, change):
+        """(phase, the slots resting an order) two cycles after `change` hits
+        a market that rests both bids and the exit of a favorite fill."""
+        farmer = self.started_farmer()
+        self.fill(farmer)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual({name for name, s in self.farm_state()[1].items() if s["order"]},
+                         {"FAV_BID", "LONG_BID", "FAV_ASK"})
+        change(farmer)
+        farmer.cycle()
+        farmer.cycle()
+        row, slots = self.farm_state()
+        return row["phase"], {name for name, s in slots.items() if s["order"]}
+
+    def test_the_exit_stays_resting_while_a_cooldown_takes_the_bids_down(self):
+        def ask_drop(farmer):
+            self.book = Levels(bids=[(0.92, 1000.0)], asks=[(0.93, 1000.0)], tick=0.001)
+        self.assertEqual(self.resting_after(ask_drop), ("COOLDOWN", {"FAV_ASK"}))
+        # 95.5c, the exit floor of shares bought at 95c, over the 92.5c midpoint.
+        self.assertEqual(self.farm_state()[1]["FAV_ASK"]["target"]["price"], 0.955)
+
+    def test_the_exit_stays_resting_below_range(self):
+        def below_range(farmer):
+            self.book = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+        self.assertEqual(self.resting_after(below_range), ("BELOW_RANGE", {"FAV_ASK"}))
+
+    def test_the_exit_stays_resting_after_rewards_end(self):
+        def rewards_end(farmer):
+            farmer.total_rates.rates = {"0xother": 1.0}
+        self.assertEqual(self.resting_after(rewards_end), ("UNREWARDED", {"FAV_ASK"}))
+
+    def test_a_pause_takes_the_exit_down_too(self):
+        self.assertEqual(self.resting_after(lambda farmer: farm_db.set_paused(self.ui, CID, True)),
+                         ("PAUSED", set()))
+
     def test_a_restart_recovers_the_fill_mid_from_the_last_favorite_fill(self):
         self.sample_mid(0.975, seconds_ago=300)
         self.sample_mid(0.965, seconds_ago=170)

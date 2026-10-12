@@ -209,15 +209,18 @@ GLOSSARY = {
     "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
                                  "threshold within the drop window). The ask is the price "
                                  "at which the favorite's asks add up to three reward "
-                                 "minimums. All orders are pulled until the cooldown ends "
-                                 "or you end it with End cooldown."),
-    "BELOW_RANGE": Term("Below range", "The favorite's midpoint is below the minimum. All "
-                                       "orders are pulled until it recovers 0.5c above it."),
+                                 "minimums. The bids are pulled until the cooldown ends or "
+                                 "you end it with End cooldown. Exits of shares held "
+                                 "stay."),
+    "BELOW_RANGE": Term("Below range", "The favorite's midpoint is below the minimum. The "
+                                       "bids are pulled until it recovers 0.5c above it. "
+                                       "Exits of shares held stay."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "
                              "it."),
     "UNREWARDED": Term("Unrewarded", "Polymarket's reward listing no longer pays this "
-                                     "market. All orders are pulled, and quoting resumes "
-                                     "on its own if rewards return."),
+                                     "market. The bids are pulled, and quoting resumes on "
+                                     "its own if rewards return. Exits of shares held "
+                                     "stay."),
     "RETIRED": Term("Retired", "The farmer stopped managing this market: market closed or "
                                "decided, expiry cutoff reached, or you retired it."),
     "WAITING": Term("Waiting", "Approved, but the farmer hasn't picked it up yet. It starts "

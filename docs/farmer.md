@@ -88,14 +88,14 @@ Each market is in one of seven states:
 - `COOLDOWN`: the favorite's ask fell by `--drop-threshold` within
   `--drop-window` seconds. The ask is the price at which the favorite's asks
   add up to three reward minimums, so one minimum-size lot that comes and
-  goes on a thin book does not move it. All orders come down for `--cooldown`
+  goes on a thin book does not move it. The bids come down for `--cooldown`
   seconds, or until an `end_cooldown` command ends the cooldown (see
   [Pausing, settings, and stopping](#pausing-settings-and-stopping)). A
   falling offer is sellers repricing the favorite down. Only the ask counts,
   because a bid that leaves looks the same whether it was cancelled or sold
   into. When a bid leaves, the farmer keeps quoting and re-plans against the
   bids that remain.
-- `BELOW_RANGE`: the midpoint is below `--min-fav`. All orders come down.
+- `BELOW_RANGE`: the midpoint is below `--min-fav`. The bids come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
 - `SOLE_BID`: you set `sole_bid = 1` on the market, and no other bid
   supports a favorite bid. That means one of three things. The midpoint
@@ -157,7 +157,7 @@ Each market is in one of seven states:
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
 - `UNREWARDED`: the market left the total reward listing. Its own CLOB
   record keeps showing the old rate after rewards end, so only the listing
-  counts. All orders come down, but the farmer keeps managing the market.
+  counts. The bids come down, but the farmer keeps managing the market.
   When the listing pays it again, the market goes through the checks above,
   the pause included, and quotes again unless one of them holds it. This
   check wins over a pause.
@@ -172,6 +172,12 @@ Each market is in one of seven states:
   market retires again at once. A dry run that retires a market leaves its
   row `approved`, so that market stays retired until you retire it and
   approve it again.
+
+`COOLDOWN`, `BELOW_RANGE` and `UNREWARDED` take down the two bids only. The
+exits of shares the farmer holds, `FAV_ASK` and `LONG_ASK`, stay resting,
+priced as in any plan: they only sell inventory, at or above its cost plus
+`--min-capture`, and a sale frees its capital whatever stopped the quoting.
+`PAUSED` and `RETIRED` take down every order.
 
 Every cycle the farmer re-reads the approved rows, their controls, the
 settings, and the commands from `farm.db`. A new approval, a rejection, a

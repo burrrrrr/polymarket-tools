@@ -618,7 +618,7 @@ def _name(snap, cid):
     return market_name(snap.markets.get(cid), cid)
 
 
-def _in_phase(phase, default_reason, effect="All its orders are down."):
+def _in_phase(phase, default_reason, effect="Its bids are down."):
     def find(snap, now):
         for cid, s in snap.states.items():
             if s.phase == phase:
@@ -680,7 +680,8 @@ ALERT_RULES = (
     AlertRule("Cooldown", "t-c", "View market", _in_phase("COOLDOWN", "ask drop")),
     AlertRule("Below range", "t-b", "View market",
               _in_phase("BELOW_RANGE", "the mid is under min_fav")),
-    AlertRule("Paused", "t-n", "Resume", _in_phase("PAUSED", "paused")),
+    AlertRule("Paused", "t-n", "Resume",
+              _in_phase("PAUSED", "paused", "All its orders are down.")),
     AlertRule("Budget bound", "t-b", "Edit budget", _budget_bound, "/review/{cid}"),
     AlertRule("Low score", "t-n", "Edit p_true", _low_score, "/review/{cid}"),
     AlertRule("Backoff", "t-r", "View market", _backoff),
