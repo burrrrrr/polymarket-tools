@@ -28,7 +28,10 @@ from tools.db import JobState
 from .forms import P_TRUE_ERROR
 
 SLOTS = ("FAV_BID", "LONG_BID", "FAV_ASK", "LONG_ASK")
-PHASES = ("QUOTING", "COOLDOWN", "BELOW_RANGE", "PAUSED", "UNREWARDED", "RETIRED")
+PHASES = ("QUOTING", "SOLE_BID", "COOLDOWN", "BELOW_RANGE", "PAUSED", "UNREWARDED",
+          "RETIRED")
+# The phases whose orders rest and earn: the console counts both as quoting.
+EARNING = ("QUOTING", "SOLE_BID")
 WAITING = "WAITING"
 
 # A farmer whose last cycle is older than this many intervals is not running.
@@ -39,7 +42,7 @@ DEFAULT_EXPIRY_BUFFER_DAYS = 7.0
 FEED_EVENTS = 12
 LOG_PAGE = 50
 
-PHASE_TONE = {"QUOTING": "t-q", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
+PHASE_TONE = {"QUOTING": "t-q", "SOLE_BID": "t-c", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
               "PAUSED": "t-n", "UNREWARDED": "t-n", "RETIRED": "t-r", WAITING: "t-n"}
 SLOT_TONE = {"FAV_BID": "t-f", "FAV_ASK": "t-f", "LONG_BID": "t-b", "LONG_ASK": "t-b"}
 JOB_TONE = {JobState.QUEUED: "t-n", JobState.RUNNING: "t-c", JobState.DONE: "t-q",
@@ -212,7 +215,7 @@ class Chrome:
 
 def chrome(snap, now, worker=NO_WORKER):
     return Chrome(liveness(snap.status, now), snap.counts.get("candidate", 0),
-                  sum(s.phase == "QUOTING" for s in snap.states.values()), worker)
+                  sum(s.phase in EARNING for s in snap.states.values()), worker)
 
 
 @dataclass(frozen=True)
@@ -415,6 +418,7 @@ class Card:
     position: Optional[dict]
     paused: bool
     naked_paused: bool
+    sole_bid: bool
     status: str
     # The farmer's favorite bid economics from its FAV_BID slot, the reason it
     # has none, and the fill history behind them; absent from farm_state rows
@@ -442,7 +446,8 @@ def card(market, state, status, now):
             book_mid=None, band=None, fav_bid=None, long_bid=None, slots=[], q1=0.0,
             q2=0.0, q_balance_pct=0.0, naked_used_usd=0.0, budget_used_usd=0.0,
             free_bid_usd=0.0, naked_pct=0.0, position=None,
-            paused=market.paused, naked_paused=market.naked_paused, status=market.status,
+            paused=market.paused, naked_paused=market.naked_paused,
+            sole_bid=market.sole_bid, status=market.status,
         )
     fav_bid, long_bid = resting(state, "FAV_BID"), resting(state, "LONG_BID")
     fav_view = state.slots.get("FAV_BID") or {}
@@ -466,7 +471,7 @@ def card(market, state, status, now):
         free_bid_usd=free.notional if free else 0.0,
         naked_pct=round(min(100.0, used / budget * 100), 1) if budget else 0.0,
         position=state.position, paused=market.paused, naked_paused=market.naked_paused,
-        status=market.status, economics=fav_view.get("economics"),
+        sole_bid=market.sole_bid, status=market.status, economics=fav_view.get("economics"),
         fav_reason=fav_view.get("fav_reason") or "",
         history=fill_cost.history_from_json(fav_view.get("history")),
         long_return=(state.slots.get("LONG_BID") or {}).get("fill_return"),
@@ -504,8 +509,9 @@ def live_daily(state, market):
     of the pool the scan recorded, or while either is missing (dry run, the
     first minutes quoting) the farmer's model, which runs low. 0.0 quoting
     without a favorite bid, None when not quoting: a paused market's
-    economics are only a preview."""
-    if state.phase != "QUOTING":
+    economics are only a preview. A sole bid has no model, so it shows 0.0
+    until Polymarket reports its share."""
+    if state.phase not in EARNING:
         return None
     pool = market.metrics.get("market", {}).get("rate_per_day") if market else None
     if state.scoring_pct is not None and pool is not None:
@@ -557,7 +563,7 @@ class Totals:
 
 
 def totals(snap, now):
-    quoting = [cid for cid, s in snap.states.items() if s.phase == "QUOTING"]
+    quoting = [cid for cid, s in snap.states.items() if s.phase in EARNING]
     today = now.strftime("%Y-%m-%d")
 
     def notional(slot):
@@ -612,13 +618,13 @@ def _name(snap, cid):
     return market_name(snap.markets.get(cid), cid)
 
 
-def _in_phase(phase, default_reason):
+def _in_phase(phase, default_reason, effect="All its orders are down."):
     def find(snap, now):
         for cid, s in snap.states.items():
             if s.phase == phase:
                 until = f" until {clock(s.phase_until)}" if s.phase_until else ""
                 yield cid, (f"{_name(snap, cid)}: {s.phase_reason or default_reason}"
-                            f"{until}. All its orders are down.")
+                            f"{until}. {effect}")
     return find
 
 
@@ -667,6 +673,10 @@ def _not_running(snap, now):
 ALERT_RULES = (
     AlertRule("Not running", "t-r", "Farmer status", _not_running, "/settings"),
     AlertRule("Naked fill", "t-r", "Naked leg controls", _naked_fill),
+    AlertRule("Sole bid", "t-c", "View market",
+              _in_phase("SOLE_BID", "no other bid supports the midpoint",
+                        "Its favorite bid is the only bid in the reward band, so every "
+                        "sale into the book fills it.")),
     AlertRule("Cooldown", "t-c", "View market", _in_phase("COOLDOWN", "ask drop")),
     AlertRule("Below range", "t-b", "View market",
               _in_phase("BELOW_RANGE", "the mid is under min_fav")),

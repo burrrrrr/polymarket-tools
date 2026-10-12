@@ -156,6 +156,7 @@ The `markets` table in `farm.db` is the interface to the farmer (see
 
 A scan updates the metrics, rank, end date, and `rewards_active` flag. It
 never touches your decisions: `status`, `p_true`, `naked_budget_usd`, `note`,
-`paused`, `naked_paused`, or `capital_usd`. Rescanning is therefore always
-safe. A market that leaves the reward set gets `rewards_active = 0` and keeps
-its status. Retiring markets is the farmer's job.
+`paused`, `naked_paused`, `capital_usd`, or `sole_bid`. Rescanning is
+therefore always safe. A market that leaves the reward set gets
+`rewards_active = 0` and keeps its status. Retiring markets is the farmer's
+job.

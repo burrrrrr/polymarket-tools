@@ -82,7 +82,7 @@ class Writes(Console):
     def snapshot_markets(self):
         return [tuple(r) for r in self.db.execute(
             "SELECT condition_id, status, p_true, naked_budget_usd, capital_usd, note, paused, "
-            "naked_paused FROM markets ORDER BY condition_id")]
+            "naked_paused, sole_bid FROM markets ORDER BY condition_id")]
 
 
 class SecurityTest(Writes):
@@ -301,6 +301,29 @@ class MarketControlTest(Writes):
         self.post(f"/markets/{A}/naked-paused", value="0")
         self.assertEqual(self.row(A)["naked_paused"], 0)
 
+    def test_sole_bid_allow_and_stop(self):
+        badge = '<span class="badge t-c">sole bid allowed'
+        pages = ("/partials/markets", f"/markets/{A}", f"/review/{A}")
+
+        def button(value, label):
+            return (f'hx-post="/markets/{A}/sole-bid" hx-vals=\'{{"value": "{value}"}}\''
+                    f' hx-swap="none">{label} sole bid</button>')
+
+        self.assertIn(button(1, "Allow"), self.client.get("/partials/markets").text)
+        for url in pages:
+            self.assertNotIn(badge, self.client.get(url).text)
+        resp = self.post(f"/markets/{A}/sole-bid", value="1")
+        self.assertEqual((resp.status_code, resp.headers["HX-Trigger"]), (200, "controls"))
+        self.post(f"/markets/{A}/sole-bid", value="1")
+        self.assertEqual([self.row(c)["sole_bid"] for c in (A, B)], [1, 0])
+        self.assertEqual((self.row(A)["paused"], self.row(A)["naked_paused"]), (0, 0))
+        for url in pages:
+            self.assertEqual(self.client.get(url).text.count(badge), 1)
+        for url in pages[:2]:
+            self.assertIn(button(0, "Stop"), self.client.get(url).text)
+        self.post(f"/markets/{A}/sole-bid", value="0")
+        self.assertEqual(self.row(A)["sole_bid"], 0)
+
     def test_retire_asks_first_and_moves_status(self):
         card = self.client.get("/partials/markets").text
         self.assertIn('hx-confirm="Retire &quot;alpha?&quot;? The farmer cancels', card)
@@ -313,6 +336,8 @@ class MarketControlTest(Writes):
         before = self.snapshot_markets()
         self.assertEqual(self.post(f"/markets/{A}/paused", value="yes").status_code, 400)
         self.assertEqual(self.post("/markets/0xnope/paused", value="1").status_code, 404)
+        self.assertEqual(self.post(f"/markets/{A}/sole-bid", value="yes").status_code, 400)
+        self.assertEqual(self.post("/markets/0xnope/sole-bid", value="1").status_code, 404)
         self.assertEqual(self.snapshot_markets(), before)
 
     def test_end_cooldown_sends_the_farmer_a_command_naming_the_market(self):

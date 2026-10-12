@@ -75,7 +75,17 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                plan just follows the bids that remain.
   BELOW_RANGE  the midpoint fell under --min-fav, where the strategy does not
                apply; it resumes a little above the threshold.
-  PAUSED       a human paused the market (markets.paused). It leaves the
+  SOLE_BID     on a market a human opted in (markets.sole_bid), no other bid
+               supports a favorite bid: the midpoint without our orders is
+               under --min-fav, or no price within --max-lead of the best
+               other bid scores. Instead of going BELOW_RANGE or resting no
+               favorite bid, the market rests sole_bid_target's orders: the
+               favorite bid just above the lowest price that keeps the
+               longshot bid scoring, and the longshot bid as it rests. With
+               no other maker scoring, that earns the whole pool. It lasts
+               until another bid supports the midpoint again, an ask drop
+               cools the market down, or the orders cannot rest.
+  PAUSED      a human paused the market (markets.paused). It leaves the
                moment the flag clears and goes through the checks above.
                When resuming would quote, the orders it would place are
                published to farm_state as a preview and never sent.
@@ -89,7 +99,7 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                after the farmer saw it unapproved starts over from QUOTING
                with fresh runtime state, through the same checks.
 
-Every state but QUOTING wants no orders, so the same reconcile step that
+Every state but QUOTING and SOLE_BID wants no orders, so the same reconcile step that
 maintains quotes also cancels them. Separately, a longshot fill (longshot
 shares went up) pauses the naked LONG_BID for --naked-cooldown seconds, and
 with it the favorite bid it was balancing; markets.naked_paused does the same
@@ -208,6 +218,8 @@ from farm.reward_screener import (
     _make_output_safe,
     adjust_levels,
     adjusted_mid,
+    best_price,
+    created_mid,
     fav_bid_candidates,
     fav_ceiling,
     fetch_gamma,
@@ -240,6 +252,15 @@ BUY, SELL = "BUY", "SELL"
 # A BELOW_RANGE market resumes this far above --min-fav, so a midpoint
 # hovering at the threshold does not flap the quotes on and off.
 RESUME_MARGIN = 0.005
+
+# A sole bid (sole_bid_target) rests this many ticks above the lowest price
+# that keeps the longshot bid scoring. At that price itself the longshot
+# share scores next to nothing, and one tick off the ask would end it.
+SOLE_BID_LEAD_TICKS = 2
+# A favorite bid resting up to this far above that target stays the sole
+# bid. The target moves a tick for each tick of the ask, and a replacement
+# scores nothing for ~30 seconds with no other maker scoring.
+SOLE_BID_KEEP_ABOVE = 0.01
 
 # The fractions of the capital left that a favorite bid is planned at.
 SIZE_LADDER = (1.0, 0.75, 0.5, 0.25, 0.125)
@@ -399,6 +420,7 @@ class FarmMarket(NamedTuple):
     zones: Zones
     paused: bool = False
     naked_paused: bool = False
+    sole_bid: bool = False
 
     def token(self, role):
         return self.fav_token_id if role is Role.FAV else self.long_token_id
@@ -457,12 +479,15 @@ class Target(NamedTuple):
     """The orders wanted, and the midpoint they were scored against.
 
     mid is the size-adjusted midpoint after our own quotes join the book, or
-    None when the book is one-sided and nothing can be planned.
+    None when the book is one-sided and nothing can be planned. sole_kept is
+    None in every plan but sole_bid_target's, which names there the resting
+    bids it was planned around: those stay and every other bid is replaced.
     """
 
     mid: Optional[float]
     intents: list
     fav: FavChoice = FavChoice()
+    sole_kept: Optional[frozenset] = None
 
 
 class Cancel(NamedTuple):
@@ -490,6 +515,7 @@ class Phase(Enum):
     QUOTING = "QUOTING"
     COOLDOWN = "COOLDOWN"
     BELOW_RANGE = "BELOW_RANGE"
+    SOLE_BID = "SOLE_BID"
     PAUSED = "PAUSED"
     UNREWARDED = "UNREWARDED"
     RETIRED = "RETIRED"
@@ -514,7 +540,8 @@ class Observation(NamedTuple):
     up to DROP_DEPTH reward minimums, both in the book without our orders;
     recent_asks holds (time, ask) from earlier cycles. paused and naked_paused
     are the human's flags on the market row; naked_cooldown_until is set by
-    the farmer after a longshot fill.
+    the farmer after a longshot fill. sole_bid says the market opted in, no
+    other bid supports a favorite bid, and sole_bid_target has orders to rest.
     """
 
     mid: Optional[float]
@@ -529,6 +556,7 @@ class Observation(NamedTuple):
     naked_paused: bool = False
     naked_cooldown_until: Optional[datetime] = None
     resolution: Optional[str] = None
+    sole_bid: bool = False
 
 
 class MarketInfo(NamedTuple):
@@ -935,6 +963,101 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline))
 
 
+def supported(levels, fm, cfg, margin=0.0):
+    """Whether another maker's bid supports a favorite bid here: the book
+    without our orders has a midpoint at least margin over min_fav, and some
+    price within max_lead of its best bid scores (fav_bid_candidates)."""
+    mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
+    return (mid is not None and mid >= cfg.min_fav + margin
+            and bool(fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead)))
+
+
+def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
+    """The orders a market that opted in (fm.sole_bid) rests while no other
+    bid supports a favorite bid, or None when it cannot rest them.
+
+    `levels` is the favorite book without our orders, and `orders` the ones
+    resting. With no other bid in the band ours is the best bid, so the
+    reward midpoint is halfway between it and the best ask, and with no other
+    maker scoring, any score on both sides earns the whole pool. So the
+    favorite bid goes as low as still pays: SOLE_BID_LEAD_TICKS above the
+    lowest price whose midpoint keeps the longshot bid inside the band, with
+    all of capital_room, and never above ev_cap. Nothing here values its
+    fills: the human opted the market in knowing that every sale into the
+    book fills this bid.
+
+    The longshot bid stays as it rests, whatever it covers or costs, because
+    its side needs only some score. With none resting, one goes to the lowest
+    tick with all of naked_room. A favorite bid resting between the lowest
+    scoring price and SOLE_BID_KEEP_ABOVE over the target stays too, at any
+    size the capital allows. The exits rest as in any plan, the favorite ask
+    anchored at the midpoint the longshot bid needs.
+
+    None when the book has no ask of min_size, no longshot bid can rest, the
+    bid would cross, top ev_cap or leave the midpoint under min_fav, or the
+    capital buys less than min_size.
+    """
+    tick, v, decimals = fm.tick, fm.v, tick_decimals(fm.tick)
+    best_ask = best_price(levels.asks, fm.min_size)
+    if best_ask is None:
+        return None
+    years_left = fm.zones.years_left
+    long = next((o for o in orders if o.slot is Slot.LONG_BID and on_tick(o.price, tick)
+                 and o.size_remaining >= fm.min_size
+                 and not over_max_return(o.price, years_left)), None)
+    if long is not None:
+        long_price, long_size = long.price, long.size_remaining
+    else:
+        long_price, long_size = tick, round_size_down(naked_room(fm, position) / tick)
+        if long_size < fm.min_size or over_max_return(long_price, years_left):
+            return None
+    # The longshot bid scores while the favorite midpoint is above this.
+    edge_mid = 1 - long_price - v
+
+    fav_ask = None
+    if position.fav_shares >= fm.min_size:
+        fav_ask = plan_fav_ask_price(fm, levels, edge_mid, position, cfg, fill_mid)
+    ask = best_ask if fav_ask is None else min(best_ask, fav_ask)
+
+    # A bid at p makes the midpoint (p + ask) / 2: over edge_mid above the
+    # first price, and within v of the bid itself above the second.
+    lowest = max(tick, round(
+        floor_to_tick(max(2 * edge_mid - ask, ask - 2 * v), tick) + tick, decimals))
+    ceiling = min(ev_cap(fm, cfg), floor_to_tick(min(levels.asks[0][0], ask) - tick, tick))
+    price = min(round(lowest + SOLE_BID_LEAD_TICKS * tick, decimals), ceiling)
+    if price < lowest - 1e-9:
+        return None
+
+    room = capital_room(fm, position)
+    highest = min(price + SOLE_BID_KEEP_ABOVE, ceiling)
+    bid = next((o for o in orders if o.slot is Slot.FAV_BID and on_tick(o.price, tick)
+                and lowest - 1e-9 <= o.price <= highest + 1e-9
+                and o.size_remaining >= fm.min_size
+                and o.price * o.size_remaining <= KEEP_SIZE_RANGE[1] * room + 1e-9), None)
+    if bid is not None:
+        price, size = bid.price, bid.size_remaining
+    else:
+        size = round_size_down(room / price)
+        if size < fm.min_size:
+            return None
+
+    mid = created_mid(price, best_price(levels.bids, fm.min_size) or 0.0, ask)
+    sized = {Slot.FAV_BID: (price, size), Slot.LONG_BID: (long_price, long_size)}
+    if position.long_shares >= fm.min_size:
+        sized[Slot.LONG_ASK] = (plan_long_ask_price(fm, levels, price, position, cfg),
+                                position.long_shares)
+    if fav_ask is not None:
+        sized[Slot.FAV_ASK] = fav_ask, position.fav_shares
+    intents = {slot: Intent(slot, fm.token(slot.role), slot.side, at, round_size_down(shares),
+                            order_score(slot, at, mid, v))
+               for slot, (at, shares) in sized.items()}
+    if mid < cfg.min_fav or min(intents[Slot.FAV_BID].score, intents[Slot.LONG_BID].score) <= 1e-9:
+        return None
+    return Target(mid, [intents[slot] for slot in Slot if slot in intents],
+                  FavChoice(reason="sole bid"),
+                  frozenset(o.id for o in (bid, long) if o is not None))
+
+
 def keep_failure(order, intent, target, fm, position, cfg):
     """Why a resting order is not close enough to its target to leave alone, or None.
 
@@ -976,6 +1099,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
     order only moves toward the front, and a target that wobbles moves it
     once, to its lowest, and no more. One under long_exit_floor is replaced
     all the same: a further longshot fill can lift the cost over it.
+    In a sole-bid plan the two bids are judged by the plan alone: the ones
+    it was planned around stay (target.sole_kept), and any other is replaced.
     """
     low, high = KEEP_SIZE_RANGE
     size = intent.size
@@ -983,6 +1108,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
         return "wrong token or side"
     if not on_tick(order.price, fm.tick):
         return "off the tick grid"
+    if target.sole_kept is not None and order.side == BUY:
+        return None if order.id in target.sole_kept else "off the sole-bid plan"
     if order.slot is Slot.FAV_BID:
         fav = target.fav
         value = fav.resting.get(order.id)
@@ -1122,9 +1249,12 @@ def ask_dropped(recent_asks, ask, now, cfg):
 
     Only the ask counts. A bid leaving looks the same whether it was cancelled
     or sold into, and the farmer re-plans against the bids that remain, while
-    a falling offer is sellers repricing the favorite down.
+    a falling offer is sellers repricing the favorite down. Asks too thin to
+    read (no drop_ask) are sellers leaving, not repricing.
     """
-    window = [a for t, a in recent_asks if (now - t).total_seconds() <= cfg.drop_window_s]
+    if ask is None:
+        return False
+    window =[a for t, a in recent_asks if (now - t).total_seconds() <= cfg.drop_window_s]
     return bool(window) and max(window) - ask >= cfg.drop_threshold - 1e-9
 
 
@@ -1140,12 +1270,14 @@ def step_state(state, obs, now, cfg):
         return State(Phase.PAUSED, reason="paused by operator")
     if state.phase in (Phase.PAUSED, Phase.UNREWARDED):
         state = State(Phase.QUOTING)
-    if obs.mid is None:
-        return state
+    if obs.mid is None and not obs.sole_bid:
+        return State(Phase.QUOTING) if state.phase is Phase.SOLE_BID else state
     if ask_dropped(obs.recent_asks, obs.ask, now, cfg):
         return State(Phase.COOLDOWN, now + timedelta(seconds=cfg.cooldown_s), "ask drop")
     if state.phase is Phase.COOLDOWN and now < state.until:
         return state
+    if obs.sole_bid:
+        return State(Phase.SOLE_BID)
     if obs.mid < cfg.min_fav:
         return State(Phase.BELOW_RANGE)
     if state.phase is Phase.BELOW_RANGE and obs.mid < cfg.min_fav + RESUME_MARGIN:
@@ -1296,7 +1428,8 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
         if intent is None and slot in previews and not resting:
             decision, reason = "preview", "would place on resume"
         elif intent is None:
-            why = "no target" if state.phase is Phase.QUOTING else str(state)
+            why = ("no target" if state.phase in (Phase.QUOTING, Phase.SOLE_BID)
+                   else str(state))
             if slot is Slot.FAV_BID and state.phase is Phase.QUOTING and target.fav.reason:
                 why = target.fav.reason
             decision, reason = ("cancel" if resting else "none"), why
@@ -1442,6 +1575,7 @@ def farm_market(row, info, cfg, now):
         zones=Zones(fill_cost.years_until(end_date, now)),
         paused=bool(row["paused"]),
         naked_paused=bool(row["naked_paused"]),
+        sole_bid=bool(row["sole_bid"]),
     )
 
 
@@ -2204,6 +2338,15 @@ class Farmer:
             naked_cooldown_until=managed.naked_paused_until,
             resolution=self.resolutions.get(fm.condition_id),
         )
+        managed.fill_mid = held_fill_mid(managed.fill_mid, book_mid, managed.position, fm)
+        sole = None
+        # Once it is the sole bid the market stays one until the midpoint is
+        # the resume margin over min_fav, as BELOW_RANGE does.
+        margin = RESUME_MARGIN if managed.state.phase is Phase.SOLE_BID else 0.0
+        if fm.sole_bid and naked_allowed(obs, now) and not supported(book, fm, self.cfg, margin):
+            sole = sole_bid_target(fm, book, managed.position, self.cfg, orders,
+                                   managed.fill_mid)
+        obs = obs._replace(sole_bid=sole is not None)
         previous, managed.state = managed.state, step_state(managed.state, obs, now, self.cfg)
         if book_ask is not None:
             managed.recent_asks.append((now, book_ask))
@@ -2221,8 +2364,9 @@ class Farmer:
         previewing = (managed.state.phase is Phase.PAUSED
                       and step_state(managed.state, obs._replace(paused=False), now,
                                      self.cfg).phase is Phase.QUOTING)
-        managed.fill_mid = held_fill_mid(managed.fill_mid, book_mid, managed.position, fm)
-        if managed.state.phase is Phase.QUOTING or previewing:
+        if managed.state.phase is Phase.SOLE_BID:
+            target = sole
+        elif managed.state.phase is Phase.QUOTING or previewing:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
                 market_outlook(fm, self.total_rates.rates, self.history(fm), self.prior,

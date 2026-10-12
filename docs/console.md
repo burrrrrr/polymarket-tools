@@ -36,7 +36,7 @@ Pages:
 | Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids and the part of them the budgets limit, farm inventory, the $/day Polymarket's scoring share of each quoting pool pays beside the screener's estimate, today's earnings split into farmer-managed markets and the rest of the wallet), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
 | Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode, text in the question or slug, status, and minimum days to the farmer's cutoff | Run a scan |
 | Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures (gross, fills/day, fill cost and net APR), the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, and capital; reject with a note; retire an approved market; re-approve a retired one |
-| Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, edit p_true and budget, retire, end a cooldown |
+| Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, allow or stop a sole bid, edit p_true and budget, retire, end a cooldown |
 | Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
 | Activity (`/activity?tab=`) | `rewards`: earnings per day and market, the live rate from Polymarket's scoring share of each pool, and the week's earnings in farmer-managed markets against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
 | Settings (`/settings`) | The farmer process (mode, pid, start, last cycle, interval, heartbeat) and every setting with its effective value and where it comes from: your override, the farmer's own value, or the built-in default | Stop the farmer, save or reset settings, cancel all managed orders |
@@ -84,6 +84,14 @@ rows and its funnel in one transaction and never changes your decisions.
 - **Pause and naked leg** set `paused` or `naked_paused` to the level the
   button names, so pressing twice changes nothing. Each button names the
   action it takes, such as Resume while the market is paused.
+- **Sole bid** sets `sole_bid` the same way, with Allow and Stop. When no
+  other bid supports a market's midpoint, the farmer normally takes its
+  orders down. With a sole bid allowed, the market enters `SOLE_BID` instead.
+  The farmer keeps its favorite bid at full size as the only bid in the
+  reward band until another bid returns. Every sale into the book fills that
+  bid, so allow it only on a market you are near certain of. The market
+  shows a `sole bid allowed` badge while the flag is set, and the Overview
+  raises a Sole bid alert while the market is in that phase.
 - **Retire** asks first, naming the market, then sets `status` to `retired`.
   The farmer cancels the market's orders on its next cycle.
 - **End cooldown** shows only while the market is in `COOLDOWN`. It inserts

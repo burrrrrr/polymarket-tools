@@ -118,6 +118,14 @@ def routes(ctx):
             farm_db.set_naked_paused(conn, condition_id, paused)
         return changed()
 
+    @router.post("/markets/{condition_id}/sole-bid")
+    async def set_sole_bid(request: Request, condition_id: str):
+        on = level(await form_of(request))
+        with closing(ctx.connect()) as conn:
+            ctx.find(conn, condition_id)
+            farm_db.set_sole_bid(conn, condition_id, on)
+        return changed()
+
     @router.post("/markets/{condition_id}/end-cooldown")
     async def end_cooldown(request: Request, condition_id: str):
         with closing(ctx.connect()) as conn:

@@ -27,6 +27,7 @@ from farm.reward_farmer import (
     State,
     Farmer,
     around_kept_bid,
+    ask_dropped,
     build_parser,
     capital_room,
     config_from,
@@ -43,8 +44,10 @@ from farm.reward_farmer import (
     ratchet_baseline,
     reconcile,
     rewards_active,
+    sole_bid_target,
     step_state,
     strip_own,
+    supported,
     target_orders,
     value_of,
     without_backed_off,
@@ -922,6 +925,39 @@ class StepStateTest(unittest.TestCase):
         for state in (cooling, State(Phase.BELOW_RANGE)):
             self.assertEqual(step_state(state, observe(paused=True), NOW, CFG).phase, Phase.PAUSED)
 
+    def test_asks_too_thin_to_read_are_no_ask_drop(self):
+        self.assertFalse(ask_dropped(asked(1.0), None, NOW, CFG))
+        self.assertEqual(step_state(QUOTING, observe(ask=None, recent_asks=asked(1.0)), NOW, CFG),
+                         QUOTING)
+
+    def test_a_sole_bid_takes_the_place_of_below_range_and_of_a_one_sided_book(self):
+        sole_bid = State(Phase.SOLE_BID)
+        for state in (QUOTING, State(Phase.BELOW_RANGE), sole_bid):
+            for mid in (0.885, 0.96, None):
+                with self.subTest(state=state, mid=mid):
+                    obs = observe(mid=mid, sole_bid=True)
+                    self.assertEqual(step_state(state, obs, NOW, CFG), sole_bid)
+
+    def test_a_sole_bid_ends_when_its_orders_cannot_rest(self):
+        sole_bid = State(Phase.SOLE_BID)
+        self.assertEqual(step_state(sole_bid, observe(), NOW, CFG), QUOTING)
+        self.assertEqual(step_state(sole_bid, observe(mid=None), NOW, CFG), QUOTING)
+        self.assertEqual(step_state(sole_bid, observe(mid=0.885), NOW, CFG),
+                         State(Phase.BELOW_RANGE))
+
+    def test_an_ask_drop_a_pause_and_lost_rewards_all_beat_a_sole_bid(self):
+        sole_bid = State(Phase.SOLE_BID)
+        dropped = observe(mid=None, sole_bid=True, ask=0.97, recent_asks=asked(1.0))
+        cooling = step_state(sole_bid, dropped, NOW, CFG)
+        self.assertEqual(cooling.phase, Phase.COOLDOWN)
+        self.assertEqual(step_state(cooling, observe(sole_bid=True), NOW, CFG), cooling)
+        self.assertEqual(
+            step_state(sole_bid, observe(sole_bid=True, paused=True), NOW, CFG).phase,
+            Phase.PAUSED)
+        self.assertEqual(
+            step_state(sole_bid, observe(sole_bid=True, rewards_active=False), NOW, CFG).phase,
+            Phase.UNREWARDED)
+
     def test_retire_beats_rewards_ending_and_pause(self):
         paused = State(Phase.PAUSED, reason="paused by operator")
         unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
@@ -955,6 +991,139 @@ class StepStateTest(unittest.TestCase):
         self.assertFalse(naked_allowed(obs, NOW))
         self.assertTrue(naked_allowed(obs, NOW + timedelta(seconds=10)))
         self.assertFalse(naked_allowed(obs._replace(naked_paused=True), NOW + timedelta(seconds=10)))
+
+
+# The lone other bid of a thin book has left: 80c is all that is bid under a
+# 97c ask, so the midpoint without us is 88.5c. With a 5.5c max spread a 0.1c
+# longshot bid scores while the favorite midpoint is over 94.4c, which a bid
+# of ours over 91.8c makes: 91.9c is the lowest that pays and 92.1c the target.
+THIN_BOOK = Levels(bids=[(0.80, 500.0)], asks=[(0.97, 1000.0)], tick=0.001)
+THIN = market(v=0.055, min_size=100.0, sole_bid=True)
+
+
+def sole(orders=(), fm=THIN, book=THIN_BOOK, position=Position(), cfg=CFG):
+    return sole_bid_target(fm, book, position, cfg, orders)
+
+
+class SoleBidTest(unittest.TestCase):
+    def test_a_thin_book_is_unsupported_below_range_or_with_no_scoring_price(self):
+        self.assertTrue(supported(FLOOR_BOOK, market(), CFG))
+        self.assertFalse(supported(THIN_BOOK, THIN, CFG))
+        # A 91c midpoint, but 85.5c is the highest bid allowed and scores nothing.
+        lead_capped = THIN_BOOK._replace(bids=[(0.85, 500.0)])
+        self.assertEqual(fav_bid_candidates(lead_capped, 0.055, 0.001, 100.0, CFG.max_lead), [])
+        self.assertFalse(supported(lead_capped, THIN, CFG))
+        self.assertFalse(supported(THIN_BOOK._replace(bids=[]), THIN, CFG))
+
+    def test_support_can_be_asked_for_a_margin_over_min_fav(self):
+        book = Levels(bids=[(0.86, 500.0)], asks=[(0.944, 1000.0)], tick=0.001)
+        self.assertTrue(supported(book, THIN, CFG))
+        self.assertFalse(supported(book, THIN, CFG, margin=0.005))
+
+    def test_the_bid_rests_two_ticks_over_the_lowest_price_that_keeps_the_longshot_scoring(self):
+        target = sole()
+        intents = by_slot(target)
+        self.assertEqual(set(intents), {Slot.FAV_BID, Slot.LONG_BID})
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((fav.price, fav.size), (0.921, round_size_down(500.0 / 0.921)))
+        self.assertEqual((low.price, low.size), (0.001, 25000.0))
+        self.assertAlmostEqual(target.mid, 0.9455)
+        self.assertGreater(min(fav.score, low.score), 0)
+        self.assertEqual(target.sole_kept, frozenset())
+        # A bid at 91.8c leaves the longshot bid on the band's edge, scoring nothing.
+        self.assertEqual(order_score(Slot.LONG_BID, 0.001, (0.918 + 0.97) / 2, 0.055), 0.0)
+        self.assertGreater(order_score(Slot.LONG_BID, 0.001, (0.919 + 0.97) / 2, 0.055), 0)
+
+    def test_it_rises_a_tick_for_each_tick_the_ask_falls(self):
+        lower_ask = THIN_BOOK._replace(asks=[(0.969, 1000.0)])
+        self.assertEqual(by_slot(sole(book=lower_ask))[Slot.FAV_BID].price, 0.922)
+
+    def test_a_book_with_no_other_bid_at_all_rests_the_same_orders(self):
+        empty = THIN_BOOK._replace(bids=[])
+        self.assertEqual(sole(book=empty).intents, sole().intents)
+
+    def test_the_resting_longshot_bid_stays_whatever_it_costs(self):
+        resting = [live("low", Slot.LONG_BID, 0.001, 40000.0)]
+        target = sole(resting)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.001, 40000.0))
+        self.assertEqual(target.sole_kept, frozenset({"low"}))
+        actions = reconcile(target, resting, THIN, Position(), CFG)
+        self.assertEqual([a.intent.slot for a in actions], [Slot.FAV_BID])
+
+    def test_a_dearer_resting_longshot_bid_lets_the_favorite_bid_rest_lower(self):
+        # At 1.8c the longshot bid scores down to a 92.7c midpoint.
+        target = sole([live("low", Slot.LONG_BID, 0.018, 600.0)])
+        self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.887)
+
+    def test_a_longshot_bid_under_the_minimum_or_over_the_return_limit_is_replaced(self):
+        self.assertTrue(over_max_return(0.049, THIN.zones.years_left))
+        for order in (live("low", Slot.LONG_BID, 0.001, 99.0),
+                      live("low", Slot.LONG_BID, 0.049, 500.0)):
+            with self.subTest(order=order):
+                target = sole([order])
+                self.assertEqual(target.sole_kept, frozenset())
+                self.assertEqual(by_slot(target)[Slot.LONG_BID].price, 0.001)
+                actions = reconcile(target, [order], THIN, Position(), CFG)
+                self.assertEqual(actions[0].order_ids, ("low",))
+
+    def test_a_longshot_bid_left_off_the_grid_by_a_tick_change_is_replaced_on_it(self):
+        coarse = THIN._replace(tick=0.01)
+        resting = [live("low", Slot.LONG_BID, 0.001, 25000.0)]
+        target = sole(resting, fm=coarse, book=THIN_BOOK._replace(tick=0.01))
+        self.assertEqual(target.sole_kept, frozenset())
+        self.assertEqual(by_slot(target)[Slot.LONG_BID].price, 0.01)
+
+    def test_a_resting_favorite_bid_stays_from_the_lowest_paying_price_to_a_cent_over_target(self):
+        for price, kept in ((0.918, False), (0.919, True), (0.921, True), (0.931, True),
+                            (0.932, False)):
+            with self.subTest(price=price):
+                resting = [live("fav", Slot.FAV_BID, price, 300.0)]
+                target = sole(resting)
+                fav = by_slot(target)[Slot.FAV_BID]
+                self.assertEqual((fav.price, fav.size), (price, 300.0) if kept
+                                 else (0.921, round_size_down(500.0 / 0.921)))
+                self.assertEqual(target.sole_kept, frozenset({"fav"} if kept else ()))
+                cancelled = [i for a in reconcile(target, resting, THIN, Position(), CFG)
+                             if isinstance(a, Cancel) for i in a.order_ids]
+                self.assertEqual(cancelled, [] if kept else ["fav"])
+
+    def test_a_resting_favorite_bid_over_the_capital_is_replaced(self):
+        target = sole([live("fav", Slot.FAV_BID, 0.921, 700.0)])
+        self.assertEqual(target.sole_kept, frozenset())
+        self.assertEqual(by_slot(target)[Slot.FAV_BID].size, round_size_down(500.0 / 0.921))
+
+    def test_the_bid_never_tops_the_ev_cap_or_crosses_an_ask_of_any_size(self):
+        capped = sole(fm=THIN._replace(p_true=0.93))
+        self.assertEqual(by_slot(capped)[Slot.FAV_BID].price, 0.920)
+        self.assertIsNone(sole(fm=THIN._replace(p_true=0.928)))
+        dust = THIN_BOOK._replace(asks=[(0.92, 5.0), (0.97, 1000.0)])
+        self.assertEqual(by_slot(sole(book=dust))[Slot.FAV_BID].price, 0.919)
+        self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.919, 5.0), (0.97, 1000.0)])))
+
+    def test_nothing_rests_without_an_ask_a_longshot_bid_or_the_capital_for_a_minimum(self):
+        self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.97, 99.0)])))
+        self.assertIsNone(sole(fm=THIN._replace(naked_budget_usd=0.05)))
+        self.assertIsNone(sole(fm=THIN._replace(capital=90.0)))
+        # An ask this low leaves no bid under it that keeps the midpoint up.
+        self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.94, 1000.0)])))
+
+    def test_a_midpoint_under_min_fav_rests_nothing(self):
+        wide = THIN._replace(v=0.12)
+        self.assertIsNotNone(sole(fm=wide, cfg=CFG._replace(min_fav=0.85)))
+        self.assertIsNone(sole(fm=wide))
+
+    def test_favorite_shares_held_rest_their_exit_and_the_bid_prices_off_it(self):
+        held = Position(fav_shares=200.0, fav_avg=0.921)
+        target = sole(position=held)
+        intents = by_slot(target)
+        ask, fav = intents[Slot.FAV_ASK], intents[Slot.FAV_BID]
+        # A cent over the 94.4c midpoint the longshot bid needs, under the book's 97c.
+        self.assertEqual((ask.price, ask.size), (0.954, 200.0))
+        self.assertEqual(fav.price, 0.937)
+        self.assertEqual(fav.size, round_size_down((500.0 - 200.0 * 0.921) / 0.937))
+        self.assertAlmostEqual(target.mid, (0.937 + 0.954) / 2)
+        self.assertGreater(intents[Slot.LONG_BID].score, 0)
 
 
 class BaselineTest(unittest.TestCase):
@@ -1544,7 +1713,7 @@ class ReturnLimitTest(unittest.TestCase):
     def test_a_market_is_read_with_the_time_its_end_date_leaves(self):
         row = {"condition_id": CID, "slug": "", "question": "", "p_true": 0.98,
                "naked_budget_usd": 25.0, "capital_usd": None, "paused": 0, "naked_paused": 0,
-               "end_date": (NOW + timedelta(days=30)).isoformat(),
+               "sole_bid": 0, "end_date": (NOW + timedelta(days=30)).isoformat(),
                "metrics": json.dumps(METRICS)}
         fm = reward_farmer.farm_market(row, INFO, CFG, NOW)
         self.assertAlmostEqual(fm.zones.years_left, 30 / 365.25)
@@ -2250,6 +2419,53 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(after[:2], ("QUOTING", ""))
         self.assertEqual(after[2], {"FAV_BID": (0.855, 584.79), "LONG_BID": (0.001, 795.97)})
         self.assertNotIn("PHASE", [kind for kind, _ in events])
+
+    # FLOOR_BOOK once its only bid has left for 80c: an 89.75c midpoint
+    # without us. A bid of ours over 93.3c keeps the 0.1c longshot bid in the
+    # 3.5c band, so 93.4c is the lowest that pays and 93.6c the sole bid.
+    UNSUPPORTED = FLOOR_BOOK._replace(bids=[(0.80, 1000.0)])
+
+    def test_a_market_that_opted_in_holds_a_sole_bid_while_no_other_bid_supports_it(self):
+        farm_db.set_sole_bid(self.ui, CID, True)
+        farmer = self.started_farmer()
+        farmer.cycle()
+        farmer.cycle()
+        low = self.farm_state()[1]["LONG_BID"]["order"]
+        self.assertEqual(self.farm_state()[1]["FAV_BID"]["order"]["price"], 0.975)
+
+        before = self.last_event_id()
+        self.book = self.UNSUPPORTED
+        farmer.cycle()
+        row, slots = self.farm_state()
+        self.assertEqual(row["phase"], "SOLE_BID")
+        self.assertAlmostEqual(row["mid"], (0.936 + 0.995) / 2)
+        self.assertEqual((slots["FAV_BID"]["decision"], slots["FAV_BID"]["target"]["price"]),
+                         ("replace", 0.936))
+        self.assertEqual((slots["LONG_BID"]["decision"], slots["LONG_BID"]["order"]),
+                         ("hold", low))
+        self.assertEqual([(e["kind"], e["slot"]) for e in self.events(before)],
+                         [("PHASE", None), ("CANCEL", "FAV_BID"), ("PLACE", "FAV_BID")])
+
+        before = self.last_event_id()
+        farmer.cycle()
+        row, slots = self.farm_state()
+        self.assertEqual((row["phase"], slots["FAV_BID"]["decision"], slots["LONG_BID"]["decision"]),
+                         ("SOLE_BID", "hold", "hold"))
+        self.assertEqual(self.events(before), [])
+
+        self.book = FLOOR_BOOK
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+
+    def test_a_market_that_did_not_opt_in_takes_its_bids_down_on_the_same_book(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.book = self.UNSUPPORTED
+        farmer.cycle()
+        row, slots = self.farm_state()
+        self.assertEqual(row["phase"], "BELOW_RANGE")
+        self.assertEqual((slots["FAV_BID"]["decision"], slots["LONG_BID"]["decision"]),
+                         ("cancel", "cancel"))
 
     def test_deep_asks_falling_by_the_threshold_cool_down(self):
         fallen = MISTRAL_BOOK._replace(asks=[(0.967, 150.0)] + MISTRAL_BOOK.asks[1:])

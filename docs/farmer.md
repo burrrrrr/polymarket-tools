@@ -82,7 +82,7 @@ these orders.
 
 ## Market lifecycle
 
-Each market is in one of six states:
+Each market is in one of seven states:
 
 - `QUOTING`: orders rest as planned.
 - `COOLDOWN`: the favorite's ask fell by `--drop-threshold` within
@@ -97,6 +97,34 @@ Each market is in one of six states:
   bids that remain.
 - `BELOW_RANGE`: the midpoint is below `--min-fav`. All orders come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
+- `SOLE_BID`: you set `sole_bid = 1` on the market, and no other bid
+  supports a favorite bid. That means the midpoint without the farmer's own
+  orders is below `--min-fav`, or no price within `--max-lead` of the best
+  other bid scores. On a thin book this happens when one maker's bid leaves.
+  Without the flag the market goes `BELOW_RANGE` or rests no favorite bid.
+  With it, the favorite bid stays as the only bid in the reward band:
+
+  - Polymarket's midpoint is then halfway between the farmer's bid and the
+    best ask. The bid rests two ticks above the lowest price whose midpoint
+    keeps the longshot bid inside the band. In a book with a 97c ask and a
+    5.5c band, a 0.1c longshot bid scores above a 94.4c midpoint, so the
+    lowest price is 91.9c and the bid rests at 92.1c.
+  - With no other maker scoring, any score on both sides earns the whole
+    pool, so the bid sits as low as still pays. It uses all of the market's
+    capital. The farmer does not value its fills: every sale into the book
+    fills this bid.
+  - The longshot bid stays as it rests, whatever it costs or covers. If none
+    rests, one goes to the lowest tick with the whole naked budget.
+  - A favorite bid already resting stays from the lowest paying price up to
+    1c above the target. The target rises a tick for each tick the ask falls.
+  - The bid never goes above `p_true` minus `--ev-margin` and never crosses
+    an ask. If no price fits, the market leaves `SOLE_BID` and the other
+    checks apply.
+
+  It lasts as long as no other bid returns. An ask drop still starts a
+  `COOLDOWN`, and a pause, a naked-leg pause or a longshot fill's cooldown
+  ends it. Once another bid supports the midpoint 0.5c above `--min-fav`,
+  the market quotes as usual.
 - `PAUSED`: you set `paused = 1` on the market. All orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
@@ -139,6 +167,9 @@ the same as setting it once, and a farmer that restarts reads the same level.
   favorite bid shrinks to whatever the covered `FAV_ASK` still balances.
 - `capital_usd` replaces `--capital` for that market only. NULL uses
   `--capital`.
+- `sole_bid = 1` lets the market enter `SOLE_BID` (see
+  [Market lifecycle](#market-lifecycle)). Set it only on a market you are
+  near certain of.
 - To retire a market, set its `status` to `retired`. To cancel everything,
   set `paused = 1` on every approved market.
 

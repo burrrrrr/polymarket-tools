@@ -12,7 +12,7 @@ a busy timeout, and every column has exactly one writer process:
   markets         scan columns (slug, question, end_date, rewards_active,
                   rank_score, metrics, first_seen, last_scanned): screener.
                   Decisions (status, p_true, naked_budget_usd, note, paused,
-                  naked_paused, capital_usd): console or CLI.
+                  naked_paused, capital_usd, sole_bid): console or CLI.
                   baseline_fav, baseline_long: farmer, live only.
                   One exception: the live farmer retires a market by moving
                   status and note from 'approved' to 'retired' in a single
@@ -97,7 +97,8 @@ CREATE TABLE IF NOT EXISTS markets (
     baseline_long REAL,
     paused INTEGER NOT NULL DEFAULT 0,
     naked_paused INTEGER NOT NULL DEFAULT 0,
-    capital_usd REAL
+    capital_usd REAL,
+    sole_bid INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS farm_state (
@@ -231,6 +232,7 @@ ADDED_COLUMNS = {
         ("paused", "INTEGER NOT NULL DEFAULT 0"),
         ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
         ("capital_usd", "REAL"),
+        ("sole_bid", "INTEGER NOT NULL DEFAULT 0"),
     ),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
@@ -302,10 +304,10 @@ def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None, exit_prior=
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
-    naked_paused, capital_usd) are never touched, so rescanning is always
-    safe. Retiring is the farmer's call. A funnel is kept as the last scan's,
-    a prior (the JSON-safe dict of a fill prior) as the fill prior every
-    reader values fills with, and an exit_prior likewise for exits.
+    naked_paused, capital_usd, sole_bid) are never touched, so rescanning is
+    always safe. Retiring is the farmer's call. A funnel is kept as the last
+    scan's, a prior (the JSON-safe dict of a fill prior) as the fill prior
+    every reader values fills with, and an exit_prior likewise for exits.
     """
     at = stamp(now)
     with conn:
@@ -615,6 +617,12 @@ def set_naked_paused(conn, condition_id, paused):
     with conn:
         conn.execute("UPDATE markets SET naked_paused = ? WHERE condition_id = ?",
                      (int(paused), condition_id))
+
+
+def set_sole_bid(conn, condition_id, on):
+    with conn:
+        conn.execute("UPDATE markets SET sole_bid = ? WHERE condition_id = ?",
+                     (int(on), condition_id))
 
 
 def set_capital(conn, condition_id, capital_usd):
@@ -1055,6 +1063,7 @@ class MarketRecord(NamedTuple):
     paused: bool
     naked_paused: bool
     capital_usd: Optional[float]
+    sole_bid: bool
 
 
 class StoredEvent(NamedTuple):
@@ -1088,7 +1097,7 @@ def _market(row):
         first_seen=_time(row["first_seen"]), last_scanned=_time(row["last_scanned"]),
         baseline_fav=row["baseline_fav"], baseline_long=row["baseline_long"],
         paused=bool(row["paused"]), naked_paused=bool(row["naked_paused"]),
-        capital_usd=row["capital_usd"],
+        capital_usd=row["capital_usd"], sole_bid=bool(row["sole_bid"]),
     )
 
 

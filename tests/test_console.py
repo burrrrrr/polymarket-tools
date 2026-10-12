@@ -35,13 +35,13 @@ def metrics(slug, est=10.0, v=0.035, mode="FLOOR"):
 
 
 def market(cid, slug, status="approved", budget=25.0, p_true=0.99, est=10.0, v=0.035,
-           paused=False):
+           paused=False, sole_bid=False):
     return MarketRecord(
         condition_id=cid, slug=slug, question=f"{slug}?", status=status, p_true=p_true,
         naked_budget_usd=budget, note=None, end_date=NOW + timedelta(days=100),
         rewards_active=True, rank_score=1.0, metrics=metrics(slug, est, v), first_seen=NOW,
         last_scanned=NOW, baseline_fav=None, baseline_long=None, paused=paused,
-        naked_paused=False, capital_usd=None,
+        naked_paused=False, capital_usd=None, sole_bid=sole_bid,
     )
 
 
@@ -126,6 +126,13 @@ class AlertRuleTest(unittest.TestCase):
     def test_below_range_fires(self):
         self.assertEqual(kinds(snap([state(A, "BELOW_RANGE")], [market(A, "a")])),
                          ["Below range"])
+
+    def test_sole_bid_fires_and_says_the_bid_rests(self):
+        found = views.alerts(snap([state(A, "SOLE_BID")], [market(A, "a", sole_bid=True)]), NOW)
+        self.assertEqual([(a.kind, a.tone, a.href) for a in found],
+                         [("Sole bid", "t-c", f"/markets/{A}")])
+        self.assertIn("the only bid in the reward band", found[0].text)
+        self.assertNotIn("orders are down", found[0].text)
 
     def test_paused_fires(self):
         self.assertEqual(kinds(snap([state(A, "PAUSED", "paused by operator", slots={})],
@@ -299,6 +306,11 @@ class TotalsTest(unittest.TestCase):
         self.assertEqual(views.live_daily(state(A, scoring_pct=None), market(A, "a")), 0.0)
         # A share with no pool to apply it to falls back the same way.
         self.assertEqual(views.live_daily(scored, None), 4.8)
+        # A sole bid earns its share too, and has no model to fall back on.
+        sole = state(A, "SOLE_BID", scoring_pct=100.0)
+        self.assertAlmostEqual(views.live_daily(sole, market(A, "a")), 100.0)
+        self.assertEqual(views.live_daily(state(A, "SOLE_BID"), market(A, "a")), 0.0)
+        self.assertEqual(views.totals(snap([sole], [market(A, "a")]), NOW).quoting, 1)
         # A share is not an earning rate unless the market is quoting.
         for phase in ("PAUSED", "COOLDOWN"):
             with self.subTest(phase=phase):
@@ -800,6 +812,19 @@ class RoutesTest(Console):
         for needle in ("alpha?", "rewards removed", "reward listing no longer pays this market"):
             self.assertIn(needle, resp.text)
         self.assertNotIn("bravo?", resp.text)
+
+    def test_a_sole_bid_market_lists_under_its_own_phase_as_a_warning(self):
+        self.publish(states=[state(A, "SOLE_BID", "no other bid supports the midpoint")
+                             ._replace(updated_at=self.now)])
+        resp = self.client.get("/markets?phase=SOLE_BID")
+        self.assertEqual(resp.status_code, 200)
+        for needle in ("alpha?", 'href="/markets?phase=SOLE_BID">Sole Bid</a>',
+                       '<span class="badge t-c">SOLE BID<button type="button" class="tip"',
+                       "Every sale into the book fills the favorite bid."):
+            self.assertIn(needle, resp.text)
+        self.assertNotIn("bravo?", resp.text)
+        self.assertIn("alpha?: no other bid supports the midpoint. Its favorite bid is the only "
+                      "bid in the reward band", self.client.get("/partials/overview/alerts").text)
 
     def test_log_kind_filter_excludes_other_kinds(self):
         text = self.client.get("/activity?tab=log&kind=FILL").text

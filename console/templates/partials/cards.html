@@ -11,6 +11,7 @@
         {%- if c.status != 'approved' %}<span class="badge t-r">{{ c.status }}</span>{% endif %}
         {%- if c.paused %}<span class="badge t-n">paused</span>{% endif %}
         {%- if c.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
+        {%- if c.sole_bid %}<span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}
         <span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{{ tip(c.phase) }}</span>
       </span>
     </div>
@@ -65,7 +66,7 @@
       {{ polymarket_link(c.slug, "btn") }}
     </div>
     <div class="actions">
-      {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused) }}
+      {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused, c.sole_bid) }}
     </div>
   </article>
 {%- else %}

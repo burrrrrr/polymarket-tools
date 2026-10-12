@@ -115,7 +115,7 @@ def routes(ctx):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None values it at the book midpoint."""
         terms = {"p_true": p_true, "naked_budget_usd": budget,
-                 "capital_usd": capital, "paused": 0, "naked_paused": 0}
+                 "capital_usd": capital, "paused": 0, "naked_paused": 0, "sole_bid": 0}
         cid = row["condition_id"]
         info, rates = ctx.infos.get(cid), ctx.total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]

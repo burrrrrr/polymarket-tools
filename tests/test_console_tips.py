@@ -96,7 +96,7 @@ class RenderedTipsTest(Writes):
             "fill_cost", "fills_per_day", "net_daily", "planned_capital", "apr", "net_apr"},
         "/markets": {"QUOTING", "WAITING", "mid_effective", "book_mid", "q1_q2",
                      "naked_budget", "farm_inventory", "baseline", "FAV_BID", "LONG_ASK",
-                     "hold", "expiry_cutoff", "naked_leg", "floor"},
+                     "hold", "expiry_cutoff", "naked_leg", "sole_bid", "floor"},
         f"/markets/{A}": {"QUOTING", "mid_effective", "book_mid", "capital_in_bids",
                           "expiry_cutoff", "net_daily", "backoff", "book_in_band",
                           "score_per_share",

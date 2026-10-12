@@ -111,7 +111,8 @@ class MigrationTest(ScratchDb):
         a = rows["0xa"]
         self.assertEqual((a["status"], a["p_true"], a["naked_budget_usd"], a["baseline_fav"]),
                          ("approved", 0.97, 25.0, 12.0))
-        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"]), (0, 0, None))
+        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"], a["sole_bid"]),
+                         (0, 0, None, 0))
         self.assertEqual((rows["0xb"]["status"], rows["0xb"]["note"]), ("rejected", "risky"))
 
     def test_first_release_db_without_baselines_migrates(self):
@@ -385,10 +386,25 @@ class ControlsTest(ScratchDb):
         farm_db.approve_market(conn, "0xa", 0.97, 25.0, 200.0, now=NOW)
         farm_db.set_paused(conn, "0xa", True)
         farm_db.set_naked_paused(conn, "0xa", True)
+        farm_db.set_sole_bid(conn, "0xa", True)
         seed(conn, "0xa")
         row = farm_db.find_market(conn, "0xa")
-        self.assertEqual((row["status"], row["paused"], row["naked_paused"], row["capital_usd"]),
-                         ("approved", 1, 1, 200.0))
+        self.assertEqual((row["status"], row["paused"], row["naked_paused"], row["capital_usd"],
+                          row["sole_bid"]), ("approved", 1, 1, 200.0, 1))
+
+    def test_sole_bid_is_allowed_and_stopped_for_one_market(self):
+        conn = self.open()
+        seed(conn, "0xa", "0xb")
+
+        def allowed():
+            return {m.condition_id: m.sole_bid
+                    for m in farm_db.read_markets(conn, statuses=("candidate",))}
+
+        self.assertEqual(allowed(), {"0xa": False, "0xb": False})
+        farm_db.set_sole_bid(conn, "0xa", True)
+        self.assertEqual(allowed(), {"0xa": True, "0xb": False})
+        farm_db.set_sole_bid(conn, "0xa", False)
+        self.assertEqual(allowed(), {"0xa": False, "0xb": False})
 
     def test_commands_are_consumed_once_and_stale_ones_expire(self):
         conn = self.open()

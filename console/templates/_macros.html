@@ -10,12 +10,14 @@
 {%- macro polymarket_link(slug, cls="", label="Polymarket ↗") -%}
 {%- if slug %}<a{% if cls %} class="{{ cls }}"{% endif %} href="{{ polymarket_url(slug) }}" target="_blank" rel="noopener noreferrer" title="Open on Polymarket in a new tab" aria-label="Open on Polymarket in a new tab">{{ label }}</a>{% endif -%}
 {%- endmacro -%}
-{#- Pause, naked leg, edit and retire for an approved market, and End cooldown while it
-    cools down, last so no other button moves when it goes; a link to Review otherwise. -#}
-{%- macro market_controls(cid, name, status, phase, paused, naked_paused, long=False) -%}
+{#- Pause, naked leg, sole bid, edit and retire for an approved market, and End cooldown
+    while it cools down, last so no other button moves when it goes; a link to Review
+    otherwise. -#}
+{%- macro market_controls(cid, name, status, phase, paused, naked_paused, sole_bid, long=False) -%}
 {%- if status == 'approved' %}
 <button class="btn {{ 'btn-on' if paused }}" type="button" hx-post="/markets/{{ cid }}/paused" hx-vals='{"value": "{{ 0 if paused else 1 }}"}' hx-swap="none">{{ 'Resume' if paused else 'Pause' }}{{ ' quoting' if long }}</button>
 <button class="btn {{ 'btn-on' if naked_paused }}" type="button" hx-post="/markets/{{ cid }}/naked-paused" hx-vals='{"value": "{{ 0 if naked_paused else 1 }}"}' hx-swap="none">{{ 'Resume' if naked_paused else 'Pause' }} naked leg</button>{{ tip('naked_leg') }}
+<button class="btn {{ 'btn-on' if sole_bid }}" type="button" hx-post="/markets/{{ cid }}/sole-bid" hx-vals='{"value": "{{ 0 if sole_bid else 1 }}"}' hx-swap="none">{{ 'Stop' if sole_bid else 'Allow' }} sole bid</button>{{ tip('sole_bid') }}
 <a class="btn" href="/review/{{ cid }}">Edit p_true / budget</a>
 <button class="btn btn-danger" type="button" hx-post="/markets/{{ cid }}/retire" hx-swap="none" hx-confirm="Retire &quot;{{ name }}&quot;? The farmer cancels its orders and stops managing it.">Retire</button>
 {%- if phase == 'COOLDOWN' %}

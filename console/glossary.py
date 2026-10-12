@@ -165,6 +165,12 @@ GLOSSARY = {
     "naked_leg": Term("Naked leg", "The longshot bid. Pausing it removes the longshot bid, "
                                    "and the favorite bid with it, because one-sided quotes "
                                    "earn nothing above 90c."),
+    "sole_bid": Term("Sole bid", "Normally the farmer takes its orders down when no other "
+                                 "bid supports the midpoint. With this allowed it keeps its "
+                                 "favorite bid there instead, at full size, as the only bid "
+                                 "in the reward band, until another bid returns. Every sale "
+                                 "into the book fills that bid, so allow it only on a market "
+                                 "you are near certain of."),
 
     # order slots and their decisions
     "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price and the "
@@ -191,6 +197,12 @@ GLOSSARY = {
 
     # phases
     "QUOTING": Term("Quoting", "Orders are resting and earning rewards."),
+    "SOLE_BID": Term("Sole bid", "No other bid supports the midpoint, and you allowed a sole "
+                                 "bid on this market. The favorite bid rests at full size as "
+                                 "the only bid in the reward band, two ticks above the lowest "
+                                 "price that keeps the longshot bid scoring, and the longshot "
+                                 "bid stays as it rests. Every sale into the book fills the "
+                                 "favorite bid. Quoting resumes when another bid returns."),
     "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
                                  "threshold within the drop window). The ask is the price "
                                  "at which the favorite's asks add up to three reward "

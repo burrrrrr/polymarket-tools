@@ -43,6 +43,7 @@
     {%- endif %}
     {%- if market.paused %}<span class="badge t-n">paused flag set</span>{% endif %}
     {%- if market.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
+    {%- if market.sole_bid %}<span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}
     {{ polymarket_link(market.slug) }}
   </div>
   {%- if m.event_slug or m.tags %}
