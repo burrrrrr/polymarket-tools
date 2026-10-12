@@ -87,12 +87,13 @@ class Decision(NamedTuple):
     naked_budget: float
     capital: Optional[float]
     start_paused: bool
+    sole_bid: bool
 
 
 def parse_decision(form):
     """Approval terms: p_true as a whole percent, a budget of 0 or more, and an
-    optional positive capital (blank means the farmer's capital), and whether to
-    start paused."""
+    optional positive capital (blank means the farmer's capital), whether to
+    start paused, and whether a sole bid is allowed."""
     errors = {}
     p_true = parse_p_true(form.get("p_true"))
     if p_true is None:
@@ -106,7 +107,8 @@ def parse_decision(form):
         if capital is None or not capital > 0:
             errors["capital"] = "Enter a positive amount, or leave blank for the farmer's."
     start_paused = form.get("start_paused") == "1"
-    return (None if errors else Decision(p_true, budget, capital, start_paused)), errors
+    sole_bid = form.get("sole_bid") == "1"
+    return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid)), errors
 
 
 def preview_terms(form):

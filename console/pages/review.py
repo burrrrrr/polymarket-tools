@@ -67,6 +67,7 @@ def routes(ctx):
                                               else reward_screener.DEFAULT_NAKED_BUDGET),
             "capital": views.number_text(market.capital_usd)
             if market.capital_usd is not None else "",
+            "sole_bid": market.sole_bid,
             "note": "",
         }
         cutoff = views.expiry_cutoff(market, status)
@@ -111,11 +112,12 @@ def routes(ctx):
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
     def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
-                 capital=None):
+                 capital=None, sole_bid=False):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None values it at the book midpoint."""
         terms = {"p_true": p_true, "naked_budget_usd": budget,
-                 "capital_usd": capital, "paused": 0, "naked_paused": 0, "sole_bid": 0}
+                 "capital_usd": capital, "paused": 0, "naked_paused": 0,
+                 "sole_bid": int(sole_bid)}
         cid = row["condition_id"]
         info, rates = ctx.infos.get(cid), ctx.total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
@@ -182,7 +184,8 @@ def routes(ctx):
 
     @router.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
     def review_live(request: Request, condition_id: str, p_true: str = "",
-                    naked_budget: str = "", capital: str = "", mode: Optional[str] = None):
+                    naked_budget: str = "", capital: str = "", sole_bid: str = "",
+                    mode: Optional[str] = None):
         mode = parse_mode(mode)
         p, budget, cap = forms.preview_terms(
             {"p_true": p_true, "naked_budget": naked_budget, "capital": capital})
@@ -193,7 +196,8 @@ def routes(ctx):
             cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
         try:
             (live, active), error = plan_now(row, cfg, prior, p,
-                                             0.0 if budget is None else budget, cap), None
+                                             0.0 if budget is None else budget, cap,
+                                             sole_bid == "1"), None
         except Exception as e:
             live, active, error = None, None, f"{type(e).__name__}: {e}"
         record_rewards([(row, active)])
@@ -270,6 +274,7 @@ def routes(ctx):
             ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
                                  decision.capital, decision.start_paused, now=ctx.clock())
+            farm_db.set_sole_bid(conn, condition_id, decision.sole_bid)
             if market.status == "candidate" and not decision.start_paused:
                 return see_other(next_review(conn, ids, condition_id, mode))
         return see_other(f"/markets/{condition_id}")

@@ -1232,14 +1232,22 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
         note = f"The farmer cannot manage this market: {fm.reason}."
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
+        sole = None
+        if fm.sole_bid and not reward_farmer.supported(levels, fm, cfg):
+            sole = reward_farmer.sole_bid_target(fm, levels, reward_farmer.Position(), cfg, ())
         obs = reward_farmer.Observation(
             mid=book_mid, ask=reward_farmer.drop_ask(levels.asks, info.min_size), recent_asks=(),
             rewards_active=reward_farmer.rewards_active(info, fm.condition_id, total_rates),
             accepting_orders=info.accepting_orders, closed=info.closed, approved=True,
-            expires_at=fm.expires_at)
+            expires_at=fm.expires_at, sole_bid=sole is not None)
         state = reward_farmer.step_state(reward_farmer.State(reward_farmer.Phase.QUOTING),
                                          obs, now, cfg)
-        if state.phase is reward_farmer.Phase.QUOTING:
+        if state.phase is reward_farmer.Phase.SOLE_BID:
+            target, pool = sole, reward_farmer.live_rate(fm, total_rates)
+            note = ("No other bid supports the midpoint, so the farmer would hold a sole bid. "
+                    "It earns the whole pool while no other maker scores, and nothing here "
+                    "values its fills.")
+        elif state.phase is reward_farmer.Phase.QUOTING:
             outlook = reward_farmer.market_outlook(fm, total_rates, history, prior, cfg, now)
             pool = outlook.rate_per_day
             target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True,

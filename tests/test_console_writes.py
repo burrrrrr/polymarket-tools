@@ -432,7 +432,7 @@ class ReviewTest(Writes):
                        "Approve and start quoting",
                        "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
-                       'hx-include="#d-p_true, #d-naked_budget, #d-capital"'):
+                       'hx-include="#d-p_true, #d-naked_budget, #d-capital, #d-sole_bid"'):
             self.assertIn(needle, page)
         self.assertIn('hx-trigger="input changed delay:300ms"', page)
 
@@ -589,6 +589,20 @@ class ReviewTest(Writes):
         self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
                                                  r"bid pays: best net -\$\d+\.\d\d/day at 92\.6c\.")
 
+    def test_live_plan_follows_the_sole_bid_box_when_no_other_bid_supports_the_market(self):
+        # The only bid left is 80c under a 97c ask: an 88.5c midpoint.
+        self.remote.books["tok-0xddd"] = BUDGET_BOOK._replace(bids=[(0.80, 1000.0)],
+                                                              asks=[(0.97, 1000.0)])
+        without = self.live(p_true="99")
+        self.assertIn("The farmer would not quote: the midpoint 88.5c is under min_fav", without)
+        self.assertNotIn("Buy No", without)
+        allowed = self.live(p_true="99", sole_bid="1")
+        self.assertIn("the farmer would hold a sole bid", allowed)
+        # 96.1c is two ticks over the lowest bid that keeps a 0.1c longshot bid in the 3.5c band.
+        self.assertIn("Buy No 96.1c", allowed)
+        self.assertIn("Buy Yes 0.1c", allowed)
+        self.assertIn('id="d-sole_bid"', self.client.get("/review/0xddd").text)
+
     def test_live_book_is_cached_briefly_and_a_failed_read_says_so(self):
         from console.app import utc_now
         start = utc_now()
@@ -669,6 +683,24 @@ class ReviewTest(Writes):
         self.assertEqual((self.row("0xddd")["status"], self.row("0xddd")["paused"]), ("approved", 1))
         self.assertEqual(self.row("0xeee")["paused"], 0)
         self.assertNotIn('name="start_paused"', self.client.get("/review/0xddd").text)
+
+    def test_approve_sets_the_sole_bid_flag_to_the_checkbox_and_shows_it_again(self):
+        self.assertNotIn(' checked> Allow sole bid', self.client.get("/review/0xddd").text)
+        self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                  sole_bid="1")
+        self.assertEqual((self.row("0xddd")["status"], self.row("0xddd")["sole_bid"]),
+                         ("approved", 1))
+        self.assertIn(' checked> Allow sole bid', self.client.get("/review/0xddd").text)
+        # Saving the terms with the box cleared turns it off again.
+        self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="")
+        self.assertEqual(self.row("0xddd")["sole_bid"], 0)
+
+    def test_a_rejected_form_keeps_the_sole_bid_box_as_it_was_sent(self):
+        resp = self.post("/review/0xddd/approve", p_true="", naked_budget="30", capital="",
+                         sole_bid="1")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn(' checked> Allow sole bid', resp.text)
+        self.assertEqual(self.row("0xddd")["sole_bid"], 0)
 
     def test_queue_filters_by_mode_and_keeps_the_mode_through_decisions(self):
         resp = self.client.get("/review?mode=floor", follow_redirects=False)

@@ -70,7 +70,7 @@
         <h2>Live orders and book{{ tip('band_strip') }}</h2>
         <span class="streaming"><span class="dot" style="width: 6px; height: 6px; background: #63D3A6"></span>live, every {{ LIVE_POLL_S }}s</span>
       </div>
-      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-naked_budget, #d-capital" hx-swap="innerHTML">
+      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-naked_budget, #d-capital, #d-sole_bid" hx-swap="innerHTML">
         <span class="small muted">Reading the live book...</span>
       </div>
     </section>
@@ -130,6 +130,7 @@
       {%- if market.status != 'approved' %}
       <label class="check"><input type="checkbox" name="start_paused" value="1"{{ ' checked' if values.start_paused }}> Start paused{{ tip('start_paused') }}</label>
       {%- endif %}
+      <label class="check"><input type="checkbox" id="d-sole_bid" name="sole_bid" value="1"{{ ' checked' if values.sole_bid }}> Allow sole bid{{ tip('sole_bid') }}</label>
       {%- if market.status == 'rejected' %}
       <button class="btn btn-strong" type="submit" formaction="/review/{{ cid }}/unreject" formnovalidate>Un-reject (back to the queue)</button>
       <button class="btn" type="submit">Approve and start quoting</button>
