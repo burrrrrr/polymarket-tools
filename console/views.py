@@ -1233,7 +1233,8 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
         sole = None
-        if fm.sole_bid and not reward_farmer.supported(levels, fm, cfg):
+        if fm.sole_bid and not reward_farmer.supported(levels, fm, reward_farmer.Position(),
+                                                       cfg):
             sole = reward_farmer.sole_bid_target(fm, levels, reward_farmer.Position(), cfg, ())
         obs = reward_farmer.Observation(
             mid=book_mid, ask=reward_farmer.drop_ask(levels.asks, info.min_size), recent_asks=(),

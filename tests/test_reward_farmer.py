@@ -1008,18 +1008,39 @@ def sole(orders=(), fm=THIN, book=THIN_BOOK, position=Position(), cfg=CFG):
 
 class SoleBidTest(unittest.TestCase):
     def test_a_thin_book_is_unsupported_below_range_or_with_no_scoring_price(self):
-        self.assertTrue(supported(FLOOR_BOOK, market(), CFG))
-        self.assertFalse(supported(THIN_BOOK, THIN, CFG))
+        self.assertTrue(supported(FLOOR_BOOK, market(), Position(), CFG))
+        self.assertFalse(supported(THIN_BOOK, THIN, Position(), CFG))
         # A 91c midpoint, but 85.5c is the highest bid allowed and scores nothing.
         lead_capped = THIN_BOOK._replace(bids=[(0.85, 500.0)])
         self.assertEqual(fav_bid_candidates(lead_capped, 0.055, 0.001, 100.0, CFG.max_lead), [])
-        self.assertFalse(supported(lead_capped, THIN, CFG))
-        self.assertFalse(supported(THIN_BOOK._replace(bids=[]), THIN, CFG))
+        self.assertFalse(supported(lead_capped, THIN, Position(), CFG))
+        self.assertFalse(supported(THIN_BOOK._replace(bids=[]), THIN, Position(), CFG))
+
+    def test_a_midpoint_too_low_for_a_longshot_bid_to_balance_is_unsupported(self):
+        # The Meta #2 AI lab book of 2026-10-12, 80 days out: bids to 85.7c
+        # under a 93.2c ask. Favorite prices score against its 89.45c midpoint,
+        # but a longshot bid scores only above 4.05c, which offers a favorite
+        # buyer over 20% a year, so no plan rests a favorite bid.
+        book = Levels(bids=[(0.857, 135.0), (0.854, 80.0), (0.85, 20.0)],
+                      asks=[(0.932, 166.91), (0.95, 532.07)], tick=0.001)
+        fm = market(v=0.065, min_size=20.0, p_true=0.95, naked_budget_usd=10.0, capital=100.0,
+                    zones=steady(0.8945, days=80), sole_bid=True)
+        cfg = CFG._replace(min_fav=0.87, ev_margin=0.02)
+        self.assertTrue(fav_bid_candidates(book, 0.065, 0.001, 20.0, cfg.max_lead, ev_cap(fm, cfg)))
+        self.assertTrue(over_max_return(0.041, fm.zones.years_left))
+        self.assertFalse(supported(book, fm, Position(), cfg))
+        # The sole bid leads the book: 92.1c makes a 92.65c midpoint, which
+        # keeps a 1.0c longshot bid, the top of the free zone, in the band.
+        intents = by_slot(sole(fm=fm, book=book, cfg=cfg))
+        self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.FAV_BID].size),
+                         (0.921, round_size_down(100.0 / 0.921)))
+        self.assertEqual((intents[Slot.LONG_BID].price, intents[Slot.LONG_BID].size),
+                         (0.01, 1000.0))
 
     def test_support_can_be_asked_for_a_margin_over_min_fav(self):
         book = Levels(bids=[(0.86, 500.0)], asks=[(0.944, 1000.0)], tick=0.001)
-        self.assertTrue(supported(book, THIN, CFG))
-        self.assertFalse(supported(book, THIN, CFG, margin=0.005))
+        self.assertTrue(supported(book, THIN, Position(), CFG))
+        self.assertFalse(supported(book, THIN, Position(), CFG, margin=0.005))
 
     def test_the_bid_rests_two_ticks_over_the_lowest_price_that_keeps_the_longshot_scoring(self):
         target = sole()

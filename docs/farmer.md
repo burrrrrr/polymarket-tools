@@ -98,9 +98,13 @@ Each market is in one of seven states:
 - `BELOW_RANGE`: the midpoint is below `--min-fav`. All orders come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
 - `SOLE_BID`: you set `sole_bid = 1` on the market, and no other bid
-  supports a favorite bid. That means the midpoint without the farmer's own
-  orders is below `--min-fav`, or no price within `--max-lead` of the best
-  other bid scores. On a thin book this happens when one maker's bid leaves.
+  supports a favorite bid. That means one of three things. The midpoint
+  without the farmer's own orders is below `--min-fav`. Or no price within
+  `--max-lead` of the best other bid scores. Or the midpoint is too low for
+  a longshot bid to balance a favorite bid: under a 90c midpoint with a 6.5c
+  band a longshot bid scores only above 3.5c, which near the end date offers
+  a favorite buyer more than the 20% a year limit. On a thin book the first
+  two happen when one maker's bid leaves, and the third on a wide spread.
   Without the flag the market goes `BELOW_RANGE` or rests no favorite bid.
   With it, the favorite bid stays as the only bid in the reward band:
 

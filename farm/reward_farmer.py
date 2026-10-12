@@ -78,7 +78,8 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
   SOLE_BID     on a market a human opted in (markets.sole_bid), no other bid
                supports a favorite bid: the midpoint without our orders is
                under --min-fav, or no price within --max-lead of the best
-               other bid scores. Instead of going BELOW_RANGE or resting no
+               other bid rests a favorite bid a longshot bid can balance
+               (supported). Instead of going BELOW_RANGE or resting no
                favorite bid, the market rests sole_bid_target's orders: the
                favorite bid just above the lowest price that keeps the
                longshot bid scoring, and the longshot bid as it rests, or
@@ -966,13 +967,26 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline))
 
 
-def supported(levels, fm, cfg, margin=0.0):
-    """Whether another maker's bid supports a favorite bid here: the book
-    without our orders has a midpoint at least margin over min_fav, and some
-    price within max_lead of its best bid scores (fav_bid_candidates)."""
+def supported(levels, fm, position, cfg, margin=0.0, fill_mid=None):
+    """Whether the other makers' bids support a favorite bid here: the book
+    without our orders has a midpoint at least margin over min_fav, and at
+    some price within max_lead of its best bid the plan rests a favorite bid
+    (quotes_at, with the naked leg allowed).
+
+    A plan rests none where no such price scores, and where the midpoint is
+    too low for a longshot bid to balance it: under a 90c midpoint with a
+    6.5c band a longshot bid scores only above 3.5c, which near the end date
+    offers more than MAX_RETURN. What a favorite bid there would earn or
+    cost is not asked: that is target_orders' to judge.
+    """
     mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
-    return (mid is not None and mid >= cfg.min_fav + margin
-            and bool(fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead)))
+    if mid is None or mid < cfg.min_fav + margin:
+        return False
+    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
+                                ev_cap(fm, cfg))
+    return any(i.slot is Slot.FAV_BID for price in prices
+               for i in quotes_at(fm, levels, position, cfg, True, price,
+                                  fill_mid=fill_mid).intents)
 
 
 def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
@@ -2388,7 +2402,8 @@ class Farmer:
         # Once it is the sole bid the market stays one until the midpoint is
         # the resume margin over min_fav, as BELOW_RANGE does.
         margin = RESUME_MARGIN if managed.state.phase is Phase.SOLE_BID else 0.0
-        if fm.sole_bid and naked_allowed(obs, now) and not supported(book, fm, self.cfg, margin):
+        if fm.sole_bid and naked_allowed(obs, now) and not supported(
+                book, fm, managed.position, self.cfg, margin, managed.fill_mid):
             sole = sole_bid_target(fm, book, managed.position, self.cfg, orders,
                                    managed.fill_mid)
         obs = obs._replace(sole_bid=sole is not None)
