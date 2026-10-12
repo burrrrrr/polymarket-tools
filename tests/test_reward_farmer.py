@@ -477,6 +477,14 @@ class NetPricingTest(unittest.TestCase):
         self.assertEqual(unread.rate_per_day, 100.0)
         self.assertEqual(unread.fills, fill_cost.fill_curve(None, PRIOR, CFG.min_fav))
 
+    def test_the_outlook_drops_a_history_read_at_another_floor_unless_any_floor(self):
+        fm, lower = market(), CFG._replace(min_fav=0.85)
+        self.assertFalse(market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW).fills.from_history)
+        kept = market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW, any_floor=True)
+        self.assertEqual(kept.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, 0.90))
+        unread = market_outlook(fm, None, None, PRIOR, lower, NOW, any_floor=True)
+        self.assertEqual(unread.fills, fill_cost.fill_curve(None, PRIOR, 0.85))
+
 
 def live(order_id, slot, price, size):
     token = FAV if slot in (Slot.FAV_BID, Slot.FAV_ASK) else LONG
@@ -2323,6 +2331,18 @@ class FarmerCycleTest(FarmerHarness):
         farmer.histories.refresh(farmer.http)
         farmer.cycle()
         self.assertEqual(self.farm_state()[1]["FAV_BID"]["decision"], "place")
+
+    def test_a_min_fav_change_keeps_the_favorite_bid_until_its_history_is_read_again(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        before = self.last_event_id()
+        farm_db.put_setting(self.ui, "min_fav", 0.85, NOW)
+        farmer.cycle()
+        fav = self.farm_state()[1]["FAV_BID"]
+        self.assertEqual((fav["decision"], fav["history"]["floor"]), ("hold", 0.90))
+        self.assertEqual([e["kind"] for e in self.events(before)], ["SETTINGS"])
+        self.assertEqual(farmer.histories.wanted,
+                         {CID: reward_farmer.Want(FAV, 0.85, "test-market")})
 
     def first_bid_on_stored_history(self, history):
         """The favorite bid slot of a restarted farmer's first cycle, its

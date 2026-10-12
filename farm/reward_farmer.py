@@ -816,11 +816,17 @@ def live_rate(fm, total_rates):
     return fm.rate_per_day if rate is None else rate
 
 
-def market_outlook(fm, total_rates, history, prior, cfg, now):
+def market_outlook(fm, total_rates, history, prior, cfg, now, any_floor=False):
     """The Outlook a favorite bid on this market is valued with: fills from its
-    history shrunk toward prior, or prior alone without a history."""
+    history shrunk toward prior, or prior alone without a history.
+
+    any_floor values a history read at another min_fav as a reader with that
+    floor would. The farmer asks for it: a min_fav change leaves every history
+    at the old floor until the reader replaces it, minutes later, and dropping
+    them would cancel every favorite bid for that long."""
+    floor = history.floor if any_floor and history is not None else cfg.min_fav
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   fill_cost.fill_curve(history, prior, cfg.min_fav), cfg.hurdle_rate)
+                   fill_cost.fill_curve(history, prior, floor), cfg.hurdle_rate)
 
 
 def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
@@ -2220,7 +2226,7 @@ class Farmer:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
                 market_outlook(fm, self.total_rates.rates, self.history(fm), self.prior,
-                               self.cfg, now),
+                               self.cfg, now, any_floor=True),
                 fill_mid=managed.fill_mid, resting=orders,
             )
             if previewing:

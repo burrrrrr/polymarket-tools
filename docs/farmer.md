@@ -47,7 +47,9 @@ net -$0.12/day at 93.8c`.
 
 A thread beside the main loop reads each approved market's fill history, so a
 cycle never waits on those reads. It reads a market as soon as the farmer
-manages it, then every hour, and again at once when `min_fav` changes. It
+manages it, then every hour, and again at once when `min_fav` changes. Until
+that read lands, the farmer keeps valuing the market on the history it has,
+read at the old `min_fav`, so the change cancels no favorite bid. It
 reads one market at a time: the markets with no history yet first, and the
 markets that are quoting before the rest. The hour runs from each market's
 own read, not from the start of the pass. A failed read keeps the last
