@@ -732,6 +732,14 @@ class RunScanTest(unittest.TestCase):
         self.assertEqual(result.funnel.assessed, 2)
         self.assertIsNone(result.prior)
 
+    def test_a_sole_market_is_kept_without_taking_a_history_slot(self):
+        result, asked = self.scan({}, books={"fav-0x1": SoleScanTest.LONE})
+        self.assertEqual(asked, [["0x2", "0x3"]])
+        modes = {a.market.condition_id: a.plan.mode for a in result.assessments}
+        self.assertIs(modes.pop("0x1"), Mode.SOLE)
+        self.assertNotIn(Mode.SOLE, modes.values())
+        self.assertEqual((result.funnel.assessed, result.funnel.assess_skips), (3, {}))
+
     def test_listing_tags_and_the_gamma_event_land_in_the_stored_market(self):
         gamma = {"0x1": parse_gamma({"slug": "0x1", "events": [
                      {"slug": "2027-french-election", "title": "2027 French election",
@@ -846,6 +854,67 @@ class FragileMidTest(unittest.TestCase):
         # A 0.91 bid behind it holds the midpoint at (0.91 + 0.997) / 2 = 0.9535, 1c down.
         backed = MISTRAL_BOOK._replace(bids=[(0.93, 487.0), (0.91, 100.0), (0.85, 20.0)])
         self.assertNotIsInstance(assess(MISTRAL_MARKET, backed, CONFIG, self.NOW, PRIOR), Skip)
+
+
+class SoleScanTest(unittest.TestCase):
+    NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    # The live DeepSeek book, which assess skips as fragile. Under its 98.5c
+    # ask a bid over 94.3c keeps a 0.1c longshot bid in the 3.5c band, so
+    # 94.4c is the lowest sole bid that pays and 94.6c the one planned.
+    LONE = Levels(bids=[(0.943, 20.0), (0.79, 20.0)], asks=[(0.985, 100.0)], tick=0.001)
+
+    def sole(self, levels=LONE):
+        return reward_screener.assess_all([(MARKET, levels, None)], CONFIG, self.NOW, PRIOR, {})
+
+    def test_a_market_skipped_for_its_book_is_kept_where_a_sole_bid_can_quote_it(self):
+        self.assertEqual(assess(MARKET, self.LONE, CONFIG, self.NOW, PRIOR),
+                         Skip("fragile midpoint"))
+        [a], skipped, valued = self.sole()
+        self.assertIs(a.plan.mode, Mode.SOLE)
+        self.assertEqual((a.plan.fav_bid_price, a.plan.low_price), (0.946, 0.001))
+        self.assertAlmostEqual(a.mid, (0.946 + 0.985) / 2)
+        self.assertAlmostEqual(a.book_mid, (0.943 + 0.985) / 2)
+        self.assertEqual((a.best_bid, a.best_ask), (0.943, 0.985))
+        self.assertEqual((dict(skipped), valued), ({}, []))
+
+    def test_its_reward_is_the_pool_times_our_share_and_no_fill_is_valued(self):
+        [a], _, _ = self.sole()
+        self.assertGreater(a.comp_q, 0)
+        self.assertAlmostEqual(a.share, a.my_q / (a.my_q + a.comp_q))
+        self.assertAlmostEqual(a.est_daily_usd, 100.0 * a.share)
+        self.assertEqual((a.net_daily_usd, a.net_apr), (a.est_daily_usd, a.apr))
+        self.assertEqual((a.fills_per_day, a.fill_cost_usd, a.loss_per_share, a.fill_source,
+                          a.history), (None,) * 5)
+        self.assertAlmostEqual(a.rank_score, a.est_daily_usd / a.capital_usd
+                               * min(a.days_left, CONFIG.horizon_cap_days))
+        # With no other bid in the band the sole bid earns the whole pool.
+        [alone], _, _ = self.sole(self.LONE._replace(bids=[(0.79, 20.0)]))
+        self.assertEqual((alone.share, alone.est_daily_usd), (1.0, 100.0))
+
+    def test_a_market_no_sole_bid_can_quote_keeps_its_skip(self):
+        low_ask = Levels(bids=[(0.80, 20.0)], asks=[(0.90, 100.0)], tick=0.001)
+        assessments, skipped, _ = self.sole(low_ask)
+        self.assertEqual((assessments, dict(skipped)), ([], {"favorite too cheap": 1}))
+
+    def test_a_scan_row_stores_the_sole_mode_and_the_table_prints_it(self):
+        [a], _, _ = self.sole()
+        record = reward_screener.assessment_record(a)
+        self.assertEqual(json.loads(json.dumps(record))["plan"]["mode"], "sole")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            reward_screener.print_table([a])
+        row = out.getvalue().splitlines()[2]
+        self.assertIn(" sole ", row)
+        self.assertIn(" -- ", row)
+
+    def test_the_prefilter_reads_the_book_of_a_listing_priced_down_to_67c(self):
+        def screen(price):
+            item = listing_item("0x1", 100.0)
+            item["tokens"][0]["price"], item["tokens"][1]["price"] = price, 1 - price
+            return reward_screener.screen_listing(item, {"0x1": 100.0}, CONFIG, SCAN_NOW)
+
+        self.assertIsInstance(screen(0.68), RewardMarket)
+        self.assertEqual(screen(0.66), Skip("favorite too cheap"))
 
 
 class ResolutionSignalTest(unittest.TestCase):

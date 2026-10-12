@@ -5,7 +5,7 @@
     <div class="actions">
       <span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{% if vm.phase_since %} since {{ vm.phase_since | clock }}{% endif %}{{ tip(c.phase) }}</span>
       {%- if c.phase_reason %}<span class="badge t-n">{{ c.phase_reason }}{% if c.phase_until %} until {{ c.phase_until | clock }}{% endif %}</span>{% endif %}
-      {%- if c.mode %}<span class="badge {{ 't-b' if c.mode | lower == 'budget' else 't-f' }}">{{ c.mode | upper }}{{ tip(c.mode | lower) }}</span>{% endif %}
+      {%- if c.mode %}<span class="badge {{ mode_tone(c.mode) }}">{{ c.mode | upper }}{{ tip(c.mode | lower) }}</span>{% endif %}
       <span class="badge t-n">favorite {{ c.fav_outcome or '--' }} · p_true {{ '%.3f' % c.p_true if c.p_true is not none else '--' }}{{ tip('p_true') }}</span>
       <span class="badge t-n">band {{ vm.v | cents }}{{ tip('band') }} · min {{ vm.min_size | shares }}{{ tip('min_size') }} · tick {{ '%g' % vm.tick if vm.tick else '--' }}</span>
       <span class="badge t-n">budget {{ c.budget_usd | usd }}{{ tip('naked_budget') }} · capital {{ c.capital_usd | usd if c.capital_usd is not none else 'farmer default' }}{{ tip('capital_cap') }}</span>

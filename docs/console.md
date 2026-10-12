@@ -34,8 +34,8 @@ Pages:
 | Page | Shows | Actions |
 | --- | --- | --- |
 | Overview (`/`) | Totals (markets quoting, capital in favorite bids, naked longshot bids and the part of them the budgets limit, farm inventory, the $/day Polymarket's scoring share of each quoting pool pays beside the screener's estimate, today's earnings split into farmer-managed markets and the rest of the wallet), the alerts that need you, the tracked markets, and the latest events | Each alert links to its action: Resume, Edit budget, Edit p_true, or the farmer status |
-| Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode, text in the question or slug, status, and minimum days to the farmer's cutoff | Run a scan |
-| Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures (gross, fills/day, fill cost and net APR), the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate | Approve with p_true, naked budget, capital, and whether a sole bid is allowed; reject with a note; retire an approved market; re-approve a retired one |
+| Discover (`/discover`) | The scan parameters, the last scan's funnel (listed, passed the prefilter, assessed on the book, and the skip reasons), and the stored markets by rank, 50 per page. Filter by mode (floor, budget, or sole), text in the question or slug, status, and minimum days to the farmer's cutoff. An undecided sole candidate lists only under the Sole filter, which shows how many there are | Run a scan |
+| Review (`/review/<condition_id>`) | The plan from the last scan: the reward band with the scanned best bid and ask and your planned bids, each planned order with why it is priced that way, the yield figures (gross, fills/day, fill cost and net APR), the resolution rules from Gamma, and what your wallet already holds, which becomes the farmer's baseline. `/review` opens the best-ranked undecided candidate. The queue filters by mode. A sole candidate is in the queue only under its Sole filter, which shows how many there are, and `/review?mode=sole` opens the best-ranked one | Approve with p_true, naked budget, capital, and whether a sole bid is allowed; reject with a note; retire an approved market; re-approve a retired one |
 | Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, allow or stop a sole bid, edit p_true and budget, retire, end a cooldown |
 | Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
 | Activity (`/activity?tab=`) | `rewards`: earnings per day and market, the live rate from Polymarket's scoring share of each pool, and the week's earnings in farmer-managed markets against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
@@ -95,6 +95,20 @@ rows and its funnel in one transaction and never changes your decisions.
   bid, so allow it only on a market you are near certain of. The market
   shows a `sole bid allowed` badge while the flag is set, and the Overview
   raises a Sole bid alert while the market is in that phase.
+- **Sole candidates.** A scan also keeps the markets that no other bid
+  supports, with the sole bid it would rest as their plan (mode `sole`). Most
+  have a $1 pool. The normal queue, the Review queue count in the sidebar,
+  the Discover list, and Claude's batch triage leave them out. To find them,
+  click **Sole** in the mode filter of Discover or of the Review queue. The
+  button shows how many are undecided. Once you approve or reject a sole
+  candidate, it lists like any other market. The Review page of a sole
+  candidate opens with "Allow sole bid" ticked. Until you type a p_true, the
+  live preview caps the sole bid by the ask alone, as the scan does. Your
+  p_true then caps it, and can leave no sole bid to rest. The EV check says
+  whether the scanned sole bid is within your cap. It does not re-score a
+  sole bid that is over the cap, because the live preview shows where the
+  farmer would rest it. Nothing values a sole bid's fills, so the page shows
+  no fill cost or net for it.
 - **Retire** asks first, naming the market, then sets `status` to `retired`.
   The farmer cancels the market's orders on its next cycle.
 - **End cooldown** shows only while the market is in `COOLDOWN`. It inserts

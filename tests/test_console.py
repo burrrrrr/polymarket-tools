@@ -103,7 +103,7 @@ def snap(states=(), markets=(), fills=(), rewards=(), st=None, running=True):
         status=st or (status() if running else None),
         states={s.condition_id: s for s in states},
         markets={m.condition_id: m for m in markets},
-        fills=list(fills), rewards=list(rewards), counts={"approved": len(markets)},
+        fills=list(fills), rewards=list(rewards), candidates=0,
     )
 
 

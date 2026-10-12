@@ -1168,6 +1168,35 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
                   frozenset(o.id for o in (bid, long) if o is not None))
 
 
+def scan_sole_bid(market, levels, config, now):
+    """sole_bid_target for a scan (reward_screener.assess_sole): (midpoint,
+    favorite bid Intent, longshot bid Intent) on a reward_screener market
+    with the capital, naked budget and min_fav of its ScreenConfig, from no
+    position, or None when no sole bid can rest. A scan has no p_true, so
+    only the ask caps the bid."""
+    cfg = FarmConfig(
+        capital=config.capital, max_lead=config.max_lead, min_fav=config.min_fav,
+        min_low_score=config.min_low_score, expiry_buffer_days=config.expiry_buffer_days,
+        hurdle_rate=config.hurdle_rate, ev_margin=0.0,
+        # A plan from no position prices no exit and keeps no order.
+        ask_offset=0.0, min_capture=0.0, keep_ratio=0.0, drop_threshold=0.0,
+        drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0)
+    fm = FarmMarket(
+        condition_id=market.condition_id, slug=market.slug, question=market.question,
+        end_date=market.end_date, neg_risk=market.neg_risk, tick=market.tick,
+        fav_token_id=market.fav_token_id, fav_outcome=market.fav_outcome,
+        rate_per_day=market.rate_per_day, v=market.v, min_size=market.min_size,
+        long_token_id="", p_true=1.0, naked_budget_usd=config.naked_budget,
+        expires_at=market.end_date - timedelta(days=config.expiry_buffer_days),
+        capital=config.capital, zones=Zones(fill_cost.years_until(market.end_date, now)),
+        sole_bid=True)
+    target = sole_bid_target(fm, levels, Position(), cfg, ())
+    if target is None:
+        return None
+    by_slot = {i.slot: i for i in target.intents}
+    return target.mid, by_slot[Slot.FAV_BID], by_slot[Slot.LONG_BID]
+
+
 def keep_failure(order, intent, target, fm, position, cfg):
     """Why a resting order is not close enough to its target to leave alone, or None.
 

@@ -77,9 +77,9 @@
 <section class="panel pad-table">
   <form class="filters" method="get" action="/discover" style="padding: 0 18px 14px">
     <div class="seg" role="group" aria-label="Mode filter">
-      <a class="{{ 'on' if not f.mode }}" href="/discover{{ f.query(mode=None) }}">All</a>
+      <a class="{{ 'on' if not f.mode }}" href="/discover{{ f.query(mode=None) }}" title="Undecided sole candidates list under Sole.">All</a>
       {%- for m in modes %}
-      <a class="{{ 'on' if f.mode == m }}" href="/discover{{ f.query(mode=m) }}">{{ m | title }}</a>
+      <a class="{{ 'on' if f.mode == m }}" href="/discover{{ f.query(mode=m) }}">{{ m | title }}{% if m == 'sole' %}&nbsp;<span class="mono">{{ '{:,}'.format(sole_count) }}</span>{% endif %}</a>
       {%- endfor %}
     </div>
     {%- if f.mode %}<input type="hidden" name="mode" value="{{ f.mode }}">{% endif %}

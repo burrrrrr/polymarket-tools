@@ -8,7 +8,7 @@
   <span class="lbl" style="margin-right: 6px">Queue</span>
   <div class="seg" role="group" aria-label="Queue mode filter">
     {%- for m in [none] + MODES | list %}
-    <a class="{{ 'on' if queue_mode == m }}" href="/review{{ '?mode=' ~ m if m }}">{{ (m or 'all') | title }}</a>
+    <a class="{{ 'on' if queue_mode == m }}" href="/review{{ '?mode=' ~ m if m }}"{% if not m %} title="Floor and budget candidates. Sole candidates list under Sole."{% endif %}>{{ (m or 'all') | title }}{% if m == 'sole' %}&nbsp;<span class="mono">{{ '{:,}'.format(sole_count) }}</span>{% endif %}</a>
     {%- endfor %}
   </div>
   {%- set kind = (queue_mode ~ ' ') if queue_mode else '' %}
@@ -29,7 +29,7 @@
   <h1 class="question">{{ market.question or market.slug }}</h1>
   <div class="actions" style="gap: 8px">
     <span class="badge {{ 't-q' if market.status == 'approved' else ('t-r' if market.status in ('rejected', 'retired') else 't-n') }}">{{ market.status }}</span>
-    {%- if plan %}<span class="badge {{ 't-b' if plan.mode == 'budget' else 't-f' }}">{{ plan.mode | upper }}{{ tip(plan.mode | lower) }}</span>{% endif %}
+    {%- if plan %}<span class="badge {{ mode_tone(plan.mode) }}">{{ plan.mode | upper }}{{ tip(plan.mode | lower) }}</span>{% endif %}
     <span class="badge t-n">favorite {{ m.fav_outcome or '--' }} {{ market.metrics.get('book_mid') | cents }}{{ tip('favorite') }}</span>
     <span class="badge t-n">{{ '%.0f' % cutoff_days if cutoff_days is not none else '--' }} days to cutoff{{ tip('days') }}</span>
     <span class="badge t-n">pool ${{ '%.0f' % m.rate_per_day if m.rate_per_day is not none else '--' }}/day{{ tip('pool') }} · band {{ m.v | cents }}{{ tip('band') }} · min {{ m.min_size | shares }}{{ tip('min_size') }}</span>

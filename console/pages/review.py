@@ -67,7 +67,8 @@ def routes(ctx):
                                               else reward_screener.DEFAULT_NAKED_BUDGET),
             "capital": views.number_text(market.capital_usd)
             if market.capital_usd is not None else "",
-            "sole_bid": market.sole_bid,
+            "sole_bid": market.sole_bid or (market.status == "candidate"
+                                            and views.sole_plan(market.metrics)),
             "note": "",
         }
         cutoff = views.expiry_cutoff(market, status)
@@ -76,6 +77,7 @@ def routes(ctx):
             "plan": market.metrics.get("plan"),
             "queue": views.queue(farm_db.candidate_queue(conn, mode), market.condition_id),
             "queue_mode": mode, "skipped": skipped,
+            "sole_count": len(farm_db.candidate_queue(conn, farm_db.SOLE)),
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
             "ev": views.ev_check(market.metrics, forms.parse_p_true(values["p_true"]),
                                  values["naked_budget"], ev_margin,
@@ -102,7 +104,8 @@ def routes(ctx):
             if ids:
                 return see_other(views.review_url(ids[0], mode))
             return ctx.render(request, "review_empty.html", now, ctx.snapshot(conn, now),
-                              page="review", queue_mode=mode)
+                              page="review", queue_mode=mode,
+                              sole_count=len(farm_db.candidate_queue(conn, farm_db.SOLE)))
 
     @router.get("/review/{condition_id}", response_class=HTMLResponse)
     def review(request: Request, condition_id: str, mode: Optional[str] = None,
@@ -126,10 +129,12 @@ def routes(ctx):
         return live, views.rewards_state(info, cid, rates)
 
     def quotable(row, cfg, prior):
-        """(whether the farmer would quote this candidate now, its rewards state).
-        A market whose book cannot be read counts, so its page can show why."""
+        """(whether the farmer would quote this candidate now, its rewards state),
+        with a sole bid allowed where the scan planned one. A market whose book
+        cannot be read counts, so its page can show why."""
         try:
-            live, active = plan_now(row, cfg, prior)
+            live, active = plan_now(row, cfg, prior,
+                                    sole_bid=views.sole_plan(json.loads(row["metrics"])))
         except Exception:
             return True, None
         return bool(live.orders), active

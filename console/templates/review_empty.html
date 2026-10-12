@@ -5,5 +5,5 @@
   <h1>Review queue</h1>
   <p class="sub">Undecided candidates, best ranked first.</p>
 </header>
-<div class="empty">No undecided candidates. <a href="/discover">Run a scan</a> to find more, or <a href="/discover?status=all">browse every market</a>.</div>
+<div class="empty">No undecided candidates. <a href="/discover">Run a scan</a> to find more, or <a href="/discover?status=all">browse every market</a>.{% if sole_count and queue_mode != 'sole' %} {{ '{:,}'.format(sole_count) }} sole candidate{{ ' lists' if sole_count == 1 else 's list' }} under <a href="/review?mode=sole">Sole</a>.{% endif %}</div>
 {% endblock %}

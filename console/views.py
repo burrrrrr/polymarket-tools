@@ -12,7 +12,7 @@ from typing import Callable, Iterable, NamedTuple, Optional
 from urllib.parse import quote, urlencode
 
 from farm import fill_cost, reward_farmer
-from farm.farm_db import EventKind, FarmerStatus, resting_order
+from farm.farm_db import SOLE, EventKind, FarmerStatus, resting_order
 from farm.reward_screener import (
     Skip,
     adjusted_mid,
@@ -67,7 +67,8 @@ class Snapshot(NamedTuple):
 
     markets holds the approved markets plus every market with a farm_state
     row; fills are the FILL events of the last 24 hours; rewards are
-    (date, condition_id, usd) rows of the last 30 days.
+    (date, condition_id, usd) rows of the last 30 days; candidates is the
+    length of the review queue.
     """
 
     status: Optional[FarmerStatus]
@@ -75,7 +76,7 @@ class Snapshot(NamedTuple):
     markets: dict
     fills: list
     rewards: list
-    counts: dict
+    candidates: int
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +215,7 @@ class Chrome:
 
 
 def chrome(snap, now, worker=NO_WORKER):
-    return Chrome(liveness(snap.status, now), snap.counts.get("candidate", 0),
+    return Chrome(liveness(snap.status, now), snap.candidates,
                   sum(s.phase in EARNING for s in snap.states.values()), worker)
 
 
@@ -1013,7 +1014,9 @@ def setting_rows(fields, group, status, overrides, bad_rows, defaults, submitted
 # ---------------------------------------------------------------------------
 
 DISCOVER_PAGE = 50
-MODES = ("floor", "budget")
+# Each planned mode a list filters by, and the tone of its badge.
+MODE_TONE = {"floor": "t-f", "budget": "t-b", SOLE: "t-c"}
+MODES = tuple(MODE_TONE)
 STATUS_FILTERS = ("candidate", "approved", "rejected", "retired", "all")
 STATUS_TONE = {"candidate": "t-n", "approved": "t-q", "rejected": "t-r", "retired": "t-c"}
 
@@ -1056,7 +1059,12 @@ class DiscoverRow:
 
 
 def mode_tone(mode):
-    return "t-b" if (mode or "").lower() == "budget" else "t-f"
+    return MODE_TONE.get((mode or "").lower(), "t-f")
+
+
+def sole_plan(metrics):
+    """Whether the scan planned a sole bid on this market."""
+    return (metrics.get("plan") or {}).get("mode") == SOLE
 
 
 def discover_row(rank, market, status, now):
@@ -1183,6 +1191,8 @@ class LiveReview:
     fill_source: str = "default"
     prior: Optional[fill_cost.Prior] = None
     pool_per_day: Optional[float] = None
+    # Whether the orders are a sole bid's, which has no economics.
+    sole: bool = False
 
     @property
     def share(self):
@@ -1211,16 +1221,18 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     A market the farmer already manages gets the book without a plan.
 
     A row with no p_true is valued at the book midpoint, as the scan values
-    it. Fills come from the history the scan stored shrunk toward prior, or
+    it, and its sole bid is capped by the ask alone, as the scan plans one.
+    Fills come from the history the scan stored shrunk toward prior, or
     prior alone without one; the console never reads a history itself, and
     the farmer would not bid until it has read one."""
     metrics = json.loads(row["metrics"])
     fav = metrics["market"].get("fav_outcome") or "favorite"
     long = OTHER_OUTCOME.get(fav, "longshot")
     book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
-    target, note, pool = reward_farmer.Target(book_mid, []), "", None
+    target, note, pool, sole = reward_farmer.Target(book_mid, []), "", None, None
     history = fill_cost.history_from_json(metrics.get("history"))
-    if row["p_true"] is None:
+    unpriced = row["p_true"] is None
+    if unpriced:
         row = {**dict(row), "p_true": book_mid}
     fm = reward_farmer.farm_market(row, info, cfg, now)
     if not isinstance(fm, Skip):
@@ -1233,10 +1245,15 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
         note = f"The farmer cannot manage this market: {fm.reason}."
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
-        sole = None
         if fm.sole_bid and not reward_farmer.supported(levels, fm, reward_farmer.Position(),
                                                        cfg):
-            sole = reward_farmer.sole_bid_target(fm, levels, reward_farmer.Position(), cfg, ())
+            sole_fm, sole_cfg = fm, cfg
+            if unpriced:
+                # The book midpoint of a market only a sole bid can quote sits
+                # cents under that bid, so it is no stand-in for a p_true here.
+                sole_fm, sole_cfg = fm._replace(p_true=1.0), cfg._replace(ev_margin=0.0)
+            sole = reward_farmer.sole_bid_target(sole_fm, levels, reward_farmer.Position(),
+                                                 sole_cfg, ())
         obs = reward_farmer.Observation(
             mid=book_mid, ask=reward_farmer.drop_ask(levels.asks, info.min_size), recent_asks=(),
             rewards_active=reward_farmer.rewards_active(info, fm.condition_id, total_rates),
@@ -1306,7 +1323,8 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     return LiveReview(now, fav, long, book_mid, mid, note, orders, strip,
                       list(reversed(ladder(ask_rows))), ladder(bid_rows),
                       outside_asks, outside_bids, target.fav.best,
-                      fill_cost.fill_source(history, prior, cfg.min_fav), prior, pool)
+                      fill_cost.fill_source(history, prior, cfg.min_fav), prior, pool,
+                      sole=target is sole)
 
 
 @dataclass(frozen=True)
@@ -1334,13 +1352,24 @@ def ev_check(metrics, p_true, budget_text, ev_margin, years_left):
     typed percent is invalid) and budget, by its own rule: the favorite bid
     never prices above floor_to_tick(p_true - ev_margin). The budget is held
     against what the planned longshot leg takes of it with years_left to the
-    end date (planned_budget_cost)."""
+    end date (planned_budget_cost).
+
+    A sole plan over the cap is not re-scored, because where its bid then
+    rests depends on the longshot bid the farmer picks against the live book.
+    Its longshot bid is sized to the budget, whatever the budget is."""
     plan, m = metrics.get("plan"), metrics.get("market", {})
     if p_true is None or not plan:
         return EvCheck("c-warn", [P_TRUE_ERROR])
     tick = m.get("tick") or 0.001
     bid, cap = plan["fav_bid_price"], floor_to_tick(p_true - ev_margin, tick)
     margin = f"p_true − {cents(ev_margin)}"
+    if sole_plan(metrics):
+        if bid <= cap + 1e-9:
+            return EvCheck("c-good", [f"Sole bid {cents(bid)} is within your {cents(cap)} cap "
+                                      f"({margin}): a fill is +EV."])
+        return EvCheck("c-warn", [f"Sole bid {cents(bid)} is over your {cents(cap)} cap "
+                                  f"({margin}): the farmer rests it at or under the cap, or "
+                                  f"not at all. The live plan shows which."])
     if bid <= cap + 1e-9:
         tone, lines = "c-good", [f"Bid {cents(bid)} is within your {cents(cap)} cap ({margin}): "
                                  f"a fill is +EV."]

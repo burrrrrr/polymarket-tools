@@ -91,6 +91,7 @@ class RenderedTipsTest(Writes):
         "/review/0xddd": {"budget", "band", "min_size", "band_strip", "ahead",
                           "holding_rewards", "p_true", "naked_budget", "capital_cap",
                           "ev_check", "start_paused", "sole_bid"},
+        "/review/0x777": {"sole", "sole_bid"},
         "/partials/review/0xddd/live?p_true=97&naked_budget=25": {
             "score_per_share", "ties_up", "FAV_BID", "LONG_BID", "est_share", "est_daily",
             "fill_cost", "fills_per_day", "net_daily", "planned_capital", "apr", "net_apr"},

@@ -47,6 +47,32 @@ fill histories.
    market that read no history is valued on the prior alone, marked `p` in
    the table.
 
+A market the scan would skip for the shape of its book is kept when a sole
+bid can quote it. That covers four skips: `favorite too cheap`, `fragile
+midpoint`, `favorite bid outside band` and `no scoring longshot bid within
+the naked budget`. These are thin books with a wide spread, where no other
+maker supports a normal bid. The scan plans the orders the farmer would rest
+there as a sole bid (see [Market lifecycle](farmer.md#market-lifecycle)) and
+stores the market with mode `sole`:
+
+- The favorite bid sits two ticks above the lowest price that keeps the
+  longshot bid scoring, and makes the midpoint itself. The scan has no
+  p_true, so only the ask caps it. Your p_true at approval sets the real cap.
+- The reward is the pool times our share at that midpoint, which is the
+  whole pool where no other maker scores there.
+- No fills are valued, as the farmer values none for a sole bid. The fill
+  columns are empty, net equals the reward, and the market reads no fill
+  history.
+- A wide spread is not near certainty. The scan cannot tell a sure thing
+  with a thin book from a market nobody agrees on. Approve one only if you
+  are near certain of it, and allow a sole bid on it, or the farmer will rest
+  nothing there.
+
+To find these, the scan reads the book of any market whose listing price is
+0.70 or more, where it used to stop at `--min-fav`. A wide spread puts the
+listing price well under the midpoint a sole bid would make. That roughly
+doubles the books read and adds a few seconds.
+
 The prior comes from the random sample because the top markets are the
 busiest, while most of the markets the prior values trade little. A prior fit
 from the top would cost every quiet market's fills too high. The draw
@@ -76,7 +102,7 @@ cannot narrow the sample to the busy markets it spared.
 
 | Column | Meaning |
 | --- | --- |
-| `mode` | `floor` or `budget`, as above |
+| `mode` | `floor`, `budget` or `sole`, as above |
 | `fav` | Favorite outcome and its size-adjusted midpoint in cents |
 | `pool$` | The market's whole daily reward pool in USD, sponsored rewards included |
 | `v` | Max spread from the midpoint that still scores, in cents |

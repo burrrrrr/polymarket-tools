@@ -402,12 +402,21 @@ _MUTE_MATCHES = ("(mutes.kind = 'event' "
 # Muting decides nothing, so decided rows always show.
 MUTED = f"(status = 'candidate' AND EXISTS (SELECT 1 FROM mutes WHERE {_MUTE_MATCHES}))"
 
+# The planned mode of a market no other maker's bid supports, as
+# reward_screener.Mode.SOLE stores it. A scan keeps hundreds of them, most
+# with a $1 pool, so an undecided one lists and counts only under its own
+# mode. Decided rows always show.
+SOLE = "sole"
+_MODE = "json_extract(metrics, '$.plan.mode')"
+SOLE_CANDIDATE = f"(status = 'candidate' AND {_MODE} IS '{SOLE}')"
+
 
 def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, limit,
                    offset):
     """(markets, total) by rank, filtered; each filter applies only when given.
 
-    mode is the planned mode ('floor' or 'budget'). min_days counts from now to
+    mode is the planned mode ('floor', 'budget' or 'sole'); without one, sole
+    candidates are left out (see SOLE_CANDIDATE). min_days counts from now to
     the end date less buffer_days, the farmer's cutoff. Stale and muted
     candidates are always left out (see CURRENT and MUTED).
     """
@@ -416,8 +425,10 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
         where.append(f"status IN ({', '.join('?' * len(statuses))})")
         params.extend(statuses)
     if mode:
-        where.append("json_extract(metrics, '$.plan.mode') = ?")
+        where.append(f"{_MODE} = ?")
         params.append(mode)
+    else:
+        where.append(f"NOT {SOLE_CANDIDATE}")
     if text:
         pattern = "%" + "".join("!" + c if c in "!%_" else c for c in text) + "%"
         where.append("(question LIKE ? ESCAPE '!' OR slug LIKE ? ESCAPE '!')")
@@ -434,13 +445,13 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
 
 def candidate_queue(conn, mode=None, after=None):
     """Condition ids of the undecided candidates neither stale nor muted, best
-    rank first; mode ('floor' or 'budget') keeps only that planned mode. after
-    (a condition id) keeps only those the queue orders after that market, which
-    holds its place even when it has left the queue."""
-    where, params = "", []
+    rank first; mode ('floor', 'budget' or 'sole') keeps only that planned
+    mode, and without one the sole candidates are left out (see
+    SOLE_CANDIDATE). after (a condition id) keeps only those the queue orders
+    after that market, which holds its place even when it has left the queue."""
+    where, params = f" AND NOT {SOLE_CANDIDATE}", []
     if mode:
-        where += " AND json_extract(metrics, '$.plan.mode') = ?"
-        params.append(mode)
+        where, params = f" AND {_MODE} = ?", [mode]
     if after:
         where += (" AND (rank_score, condition_id) < "
                   "(SELECT rank_score, condition_id FROM markets WHERE condition_id = ?)")
@@ -1110,10 +1121,6 @@ def read_markets(conn, condition_ids=(), statuses=()):
         ids + sts,
     ).fetchall()
     return [_market(r) for r in rows]
-
-
-def status_counts(conn):
-    return dict(conn.execute("SELECT status, COUNT(*) FROM markets GROUP BY status"))
 
 
 def read_farmer_status(conn):

@@ -21,7 +21,9 @@ GLOSSARY = {
     "mode": Term("Mode", "Floor or budget: where the scan planned the longshot bid. Floor is the "
                          "free zone, at a price where a fill would give a favorite buyer under "
                          "5% a year, which the naked budget does not limit. Budget is above it, "
-                         "within the budget."),
+                         "within the budget. Sole is a market no other bid supports, which "
+                         "only a sole bid can quote. Undecided sole candidates list under "
+                         "the Sole filter alone."),
     "floor": Term("Floor", "The scan planned the longshot bid in the free zone: at a price where "
                            "a fill would give a favorite buyer under 5% a year to the end date, "
                            "0.1c on most markets. Almost no buyer takes that, so where a share "
@@ -35,6 +37,11 @@ GLOSSARY = {
                              "zone qualifies. That bid is real risk, capped by the market's "
                              "naked budget, and the favorite bid shrinks to what it balances. No "
                              "longshot bid rests where a fill would give over 20% a year."),
+    "sole": Term("Sole", "No other bid supports this market, so the scan planned a sole bid. "
+                         "The favorite bid sits two ticks above the lowest price that keeps the "
+                         "longshot bid scoring, and makes the midpoint itself. It earns the "
+                         "whole pool while no other maker scores. Nothing values its fills, so "
+                         "approve only a market you are near certain of."),
     "favorite": Term("Favorite", "The outcome priced at 90c or more. The farmer bids on it and "
                                  "is happy to be filled below your p_true."),
     "longshot": Term("Longshot", "The other outcome. The farmer bids on it only so the "

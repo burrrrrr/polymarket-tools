@@ -357,11 +357,38 @@ class ControlsTest(ScratchDb):
         conn = self.open()
         farm_db.store_scan(conn, [
             farm_db.ScanRow(cid, cid, cid, None, rank, json.dumps({"plan": {"mode": mode}}))
-            for cid, rank, mode in (("0xa", 3.0, "floor"), ("0xb", 2.0, "budget"),
-                                    ("0xc", 1.0, "floor"))], ["0xa", "0xb", "0xc"], NOW)
+            for cid, rank, mode in (("0xs", 4.0, "sole"), ("0xa", 3.0, "floor"),
+                                    ("0xb", 2.0, "budget"), ("0xc", 1.0, "floor"),
+                                    ("0xt", 0.5, "sole"))],
+            ["0xs", "0xa", "0xb", "0xc", "0xt"], NOW)
         self.assertEqual(farm_db.candidate_queue(conn), ["0xa", "0xb", "0xc"])
         self.assertEqual(farm_db.candidate_queue(conn, "floor"), ["0xa", "0xc"])
         self.assertEqual(farm_db.candidate_queue(conn, "budget"), ["0xb"])
+        self.assertEqual(farm_db.candidate_queue(conn, "sole"), ["0xs", "0xt"])
+        self.assertEqual(farm_db.candidate_queue(conn, "sole", after="0xs"), ["0xt"])
+        self.assertEqual(farm_db.candidate_queue(conn, after="0xa"), ["0xb", "0xc"])
+
+    def test_search_lists_sole_candidates_only_under_their_own_mode(self):
+        conn = self.open()
+        farm_db.store_scan(conn, [
+            farm_db.ScanRow(cid, cid, cid, None, rank, metrics)
+            for cid, rank, metrics in (("0xs", 4.0, '{"plan": {"mode": "sole"}}'),
+                                       ("0xt", 3.0, '{"plan": {"mode": "sole"}}'),
+                                       ("0xa", 2.0, '{"plan": {"mode": "floor"}}'),
+                                       ("0xbare", 1.0, "{}"))],
+            ["0xs", "0xt", "0xa", "0xbare"], NOW)
+        farm_db.approve_market(conn, "0xt", 0.99, 10.0, now=NOW)
+
+        def search(mode):
+            rows, total = farm_db.search_markets(
+                conn, statuses=(), mode=mode, text="", min_days=None, buffer_days=7, now=NOW,
+                limit=50, offset=0)
+            self.assertEqual(total, len(rows))
+            return [r.condition_id for r in rows]
+
+        # Decided, a sole market lists like any other.
+        self.assertEqual(search(None), ["0xt", "0xa", "0xbare"])
+        self.assertEqual(search("sole"), ["0xs", "0xt"])
 
     def test_set_approval_paused_sets_the_flag_and_otherwise_keeps_it(self):
         conn = self.open()

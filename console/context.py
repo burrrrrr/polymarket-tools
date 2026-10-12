@@ -52,7 +52,8 @@ class Context:
             TOKEN_FIELD=security.TOKEN_FIELD, TOKEN_HEADER=security.TOKEN_HEADER,
             CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
             polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
-            review_url=views.review_url, MODES=views.MODES, glossary=glossary.GLOSSARY,
+            review_url=views.review_url, MODES=views.MODES, mode_tone=views.mode_tone,
+            glossary=glossary.GLOSSARY,
             REJECT_REASONS=list(farm_db.RejectReason),
             static=lambda name: f"/static/{name}?v={versions[name]}")
         self.rules = remote.TtlCache(fetch_rules, remote.RULES_TTL, clock)
@@ -97,7 +98,7 @@ class Context:
             fills=farm_db.read_events(conn, kinds=(EventKind.FILL,),
                                       since=now - timedelta(hours=24)),
             rewards=farm_db.read_rewards(conn, (now - timedelta(days=29)).strftime("%Y-%m-%d")),
-            counts=farm_db.status_counts(conn),
+            candidates=len(farm_db.candidate_queue(conn)),
         )
 
     def render(self, request, template, now, snap, status_code=200, **context):

@@ -42,6 +42,9 @@ FLOOR_BOOK = Levels(bids=[(0.985, 1000.0), (0.95, 1000.0)], asks=[(0.995, 1000.0
                     tick=0.001)
 # Its favorite fell since the scan: mid 0.885 is under min_fav, so the farmer would not quote.
 FALLEN_BOOK = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+# No other bid supports a favorite bid here. A sole bid at 96.1c, two ticks over the
+# lowest that keeps a 0.1c longshot bid in the 3.5c band, makes a 96.55c midpoint.
+SOLE_BOOK = Levels(bids=[(0.80, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
 
 
 def assessed_row(cid, slug, book, now, rank, question=None, days=100, **topic):
@@ -52,6 +55,23 @@ def assessed_row(cid, slug, book, now, rank, question=None, days=100, **topic):
     return reward_screener.scan_row(a._replace(rank_score=rank))
 
 
+def sole_row(cid, slug, now, rank):
+    """The scan row of a market only a sole bid can quote, read on SOLE_BOOK:
+    a plan of mode sole that earns the whole pool, with no fills valued."""
+    row = assessed_row(cid, slug, FLOOR_BOOK, now, rank)
+    capital = 0.961 * 520.29 + 0.001 * 10000.0
+    return row._replace(metrics=json.dumps({
+        **json.loads(row.metrics),
+        "plan": {"mid": 0.9655, "fav_bid_price": 0.961, "fav_bid_size": 520.29,
+                 "fav_bid_score": 0.7594, "low_price": 0.001, "low_size": 10000.0,
+                 "low_score": 0.0018, "mode": "sole"},
+        "mid": 0.9655, "book_mid": 0.885, "best_bid": 0.80, "best_ask": 0.97,
+        "comp_q": 0.0, "share": 1.0, "est_daily_usd": 50.0, "net_daily_usd": 50.0,
+        "capital_usd": capital, "apr": 50.0 / capital * 365, "net_apr": 50.0 / capital * 365,
+        "fills_per_day": None, "fill_cost_usd": None, "loss_per_share": None,
+        "fill_source": None, "history": None}))
+
+
 def form(client, **fields):
     return {"console_token": client.app_token, **fields}
 
@@ -60,7 +80,8 @@ class Writes(Console):
     """Console with real assessments: D (budget, rank 30), E (floor, rank 20) and
     F (floor, rank 10) are candidates; A and B are approved. D ends in 40 days,
     where the prices that score on its book offer a favorite buyer over 5% a
-    year, and the others in 100."""
+    year, and the others in 100. G (rank 50) and H (rank 40) are sole
+    candidates, which outrank the rest and list only under the sole filter."""
 
     def setUp(self):
         super().setUp()
@@ -69,7 +90,9 @@ class Writes(Console):
             assessed_row("0xeee", "echo", FLOOR_BOOK, self.now, 20.0),
             assessed_row("0xfff", "foxtrot", FLOOR_BOOK, self.now, 10.0),
             assessed_row(A, "alpha", FLOOR_BOOK, self.now, 5.0),
-        ], [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
+            sole_row("0x777", "golf", self.now, 50.0),
+            sole_row("0x888", "hotel", self.now, 40.0),
+        ], [A, B, C, "0xddd", "0xeee", "0xfff", "0x777", "0x888"], self.now)
         farm_db.reject_market(self.db, C, "not for us", farm_db.RejectReason.OTHER, self.now)
         self.client.app_token = self.app.state.token
 
@@ -718,6 +741,77 @@ class ReviewTest(Writes):
         self.assertEqual(resp.headers["location"], "/review?mode=floor")
         self.assertEqual(self.client.get("/review?mode=bogus").status_code, 422)
 
+    def test_sole_candidates_queue_apart_under_the_sole_filter(self):
+        sole_link = 'href="/review?mode=sole">Sole&nbsp;<span class="mono">2</span></a>'
+        self.assertIn(sole_link, self.client.get("/review/0xddd").text)
+        resp = self.client.get("/review?mode=sole", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0x777?mode=sole")
+        page = self.client.get("/review/0x777?mode=sole").text
+        self.assertIn("1 of 2 undecided sole candidates", page)
+        self.assertIn('href="/review/0x888?mode=sole">Next', page)
+        # Opened from the normal queue it is outside it, like a decided market.
+        self.assertIn("3 undecided candidates · this market is candidate, sole",
+                      self.client.get("/review/0x777").text)
+        resp = self.post("/review/0x777/reject", reason="other", note="", queue_mode="sole")
+        self.assertEqual(resp.headers["location"], "/review/0x888?mode=sole")
+        resp = self.post("/review/0x888/reject", reason="other", note="", queue_mode="sole")
+        self.assertEqual(resp.headers["location"], "/review?mode=sole")
+        self.assertIn("1 of 3 undecided candidates", self.client.get("/review/0xddd").text)
+
+    def test_an_empty_queue_points_to_the_sole_candidates(self):
+        for cid in ("0xddd", "0xeee", "0xfff"):
+            self.post(f"/review/{cid}/reject", reason="other")
+        page = self.client.get("/review").text
+        self.assertIn("No undecided candidates", page)
+        self.assertIn('2 sole candidates list under <a href="/review?mode=sole">Sole</a>.', page)
+        self.post("/review/0x777/reject", reason="other")
+        self.assertIn("1 sole candidate lists under", self.client.get("/review").text)
+        self.post("/review/0x888/reject", reason="other")
+        self.assertNotIn("sole candidate", self.client.get("/review?mode=sole").text)
+
+    def test_a_sole_candidate_opens_with_the_sole_bid_allowed_and_no_fill_figures(self):
+        page = self.client.get("/review/0x777?mode=sole").text
+        self.assertIn('<span class="badge t-c">SOLE<button', page)
+        self.assertIn("No other bid supports this market, so the scan planned a sole bid.", page)
+        self.assertIn(' checked> Allow sole bid', page)
+        self.assertNotIn("None", page)
+
+        def ev(p_true):
+            return self.client.get("/partials/review/0x777/ev",
+                                   params={"p_true": p_true, "naked_budget": "5"}).text
+        self.assertIn("Sole bid 96.1c is within your 97.0c cap", ev("99"))
+        # Under the scanned bid the cap moves the sole bid or ends it, and the
+        # longshot bid is sized to any budget, so neither is re-scored here.
+        capped = ev("97")
+        self.assertIn("Sole bid 96.1c is over your 95.0c cap", capped)
+        self.assertNotIn("scores", capped)
+        self.assertNotIn("budget", capped)
+        # Approved with the box cleared, the page shows the stored flag again.
+        self.post("/review/0x777/approve", p_true="99", naked_budget="10", capital="",
+                  queue_mode="sole")
+        self.assertEqual((self.row("0x777")["status"], self.row("0x777")["sole_bid"]),
+                         ("approved", 0))
+        self.assertNotIn(' checked> Allow sole bid', self.client.get("/review/0x777").text)
+        self.assertIn('<span class="badge t-c">SOLE<button',
+                      self.client.get("/markets/0x777").text)
+
+    def test_a_sole_candidate_previews_its_sole_bid_before_a_p_true_is_typed(self):
+        self.remote.books["tok-0x777"] = SOLE_BOOK
+        text = self.live("0x777", p_true="", sole_bid="1")
+        self.assertIn("the farmer would hold a sole bid", text)
+        self.assertIn("Buy No 96.1c", text)
+        self.assertIn("Buy Yes 0.1c", text)
+        self.assertIn("Until then only the ask caps the sole bid, as in the scan.", text)
+        self.assertNotIn("Wouldn't quote now", text)
+        self.assertNotIn("None", text)
+        # A p_true caps it as it caps the farmer's: 97% less the 2c margin is under 96.1c.
+        self.assertNotIn("Buy No 96.1c", self.live("0x777", p_true="97", sole_bid="1"))
+
+    def test_skip_counts_a_sole_candidate_no_other_bid_supports_as_quotable(self):
+        self.remote.books["tok-0x888"] = SOLE_BOOK
+        resp = self.client.get("/review/0x777/next-quotable?mode=sole", follow_redirects=False)
+        self.assertEqual(resp.headers["location"], "/review/0x888?mode=sole")
+
     def test_a_candidate_that_would_not_quote_now_offers_to_skip(self):
         self.remote.books["tok-0xddd"] = FALLEN_BOOK
         text = self.live(mode="budget")
@@ -1131,7 +1225,7 @@ class DiscoverTest(Writes):
             rows.append(assessed_row(f"0x{i:04d}", f"m-{i}", book, self.now, 1000.0 - i,
                                      question, days=40 if i % 10 == 0 else 200))
         farm_db.store_scan(self.db, rows, [r.condition_id for r in rows]
-                           + [A, B, C, "0xddd", "0xeee", "0xfff"], self.now)
+                           + [A, B, C, "0xddd", "0xeee", "0xfff", "0x777", "0x888"], self.now)
 
     def ids(self, query=""):
         return re.findall(r'<a href="/review/(0x\w+)(?:\?mode=\w+)?">',
@@ -1155,6 +1249,23 @@ class DiscoverTest(Writes):
                       self.client.get("/discover?mode=floor").text)
         self.assertIn('<a class="chip" href="/review/0x0000?mode=budget">Review</a>',
                       self.client.get("/discover?mode=budget").text)
+
+    def test_sole_candidates_list_only_under_the_sole_filter(self):
+        self.assertEqual(self.ids("?mode=sole"), ["0x777", "0x888"])
+        for query in ("?page=3", "?q=golf", "?status=all&q=golf"):
+            with self.subTest(query=query):
+                self.assertNotIn("0x777", self.ids(query))
+        page = self.client.get("/discover").text
+        self.assertIn("123 markets", page)
+        self.assertIn('status=candidate">Sole&nbsp;<span class="mono">2</span></a>', page)
+        listed = self.client.get("/discover?mode=sole").text
+        self.assertIn('<span class="badge t-c">sole</span>', listed)
+        self.assertNotIn("None", listed)
+        # Decided, it lists with its status like any market.
+        farm_db.set_approval(self.db, "0x777", 0.99, 10.0, None, now=self.now)
+        self.assertIn("0x777", self.ids("?status=approved"))
+        self.assertEqual(self.ids("?mode=sole"), ["0x888"])
+        self.assertEqual(self.ids("?mode=sole&status=all"), ["0x777", "0x888"])
 
     def test_search_matches_question_or_slug_literally(self):
         self.assertEqual(self.ids("?q=50%25"), ["0x0007"])
@@ -1260,6 +1371,10 @@ class NavAndAlertsTest(Writes):
             self.assertIn(f'<a href="{href}"', page)
         self.assertIn('Review queue <span class="badge t-n count">3</span>', page)
         self.assertNotIn("Coming in stage 3", page)
+        # The count is the queue's: a candidate whose rewards ended has left it.
+        farm_db.set_rewards_active(self.db, "0xfff", False)
+        self.assertIn('Review queue <span class="badge t-n count">2</span>',
+                      self.client.get("/").text)
 
     def test_alerts_link_to_their_actions(self):
         self.publish(stopped=self.now)

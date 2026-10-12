@@ -62,6 +62,7 @@ def routes(ctx):
             "fields": forms.SCAN_FIELDS, "values": values, "errors": errors or {},
             "categories": {forms.exclude_field(c): c for c in reward_screener.CATEGORIES},
             "refused": refused, "modes": views.MODES, "statuses": views.STATUS_FILTERS,
+            "sole_count": len(farm_db.candidate_queue(conn, farm_db.SOLE)),
             "triage_note": triage_note, "batch_default": forms.TRIAGE_BATCH_DEFAULT,
             **triage_status(conn),
         }, status_code=status_code)

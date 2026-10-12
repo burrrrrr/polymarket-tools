@@ -158,6 +158,17 @@ TWO_SIDED_ABOVE = 0.90
 # prefilter only drops markets that are clearly too cheap, and the real
 # midpoint check happens on the book.
 PREFILTER_SLACK = 0.03
+# The listing price that still gets a market's book read, when lower than
+# min_fav: a wide spread puts the listing price cents under the midpoint a
+# sole bid would make. Books read at 0.70 on 2026-10-12 found 402 markets a
+# sole bid could quote, 150 of them under the 0.877 min_fav of that scan.
+SOLE_LISTING_FAV = 0.70
+# Why assess skips a market for the shape of its book. A sole bid makes its
+# own midpoint, so assess_all asks assess_sole about each of these.
+SOLE_SKIPS = frozenset({
+    "favorite too cheap", "fragile midpoint", "favorite bid outside band",
+    "no scoring longshot bid within the naked budget",
+})
 
 # Categories a scan can leave out, each the listing tags (lowercase) that put
 # a market in it. Some NFL, tennis and UFC markets lack the Sports tag, hence
@@ -240,11 +251,13 @@ def tally(counter):
 
 class Mode(Enum):
     """A scan's label for a plan, by its longshot bid: FLOOR in the free zone
-    (under_free_return), BUDGET above it. The values are what scan rows
-    store."""
+    (under_free_return), BUDGET above it. SOLE is the plan of a market no
+    other bid supports, which only a sole bid can quote (assess_sole). The
+    values are what scan rows store."""
 
     FLOOR = "floor"
     BUDGET = "budget"
+    SOLE = "sole"
 
 
 class RewardMarket(NamedTuple):
@@ -902,6 +915,58 @@ def assess(market, levels, config, now, prior, history=None):
     )
 
 
+def assess_sole(market, levels, config, now):
+    """The Assessment of a market only a sole bid can quote, or None when
+    none can rest: reward_farmer.sole_bid_target's favorite and longshot bids
+    with the scan's capital and naked budget, as a plan of Mode.SOLE.
+
+    A scan has no p_true, so nothing caps the bid but the ask, and the human
+    who approves the market sets the cap. Nothing values the bid's fills
+    either, as the farmer does not value a sole bid's. The reward is the pool
+    times our share at the midpoint the bid makes, the whole pool where no
+    other maker scores there, and rank_score is that reward's yield over the
+    horizon.
+    """
+    # reward_farmer imports this module.
+    from farm.reward_farmer import scan_sole_bid
+    target = scan_sole_bid(market, levels, config, now)
+    if target is None:
+        return None
+    mid, fav, low = target
+    plan = QuotePlan(mid, fav.price, fav.size, fav.score, low.price, low.size, low.score,
+                     Mode.SOLE)
+    my_q = q_min(fav.score * fav.size, low.score * low.size, mid)
+    comp_q = competing_score(levels, mid, market.v, market.min_size)
+    reward = market.rate_per_day * my_q / (my_q + comp_q)
+    capital_usd = fav.size * fav.price + low.size * low.price
+    daily_yield = reward / capital_usd
+    days_left = days_until(market.end_date, config.expiry_buffer_days, now)
+    depth_ahead = sum(s for p, s in levels.asks if p < 1 - low.price - 1e-9)
+    return Assessment(
+        market=market,
+        book_mid=adjusted_mid(levels.bids, levels.asks, market.min_size),
+        mid=mid,
+        plan=plan,
+        comp_q=comp_q,
+        my_q=my_q,
+        share=my_q / (my_q + comp_q),
+        est_daily_usd=reward,
+        capital_usd=capital_usd,
+        daily_yield=daily_yield,
+        apr=daily_yield * 365,
+        days_left=days_left,
+        rank_score=daily_yield * min(days_left, config.horizon_cap_days),
+        depth_ahead=depth_ahead,
+        depth_ahead_ratio=depth_ahead / low.size,
+        floor_score=score(market.v, (1 - mid) - market.tick),
+        single_sided_ok=mid <= TWO_SIDED_ABOVE,
+        best_bid=best_price(levels.bids, market.min_size),
+        best_ask=best_price(levels.asks, market.min_size),
+        net_daily_usd=reward,
+        net_apr=daily_yield * 365,
+    )
+
+
 # ---------------------------------------------------------------------------
 # External data -> domain types
 # ---------------------------------------------------------------------------
@@ -948,7 +1013,8 @@ def screen_listing(item, total_rates, config, now):
     if len(tokens) != 2:
         return Skip("not binary")
     fav = max(tokens, key=lambda t: as_float(t.get("price")) or 0)
-    if (as_float(fav.get("price")) or 0) < config.min_fav - PREFILTER_SLACK:
+    floor = min(config.min_fav, SOLE_LISTING_FAV) - PREFILTER_SLACK
+    if (as_float(fav.get("price")) or 0) < floor:
         return Skip("favorite too cheap")
 
     return RewardMarket(
@@ -1442,6 +1508,8 @@ def run_scan(config, now, prior, rejected=frozenset(), on_stage=lambda stage: No
     for a in ranked:
         if len(top) == int(config.tape_markets):
             break
+        if a.plan.mode is Mode.SOLE:
+            continue
         if a.market.condition_id in rejected:
             passed_over += 1
         else:
@@ -1486,16 +1554,21 @@ def assess_all(candidates, config, now, prior, histories):
     """(assessments by rank_score, best first, a Counter of why the rest were
     skipped, and the markets whose fills were valued: those kept and those
     whose fills cost too much) of (market, levels, Gamma info) candidates,
-    each valued on prior and on its own history when histories holds one."""
+    each valued on prior and on its own history when histories holds one. A
+    market skipped for the shape of its book is kept where a sole bid can
+    quote it (assess_sole), with no fills valued."""
     assessments, skipped, valued = [], Counter(), []
     for market, levels, info in candidates:
         result = assess(market, levels, config, now, prior, histories.get(market.condition_id))
+        if isinstance(result, Skip) and result.reason in SOLE_SKIPS:
+            result = assess_sole(market, levels, config, now) or result
         if isinstance(result, Skip):
             skipped[result.reason] += 1
             if result.reason == FILLS_COST_TOO_MUCH:
                 valued.append(market)
             continue
-        valued.append(market)
+        if result.plan.mode is not Mode.SOLE:
+            valued.append(market)
         if info is not None:
             result = result._replace(
                 volume24hr=info.volume24hr, holding_rewards=info.holding_rewards
@@ -1552,10 +1625,12 @@ def print_table(assessments):
         m = a.market
         fav = f"{m.fav_outcome[:7]} {a.book_mid * 100:.1f}"
         holding = {True: "H", False: "-", None: "?"}[a.holding_rewards]
+        fills = ("--" if a.fills_per_day is None
+                 else f"{a.fills_per_day:.1f}{FILL_SOURCE_MARK[a.fill_source]}")
         print(
             f"{rank:>3} {a.plan.mode.value:6} {fav:>14} {m.rate_per_day:>6.0f} "
             f"{m.v * 100:>4.1f} {m.min_size:>4.0f} {a.est_daily_usd:>7.2f} "
-            f"{a.fills_per_day:>5.1f}{FILL_SOURCE_MARK[a.fill_source]} "
+            f"{fills:>6} "
             f"{a.net_daily_usd:>7.2f} {a.capital_usd:>6.0f} {a.apr * 100:>6.0f} "
             f"{a.net_apr * 100:>6.0f} {a.days_left:>5.0f} "
             f"{a.depth_ahead_ratio:>6.1f} {human_volume(a.volume24hr):>7} "
@@ -1741,7 +1816,7 @@ Examples:
                       metavar="CATEGORIES",
                       help=f"Comma-separated categories to skip, or 'none' to keep all; from "
                            f"{', '.join(CATEGORIES)} (default: {excluded})")
-    scan.add_argument("--mode", choices=("any", "floor", "budget"), default="any",
+    scan.add_argument("--mode", choices=("any", "floor", "budget", "sole"), default="any",
                       help="Show only this mode in the table (all are stored)")
     scan.add_argument("--top", type=int, default=40, help="Rows to show (default: 40)")
     scan.add_argument("--json", metavar="PATH", help="Also dump every assessment here")
