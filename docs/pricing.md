@@ -162,6 +162,18 @@ the midpoint, L(b) is negative: the share is worth more than the bid pays.
 A bid rests for its reward, so that fill costs nothing and is never counted
 as income.
 
+A bid behind a deep book is charged no fills. The model fills the whole bid
+whatever rests ahead of it, but a sweep has to take the shares bid above your
+price before it reaches your bid. So a bid with more than 20,000 shares bid
+above its price (`DEPTH_FREE_SHARES` in `farm/reward_screener.py`) is valued
+with a rate of zero, and its net is its reward. Shares at the bid's own price
+do not count. Of the 23 fills of the farmer's favorite bids from 2026-10-10
+to 2026-10-12 whose book was recorded, 19 had at most 1.1 times the bid's
+size ahead, and the deepest of the other four had 12,582 shares ahead. In
+the trade histories of the 273 quoting markets read on 2026-10-12, which
+cover 13,921 market-days, an hour of selling into bids came to over 20,000
+shares 37 times, once in 376 market-days.
+
 The farmer chooses Q as well as b. A market's capital is the most its
 favorite bid may be, favorite shares already held counted at cost. At each
 price the farmer values all of the capital left, then three quarters, a half,
@@ -170,10 +182,14 @@ minimum. The reward is a share of the pool, so each further share earns less.
 L grows with Q, because a larger inventory sells more slowly. So the size
 that nets the most can be under the capital, and the farmer rests that size
 at the price where it nets the most. Where the fills of all the capital cost
-nothing, no smaller size nets more. The naked budget is a separate limit
-where the longshot bid sits outside the free zone: a bid it cannot balance
-shrinks to what it balances, whatever the capital. A scan sizes its bid at
-all of `--capital`.
+nothing, no smaller size nets more. A bid behind a deep book therefore rests
+at all of the capital left. At a price with more than 20,000 shares ahead no
+size is charged a fill, and the largest size earns the most reward. The price
+is chosen by the same net, so the bid can also move to the price behind that
+depth where it earns the most. The naked budget is a separate limit where the
+longshot bid sits outside the free zone: a bid it cannot balance shrinks to
+what it balances, whatever the capital. A scan sizes its bid at all of
+`--capital`.
 
 A scan holds no shares and has no p_true, so it values a fill with an
 inventory of the bid alone and the book midpoint as p_true. The farmer's ask

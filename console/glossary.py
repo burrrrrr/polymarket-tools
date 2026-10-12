@@ -72,7 +72,8 @@ GLOSSARY = {
                                        "once an hour, shrunk toward the rate the last scan "
                                        "pooled across markets. Without the market's history "
                                        "it is that pooled rate alone, and the farmer does not "
-                                       "bid."),
+                                       "bid. A bid with more than 20,000 shares bid above it "
+                                       "is charged no fills."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
                                        "minus what it is worth today at the hurdle rate. The "
                                        "farmer's ask sells it slowly, measured at 67% of a "

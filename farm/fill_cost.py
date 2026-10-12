@@ -25,7 +25,8 @@ hour. Few markets see enough sweeps to be rated alone, so each count is
 shrunk toward a Prior that a scan pools across markets, by as many days of
 evidence as the markets' spread around the pooled rate is worth. A bid of Q
 shares then fills Q times the FillCurve's rate at its distance a day: a sweep
-that reaches it fills all of it.
+that reaches it fills all of it. reward_screener.value_quote charges a bid
+behind more than DEPTH_FREE_SHARES no fills at all.
 
 A History also times how long the mid took to be back where each sweep at
 EXIT_DISTANCE found it (exits, held_days), a Prior pools that

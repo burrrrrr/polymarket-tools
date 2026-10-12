@@ -26,8 +26,10 @@ farmer rests on both sides, in four slots per market:
             capital, whose rewards net of expected fills (from the market's
             fill history, shrunk toward the last scan's cross-market prior)
             are highest, never above p_true minus a margin, and only when
-            that net beats the orders without it. Until the market's history
-            is read it does not rest at all.
+            that net beats the orders without it. A bid with more than
+            reward_screener.DEPTH_FREE_SHARES bid above it is charged no
+            fills, so it rests at all of the capital left. Until the
+            market's history is read it does not rest at all.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same, and never under its average

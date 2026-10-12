@@ -154,6 +154,18 @@ DEFAULT_NAKED_BUDGET = 10.0
 # Above this midpoint only two-sided liquidity scores.
 TWO_SIDED_ABOVE = 0.90
 
+# A favorite bid with more than this many shares resting ahead of it is
+# charged no fills (shares_ahead). Any other bid is charged its whole size
+# each time a sweep reaches its price, whatever rests ahead, and behind about
+# 120,000 shares that charge shrank one bid to a quarter of its capital. Of
+# the 23 fills of the farmer's favorite bids from 2026-10-10 to 2026-10-12
+# whose book was recorded, 19 had at most 1.1 times the bid's size ahead, and
+# the deepest of the other four had 12,582 shares ahead. In the trade
+# histories of the 273 quoting markets read on 2026-10-12 (13,921
+# market-days), an hour of selling into bids came to over 20,000 shares 37
+# times, once in 376 market-days. 20,000 is a value chosen by hand.
+DEPTH_FREE_SHARES = 20_000
+
 # The favorite's sampling price is a last-trade-ish hint, not the book; the
 # prefilter only drops markets that are clearly too cheap, and the real
 # midpoint check happens on the book.
@@ -739,6 +751,13 @@ def fav_bid_candidates(levels, v, tick, min_size, max_lead, cap=None):
     return prices
 
 
+def shares_ahead(levels, price):
+    """The shares bid above price in a favorite book, which a sell sweep
+    takes before it reaches a bid at price. Shares at price itself do not
+    count."""
+    return sum(s for p, s in levels.bids if p > price + 1e-9)
+
+
 def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook, held=0.0,
                 sale_price=None):
     """What a configuration of our quotes earns per day, net of what its fills cost.
@@ -749,23 +768,26 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
     for a scan or a preview. The reward is our share of the pool against
     competing_score. The whole bid fills each time a sweep reaches past its
     distance below mid: a sweep would find our bid in the book, so mid is the
-    one our quotes create. A fill loses its price less fill_cost.share_value:
-    the share sells at sale_price, the ask the farmer would rest for it,
-    credited never over p_true, or at p_true without one, at the rate that
-    ask sells the inventory the fill leaves, fill_cost.sales_per_day of held
-    plus the bid.
+    one our quotes create. A bid with more than DEPTH_FREE_SHARES ahead of it
+    in levels (shares_ahead) is charged no fills, and its loss_per_share
+    still says what a filled share would lose. A fill loses its price less
+    fill_cost.share_value: the share sells at sale_price, the ask the farmer
+    would rest for it, credited never over p_true, or at p_true without one,
+    at the rate that ask sells the inventory the fill leaves,
+    fill_cost.sales_per_day of held plus the bid.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
     if bid is None:
         return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0)
     price, size = bid
+    deep = shares_ahead(levels, price) > DEPTH_FREE_SHARES
     return QuoteValue(
         price=price,
         size=size,
         capital_usd=capital_usd,
         reward_per_day=reward,
-        fills_per_day=size * outlook.fills.per_day(mid - price),
+        fills_per_day=0.0 if deep else size * outlook.fills.per_day(mid - price),
         loss_per_share=price - fill_cost.share_value(
             p_true, p_true if sale_price is None else min(sale_price, p_true),
             fill_cost.sales_per_day(held + size), outlook.years_left, outlook.hurdle_rate),

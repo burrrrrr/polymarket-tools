@@ -1629,6 +1629,19 @@ class SizeChoiceTest(unittest.TestCase):
         self.assertEqual(best.fill_cost_per_day, 0.0)
         self.assertEqual((best.price, best.size), (0.985, 507.61))
 
+    def test_a_bid_behind_over_20_000_shares_rests_all_its_capital(self):
+        # Behind 20,000 shares at 96.9c half the capital nets the most, at
+        # 96.4c as on POOL_BOOK. One share more there and no bid from 96.8c
+        # down is charged a fill, so all $2,000 rests at 96.8c for its reward.
+        at_limit, over = (POOL_BOOK._replace(bids=[(0.969, shares)])
+                          for shares in (20_000.0, 20_001.0))
+        best = self.chosen(book=at_limit)
+        self.assertEqual((best.price, best.size), (0.964, 1037.34))
+        best = self.chosen(book=over)
+        self.assertEqual((best.price, best.size), (0.968, 2066.11))
+        self.assertEqual(best.fill_cost_per_day, 0.0)
+        self.assertEqual(best.net_per_day, best.reward_per_day)
+
     def test_doubling_the_capital_does_not_lower_the_net_chosen(self):
         # $1,000 buys the 1,037 shares that net the most, and more capital
         # leaves the bid there: all of $1,000 is half of $2,000, a quarter of
@@ -1701,6 +1714,9 @@ class SizeChoiceTest(unittest.TestCase):
             "Newsom holding 5,000": (POOL._replace(capital=6800.0), POOL_BOOK, held, CFG, FEW),
             "Newsom at a 1,100-share minimum": (POOL._replace(min_size=1100.0), POOL_BOOK,
                                                 Position(), CFG, FEW),
+            "Newsom behind 20,001 shares": (
+                POOL, POOL_BOOK._replace(bids=[(0.969, 20_001.0), (0.950, 5000.0)]), Position(),
+                CFG, FEW),
             "Trump": (TRUMP, TRUMP_BOOK, Position(), CFG, TRUMP_FILLS),
             "OpenSI": (OPENSI, OPENSI_BOOK, OPENSI_HELD, CFG, QUIET),
             "alone in the band": (ALONE, ALONE_BOOK, Position(), CFG, FREE),

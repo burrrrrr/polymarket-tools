@@ -577,6 +577,39 @@ class ValueQuoteTest(unittest.TestCase):
         self.assertAlmostEqual(value.net_per_day, 50.0)
         self.assertAlmostEqual(value.net_apr, 50.0 * 365 / 94.0)
 
+    def test_a_bid_behind_over_20_000_shares_is_charged_no_fills(self):
+        # 12,000 and 8,001 shares rest above the 94c bid. It is valued as a
+        # bid no sweep reaches, and a filled share would lose what it loses
+        # in the thin book, where the same sweeps cost.
+        fills = outlook(curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0), years=1.0)
+        quote = (0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0, 0.96)
+        deep = self.BOOK._replace(bids=[(0.955, 12_000.0), (0.95, 8_001.0)])
+        value = reward_screener.value_quote(deep, *quote, fills)
+        self.assertEqual(value.fills_per_day, 0.0)
+        self.assertEqual(value.fill_cost_per_day, 0.0)
+        self.assertEqual(value, reward_screener.value_quote(deep, *quote,
+                                                            outlook(NO_FILLS, years=1.0)))
+        self.assertGreater(value.reward_per_day, 0.0)
+        self.assertEqual(value.net_per_day, value.reward_per_day)
+        thin = reward_screener.value_quote(self.BOOK, *quote, fills)
+        self.assertEqual(value.loss_per_share, thin.loss_per_share)
+        self.assertGreater(thin.fill_cost_per_day, 0.0)
+
+    def test_20_000_shares_ahead_or_depth_at_the_bids_own_price_is_charged_its_fills(self):
+        # Exactly 20,000 shares ahead are not over 20,000, and the shares at
+        # the bid's own 94c and under it are not ahead of it.
+        fills = outlook(curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0), years=1.0)
+        quote = (0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0, 0.96)
+        thin = reward_screener.value_quote(self.BOOK, *quote, fills)
+        books = {"20,000 ahead": [(0.955, 12_000.0), (0.95, 8_000.0)],
+                 "at its own price": [(0.95, 100.0), (0.94, 50_000.0), (0.93, 50_000.0)]}
+        for name, bids in books.items():
+            with self.subTest(name):
+                value = reward_screener.value_quote(self.BOOK._replace(bids=bids), *quote, fills)
+                self.assertEqual((value.fills_per_day, value.loss_per_share),
+                                 (thin.fills_per_day, thin.loss_per_share))
+                self.assertGreater(value.fill_cost_per_day, 0.0)
+
     def test_no_favorite_bid_earns_the_reward_with_no_fills(self):
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, None,
                                             5.0, 0.98, outlook(curve(1e6)))

@@ -108,7 +108,7 @@ cannot narrow the sample to the busy markets it spared.
 | `v` | Max spread from the midpoint that still scores, in cents |
 | `min` | Minimum order size that scores, in shares |
 | `est$/d` | Your estimated daily reward: pool times your share of the score |
-| `fill/d` | Favorite shares a day expected to fill your bid; `h` from the market's history, `p` from a scan's fill prior alone, `d` from the built-in default prior alone |
+| `fill/d` | Favorite shares a day expected to fill your bid; `h` from the market's history, `p` from a scan's fill prior alone, `d` from the built-in default prior alone. 0 for a bid with more than 20,000 shares bid above it |
 | `net$/d` | `est$/d` less `fill/d` times the loss per filled share |
 | `cap$` | Capital both bids tie up |
 | `APR%` | `est$/d` divided by `cap$`, times 365, before fill costs |
