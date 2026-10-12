@@ -83,7 +83,8 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                favorite bid, the market rests sole_bid_target's orders: the
                favorite bid just above the lowest price that keeps the
                longshot bid scoring, and the longshot bid as it rests, or
-               higher in its free zone when no favorite bid fits around it.
+               higher, up to SOLE_BID_FREE_RETURN a year, when the favorite
+               bid cannot rest its full lead around it.
                With no other maker scoring, that earns the whole pool. It lasts
                until the other bids have supported a favorite bid again for
                five minutes without a break, an ask drop cools the market
@@ -241,8 +242,8 @@ from farm.reward_screener import (
     round_size_down,
     score,
     sized_without_budget,
+    price_offering,
     tick_decimals,
-    under_free_return,
     value_quote,
 )
 from polymarket import region
@@ -268,6 +269,10 @@ SOLE_BID_LEAD_TICKS = 2
 # 2026-10-09 to 12), and each round trip replaces both bids, which score
 # nothing for ~30 seconds each time. Holding on costs only a lower share.
 SOLE_BID_EXIT_S = 300
+# Where a sole-bid plan may rest its longshot bid above the lowest tick: a
+# fill offers the favorite buyer under this a year. Wider than FREE_RETURN,
+# which also frees a bid of the naked budget: here naked_room always caps it.
+SOLE_BID_FREE_RETURN = 0.07
 # A favorite bid resting up to this far above that target stays the sole
 # bid. The target moves a tick for each tick of the ask, and a replacement
 # scores nothing for ~30 seconds with no other maker scoring.
@@ -1005,6 +1010,16 @@ def support_held(since, phase, now):
     return phase is not Phase.SOLE_BID or (now - since).total_seconds() >= SOLE_BID_EXIT_S
 
 
+def sole_long_allowed(price, fm):
+    """Whether a sole-bid plan may rest its longshot bid at price: where a
+    fill offers the favorite buyer under SOLE_BID_FREE_RETURN a year, or at
+    the lowest tick unless that offers over MAX_RETURN."""
+    years_left = fm.zones.years_left
+    if price <= fm.tick + 1e-9:
+        return not over_max_return(price, years_left)
+    return price < price_offering(SOLE_BID_FREE_RETURN, years_left)
+
+
 def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
     """The orders a market that opted in (fm.sole_bid) rests while no other
     bid supports a favorite bid, or None when it cannot rest them.
@@ -1018,52 +1033,60 @@ def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
     in the band down to a midpoint a tick lower, which a favorite bid two
     ticks lower makes.
 
-    The longshot bid stays as it rests, whatever it covers or costs, because
-    its side needs only some score. With none resting, one goes to the lowest
-    tick with all of naked_room. Only when no favorite bid can rest around
-    that one does the longshot bid move: to the highest price in the free
-    zone (under_free_return) that naked_room buys min_size of and that keeps
-    the midpoint over TWO_SIDED_ABOVE, where one-sided quotes earn nothing.
-    The highest, not the lowest that would do, because that one leaves the
-    favorite bid a tick under the ask, and the loss on a longshot fill is
-    capped at naked_room while the favorite bid carries the capital.
+    A longshot bid resting where sole_long_allowed stays as it rests,
+    whatever it covers or costs, because its side needs only some score. One
+    resting anywhere else is replaced: the plan before this one may have left
+    it near MAX_RETURN, and around that the favorite bid sits cents lower
+    than a sole bid should. With none to keep, one goes to the lowest tick
+    with all of naked_room.
+
+    The longshot bid moves up from there only when the favorite bid cannot
+    rest its full SOLE_BID_LEAD_TICKS over the lowest paying price around it:
+    under a low ask, or where ev_cap or the ask would hold the bid at the
+    highest price it may have. It then goes to the highest price
+    sole_long_allowed that naked_room buys min_size of and that keeps the
+    midpoint over TWO_SIDED_ABOVE, where one-sided quotes earn nothing. The
+    highest, because that leaves the favorite bid lowest, and the loss on a
+    longshot fill is capped at naked_room while the favorite bid carries the
+    capital. When no price gives the favorite bid its full lead, the plan
+    settles for one that holds it at its cap, the kept or cheapest longshot
+    bid first.
     """
-    tick, decimals, years_left = fm.tick, tick_decimals(fm.tick), fm.zones.years_left
+    tick, decimals = fm.tick, tick_decimals(fm.tick)
     resting = next((o for o in orders if o.slot is Slot.LONG_BID and on_tick(o.price, tick)
                     and o.size_remaining >= fm.min_size
-                    and not over_max_return(o.price, years_left)), None)
+                    and sole_long_allowed(o.price, fm)), None)
     room = naked_room(fm, position)
+    choices = []
     if resting is not None:
-        target = sole_bid_around(fm, levels, position, cfg, orders, resting.price,
-                                 resting.size_remaining, resting, fill_mid)
-        ticks = round(resting.price / tick)
-    else:
-        size = round_size_down(room / tick)
-        if size < fm.min_size or over_max_return(tick, years_left):
-            return None
-        target = sole_bid_around(fm, levels, position, cfg, orders, tick, size, None, fill_mid)
-        ticks = 1
-    if target is not None:
-        return target
+        choices.append((resting.price, resting.size_remaining, resting))
+    elif sole_long_allowed(tick, fm) and round_size_down(room / tick) >= fm.min_size:
+        choices.append((tick, round_size_down(room / tick), None))
+    ticks = round(choices[0][0] / tick) if choices else 1
     top = ticks
-    while under_free_return(round((top + 1) * tick, decimals), years_left):
+    while sole_long_allowed(round((top + 1) * tick, decimals), fm):
         top += 1
     for n in range(top, ticks, -1):
         price = round(n * tick, decimals)
-        size = round_size_down(room / price)
-        if size < fm.min_size:
-            continue
-        target = sole_bid_around(fm, levels, position, cfg, orders, price, size, None, fill_mid)
-        if target is not None and target.mid > TWO_SIDED_ABOVE:
-            return target
+        if round_size_down(room / price) >= fm.min_size:
+            choices.append((price, round_size_down(room / price), None))
+
+    for full_lead in (True, False):
+        for price, size, long in choices:
+            target = sole_bid_around(fm, levels, position, cfg, orders, price, size, long,
+                                     fill_mid, full_lead)
+            if target is not None and (long is not None or price <= tick + 1e-9
+                                       or target.mid > TWO_SIDED_ABOVE):
+                return target
     return None
 
 
 def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, long,
-                    fill_mid=None):
+                    fill_mid=None, full_lead=False):
     """sole_bid_target's plan around a longshot bid of long_size at
     long_price, which is the resting order `long` or a new one (None). None
-    when no favorite bid can rest around it.
+    when no favorite bid can rest around it, and with full_lead when ev_cap
+    or the ask would hold it under its full lead.
 
     The favorite bid rests SOLE_BID_LEAD_TICKS above the lowest price whose
     midpoint keeps that longshot bid inside the band, with all of
@@ -1099,7 +1122,11 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     lowest = max(tick, round(
         floor_to_tick(max(2 * edge_mid - ask, ask - 2 * v), tick) + tick, decimals))
     ceiling = min(ev_cap(fm, cfg), floor_to_tick(min(levels.asks[0][0], ask) - tick, tick))
-    price = min(round(lowest + SOLE_BID_LEAD_TICKS * tick, decimals), ceiling)
+    price = round(lowest + SOLE_BID_LEAD_TICKS * tick, decimals)
+    if price > ceiling + 1e-9:
+        if full_lead:
+            return None
+        price = ceiling
     if price < lowest - 1e-9:
         return None
 

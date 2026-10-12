@@ -117,17 +117,25 @@ Each market is in one of seven states:
     pool, so the bid sits as low as still pays. It uses all of the market's
     capital. The farmer does not value its fills: every sale into the book
     fills this bid.
-  - The longshot bid stays as it rests, whatever it costs or covers. If none
-    rests, one goes to the lowest tick with the whole naked budget.
-  - Only when no favorite bid can rest around that longshot bid does the
-    longshot bid move up. That happens when the ask is too low, or the bid
-    would top the EV cap. Each tick the longshot bid rises lets the favorite
-    bid rest two ticks lower. It goes to the highest price that still offers
-    a favorite buyer under 5% a year, sized with the naked budget, and no
+  - A longshot bid already resting stays as it rests, whatever it costs or
+    covers, if it is at the lowest tick or offers a favorite buyer under 7% a
+    year. One resting anywhere else is replaced: normal quoting can leave it
+    near the 20% a year limit, and around that the favorite bid would sit
+    cents lower than a sole bid should. With none to keep, one goes to the
+    lowest tick with the whole naked budget.
+  - The longshot bid moves up only when the favorite bid cannot rest its two
+    ticks above the lowest paying price. That happens when the ask is too
+    low, and when the EV cap or the ask would hold the bid at the highest
+    price it may have. Each tick the longshot bid rises lets the favorite bid
+    rest two ticks lower. It goes to the highest price that still offers a
+    favorite buyer under 7% a year, sized with the naked budget, and no
     higher than keeps the midpoint above 90c. Under a 94c ask in the book
-    above, 100 days from the end date, the longshot bid goes to 1.3c and the
-    favorite bid to 92.7c. A longshot fill costs at most the naked budget,
-    while the favorite bid carries the capital.
+    above, 100 days from the end date, the longshot bid goes to 1.8c and the
+    favorite bid to 91.7c. A longshot fill costs at most the naked budget,
+    while the favorite bid carries the capital. This 7% is the sole bid's
+    own limit. The 5% free zone of normal quoting is unchanged.
+  - When no longshot price leaves the favorite bid its two ticks, the bid
+    rests at its cap around the kept or cheapest longshot bid that works.
   - A favorite bid already resting stays from the lowest paying price up to
     1c above the target. The target rises a tick for each tick the ask falls.
   - The bid never goes above `p_true` minus `--ev-margin` and never crosses

@@ -45,6 +45,7 @@ from farm.reward_farmer import (
     reconcile,
     rewards_active,
     sole_bid_target,
+    sole_long_allowed,
     step_state,
     strip_own,
     support_held,
@@ -1030,13 +1031,14 @@ class SoleBidTest(unittest.TestCase):
         self.assertTrue(fav_bid_candidates(book, 0.065, 0.001, 20.0, cfg.max_lead, ev_cap(fm, cfg)))
         self.assertTrue(over_max_return(0.041, fm.zones.years_left))
         self.assertFalse(supported(book, fm, Position(), cfg))
-        # The sole bid leads the book: 92.1c makes a 92.65c midpoint, which
-        # keeps a 1.0c longshot bid, the top of the free zone, in the band.
+        # The sole bid leads the book. Around a 0.1c longshot bid it would
+        # cross the ask, so the longshot bid rises to 1.4c, the top of its
+        # zone, and 91.3c makes the 92.25c midpoint that keeps it in the band.
         intents = by_slot(sole(fm=fm, book=book, cfg=cfg))
         self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.FAV_BID].size),
-                         (0.921, round_size_down(100.0 / 0.921)))
+                         (0.913, round_size_down(100.0 / 0.913)))
         self.assertEqual((intents[Slot.LONG_BID].price, intents[Slot.LONG_BID].size),
-                         (0.01, 1000.0))
+                         (0.014, round_size_down(10.0 / 0.014)))
 
     def test_support_ends_a_sole_bid_only_after_five_minutes_without_a_break(self):
         since = NOW - timedelta(seconds=299)
@@ -1122,11 +1124,14 @@ class SoleBidTest(unittest.TestCase):
         self.assertEqual(by_slot(target)[Slot.FAV_BID].size, round_size_down(500.0 / 0.921))
 
     def test_the_bid_never_tops_the_ev_cap_or_crosses_an_ask_of_any_size(self):
-        capped = sole(fm=THIN._replace(p_true=0.93))
-        self.assertEqual(by_slot(capped)[Slot.FAV_BID].price, 0.920)
-        self.assertIsNone(sole(fm=THIN._replace(p_true=0.90)))
-        dust = THIN_BOOK._replace(asks=[(0.92, 5.0), (0.97, 1000.0)])
-        self.assertEqual(by_slot(sole(book=dust))[Slot.FAV_BID].price, 0.919)
+        # Under an 88.6c cap no longshot bid leaves the favorite bid its full
+        # lead, so it rests at the cap around the dearest one allowed.
+        capped = by_slot(sole(fm=THIN._replace(p_true=0.896)))
+        self.assertEqual((capped[Slot.FAV_BID].price, capped[Slot.LONG_BID].price),
+                         (0.886, 0.018))
+        self.assertIsNone(sole(fm=THIN._replace(p_true=0.89)))
+        dust = by_slot(sole(book=THIN_BOOK._replace(asks=[(0.887, 5.0), (0.97, 1000.0)])))
+        self.assertEqual((dust[Slot.FAV_BID].price, dust[Slot.LONG_BID].price), (0.886, 0.018))
         self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.88, 5.0), (0.97, 1000.0)])))
 
     def test_nothing_rests_without_an_ask_a_longshot_bid_or_the_capital_for_a_minimum(self):
@@ -1134,23 +1139,32 @@ class SoleBidTest(unittest.TestCase):
         self.assertIsNone(sole(fm=THIN._replace(naked_budget_usd=0.05)))
         self.assertIsNone(sole(fm=THIN._replace(capital=80.0)))
         # An ask this low leaves no bid under it that keeps the midpoint up.
-        self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.93, 1000.0)])))
+        self.assertIsNone(sole(book=THIN_BOOK._replace(asks=[(0.92, 1000.0)])))
 
     # Under a 94c ask no bid keeps a 0.1c longshot bid in the band: it would
     # have to rest over 94.8c. THIN is 100 days out, where a longshot bid
-    # offers the favorite buyer under 5% a year up to 1.3c.
+    # offers the favorite buyer under 7% a year up to 1.8c.
     LOW_ASK = THIN_BOOK._replace(asks=[(0.94, 1000.0)])
 
-    def test_the_longshot_bid_rises_to_the_top_of_the_free_zone_only_when_it_must(self):
+    def test_a_sole_longshot_bid_may_rest_under_7_percent_a_year_or_at_the_lowest_tick(self):
+        self.assertTrue(sole_long_allowed(0.018, THIN))
+        self.assertFalse(sole_long_allowed(0.019, THIN))
+        self.assertTrue(under_free_return(0.013, THIN.zones.years_left))
+        self.assertFalse(under_free_return(0.014, THIN.zones.years_left))
+        # A 1c tick is over 7% a year 30 days out, and over 20% a year 15 days out.
+        coarse = THIN._replace(tick=0.01)
+        self.assertTrue(sole_long_allowed(0.01, coarse._replace(zones=Zones(30 / 365.25))))
+        self.assertFalse(sole_long_allowed(0.02, coarse._replace(zones=Zones(30 / 365.25))))
+        self.assertFalse(sole_long_allowed(0.01, coarse._replace(zones=Zones(15 / 365.25))))
+
+    def test_the_longshot_bid_rises_to_the_top_of_its_zone_only_when_it_must(self):
         self.assertEqual(by_slot(sole())[Slot.LONG_BID].price, 0.001)
         resting = [live("low", Slot.LONG_BID, 0.001, 40000.0)]
         target = sole(resting, book=self.LOW_ASK)
         fav, low = by_slot(target)[Slot.FAV_BID], by_slot(target)[Slot.LONG_BID]
-        self.assertTrue(under_free_return(0.013, THIN.zones.years_left))
-        self.assertFalse(under_free_return(0.014, THIN.zones.years_left))
-        self.assertEqual((low.price, low.size), (0.013, round_size_down(25.0 / 0.013)))
-        # It scores down to a 93.2c midpoint, so 92.5c is the lowest favorite bid.
-        self.assertEqual(fav.price, 0.927)
+        self.assertEqual((low.price, low.size), (0.018, round_size_down(25.0 / 0.018)))
+        # It scores down to a 92.7c midpoint, so 91.5c is the lowest favorite bid.
+        self.assertEqual(fav.price, 0.917)
         self.assertGreater(min(fav.score, low.score), 0)
         self.assertEqual(target.sole_kept, frozenset())
         actions = reconcile(target, resting, THIN, Position(), CFG)
@@ -1158,18 +1172,43 @@ class SoleBidTest(unittest.TestCase):
         self.assertEqual({a.intent.slot for a in actions[1:]}, {Slot.FAV_BID, Slot.LONG_BID})
 
     def test_a_longshot_bid_that_rose_stays_as_it_rests(self):
-        resting = [live("low", Slot.LONG_BID, 0.013, 1923.07),
-                   live("fav", Slot.FAV_BID, 0.927, 539.37)]
+        resting = [live("low", Slot.LONG_BID, 0.018, 1388.88),
+                   live("fav", Slot.FAV_BID, 0.917, 545.25)]
         target = sole(resting, book=self.LOW_ASK)
         self.assertEqual(target.sole_kept, frozenset({"low", "fav"}))
         self.assertEqual(reconcile(target, resting, THIN, Position(), CFG), [])
 
-    def test_a_raised_longshot_bid_also_lets_the_bid_under_a_low_ev_cap_or_small_capital(self):
-        for fm in (THIN._replace(p_true=0.928), THIN._replace(capital=90.0)):
-            with self.subTest(fm=fm):
-                intents = by_slot(sole(fm=fm))
-                self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.LONG_BID].price),
-                                 (0.897, 0.013))
+    def test_a_resting_longshot_bid_outside_its_zone_is_replaced(self):
+        # The plan before left it at 3.9c, near the 20% a year limit. Around
+        # that the favorite bid would rest at 84.5c, not 92.1c.
+        resting = [live("low", Slot.LONG_BID, 0.039, 256.41)]
+        self.assertFalse(over_max_return(0.039, THIN.zones.years_left))
+        target = sole(resting)
+        intents = by_slot(target)
+        self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.LONG_BID].price),
+                         (0.921, 0.001))
+        self.assertEqual(target.sole_kept, frozenset())
+        self.assertEqual(reconcile(target, resting, THIN, Position(), CFG)[0].order_ids,
+                         ("low",))
+
+    def test_the_longshot_bid_rises_when_the_ev_cap_or_the_ask_would_hold_the_bid(self):
+        # Around a 0.1c longshot bid the favorite bid wants 92.1c. A 92c cap or
+        # a 92c ask of any size would hold it under that, so the longshot bid
+        # rises and the favorite bid rests its full lead around it, at 88.7c.
+        capped = THIN._replace(p_true=0.93)
+        dust = THIN_BOOK._replace(asks=[(0.92, 5.0), (0.97, 1000.0)])
+        resting = [live("low", Slot.LONG_BID, 0.001, 25000.0),
+                   live("fav", Slot.FAV_BID, 0.92, 543.47)]
+        for target in (sole(fm=capped), sole(book=dust), sole(resting, fm=capped)):
+            intents = by_slot(target)
+            self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.LONG_BID].price),
+                             (0.887, 0.018))
+            self.assertEqual(target.sole_kept, frozenset())
+
+    def test_a_raised_longshot_bid_also_lets_the_bid_under_a_small_capital(self):
+        intents = by_slot(sole(fm=THIN._replace(capital=90.0)))
+        self.assertEqual((intents[Slot.FAV_BID].price, intents[Slot.LONG_BID].price),
+                         (0.887, 0.018))
 
     def test_the_longshot_bid_rises_no_higher_than_the_naked_budget_buys_a_minimum(self):
         low = by_slot(sole(fm=THIN._replace(naked_budget_usd=1.0), book=self.LOW_ASK))[
@@ -1177,20 +1216,20 @@ class SoleBidTest(unittest.TestCase):
         self.assertEqual((low.price, low.size), (0.01, 100.0))
 
     def test_the_longshot_bid_rises_no_higher_than_keeps_the_midpoint_over_90c(self):
-        # A year out the free zone reaches 4.7c, where the midpoint would be 89.95c.
+        # A year out its zone reaches 6.5c, and at 4.7c the midpoint would be 89.95c.
         year_out = THIN._replace(zones=Zones(1.0))
-        self.assertTrue(under_free_return(0.047, 1.0))
+        self.assertTrue(sole_long_allowed(0.065, year_out))
         target = sole(fm=year_out, book=self.LOW_ASK)
         self.assertEqual(by_slot(target)[Slot.LONG_BID].price, 0.046)
         self.assertAlmostEqual(target.mid, 0.9005)
 
     def test_a_longshot_bid_inside_the_spread_is_the_ask_the_midpoint_is_made_from(self):
-        # 1.3c mirrors to a 98.7c favorite ask, under the book's 99.5c.
+        # 1.8c mirrors to a 98.2c favorite ask, under the book's 99.5c.
         wide = THIN_BOOK._replace(asks=[(0.995, 1000.0)])
         target = sole(fm=THIN._replace(p_true=0.90), book=wide)
         fav, low = by_slot(target)[Slot.FAV_BID], by_slot(target)[Slot.LONG_BID]
-        self.assertEqual((fav.price, low.price), (0.88, 0.013))
-        self.assertAlmostEqual(target.mid, (0.88 + 0.987) / 2)
+        self.assertEqual((fav.price, low.price), (0.875, 0.018))
+        self.assertAlmostEqual(target.mid, (0.875 + 0.982) / 2)
         self.assertGreater(min(fav.score, low.score), 0)
 
     def test_a_midpoint_under_min_fav_rests_nothing(self):
