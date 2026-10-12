@@ -81,8 +81,9 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                other bid scores. Instead of going BELOW_RANGE or resting no
                favorite bid, the market rests sole_bid_target's orders: the
                favorite bid just above the lowest price that keeps the
-               longshot bid scoring, and the longshot bid as it rests. With
-               no other maker scoring, that earns the whole pool. It lasts
+               longshot bid scoring, and the longshot bid as it rests, or
+               higher in its free zone when no favorite bid fits around it.
+               With no other maker scoring, that earns the whole pool. It lasts
                until another bid supports the midpoint again, an ask drop
                cools the market down, or the orders cannot rest.
   PAUSED      a human paused the market (markets.paused). It leaves the
@@ -210,6 +211,7 @@ from py_clob_client_v2.clob_types import (
 )
 
 from farm.reward_screener import (
+    TWO_SIDED_ABOVE,
     Outlook,
     QuoteValue,
     Read,
@@ -238,6 +240,7 @@ from farm.reward_screener import (
     score,
     sized_without_budget,
     tick_decimals,
+    under_free_return,
     value_quote,
 )
 from polymarket import region
@@ -980,44 +983,86 @@ def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
     resting. With no other bid in the band ours is the best bid, so the
     reward midpoint is halfway between it and the best ask, and with no other
     maker scoring, any score on both sides earns the whole pool. So the
-    favorite bid goes as low as still pays: SOLE_BID_LEAD_TICKS above the
-    lowest price whose midpoint keeps the longshot bid inside the band, with
-    all of capital_room, and never above ev_cap. Nothing here values its
-    fills: the human opted the market in knowing that every sale into the
-    book fills this bid.
+    favorite bid goes as low as still pays (sole_bid_around), and the
+    longshot bid decides how low that is: each tick it rests higher keeps it
+    in the band down to a midpoint a tick lower, which a favorite bid two
+    ticks lower makes.
 
     The longshot bid stays as it rests, whatever it covers or costs, because
     its side needs only some score. With none resting, one goes to the lowest
-    tick with all of naked_room. A favorite bid resting between the lowest
-    scoring price and SOLE_BID_KEEP_ABOVE over the target stays too, at any
-    size the capital allows. The exits rest as in any plan, the favorite ask
-    anchored at the midpoint the longshot bid needs.
+    tick with all of naked_room. Only when no favorite bid can rest around
+    that one does the longshot bid move: to the highest price in the free
+    zone (under_free_return) that naked_room buys min_size of and that keeps
+    the midpoint over TWO_SIDED_ABOVE, where one-sided quotes earn nothing.
+    The highest, not the lowest that would do, because that one leaves the
+    favorite bid a tick under the ask, and the loss on a longshot fill is
+    capped at naked_room while the favorite bid carries the capital.
+    """
+    tick, decimals, years_left = fm.tick, tick_decimals(fm.tick), fm.zones.years_left
+    resting = next((o for o in orders if o.slot is Slot.LONG_BID and on_tick(o.price, tick)
+                    and o.size_remaining >= fm.min_size
+                    and not over_max_return(o.price, years_left)), None)
+    room = naked_room(fm, position)
+    if resting is not None:
+        target = sole_bid_around(fm, levels, position, cfg, orders, resting.price,
+                                 resting.size_remaining, resting, fill_mid)
+        ticks = round(resting.price / tick)
+    else:
+        size = round_size_down(room / tick)
+        if size < fm.min_size or over_max_return(tick, years_left):
+            return None
+        target = sole_bid_around(fm, levels, position, cfg, orders, tick, size, None, fill_mid)
+        ticks = 1
+    if target is not None:
+        return target
+    top = ticks
+    while under_free_return(round((top + 1) * tick, decimals), years_left):
+        top += 1
+    for n in range(top, ticks, -1):
+        price = round(n * tick, decimals)
+        size = round_size_down(room / price)
+        if size < fm.min_size:
+            continue
+        target = sole_bid_around(fm, levels, position, cfg, orders, price, size, None, fill_mid)
+        if target is not None and target.mid > TWO_SIDED_ABOVE:
+            return target
+    return None
 
-    None when the book has no ask of min_size, no longshot bid can rest, the
-    bid would cross, top ev_cap or leave the midpoint under min_fav, or the
-    capital buys less than min_size.
+
+def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, long,
+                    fill_mid=None):
+    """sole_bid_target's plan around a longshot bid of long_size at
+    long_price, which is the resting order `long` or a new one (None). None
+    when no favorite bid can rest around it.
+
+    The favorite bid rests SOLE_BID_LEAD_TICKS above the lowest price whose
+    midpoint keeps that longshot bid inside the band, with all of
+    capital_room, and never above ev_cap. Nothing here values its fills: the
+    human opted the market in knowing that every sale into the book fills
+    this bid. A favorite bid resting between the lowest scoring price and
+    SOLE_BID_KEEP_ABOVE over the target stays, at any size the capital
+    allows. The exits rest as in any plan, the favorite ask anchored at the
+    midpoint the longshot bid needs.
+
+    None when the book has no ask of min_size, the favorite bid would cross,
+    top ev_cap or leave the midpoint under min_fav, either bid would score
+    nothing, or the capital buys less than min_size.
     """
     tick, v, decimals = fm.tick, fm.v, tick_decimals(fm.tick)
     best_ask = best_price(levels.asks, fm.min_size)
     if best_ask is None:
         return None
-    years_left = fm.zones.years_left
-    long = next((o for o in orders if o.slot is Slot.LONG_BID and on_tick(o.price, tick)
-                 and o.size_remaining >= fm.min_size
-                 and not over_max_return(o.price, years_left)), None)
-    if long is not None:
-        long_price, long_size = long.price, long.size_remaining
-    else:
-        long_price, long_size = tick, round_size_down(naked_room(fm, position) / tick)
-        if long_size < fm.min_size or over_max_return(long_price, years_left):
-            return None
     # The longshot bid scores while the favorite midpoint is above this.
     edge_mid = 1 - long_price - v
 
     fav_ask = None
     if position.fav_shares >= fm.min_size:
         fav_ask = plan_fav_ask_price(fm, levels, edge_mid, position, cfg, fill_mid)
-    ask = best_ask if fav_ask is None else min(best_ask, fav_ask)
+    # The longshot bid shows in the favorite book as an ask at its mirror,
+    # and is the best ask when it rests inside the spread.
+    ask = min(best_ask, mirror(long_price, tick))
+    if fav_ask is not None:
+        ask = min(ask, fav_ask)
 
     # A bid at p makes the midpoint (p + ask) / 2: over edge_mid above the
     # first price, and within v of the bid itself above the second.

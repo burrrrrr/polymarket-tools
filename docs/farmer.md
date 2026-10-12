@@ -115,6 +115,15 @@ Each market is in one of seven states:
     fills this bid.
   - The longshot bid stays as it rests, whatever it costs or covers. If none
     rests, one goes to the lowest tick with the whole naked budget.
+  - Only when no favorite bid can rest around that longshot bid does the
+    longshot bid move up. That happens when the ask is too low, or the bid
+    would top the EV cap. Each tick the longshot bid rises lets the favorite
+    bid rest two ticks lower. It goes to the highest price that still offers
+    a favorite buyer under 5% a year, sized with the naked budget, and no
+    higher than keeps the midpoint above 90c. Under a 94c ask in the book
+    above, 100 days from the end date, the longshot bid goes to 1.3c and the
+    favorite bid to 92.7c. A longshot fill costs at most the naked budget,
+    while the favorite bid carries the capital.
   - A favorite bid already resting stays from the lowest paying price up to
     1c above the target. The target rises a tick for each tick the ask falls.
   - The bid never goes above `p_true` minus `--ev-margin` and never crosses
