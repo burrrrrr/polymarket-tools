@@ -85,8 +85,9 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                longshot bid scoring, and the longshot bid as it rests, or
                higher in its free zone when no favorite bid fits around it.
                With no other maker scoring, that earns the whole pool. It lasts
-               until another bid supports the midpoint again, an ask drop
-               cools the market down, or the orders cannot rest.
+               until the other bids have supported a favorite bid again for
+               five minutes without a break, an ask drop cools the market
+               down, or the orders cannot rest.
   PAUSED      a human paused the market (markets.paused). It leaves the
                moment the flag clears and goes through the checks above.
                When resuming would quote, the orders it would place are
@@ -261,6 +262,12 @@ RESUME_MARGIN = 0.005
 # that keeps the longshot bid scoring. At that price itself the longshot
 # share scores next to nothing, and one tick off the ask would end it.
 SOLE_BID_LEAD_TICKS = 2
+# A sole bid ends once the other makers' bids have supported a favorite bid
+# for this long without a break (support_held). Support that returns on a
+# thin book leaves again within 5 minutes nine times in ten (1,056 spells,
+# 2026-10-09 to 12), and each round trip replaces both bids, which score
+# nothing for ~30 seconds each time. Holding on costs only a lower share.
+SOLE_BID_EXIT_S = 300
 # A favorite bid resting up to this far above that target stays the sole
 # bid. The target moves a tick for each tick of the ask, and a replacement
 # scores nothing for ~30 seconds with no other maker scoring.
@@ -967,11 +974,11 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline))
 
 
-def supported(levels, fm, position, cfg, margin=0.0, fill_mid=None):
+def supported(levels, fm, position, cfg, fill_mid=None):
     """Whether the other makers' bids support a favorite bid here: the book
-    without our orders has a midpoint at least margin over min_fav, and at
-    some price within max_lead of its best bid the plan rests a favorite bid
-    (quotes_at, with the naked leg allowed).
+    without our orders has a midpoint of at least min_fav, and at some price
+    within max_lead of its best bid the plan rests a favorite bid (quotes_at,
+    with the naked leg allowed).
 
     A plan rests none where no such price scores, and where the midpoint is
     too low for a longshot bid to balance it: under a 90c midpoint with a
@@ -980,13 +987,22 @@ def supported(levels, fm, position, cfg, margin=0.0, fill_mid=None):
     cost is not asked: that is target_orders' to judge.
     """
     mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
-    if mid is None or mid < cfg.min_fav + margin:
+    if mid is None or mid < cfg.min_fav:
         return False
     prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
                                 ev_cap(fm, cfg))
     return any(i.slot is Slot.FAV_BID for price in prices
                for i in quotes_at(fm, levels, position, cfg, True, price,
                                   fill_mid=fill_mid).intents)
+
+
+def support_held(since, phase, now):
+    """Whether support that has lasted since `since` (None for none) ends or
+    forestalls a sole bid: at once for a market that is not one, and after
+    SOLE_BID_EXIT_S without a break for one that is."""
+    if since is None:
+        return False
+    return phase is not Phase.SOLE_BID or (now - since).total_seconds() >= SOLE_BID_EXIT_S
 
 
 def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
@@ -1901,6 +1917,9 @@ class Managed:
         self.mid_watch = None
         self.naked_paused_until = None
         self.fill_mid = None
+        # Since when the book has supported a favorite bid without a break,
+        # on a market that opted into a sole bid (support_held).
+        self.supported_since = None
         self.held = None
         self.position = None
         self.orders = []
@@ -2399,13 +2418,14 @@ class Farmer:
         )
         managed.fill_mid = held_fill_mid(managed.fill_mid, book_mid, managed.position, fm)
         sole = None
-        # Once it is the sole bid the market stays one until the midpoint is
-        # the resume margin over min_fav, as BELOW_RANGE does.
-        margin = RESUME_MARGIN if managed.state.phase is Phase.SOLE_BID else 0.0
-        if fm.sole_bid and naked_allowed(obs, now) and not supported(
-                book, fm, managed.position, self.cfg, margin, managed.fill_mid):
-            sole = sole_bid_target(fm, book, managed.position, self.cfg, orders,
-                                   managed.fill_mid)
+        if fm.sole_bid and naked_allowed(obs, now):
+            if not supported(book, fm, managed.position, self.cfg, managed.fill_mid):
+                managed.supported_since = None
+            elif managed.supported_since is None:
+                managed.supported_since = now
+            if not support_held(managed.supported_since, managed.state.phase, now):
+                sole = sole_bid_target(fm, book, managed.position, self.cfg, orders,
+                                       managed.fill_mid)
         obs = obs._replace(sole_bid=sole is not None)
         previous, managed.state = managed.state, step_state(managed.state, obs, now, self.cfg)
         if book_ask is not None:

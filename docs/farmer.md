@@ -136,8 +136,14 @@ Each market is in one of seven states:
 
   It lasts as long as no other bid returns. An ask drop still starts a
   `COOLDOWN`, and a pause, a naked-leg pause or a longshot fill's cooldown
-  ends it. Once another bid supports the midpoint 0.5c above `--min-fav`,
-  the market quotes as usual.
+  ends it. When the other bids support a favorite bid again, the market
+  waits until they have done so for five minutes without a break, then
+  quotes as usual. Support that returns on a thin book mostly leaves again
+  within minutes, and each switch replaces both bids, which score nothing
+  for about 30 seconds each time. The sole orders keep resting and scoring
+  through the wait. If the returned bids leave the sole bid outside the
+  band, there is nothing to hold and the market quotes as usual at once. A
+  restart does not carry the wait over.
 - `PAUSED`: you set `paused = 1` on the market. All orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.

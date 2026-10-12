@@ -47,6 +47,7 @@ from farm.reward_farmer import (
     sole_bid_target,
     step_state,
     strip_own,
+    support_held,
     supported,
     target_orders,
     value_of,
@@ -1037,10 +1038,15 @@ class SoleBidTest(unittest.TestCase):
         self.assertEqual((intents[Slot.LONG_BID].price, intents[Slot.LONG_BID].size),
                          (0.01, 1000.0))
 
-    def test_support_can_be_asked_for_a_margin_over_min_fav(self):
-        book = Levels(bids=[(0.86, 500.0)], asks=[(0.944, 1000.0)], tick=0.001)
-        self.assertTrue(supported(book, THIN, Position(), CFG))
-        self.assertFalse(supported(book, THIN, Position(), CFG, margin=0.005))
+    def test_support_ends_a_sole_bid_only_after_five_minutes_without_a_break(self):
+        since = NOW - timedelta(seconds=299)
+        self.assertFalse(support_held(since, Phase.SOLE_BID, NOW))
+        self.assertTrue(support_held(since, Phase.SOLE_BID, NOW + timedelta(seconds=1)))
+        self.assertFalse(support_held(None, Phase.SOLE_BID, NOW))
+        # A market that is not a sole bid does not become one while it is supported.
+        for phase in (Phase.QUOTING, Phase.BELOW_RANGE, Phase.COOLDOWN):
+            self.assertTrue(support_held(NOW, phase, NOW))
+            self.assertFalse(support_held(None, phase, NOW))
 
     def test_the_bid_rests_two_ticks_over_the_lowest_price_that_keeps_the_longshot_scoring(self):
         target = sole()
@@ -2532,6 +2538,51 @@ class FarmerCycleTest(FarmerHarness):
                          ("SOLE_BID", "hold", "hold"))
         self.assertEqual(self.events(before), [])
 
+        self.book = FLOOR_BOOK
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+
+    # Support back under the sole bid's band: a 94.5c bid makes a 97c
+    # midpoint, which the plan can quote and where the 93.6c sole bid and its
+    # longshot bid both still score.
+    RETURNED = FLOOR_BOOK._replace(bids=[(0.945, 1000.0)])
+
+    def test_a_sole_bid_outlasts_support_that_returns_for_under_five_minutes(self):
+        farm_db.set_sole_bid(self.ui, CID, True)
+        clock = [NOW]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        def cycle_at(seconds, book):
+            clock[0], self.book = NOW + timedelta(seconds=seconds), book
+            before = self.last_event_id()
+            farmer.cycle()
+            return self.farm_state()[0]["phase"], [e["kind"] for e in self.events(before)]
+
+        with mock.patch.object(reward_farmer, "datetime", Clock):
+            farmer = self.started_farmer()
+            cycle_at(0, FLOOR_BOOK)
+            self.assertEqual(cycle_at(5, self.UNSUPPORTED)[0], "SOLE_BID")
+            cycle_at(10, self.UNSUPPORTED)
+            self.assertEqual(cycle_at(15, self.RETURNED), ("SOLE_BID", []))
+            # A break starts the five minutes again.
+            self.assertEqual(cycle_at(200, self.UNSUPPORTED), ("SOLE_BID", []))
+            self.assertEqual(cycle_at(205, self.RETURNED), ("SOLE_BID", []))
+            self.assertEqual(cycle_at(504, self.RETURNED), ("SOLE_BID", []))
+            phase, events = cycle_at(505, self.RETURNED)
+            self.assertEqual((phase, events[0]), ("QUOTING", "PHASE"))
+
+    def test_a_sole_bid_ends_at_once_when_returned_support_leaves_it_out_of_the_band(self):
+        farm_db.set_sole_bid(self.ui, CID, True)
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.book = self.UNSUPPORTED
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[0]["phase"], "SOLE_BID")
+        # Under a 99c midpoint the 93.6c sole bid is 5.4c out, past the 3.5c band.
         self.book = FLOOR_BOOK
         farmer.cycle()
         self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")

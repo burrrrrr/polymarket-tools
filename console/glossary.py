@@ -204,8 +204,8 @@ GLOSSARY = {
                                  "bid stays as it rests. If no favorite bid fits around it, "
                                  "the longshot bid moves up, to at most the price that offers "
                                  "a favorite buyer under 5% a year. Every sale into the book "
-                                 "fills the favorite bid. Quoting resumes when another bid "
-                                 "returns."),
+                                 "fills the favorite bid. Quoting resumes once other bids "
+                                 "have supported the market for five minutes."),
     "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
                                  "threshold within the drop window). The ask is the price "
                                  "at which the favorite's asks add up to three reward "
