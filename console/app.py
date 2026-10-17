@@ -2,6 +2,7 @@ import mimetypes
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from farm import reward_screener, triage
@@ -42,6 +43,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     app = FastAPI(title="Console", docs_url=None, redoc_url=None)
     app.state.token = token = security.new_token()
     app.add_middleware(security.Guard, port=port, token=token)
+    app.add_middleware(GZipMiddleware)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
     app.add_api_route("/glossary.json", glossary.texts, methods=["GET"])
     ctx = Context(db_path, token, clock, poll_s=poll_s, max_polls=max_polls, scan=scan,

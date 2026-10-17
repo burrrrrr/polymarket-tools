@@ -957,6 +957,12 @@ class StreamTest(Console):
         text = self.read_stream(0.02, 5)
         self.assertNotIn("event:", text)
 
+    def test_pages_are_gzipped_but_the_stream_is_not(self):
+        client = TestClient(create_app(self.path, poll_s=0.01, max_polls=2), base_url=ORIGIN)
+        self.assertEqual(client.get("/partials/markets").headers["content-encoding"], "gzip")
+        self.assertNotIn("content-encoding", client.get("/stream").headers)
+        client.app.state.close()
+
 
 if __name__ == "__main__":
     unittest.main()
