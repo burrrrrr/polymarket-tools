@@ -577,7 +577,8 @@ def under_free_return(price, years_left):
 
 def free_zone_open(long_shares, min_size):
     """Whether a market's free zone is open: while it holds no longshot
-    shares that rest an exit. A longshot bid that filled leaves such shares.
+    shares that rest a scoring exit, one of at least the reward minimum. A
+    longshot bid that filled leaves such shares.
     Their exit adds to Q_one, and a bid sized without the budget to balance
     that would grow with every fill. So the budget, less the shares held at
     cost, then limits every price."""

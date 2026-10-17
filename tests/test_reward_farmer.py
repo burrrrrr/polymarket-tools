@@ -368,8 +368,16 @@ class BalancingTest(unittest.TestCase):
         self.assertEqual((ask.token_id, ask.side, ask.price, ask.size), (LONG, "SELL", 0.021, 200.0))
         self.assertAlmostEqual(ask.score, intents[Slot.FAV_BID].score)
 
-    def test_inventory_below_min_size_gets_no_exit(self):
+    def test_inventory_below_min_size_rests_exits_that_balance_nothing(self):
         held = Position(fav_shares=20.0, fav_avg=0.97, long_shares=20.0, long_avg=0.01)
+        intents = by_slot(quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979, 400.0))
+        bare = by_slot(quotes_at(market(), FLOOR_BOOK, Position(), CFG, True, 0.979, 400.0))
+        self.assertEqual([(intents[s].size, intents[s].score) for s in (Slot.FAV_ASK, Slot.LONG_ASK)],
+                         [(20.0, 0.0), (20.0, 0.0)])
+        self.assertEqual(intents[Slot.LONG_BID], bare[Slot.LONG_BID])
+
+    def test_inventory_under_the_order_minimum_gets_no_exit(self):
+        held = Position(fav_shares=4.99, fav_avg=0.97, long_shares=4.99, long_avg=0.01)
         intents = by_slot(quotes_at(market(), FLOOR_BOOK, held, CFG, True, 0.979))
         self.assertNotIn(Slot.FAV_ASK, intents)
         self.assertNotIn(Slot.LONG_ASK, intents)
@@ -1355,6 +1363,37 @@ class AskKeepTest(unittest.TestCase):
     def test_an_ask_over_the_target_is_judged_by_its_score(self):
         self.assertIsNone(self.keep(0.961))
         self.assertEqual(self.keep(0.962), "score below keep ratio")
+
+
+# Cuba once its 95c exit had sold 832.69 of 909.16 shares, off a fill at 91c
+# with the mid at 93.5c. The 76.47 left are under the 100-share reward
+# minimum, and at a 92.5c mid no longshot bid both scores and offers under
+# MAX_RETURN, so no favorite bid rests.
+CUBA = market(v=0.045, min_size=100.0, tick=0.01, p_true=0.95, naked_budget_usd=10.0,
+              capital=1000.0, end_date=NOW + timedelta(days=76),
+              expires_at=NOW + timedelta(days=69), zones=Zones(76 / 365.25))
+CUBA_BOOK = Levels(bids=[(0.92, 2054.27), (0.91, 6013.54), (0.9, 1914.84), (0.89, 1100.0)],
+                   asks=[(0.93, 545.1), (0.94, 3427.37), (0.95, 13377.42), (0.96, 3035.37),
+                         (0.97, 26594.53)], tick=0.01)
+CUBA_HELD = Position(fav_shares=76.47, fav_avg=0.9277)
+
+
+class LeftoverExitTest(unittest.TestCase):
+    def setUp(self):
+        self.target = target_orders(CUBA, CUBA_BOOK, CUBA_HELD, CFG, True,
+                                    outlook_with(CUBA, QUIET), fill_mid=0.935)
+
+    def test_a_partly_filled_exit_keeps_resting_what_is_left(self):
+        self.assertEqual(self.target.fav.reason, "no scoring favorite bid")
+        self.assertEqual([(i.slot, i.price, i.size, i.score) for i in self.target.intents],
+                         [(Slot.FAV_ASK, 0.95, 76.47, 0.0)])
+        left = live("a", Slot.FAV_ASK, 0.95, 76.47)
+        self.assertEqual(reconcile(self.target, [left], CUBA, CUBA_HELD, CFG), [])
+
+    def test_a_leftover_exit_far_over_its_target_is_replaced(self):
+        far = live("a", Slot.FAV_ASK, 0.97, 76.47)
+        self.assertEqual(keep_failure(far, by_slot(self.target)[Slot.FAV_ASK], self.target,
+                                      CUBA, CUBA_HELD, CFG), "score below keep ratio")
 
 
 # Qatar's shape once both its bids had filled and no favorite bid paid: the

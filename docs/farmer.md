@@ -77,6 +77,11 @@ four slots per market:
 Q_two comes from the covered `FAV_ASK` first, and only the remainder from the
 naked `LONG_BID`.
 
+The two asks rest for as few as 5 shares, the smallest order the CLOB takes,
+so the shares a partial fill leaves always have an exit. An ask under the
+market's reward minimum scores nothing, and the plan counts none of it toward
+Q_one or Q_two.
+
 The farmer never buys at market. All inventory comes from passive fills of
 these orders.
 

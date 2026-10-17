@@ -327,6 +327,10 @@ ASK_PRICE_SLACK_TICKS = 2
 # so a cover check exact to the share would replace them every cycle.
 SIZE_STEP = 0.01
 
+# The smallest order the CLOB takes. An exit rests down to this size, under
+# the reward minimum too, so a partial fill never strands what it leaves.
+ORDER_MIN_SHARES = 5.0
+
 # A resting favorite bid stays while its net trails the best bid's by no
 # more than this, in $/day, or (1 - keep_ratio) of the best net if larger.
 NET_KEEP_SLACK_USD = 0.02
@@ -633,6 +637,12 @@ def order_score(slot, price, mid, v):
     return score(v, distance)
 
 
+def sized_score(slot, price, size, mid, fm):
+    """Per-share score of an order of `size` shares: order_score, or nothing
+    under the reward minimum, where Polymarket scores no order."""
+    return order_score(slot, price, mid, fm.v) if size >= fm.min_size else 0.0
+
+
 def ev_cap(fm, cfg):
     """Highest favorite bid that is still +EV by the margin we demand."""
     return floor_to_tick(fm.p_true - cfg.ev_margin, fm.tick)
@@ -793,7 +803,8 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     The LONG_BID is re-derived when the favorite bid is dropped, because the
     cheapest covering price depends on what it must cover. A bid that ends
     below the reward minimum size is dropped, because an order that does not
-    score is risk without reward; the two asks are exits and stay regardless.
+    score is risk without reward; the two asks are exits and stay regardless,
+    down to ORDER_MIN_SHARES, scoring nothing under the reward minimum.
     """
     book_mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
     if book_mid is None:
@@ -806,9 +817,9 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     if fav_price is not None:
         fav_bid = fav_price, fav_size
     long_ask = fav_ask = None
-    if position.long_shares >= fm.min_size:
+    if position.long_shares >= ORDER_MIN_SHARES:
         long_ask = plan_long_ask_price(fm, levels, fav_price, position, cfg)
-    if position.fav_shares >= fm.min_size:
+    if position.fav_shares >= ORDER_MIN_SHARES:
         fav_ask = plan_fav_ask_price(fm, levels, book_mid, position, cfg, fill_mid)
 
     our_bids = [(fav_bid[0], fav_bid[1])] if fav_bid and fav_bid[1] > 0 else []
@@ -827,10 +838,10 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
 
     if long_ask is not None:
         add(Slot.LONG_ASK, long_ask, position.long_shares,
-            order_score(Slot.LONG_ASK, long_ask, mid, v))
+            sized_score(Slot.LONG_ASK, long_ask, position.long_shares, mid, fm))
     if fav_ask is not None:
         add(Slot.FAV_ASK, fav_ask, position.fav_shares,
-            order_score(Slot.FAV_ASK, fav_ask, mid, v))
+            sized_score(Slot.FAV_ASK, fav_ask, position.fav_shares, mid, fm))
 
     fav_score = order_score(Slot.FAV_BID, fav_bid[0], mid, v) if fav_bid else 0.0
     fav_size = fav_bid[1] if fav_score > 0 else 0.0
@@ -1119,12 +1130,13 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     edge_mid = 1 - long_price - v
 
     fav_ask = None
-    if position.fav_shares >= fm.min_size:
+    if position.fav_shares >= ORDER_MIN_SHARES:
         fav_ask = plan_fav_ask_price(fm, levels, edge_mid, position, cfg, fill_mid)
     # The longshot bid shows in the favorite book as an ask at its mirror,
-    # and is the best ask when it rests inside the spread.
+    # and is the best ask when it rests inside the spread. An ask under the
+    # reward minimum does not move the reward midpoint.
     ask = min(best_ask, mirror(long_price, tick))
-    if fav_ask is not None:
+    if fav_ask is not None and position.fav_shares >= fm.min_size:
         ask = min(ask, fav_ask)
 
     # A bid at p makes the midpoint (p + ask) / 2: over edge_mid above the
@@ -1155,13 +1167,13 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
 
     mid = created_mid(price, best_price(levels.bids, fm.min_size) or 0.0, ask)
     sized = {Slot.FAV_BID: (price, size), Slot.LONG_BID: (long_price, long_size)}
-    if position.long_shares >= fm.min_size:
+    if position.long_shares >= ORDER_MIN_SHARES:
         sized[Slot.LONG_ASK] = (plan_long_ask_price(fm, levels, price, position, cfg),
                                 position.long_shares)
     if fav_ask is not None:
         sized[Slot.FAV_ASK] = fav_ask, position.fav_shares
     intents = {slot: Intent(slot, fm.token(slot.role), slot.side, at, round_size_down(shares),
-                            order_score(slot, at, mid, v))
+                            sized_score(slot, at, shares, mid, fm))
                for slot, (at, shares) in sized.items()}
     if mid < cfg.min_fav or min(intents[Slot.FAV_BID].score, intents[Slot.LONG_BID].score) <= 1e-9:
         return None
@@ -1232,6 +1244,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
     target that replaces it is priced by the same zones in the same cycle.
     A favorite ask is judged by score too, but one more than
     ASK_PRICE_SLACK_TICKS under target is replaced although it scores more.
+    One under the reward minimum scores nothing, so it is judged by what its
+    price would score at the minimum.
     A longshot ask is judged by price alone. Priced over target it is
     replaced however close its score: in the favorite book it is a bid, and
     every bid above it fills first, so the new order's place in the queue is
@@ -1282,8 +1296,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
     elif order.slot is Slot.LONG_ASK:
         if order.price > intent.price + 1e-9:
             return "above the target price"
-    elif order_score(order.slot, order.price, target.mid, fm.v) < (
-            cfg.keep_ratio * intent.score - 1e-12):
+    elif order_score(order.slot, order.price, target.mid, fm.v) < cfg.keep_ratio * order_score(
+            intent.slot, intent.price, target.mid, fm.v) - 1e-12:
         return "score below keep ratio"
     if order.slot is not Slot.LONG_BID and not (
             low * size - 1e-9 <= order.size_remaining <= high * size + 1e-9):
@@ -1460,8 +1474,8 @@ def pre_fill_mid(samples, seen_at):
 
 def held_fill_mid(fill_mid, book_mid, position, fm):
     """The fill mid while it still prices the exit: None once the farm holds
-    less than a reward minimum of the favorite, or the mid is back at it."""
-    if fill_mid is None or position.fav_shares < fm.min_size:
+    too few favorite shares to rest an exit, or the mid is back at it."""
+    if fill_mid is None or position.fav_shares < ORDER_MIN_SHARES:
         return None
     if book_mid is not None and book_mid >= fill_mid - 1e-9:
         return None
@@ -2292,7 +2306,7 @@ class Farmer:
                     farm_db.save_baseline(self.db, fm.condition_id, baseline.fav, baseline.long)
             current = managed.position = farm_position(held, baseline)
             if previous is None:
-                if current.fav_shares >= fm.min_size:
+                if current.fav_shares >= ORDER_MIN_SHARES:
                     managed.fill_mid = self.last_fill_mid(fm)
                 if held != Position() or baseline != Baseline(0.0, 0.0):
                     log(f"{fm.label}: holding fav {held.fav_shares:g} @ "
