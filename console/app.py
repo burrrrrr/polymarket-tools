@@ -50,6 +50,8 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
                   tools_db=tools_db, search_markets=search_markets, fetch_books=fetch_books)
     app.state.triage = ctx.triager
     app.state.total_rates = ctx.total_rates
+    app.state.close = ctx.close
+    app.router.add_event_handler("shutdown", ctx.close)
     app.include_router(overview.routes(ctx))
     app.include_router(markets.routes(ctx))
     app.include_router(activity.routes(ctx))

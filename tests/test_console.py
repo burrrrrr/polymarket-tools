@@ -692,6 +692,7 @@ class Console(unittest.TestCase):
         # the network nor outlive the scratch directory.
         self.addCleanup(settle_total_rates)
         self.app = create_app(self.path, **{"fetch_total_rates": dict, **self.app_kwargs()})
+        self.addCleanup(self.app.state.close)
         self.client = TestClient(self.app, base_url=ORIGIN)
 
     def app_kwargs(self):
@@ -841,6 +842,18 @@ class RoutesTest(Console):
         self.assertIn('hx-get="/partials/overview/kpis" hx-trigger="sse:cycle"', text)
         self.assertIn('hx-get="/partials/overview/events" hx-trigger="sse:farm-event"', text)
         self.assertNotIn("Not running", text)
+
+    def test_one_cycle_of_regions_reads_farm_db_once_until_the_farmer_publishes(self):
+        with mock.patch.object(farm_db, "read_farm_states",
+                               wraps=farm_db.read_farm_states) as reads:
+            for url in ("/partials/chrome/status", "/partials/chrome/banner",
+                        "/partials/overview/kpis", "/partials/overview/tracked"):
+                self.assertEqual(self.client.get(url).status_code, 200)
+            self.assertEqual(reads.call_count, 1)
+            self.publish(stopped=self.now)
+            self.assertIn("The farmer is not running",
+                          self.client.get("/partials/chrome/banner").text)
+            self.assertEqual(reads.call_count, 2)
 
     def test_stopped_farmer_shows_the_banner_on_every_page(self):
         self.publish(stopped=self.now)

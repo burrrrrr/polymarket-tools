@@ -1,3 +1,5 @@
+import sqlite3
+import threading
 from contextlib import closing
 from datetime import timedelta
 from pathlib import Path
@@ -19,6 +21,8 @@ HERE = Path(__file__).parent
 FARMER_DEFAULTS = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))._asdict()
 CONTROLS_EVENT = "controls"
 LIVE_POLL_S = 5
+# A page fetches its live regions together, so one snapshot serves them all.
+SNAPSHOT_MAX_AGE = timedelta(seconds=5)
 
 
 class Context:
@@ -64,9 +68,26 @@ class Context:
         self.books = remote.TtlCache(fetch_book, remote.BOOK_TTL, clock)
         self.total_rates = remote.TotalRates(
             fetch_total_rates, remote.TOTAL_RATES_TTL, clock, on_rates=self._record_paying)
+        self._changes = None
+        self._changes_lock = threading.Lock()
+        self._shared = None
 
     def connect(self):
         return farm_db.open_db(self.db_path)
+
+    def _data_version(self):
+        """farm.db's PRAGMA data_version on one long-lived connection, which
+        changes whenever any other connection commits."""
+        with self._changes_lock:
+            if self._changes is None:
+                self._changes = sqlite3.connect(self.db_path, check_same_thread=False)
+            return self._changes.execute("PRAGMA data_version").fetchone()[0]
+
+    def close(self):
+        with self._changes_lock:
+            if self._changes is not None:
+                self._changes.close()
+                self._changes = None
 
     def connect_tools(self):
         """A connection to tools.db; 404 for a console started without one."""
@@ -89,6 +110,18 @@ class Context:
                 conn, {cid for cid, rate in rates.items() if rate > 0})
 
     def snapshot(self, conn, now):
+        """Shared by every request until farm.db changes or it is
+        SNAPSHOT_MAX_AGE old."""
+        version = self._data_version()
+        shared = self._shared
+        if (shared is not None and shared[0] == version
+                and timedelta(0) <= now - shared[1] < SNAPSHOT_MAX_AGE):
+            return shared[2]
+        snap = self._read_snapshot(conn, now)
+        self._shared = (version, now, snap)
+        return snap
+
+    def _read_snapshot(self, conn, now):
         states = farm_db.read_farm_states(conn)
         markets = farm_db.read_markets(conn, states, ("approved",))
         return views.Snapshot(
