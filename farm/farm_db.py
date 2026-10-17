@@ -148,6 +148,7 @@ CREATE TABLE IF NOT EXISTS farm_events (
 );
 CREATE INDEX IF NOT EXISTS farm_events_at ON farm_events (at);
 CREATE INDEX IF NOT EXISTS farm_events_kind_at ON farm_events (kind, at);
+CREATE INDEX IF NOT EXISTS farm_events_market ON farm_events (condition_id, id);
 
 CREATE TABLE IF NOT EXISTS farm_mids (
     condition_id TEXT NOT NULL,
