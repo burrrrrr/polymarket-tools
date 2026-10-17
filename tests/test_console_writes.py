@@ -772,7 +772,7 @@ class ReviewTest(Writes):
     def test_a_sole_candidate_opens_with_the_sole_bid_allowed_and_no_fill_figures(self):
         page = self.client.get("/review/0x777?mode=sole").text
         self.assertIn('<span class="badge t-c">SOLE<button', page)
-        self.assertIn("No other bid supports this market, so the scan planned a sole bid.", page)
+        self.assertIn('data-tip="sole"', page)
         self.assertIn(' checked> Allow sole bid', page)
         self.assertNotIn("None", page)
 

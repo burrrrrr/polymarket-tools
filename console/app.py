@@ -6,7 +6,7 @@ from fastapi.staticfiles import StaticFiles
 
 from farm import reward_screener, triage
 
-from . import remote, security
+from . import glossary, remote, security
 from .context import HERE, Context
 from .pages import (activity, discover, markets, orders, overview, review, settings, sniper,
                     stream)
@@ -43,6 +43,7 @@ def create_app(db_path, port=DEFAULT_PORT, poll_s=1.0, max_polls=None, clock=utc
     app.state.token = token = security.new_token()
     app.add_middleware(security.Guard, port=port, token=token)
     app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
+    app.add_api_route("/glossary.json", glossary.texts, methods=["GET"])
     ctx = Context(db_path, token, clock, poll_s=poll_s, max_polls=max_polls, scan=scan,
                   fetch_rules=fetch_rules, fetch_position=fetch_position, fetch_info=fetch_info,
                   fetch_book=fetch_book, fetch_total_rates=fetch_total_rates,

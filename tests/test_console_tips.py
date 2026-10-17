@@ -48,9 +48,11 @@ def template_keys():
     return used, unknown
 
 
-def tips(page):
-    """(aria-label, data-tip) of each tip button, unescaped."""
-    found = [(html.unescape(a), html.unescape(t)) for a, t in TIP.findall(page)]
+def tips(page, texts=None):
+    """(aria-label, text) of each tip button, its text looked up in texts, what
+    /glossary.json served, or else the glossary as it stands."""
+    texts = glossary.texts() if texts is None else texts
+    found = [(html.unescape(a), texts[html.unescape(k)]) for a, k in TIP.findall(page)]
     assert len(found) == page.count('class="tip"'), "a tip button with unexpected markup"
     return found
 
@@ -70,10 +72,10 @@ class GlossaryTest(unittest.TestCase):
         with self.assertRaises(KeyError):
             env.from_string("<th>Pool{{ tip('no_such_term') }}</th>").render()
 
-    def test_tip_escapes_its_text(self):
+    def test_tip_escapes_its_label_and_carries_its_key(self):
         with mock.patch.dict(GLOSSARY, {"pool": Term('A "pool"', "<b>x</b> & y")}):
             self.assertEqual(TIP.findall(glossary.tip("pool")),
-                             [("What does A &#34;pool&#34; mean?", "&lt;b&gt;x&lt;/b&gt; &amp; y")])
+                             [("What does A &#34;pool&#34; mean?", "pool")])
 
 
 class RenderedTipsTest(Writes):
@@ -118,6 +120,14 @@ class RenderedTipsTest(Writes):
                     self.assertIn(text, by_text, "data-tip is not a glossary text")
                 self.assertEqual(keys - {by_text[text] for _, text in found}, set())
 
+    def test_the_glossary_texts_are_served_once_instead_of_on_every_tip(self):
+        with mock.patch.dict(GLOSSARY, {"floor": Term("Floor", "Changed floor text.")}):
+            page = self.client.get("/markets").text
+            texts = self.client.get("/glossary.json").json()
+        self.assertEqual(set(texts), set(GLOSSARY))
+        self.assertIn(("What does Floor mean?", "Changed floor text."), tips(page, texts))
+        self.assertNotIn("Changed floor text.", page)
+
     def test_base_page_loads_tips_js_as_javascript(self):
         mtime = int((TEMPLATES.parent / "static" / "tips.js").stat().st_mtime)
         url = f"/static/tips.js?v={mtime}"
@@ -133,9 +143,12 @@ class RenderedTipsTest(Writes):
                 "min_rate": Term("Min pool", "Changed min-pool text.")}):
             settings = self.client.get("/settings").text
             discover = self.client.get("/discover").text
-        self.assertIn(("What does Keep ratio mean?", "Changed keep-ratio text."), tips(settings))
+            texts = self.client.get("/glossary.json").json()
+        self.assertIn(("What does Keep ratio mean?", "Changed keep-ratio text."),
+                      tips(settings, texts))
         self.assertNotIn(html.escape(old), settings)
-        self.assertIn(("What does Min pool mean?", "Changed min-pool text."), tips(discover))
+        self.assertIn(("What does Min pool mean?", "Changed min-pool text."),
+                      tips(discover, texts))
 
 
 if __name__ == "__main__":

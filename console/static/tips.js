@@ -4,6 +4,8 @@
 (() => {
   const GUTTER = 16;
   const GAP = 8;
+  let texts = {};
+  fetch("/glossary.json").then((r) => r.json()).then((t) => { texts = t; });
   const box = document.createElement("div");
   box.id = "tooltip";
   box.className = "tooltip";
@@ -30,7 +32,7 @@
   function show(trigger) {
     if (active && active !== trigger) active.removeAttribute("aria-describedby");
     active = trigger;
-    box.textContent = trigger.dataset.tip;
+    box.textContent = texts[trigger.dataset.tip] ?? "";
     box.hidden = false;
     trigger.setAttribute("aria-describedby", box.id);
     place(trigger);

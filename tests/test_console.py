@@ -810,7 +810,7 @@ class RoutesTest(Console):
             updated_at=self.now)])
         resp = self.client.get("/markets?phase=UNREWARDED")
         self.assertEqual(resp.status_code, 200)
-        for needle in ("alpha?", "rewards removed", "reward listing no longer pays this market"):
+        for needle in ("alpha?", "rewards removed", 'data-tip="UNREWARDED"'):
             self.assertIn(needle, resp.text)
         self.assertNotIn("bravo?", resp.text)
 
@@ -821,7 +821,7 @@ class RoutesTest(Console):
         self.assertEqual(resp.status_code, 200)
         for needle in ("alpha?", 'href="/markets?phase=SOLE_BID">Sole Bid</a>',
                        '<span class="badge t-c">SOLE BID<button type="button" class="tip"',
-                       "Every sale into the book fills the favorite bid."):
+                       'data-tip="SOLE_BID"'):
             self.assertIn(needle, resp.text)
         self.assertNotIn("bravo?", resp.text)
         self.assertIn("alpha?: no other bid supports the midpoint. Its favorite bid is the only "

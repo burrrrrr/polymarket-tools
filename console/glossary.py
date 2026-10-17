@@ -330,7 +330,12 @@ GLOSSARY = {
 }
 
 def tip(key):
-    """The tip button for a glossary term; KeyError for an unknown key."""
-    term = GLOSSARY[key]
+    """The tip button for a glossary term; KeyError for an unknown key. It
+    carries the key, and tips.js shows the text it reads once from
+    /glossary.json, since a page can hold thousands of tips."""
     return Markup('<button type="button" class="tip" aria-label="What does {} mean?" '
-                  'data-tip="{}"></button>').format(term.label, term.text)
+                  'data-tip="{}"></button>').format(GLOSSARY[key].label, key)
+
+
+def texts():
+    return {key: term.text for key, term in GLOSSARY.items()}
