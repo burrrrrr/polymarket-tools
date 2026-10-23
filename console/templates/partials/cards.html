@@ -1,75 +1,15 @@
-{% from "_macros.html" import market_controls, polymarket_link %}
-<section class="cards">
-{%- for c in vm.cards %}
-  <article class="panel card" data-condition-id="{{ c.condition_id }}">
-    <div style="display: flex; gap: 10px; align-items: flex-start; justify-content: space-between">
-      <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0">
-        <a class="title" href="/markets/{{ c.condition_id }}">{{ c.name }}</a>
-        <span class="small muted">{{ c.mode or '--' }}{% if c.mode %}{{ tip(c.mode | lower) }}{% endif %} · {{ c.fav_outcome or '--' }} · cutoff {{ c.cutoff.strftime('%Y-%m-%d') if c.cutoff else '--' }} · p_true {{ c.p_true | p_true_text }}</span>
-      </div>
-      <span class="actions" style="gap: 6px; flex: none">
-        {%- if c.status != 'approved' %}<span class="badge t-r">{{ c.status }}</span>{% endif %}
-        {%- if c.paused %}<span class="badge t-n">paused</span>{% endif %}
-        {%- if c.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
-        {%- if c.sole_bid %}<span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}
-        <span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{{ tip(c.phase) }}</span>
-      </span>
-    </div>
-    {%- if c.phase == 'WAITING' %}
-    <div class="empty">Approved, waiting for the farmer. It starts managing the market on its next cycle once the CLOB market record loads.</div>
-    {%- else %}
-    <div style="display: flex; gap: 18px; align-items: baseline; flex-wrap: wrap">
-      <span><span class="mono mid">{{ c.mid | cents }}</span>{{ tip('mid_effective') }}</span>
-      <span style="font-size: 13px; color: var(--ink-2)">book mid {{ c.book_mid | cents }}{{ tip('book_mid') }}{% if c.phase_reason %} · {{ c.phase_reason }}{% endif %}{% if c.phase_until %} until {{ c.phase_until | clock }}{% endif %}</span>
-    </div>
-    {%- if c.band %}
-    <div>
-      <div class="strip" role="img" aria-label="Reward band from {{ c.band.lo | cents }} to {{ c.band.hi | cents }}">
-        {%- for k in c.band.marks %}
-        <div class="mk {{ k.kind }}" style="left: {{ k.left }}%" title="{{ k.kind | replace('_', ' ') }} {{ k.price | cents }}"></div>
-        {%- endfor %}
-      </div>
-      <div class="strip-axis mono"><span>{{ c.band.lo | cents }}</span><span>{{ c.band.hi | cents }}</span></div>
-    </div>
-    {%- endif %}
-    <div>
-      {%- for s in c.slots %}
-      <div class="slot">
-        <span class="slot-name"><span class="badge {{ s.tone if s.order or s.target else 't-n' }}">{{ s.slot }}</span>{{ tip(s.slot) }}</span>
-        <span class="mono order">{% if s.order %}{{ s.order.price | cents }} × {{ s.order.size | shares }}{% elif s.target %}→ {{ s.target.price | cents }} × {{ s.target.size | shares }}{% else %}--{% endif %}</span>
-        <span class="muted">{{ s.decision }}{% if s.decision in ('hold', 'backoff', 'preview') %}{{ tip(s.decision) }}{% endif %}{% if s.live_score is not none %} · {{ s.live_score | score }}{% elif s.target_score is not none %} · {{ s.target_score | score }}{% endif %}{% if s.reason and s.decision != 'hold' %} · {{ s.reason | truncate(40, True) }}{% endif %}</span>
-      </div>
-      {%- endfor %}
-    </div>
-    <div class="bars">
-      <div class="stack" style="gap: 6px">
-        <span class="lbl">Q1 / Q2{{ tip('q1_q2') }}</span>
-        <span class="mono" style="font-size: 13px">{{ '%.1f' % c.q1 }} / {{ '%.1f' % c.q2 }}</span>
-        <div class="bar" title="balance {{ c.q_balance_pct }}%"><div class="q" style="width: {{ c.q_balance_pct }}%"></div></div>
-      </div>
-      <div class="stack" style="gap: 6px">
-        <span class="lbl">Naked budget{{ tip('naked_budget') }}</span>
-        <span class="mono" style="font-size: 13px">{{ c.budget_used_usd | usd }} / {{ c.budget_usd | usd }}</span>
-        <div class="bar"><div class="naked" style="width: {{ c.naked_pct }}%"></div></div>
-        {%- if c.free_bid_usd %}
-        <span class="small muted">{{ c.free_bid_usd | usd }} outside the budget{% if c.long_return is not none %}: a fill gives a buyer {{ '%.1f' % (c.long_return * 100) }}% a year{% endif %}</span>
-        {%- endif %}
-      </div>
-    </div>
-    {%- endif %}
-    <div class="actions">
-      <span class="small muted" style="flex: 1 1 200px">
-        {%- if c.position %}Farm {{ c.position.farm.fav | shares }} / {{ c.position.farm.long | shares }}{{ tip('farm_inventory') }} · baseline {{ c.position.baseline.fav | shares }} / {{ c.position.baseline.long | shares }}{{ tip('baseline') }} (fav / long) · {% endif -%}
-        {%- if c.cutoff_in_s is none %}no end date{% elif c.cutoff_in_s > 0 %}cutoff in {{ c.cutoff_in_s | span }}{{ tip('expiry_cutoff') }}{% else %}cutoff passed{{ tip('expiry_cutoff') }}{% endif -%}
-      </span>
-      <a class="btn" href="/markets/{{ c.condition_id }}">Details</a>
-      {{ polymarket_link(c.slug, "btn") }}
-    </div>
-    <div class="actions">
-      {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused, c.sole_bid) }}
-    </div>
-  </article>
+{#- Every card, or with oob only the ones the page holds an older version of,
+    each swapped into place by its id. -#}
+{%- macro article(c) %}
+  <article class="panel card" id="card-{{ c.condition_id }}" data-condition-id="{{ c.condition_id }}" data-v="{{ c.v }}"{{ ' hx-swap-oob="true"' | safe if oob }}>{{ c.html }}  </article>
+{%- endmacro %}
+{%- if oob %}
+{%- for c in cards %}{{ article(c) }}{% endfor %}
+{%- else %}
+<section class="cards" data-order="{{ order }}">
+{%- for c in cards %}{{ article(c) }}
 {%- else %}
   <div class="empty">No markets{{ ' in ' ~ vm.phase if vm.phase }}.</div>
 {%- endfor %}
 </section>
+{%- endif %}

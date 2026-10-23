@@ -900,6 +900,26 @@ class RoutesTest(Console):
         self.assertIn('<span class="badge t-n">PAUSED<button type="button" class="tip"',
                       self.client.get("/partials/markets").text)
 
+    def test_a_cycle_sends_only_the_cards_that_changed(self):
+        full = self.client.get("/partials/markets").text
+        order = re.search(r'data-order="(\w+)"', full)[1]
+        held = dict(re.findall(r'id="card-(\w+)"[^>]*data-v="(\w+)"', full))
+        have = ".".join(held.values())
+        self.assertEqual(held.keys(), {A, B})
+        self.assertEqual(self.client.get("/partials/markets",
+                                         params={"order": order, "have": have}).status_code, 204)
+        self.publish(states=[state(A, "PAUSED", "paused by operator", slots={})
+                             ._replace(updated_at=self.now)])
+        resp = self.client.get("/partials/markets", params={"order": order, "have": have})
+        self.assertEqual(resp.headers["hx-reswap"], "none")
+        self.assertIn(f'id="card-{A}"', resp.text)
+        self.assertIn('hx-swap-oob="true"', resp.text)
+        self.assertIn("paused by operator", resp.text)
+        self.assertNotIn(f'id="card-{B}"', resp.text)
+        stale = self.client.get("/partials/markets", params={"order": "0", "have": have})
+        self.assertIn('<section class="cards"', stale.text)
+        self.assertNotIn("hx-swap-oob", stale.text)
+
 
 class ApiTest(Console):
     def test_overview_json(self):

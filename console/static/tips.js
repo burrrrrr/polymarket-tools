@@ -52,7 +52,9 @@
   document.addEventListener("focusin", (e) => { const t = tipOf(e); if (t) show(t); });
   document.addEventListener("focusout", (e) => { if (active && tipOf(e) === active) hide(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); });
-  document.addEventListener("htmx:afterSwap", () => { if (active && !active.isConnected) hide(); });
+  const hideDetached = () => { if (active && !active.isConnected) hide(); };
+  document.addEventListener("htmx:afterSwap", hideDetached);
+  document.addEventListener("htmx:oobAfterSwap", hideDetached);
   window.addEventListener("scroll", hide, true);
   window.addEventListener("resize", hide);
 })();

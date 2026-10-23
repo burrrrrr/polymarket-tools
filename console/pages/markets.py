@@ -1,9 +1,12 @@
+import hashlib
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, Response
+from markupsafe import Markup
 
 from farm import farm_db
 from farm.farm_db import CommandKind, EventKind
@@ -15,6 +18,21 @@ MARKET_REGIONS = {"summary": "partials/market_summary.html",
                   "chart": "partials/market_chart.html",
                   "live": "partials/market_live.html",
                   "history": "partials/market_history.html"}
+
+
+@dataclass(frozen=True)
+class RenderedCard:
+    condition_id: str
+    html: Markup
+    v: str
+
+
+def fingerprint(text):
+    return hashlib.blake2b(text.encode(), digest_size=4).hexdigest()
+
+
+def order_of(cards):
+    return fingerprint(",".join(c.condition_id for c in cards))
 
 
 def parse_phase(phase):
@@ -47,19 +65,41 @@ def routes(ctx):
         snap = ctx.snapshot(conn, now)
         return snap, views.markets_page(snap, parse_phase(phase), now)
 
+    def rendered(vm):
+        card = ctx.templates.env.get_template("partials/card.html").module.card
+        return [RenderedCard(c.condition_id, html, fingerprint(html))
+                for c in vm.cards for html in (card(c),)]
+
     @router.get("/markets", response_class=HTMLResponse)
     def markets_page(request: Request, phase: Optional[str] = None):
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
             snap, vm = markets_vm(conn, now, phase)
-        return ctx.render(request, "markets.html", now, snap, vm=vm, page="markets")
+        cards = rendered(vm)
+        return ctx.render(request, "markets.html", now, snap, vm=vm, page="markets",
+                          cards=cards, order=order_of(cards))
 
     @router.get("/partials/markets", response_class=HTMLResponse)
-    def markets_partial(request: Request, phase: Optional[str] = None):
+    def markets_partial(request: Request, phase: Optional[str] = None,
+                        order: Optional[str] = None, have: Optional[str] = None):
+        """All the cards, or when the page holds the same cards in the same
+        order (order), only those whose version differs from the page's, in
+        have, joined by dots. A farmer cycle changes a few of hundreds."""
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
             snap, vm = markets_vm(conn, now, phase)
-        return ctx.render(request, "partials/cards.html", now, snap, vm=vm)
+        cards = rendered(vm)
+        held = have.split(".") if have else []
+        if order != order_of(cards) or len(held) != len(cards):
+            return ctx.render(request, "partials/cards.html", now, snap, vm=vm,
+                              cards=cards, order=order_of(cards))
+        changed = [c for c, v in zip(cards, held) if c.v != v]
+        if not changed:
+            return Response(status_code=204)
+        response = ctx.render(request, "partials/cards.html", now, snap, vm=vm,
+                              cards=changed, oob=True)
+        response.headers["HX-Reswap"] = "none"
+        return response
 
     @router.get("/api/markets")
     def markets_api(phase: Optional[str] = None):

@@ -1,5 +1,4 @@
 {% extends "base.html" %}
-{% from "_macros.html" import region %}
 {% block title %}Live markets{% endblock %}
 {% block content %}
 <header class="page-head">
@@ -13,5 +12,5 @@
     {%- endfor %}
   </nav>
 </header>
-{% call region("/partials/markets" ~ ('?phase=' ~ vm.phase if vm.phase else ''), "sse:cycle, " ~ CONTROLS_EVENT ~ " from:body") %}{% include "partials/cards.html" %}{% endcall %}
+<div hx-get="/partials/markets{{ '?phase=' ~ vm.phase if vm.phase }}" hx-trigger="sse:cycle[document.visibilityState === 'visible'], {{ CONTROLS_EVENT }} from:body" hx-swap="innerHTML" hx-vals="js:{order: document.querySelector('.cards')?.dataset.order ?? '', have: [...document.querySelectorAll('.card')].map((c) => c.dataset.v).join('.')}">{% include "partials/cards.html" %}</div>
 {% endblock %}
