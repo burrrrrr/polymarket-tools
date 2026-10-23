@@ -122,6 +122,19 @@ class MigrationTest(ScratchDb):
         self.assertEqual(row["status"], "approved")
         self.assertEqual((row["baseline_fav"], row["paused"], row["capital_usd"]), (None, 0, None))
 
+    def test_a_migrated_file_opens_while_another_process_writes(self):
+        farm_db.open_db(self.path).close()
+        writer = sqlite3.connect(self.path)
+        writer.execute("BEGIN IMMEDIATE")
+        try:
+            with mock.patch.object(farm_db, "BUSY_TIMEOUT_S", 0.2):
+                conn = farm_db.open_db(self.path)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0], 0)
+            conn.close()
+        finally:
+            writer.rollback()
+            writer.close()
+
     def test_migrating_twice_changes_nothing(self):
         self.make_old_db(PRE_CHANGE_MARKETS, [{"condition_id": "0xa", "status": "approved"}])
         farm_db.open_db(self.path).close()

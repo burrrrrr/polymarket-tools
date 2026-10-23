@@ -266,8 +266,12 @@ def open_db(path):
             for name, kind in columns:
                 if name not in present:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
-        conn.executemany("DELETE FROM settings WHERE key = ?",
-                         [(key,) for key in RETIRED_SETTINGS])
+        # A write on every open would wait on the farmer's write lock, so
+        # only a file holding a retired row writes.
+        retired = [key for key in RETIRED_SETTINGS if conn.execute(
+            "SELECT 1 FROM settings WHERE key = ?", (key,)).fetchone()]
+        if retired:
+            conn.executemany("DELETE FROM settings WHERE key = ?", [(key,) for key in retired])
     return conn
 
 
