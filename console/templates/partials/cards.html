@@ -5,7 +5,7 @@
     <div style="display: flex; gap: 10px; align-items: flex-start; justify-content: space-between">
       <div style="display: flex; flex-direction: column; gap: 4px; min-width: 0">
         <a class="title" href="/markets/{{ c.condition_id }}">{{ c.name }}</a>
-        <span class="small muted">{{ c.mode or '--' }}{% if c.mode %}{{ tip(c.mode | lower) }}{% endif %} · {{ c.fav_outcome or '--' }} · cutoff {{ c.cutoff.strftime('%Y-%m-%d') if c.cutoff else '--' }} · p_true {{ '%.3f' % c.p_true if c.p_true is not none else '--' }}</span>
+        <span class="small muted">{{ c.mode or '--' }}{% if c.mode %}{{ tip(c.mode | lower) }}{% endif %} · {{ c.fav_outcome or '--' }} · cutoff {{ c.cutoff.strftime('%Y-%m-%d') if c.cutoff else '--' }} · p_true {{ c.p_true | p_true_text }}</span>
       </div>
       <span class="actions" style="gap: 6px; flex: none">
         {%- if c.status != 'approved' %}<span class="badge t-r">{{ c.status }}</span>{% endif %}

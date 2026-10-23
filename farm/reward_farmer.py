@@ -29,7 +29,11 @@ farmer rests on both sides, in four slots per market:
             that net beats the orders without it. A bid with more than
             reward_screener.DEPTH_FREE_SHARES bid above it is charged no
             fills, so it rests at all of the capital left. Until the
-            market's history is read it does not rest at all.
+            market's history is read it does not rest at all. p_true is
+            the operator's view of the favorite, or none: a market without
+            one follows the book, and its p_true each cycle is the midpoint
+            of the book without our orders, with no margin under it
+            (FarmMarket.worth, ev_cap). A one-sided book rests it no bid.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
             favorite bid so it scores the same, and never under its average
@@ -77,7 +81,8 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                plan just follows the bids that remain.
   BELOW_RANGE  the midpoint fell under --min-fav, where the strategy does not
                apply; it resumes a little above the threshold.
-  SOLE_BID     on a market a human opted in (markets.sole_bid), no other bid
+  SOLE_BID     on a market a human opted in (markets.sole_bid) with a p_true
+               of their own, no other bid
                supports a favorite bid: the midpoint without our orders is
                under --min-fav, or no price within --max-lead of the best
                other bid rests a favorite bid a longshot bid can balance
@@ -433,7 +438,8 @@ class FarmMarket(NamedTuple):
     v: float
     min_size: float
     long_token_id: str
-    p_true: float
+    # The operator's view of the favorite, or None: the market follows the book.
+    p_true: Optional[float]
     naked_budget_usd: float
     expires_at: datetime
     capital: float
@@ -445,6 +451,16 @@ class FarmMarket(NamedTuple):
     paused: bool = False
     naked_paused: bool = False
     sole_bid: bool = False
+    # The adjusted midpoint of this cycle's book without our orders, set by
+    # with_book_mid; None before a book is read and in a one-sided book.
+    book_mid: Optional[float] = None
+
+    @property
+    def worth(self):
+        """What a favorite share is worth to the plan: the operator's p_true,
+        else this cycle's book midpoint, else None, and then no favorite bid
+        rests."""
+        return self.book_mid if self.p_true is None else self.p_true
 
     def token(self, role):
         return self.fav_token_id if role is Role.FAV else self.long_token_id
@@ -644,8 +660,19 @@ def sized_score(slot, price, size, mid, fm):
 
 
 def ev_cap(fm, cfg):
-    """Highest favorite bid that is still +EV by the margin we demand."""
-    return floor_to_tick(fm.p_true - cfg.ev_margin, fm.tick)
+    """Highest favorite bid the market's worth allows, or None without one.
+
+    Under an operator's p_true it keeps the EV margin, a buffer on a view. A
+    market following the book is capped at its midpoint itself: the fill
+    model charges what a fill there costs."""
+    if fm.p_true is not None:
+        return floor_to_tick(fm.p_true - cfg.ev_margin, fm.tick)
+    return None if fm.book_mid is None else floor_to_tick(fm.book_mid, fm.tick)
+
+
+def with_book_mid(fm, book):
+    """fm with book_mid read from this cycle's favorite book without our orders."""
+    return fm._replace(book_mid=adjusted_mid(book.bids, book.asks, fm.min_size))
 
 
 def exit_floor(position, fm, cfg):
@@ -916,7 +943,7 @@ def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
     sale_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
-                       bid and (bid.price, bid.size), capital, fm.p_true, outlook,
+                       bid and (bid.price, bid.size), capital, fm.worth, outlook,
                        position.fav_shares, sale_price)
 
 
@@ -959,6 +986,9 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
 
     if not outlook.fills.from_history and not bid_without_history:
         return no_bid("no fill history yet")
+    cap = ev_cap(fm, cfg)
+    if cap is None:
+        return no_bid("no p_true or book midpoint")
 
     def valued(price, size):
         """(plan, its QuoteValue) with the favorite bid at price, starting at
@@ -968,8 +998,7 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
             return plan, value_of(plan, fm, levels, position, cfg, outlook, fill_mid)
         return None
 
-    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
-                                ev_cap(fm, cfg))
+    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead, cap)
     room = capital_room(fm, position)
     full = [valued(price, round_size_down(room / price)) for price in prices]
     bar = max((value.net_per_day for _, value in filter(None, full)), default=None)
@@ -1012,11 +1041,10 @@ def supported(levels, fm, position, cfg, fill_mid=None):
     offers more than MAX_RETURN. What a favorite bid there would earn or
     cost is not asked: that is target_orders' to judge.
     """
-    mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
-    if mid is None or mid < cfg.min_fav:
+    mid, cap = adjusted_mid(levels.bids, levels.asks, fm.min_size), ev_cap(fm, cfg)
+    if mid is None or mid < cfg.min_fav or cap is None:
         return False
-    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead,
-                                ev_cap(fm, cfg))
+    prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead, cap)
     return any(i.slot is Slot.FAV_BID for price in prices
                for i in quotes_at(fm, levels, position, cfg, True, price,
                                   fill_mid=fill_mid).intents)
@@ -1118,13 +1146,14 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     allows. The exits rest as in any plan, the favorite ask anchored at the
     midpoint the longshot bid needs.
 
-    None when the book has no ask of min_size, the favorite bid would cross,
-    top ev_cap or leave the midpoint under min_fav, either bid would score
-    nothing, or the capital buys less than min_size.
+    None when the market has no ev_cap, the book no ask of min_size, the
+    favorite bid would cross, top ev_cap or leave the midpoint under
+    min_fav, either bid would score nothing, or the capital buys less than
+    min_size.
     """
     tick, v, decimals = fm.tick, fm.v, tick_decimals(fm.tick)
-    best_ask = best_price(levels.asks, fm.min_size)
-    if best_ask is None:
+    best_ask, cap = best_price(levels.asks, fm.min_size), ev_cap(fm, cfg)
+    if best_ask is None or cap is None:
         return None
     # The longshot bid scores while the favorite midpoint is above this.
     edge_mid = 1 - long_price - v
@@ -1143,7 +1172,7 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     # first price, and within v of the bid itself above the second.
     lowest = max(tick, round(
         floor_to_tick(max(2 * edge_mid - ask, ask - 2 * v), tick) + tick, decimals))
-    ceiling = min(ev_cap(fm, cfg), floor_to_tick(min(levels.asks[0][0], ask) - tick, tick))
+    ceiling = min(cap, floor_to_tick(min(levels.asks[0][0], ask) - tick, tick))
     price = round(lowest + SOLE_BID_LEAD_TICKS * tick, decimals)
     if price > ceiling + 1e-9:
         if full_lead:
@@ -1302,8 +1331,10 @@ def keep_failure(order, intent, target, fm, position, cfg):
     if order.slot is not Slot.LONG_BID and not (
             low * size - 1e-9 <= order.size_remaining <= high * size + 1e-9):
         return "size out of range"
-    if order.slot is Slot.FAV_BID and order.price > ev_cap(fm, cfg) + 1e-9:
-        return "above the EV cap"
+    if order.slot is Slot.FAV_BID:
+        cap = ev_cap(fm, cfg)
+        if cap is None or order.price > cap + 1e-9:
+            return "above the EV cap"
     if order.slot is Slot.FAV_BID and order.price * order.size_remaining > (
             high * capital_room(fm, position) + 1e-9):
         return "over the capital"
@@ -1707,8 +1738,6 @@ def farm_market(row, info, cfg, now):
     others = [t for t in info.token_ids if t != fav]
     if fav not in info.token_ids or len(others) != 1:
         return Skip("favorite token not in the market's two tokens")
-    if row["p_true"] is None:
-        return Skip("no p_true")
     end_date = parse_time(row["end_date"]) or parse_time(market["end_date"])
     return FarmMarket(
         condition_id=row["condition_id"],
@@ -1730,8 +1759,15 @@ def farm_market(row, info, cfg, now):
         zones=Zones(fill_cost.years_until(end_date, now)),
         paused=bool(row["paused"]),
         naked_paused=bool(row["naked_paused"]),
-        sole_bid=bool(row["sole_bid"]),
+        # A sole bid rests on the operator's view alone: a market following
+        # the book has no price to hold it to while no other bid supports it.
+        sole_bid=bool(row["sole_bid"]) and row["p_true"] is not None,
     )
+
+
+def p_true_text(p_true):
+    """A market's p_true as the farmer prints it: "market" for one following the book."""
+    return "market" if p_true is None else f"{p_true:.3f}"
 
 
 def position_for(fm, holdings):
@@ -2257,7 +2293,8 @@ class Farmer:
             if managed is None:
                 self.markets[cid] = Managed(fm, info, row_baseline(row))
                 self.emit(EventKind.PHASE,
-                          f"Managing {fm.label}: {fm.fav_outcome} p_true {fm.p_true:.3f}, "
+                          f"Managing {fm.label}: {fm.fav_outcome} "
+                          f"p_true {p_true_text(fm.p_true)}, "
                           f"budget ${fm.naked_budget_usd:.2f}, capital ${fm.capital:.2f}, "
                           f"v {fm.v * 100:.1f}c, min {fm.min_size:g}, tick {fm.tick:g}, "
                           f"expires {fm.expires_at:%Y-%m-%d}",
@@ -2476,7 +2513,8 @@ class Farmer:
 
         managed.orders = orders
         book = strip_own(levels, orders, fm) if self.live else levels
-        book_mid = adjusted_mid(book.bids, book.asks, fm.min_size)
+        fm = with_book_mid(fm, book)
+        book_mid = fm.book_mid
         book_ask = drop_ask(book.asks, fm.min_size)
         managed.mid_watch = watch_mid(managed.mid_watch, book_mid, now)
         fm = managed.fm = fm._replace(

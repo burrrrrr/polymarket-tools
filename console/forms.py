@@ -71,19 +71,28 @@ def _number(text):
     return value if math.isfinite(value) else None
 
 
-P_TRUE_ERROR = "Enter a whole percent from 1 to 99."
+P_TRUE_ERROR = "Enter a whole percent from 1 to 99, or tick Follow the market."
+FOLLOW_AND_P_TRUE_ERROR = "Clear p_true or untick Follow the market."
+FOLLOW_SOLE_ERROR = "A sole bid needs your p_true. Untick Follow the market or Allow sole bid."
 
 
-def parse_p_true(text):
-    """The probability of a p_true typed as a whole percent from 1 to 99, or None."""
+def parse_p_true(text, follow_market):
+    """The favorite's p_true chosen on the form: a whole percent from 1 to 99,
+    as a probability, or None when Follow the market is ticked with p_true
+    left blank. ValueError with the message to show for anything else."""
+    if follow_market:
+        if (text or "").strip():
+            raise ValueError(FOLLOW_AND_P_TRUE_ERROR)
+        return None
     percent = _number(text)
     if percent is None or percent != int(percent) or not 0 < percent < 100:
-        return None
+        raise ValueError(P_TRUE_ERROR)
     return percent / 100
 
 
 class Decision(NamedTuple):
-    p_true: float
+    # None follows the market.
+    p_true: Optional[float]
     naked_budget: float
     capital: Optional[float]
     start_paused: bool
@@ -91,13 +100,19 @@ class Decision(NamedTuple):
 
 
 def parse_decision(form):
-    """Approval terms: p_true as a whole percent, a budget of 0 or more, and an
-    optional positive capital (blank means the farmer's capital), whether to
-    start paused, and whether a sole bid is allowed."""
+    """Approval terms: p_true as a whole percent, or Follow the market ticked
+    instead, a budget of 0 or more, and an optional positive capital (blank
+    means the farmer's capital), whether to start paused, and whether a sole
+    bid is allowed, which needs a p_true."""
     errors = {}
-    p_true = parse_p_true(form.get("p_true"))
-    if p_true is None:
-        errors["p_true"] = P_TRUE_ERROR
+    follow_market = form.get("follow_market") == "1"
+    sole_bid = form.get("sole_bid") == "1"
+    try:
+        p_true = parse_p_true(form.get("p_true"), follow_market)
+    except ValueError as e:
+        p_true, errors["p_true"] = None, str(e)
+    if follow_market and sole_bid:
+        errors["follow_market"] = FOLLOW_SOLE_ERROR
     budget = _number(form.get("naked_budget"))
     if budget is None or budget < 0:
         errors["naked_budget"] = "Enter a budget in dollars, 0 or more."
@@ -107,7 +122,6 @@ def parse_decision(form):
         if capital is None or not capital > 0:
             errors["capital"] = "Enter a positive amount, or leave blank for the farmer's."
     start_paused = form.get("start_paused") == "1"
-    sole_bid = form.get("sole_bid") == "1"
     return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid)), errors
 
 
@@ -117,7 +131,11 @@ def preview_terms(form):
     decision, errors = parse_decision(form)
     if decision:
         return decision.p_true, decision.naked_budget, decision.capital
-    return (parse_p_true(form.get("p_true")),
+    try:
+        p_true = parse_p_true(form.get("p_true"), form.get("follow_market") == "1")
+    except ValueError:
+        p_true = None
+    return (p_true,
             None if "naked_budget" in errors else _number(form.get("naked_budget")),
             None if "capital" in errors else _number(form.get("capital")))
 

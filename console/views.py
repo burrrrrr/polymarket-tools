@@ -25,7 +25,7 @@ from farm.reward_screener import score as share_score
 from tools import db as tools_db
 from tools.db import JobState
 
-from .forms import P_TRUE_ERROR
+from .forms import P_TRUE_ERROR, parse_p_true
 
 SLOTS = ("FAV_BID", "LONG_BID", "FAV_ASK", "LONG_ASK")
 PHASES = ("QUOTING", "SOLE_BID", "COOLDOWN", "BELOW_RANGE", "PAUSED", "UNREWARDED",
@@ -762,8 +762,9 @@ def timeline(market, events, cutoff, now):
     capital = usd(market.capital_usd) if market.capital_usd is not None else "farmer default"
     items = [TimelineItem(market.first_seen, (
         f"First seen by the screener. Status {market.status}"
-        + (f", p_true {market.p_true:.3f}, naked budget {usd(market.naked_budget_usd)}, "
-           f"capital {capital}" if market.p_true is not None else "")
+        + (f", p_true {p_true_text(market.p_true)}, naked budget "
+           f"{usd(market.naked_budget_usd)}, capital {capital}"
+           if market.naked_budget_usd is not None else "")
         + (f". Note: {market.note}" if market.note else "") + "."))]
     items += [TimelineItem(e.at, e.message) for e in sorted(own + starts, key=lambda e: e.id)]
     if cutoff is not None:
@@ -995,6 +996,9 @@ def number_text(value):
     return f"{value:g}"
 
 
+p_true_text = reward_farmer.p_true_text
+
+
 def setting_rows(fields, group, status, overrides, bad_rows, defaults, submitted, errors):
     """One group's rows; submitted and errors are a failed save's, shown back as typed."""
     rows = []
@@ -1220,8 +1224,10 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     a zero farm position, since a new market's holdings become its baseline.
     A market the farmer already manages gets the book without a plan.
 
-    A row with no p_true is valued at the book midpoint, as the scan values
-    it, and its sole bid is capped by the ask alone, as the scan plans one.
+    A row with no p_true follows the book, as the farmer runs it: valued at
+    the book midpoint, which caps its bid with no EV margin, and with no
+    sole bid. One with its sole bid allowed is still previewed with the sole
+    bid the scan plans, capped by the ask alone, until a p_true is typed.
     Fills come from the history the scan stored shrunk toward prior, or
     prior alone without one; the console never reads a history itself, and
     the farmer would not bid until it has read one."""
@@ -1231,27 +1237,25 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
     book_mid = adjusted_mid(levels.bids, levels.asks, info.min_size)
     target, note, pool, sole = reward_farmer.Target(book_mid, []), "", None, None
     history = fill_cost.history_from_json(metrics.get("history"))
-    unpriced = row["p_true"] is None
-    if unpriced:
-        row = {**dict(row), "p_true": book_mid}
     fm = reward_farmer.farm_market(row, info, cfg, now)
     if not isinstance(fm, Skip):
         # A preview has no cycles behind it. It shows the plan the farmer
         # settles on once the midpoint has held for FREE_DWELL_S.
-        fm = fm._replace(zones=fm.zones._replace(steady_mid=book_mid))
+        fm = reward_farmer.with_book_mid(
+            fm._replace(zones=fm.zones._replace(steady_mid=book_mid)), levels)
     if managed:
         note = "The farmer manages this market. Its live orders are on the market page."
     elif isinstance(fm, Skip):
         note = f"The farmer cannot manage this market: {fm.reason}."
     else:
         fm = fm._replace(tick=levels.tick or fm.tick)
-        if fm.sole_bid and not reward_farmer.supported(levels, fm, reward_farmer.Position(),
-                                                       cfg):
-            sole_fm, sole_cfg = fm, cfg
-            if unpriced:
-                # The book midpoint of a market only a sole bid can quote sits
-                # cents under that bid, so it is no stand-in for a p_true here.
-                sole_fm, sole_cfg = fm._replace(p_true=1.0), cfg._replace(ev_margin=0.0)
+        sole_fm, sole_cfg = fm, cfg
+        if row["sole_bid"] and row["p_true"] is None:
+            # The book midpoint of a market only a sole bid can quote sits
+            # cents under that bid, so it is no stand-in for a p_true here.
+            sole_fm, sole_cfg = fm._replace(p_true=1.0, sole_bid=True), cfg._replace(ev_margin=0.0)
+        if sole_fm.sole_bid and not reward_farmer.supported(
+                levels, sole_fm, reward_farmer.Position(), sole_cfg):
             sole = reward_farmer.sole_bid_target(sole_fm, levels, reward_farmer.Position(),
                                                  sole_cfg, ())
         obs = reward_farmer.Observation(
@@ -1347,10 +1351,11 @@ def p_true_start(metrics):
     return None if mid is None else min(max(round(mid * 100), 1), 99)
 
 
-def ev_check(metrics, p_true, budget_text, ev_margin, years_left):
-    """What the farmer will do with this p_true (a probability, None while the
-    typed percent is invalid) and budget, by its own rule: the favorite bid
-    never prices above floor_to_tick(p_true - ev_margin). The budget is held
+def ev_check(metrics, p_true_text, follow_market, budget_text, ev_margin, years_left):
+    """What the farmer will do with this p_true, or Follow the market, and
+    budget as typed, by its own rule: the favorite bid never prices above
+    floor_to_tick(p_true - ev_margin), and a market that follows the market
+    is capped at the book midpoint with no margin and holds no sole bid. The budget is held
     against what the planned longshot leg takes of it with years_left to the
     end date (planned_budget_cost).
 
@@ -1358,9 +1363,21 @@ def ev_check(metrics, p_true, budget_text, ev_margin, years_left):
     rests depends on the longshot bid the farmer picks against the live book.
     Its longshot bid is sized to the budget, whatever the budget is."""
     plan, m = metrics.get("plan"), metrics.get("market", {})
-    if p_true is None or not plan:
+    try:
+        p_true = parse_p_true(p_true_text, follow_market)
+    except ValueError as e:
+        return EvCheck("c-warn", [str(e)])
+    if not plan:
         return EvCheck("c-warn", [P_TRUE_ERROR])
     tick = m.get("tick") or 0.001
+    if p_true is None:
+        if sole_plan(metrics):
+            return EvCheck("c-warn", ["A sole bid needs your p_true. Following the market, "
+                                      "the farmer holds none."])
+        tone, lines = "c-good", ["No p_true: the farmer follows the market. Each cycle the bid "
+                                 "is capped at the book midpoint, with no EV margin, and a fill "
+                                 "is valued there."]
+        return _with_budget(EvCheck(tone, lines), metrics, budget_text, years_left)
     bid, cap = plan["fav_bid_price"], floor_to_tick(p_true - ev_margin, tick)
     margin = f"p_true − {cents(ev_margin)}"
     if sole_plan(metrics):
@@ -1383,10 +1400,14 @@ def ev_check(metrics, p_true, budget_text, ev_margin, years_left):
         then = (f"scores {capped:.3f}, not {plan['fav_bid_score']:.3f}." if capped > 0 else
                 "outside the band, so no favorite bid and no reward.")
         tone, lines = "c-warn", [f"Bid capped at {cents(cap)} ({margin}): {then}"]
+    return _with_budget(EvCheck(tone, lines), metrics, budget_text, years_left)
+
+
+def _with_budget(ev, metrics, budget_text, years_left):
+    """ev, warned when the budget is short of the planned longshot leg."""
     budget = _float(budget_text)
     long_cost = planned_budget_cost(metrics, years_left)
     if budget is not None and budget < long_cost - 1e-9:
-        tone = "c-warn"
-        lines.append(f"Longshot {usd(long_cost)} is over your {usd(budget)} budget: "
-                     f"re-priced to fit.")
-    return EvCheck(tone, lines)
+        return EvCheck("c-warn", ev.lines + [f"Longshot {usd(long_cost)} is over your "
+                                             f"{usd(budget)} budget: re-priced to fit."])
+    return ev

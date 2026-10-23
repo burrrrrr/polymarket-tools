@@ -69,7 +69,7 @@ four slots per market:
 
 | Slot | Order | Side | Purpose |
 | --- | --- | --- | --- |
-| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](pricing.md#the-fill-cost-model)), never above your `p_true` minus `--ev-margin`, never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
+| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](pricing.md#the-fill-cost-model)), never above your `p_true` minus `--ev-margin` (or the book midpoint on a market [that follows the book](#markets-without-a-p_true)), never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
 | `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same, and never under their average cost plus `--min-capture`. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
 | `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price that balances Q_one, 0.1c on most markets, and never where a fill would give a favorite buyer over 20% a year. [The longshot bid](pricing.md#the-longshot-bid) has the rule. |
@@ -102,7 +102,7 @@ Each market is in one of seven states:
   bids that remain.
 - `BELOW_RANGE`: the midpoint is below `--min-fav`. The bids come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
-- `SOLE_BID`: you set `sole_bid = 1` on the market, and no other bid
+- `SOLE_BID`: you set `sole_bid = 1` on a market with a `p_true`, and no other bid
   supports a favorite bid. That means one of three things. The midpoint
   without the farmer's own orders is below `--min-fav`. Or no price within
   `--max-lead` of the best other bid scores. Or the midpoint is too low for
@@ -191,6 +191,20 @@ reads positions every 60 seconds and every market's Gamma record (reward terms,
 tick, trading status) every 5 minutes, in batched requests on a thread of its
 own, and a newly approved market's at once.
 
+## Markets without a p_true
+
+`p_true` is your view of the favorite. Leave it NULL and the market follows
+the book. Each cycle its `p_true` is the adjusted midpoint of the favorite
+book without the farmer's own orders, and the favorite bid goes no higher.
+No `--ev-margin` applies: the margin is a buffer on a view, and the
+[fill-cost model](pricing.md#the-fill-cost-model) already charges what a
+fill at that price costs, valued at the midpoint.
+
+- A one-sided book has no midpoint, so the market rests no favorite bid that
+  cycle. Its exits rest as they do in any one-sided book.
+- The market never enters `SOLE_BID`, whatever `sole_bid` says.
+- The farmer prints its `p_true` as `market`.
+
 ## Pausing, settings, and stopping
 
 The console (or any process with write access to `farm.db`) controls a
@@ -207,7 +221,7 @@ the same as setting it once, and a farmer that restarts reads the same level.
   `--capital`.
 - `sole_bid = 1` lets the market enter `SOLE_BID` (see
   [Market lifecycle](#market-lifecycle)). Set it only on a market you are
-  near certain of.
+  near certain of. A market with no `p_true` never enters `SOLE_BID`.
 - To retire a market, set its `status` to `retired`. To cancel everything,
   set `paused = 1` on every approved market.
 
@@ -255,7 +269,8 @@ if no farmer was running when it was sent.
 - Every order is post-only, so a fill is always a maker fill.
 - Every order is good-till-date. It expires at the market's end date minus
   `--expiry-buffer-days`, even if the farmer dies.
-- The favorite bid never prices above `p_true - --ev-margin`.
+- The favorite bid never prices above `p_true - --ev-margin`, or above the
+  book midpoint on a market with no `p_true`.
 - `--capital` caps each market's favorite exposure. Favorite shares already
   held count against it at cost. The favorite bid rests at the size at or
   under what is left that nets the most.
@@ -337,7 +352,7 @@ it does not manage.
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask and longshot ask minimum above the shares' average cost |
-| `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this |
+| `--ev-margin` | 0.02 | The favorite bid stays at or below `p_true` minus this. A market with no `p_true` has no margin |
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets, at its own price and size, at least this share of the best bid's |
@@ -382,7 +397,8 @@ cancels the orders 10 seconds after the heartbeats stop.
 ## Going live
 
 1. Run a scan and approve the markets you want, with your `--p-true` and
-   `--budget` for each.
+   `--budget` for each. Pass `--follow-market` in place of `--p-true` to let a market follow
+   the book.
 2. Run a dry run on the same database and read the output for a few cycles.
    Check the prices, sizes, and the `holding` lines.
 3. Make sure the wallet holds enough USDC. At startup the live farmer compares

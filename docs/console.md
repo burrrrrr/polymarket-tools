@@ -58,8 +58,15 @@ rows and its funnel in one transaction and never changes your decisions.
 - **Approve** sets `status` to `approved` with the p_true, naked budget, and
   capital you entered. You enter p_true as a whole percent from 1 to 99, with
   the - and + buttons or the arrow keys stepping it by 1; the database stores
-  it as a probability. The naked budget starts at $10 for a new market. A
-  blank capital means the farmer's `capital` setting.
+  it as a probability. To farm without a p_true, tick **Follow the market**
+  instead. The p_true field then greys out. The farmer caps the bid at the
+  book midpoint with no `ev_margin` and never holds a sole bid there (see
+  [Markets without a p_true](farmer.md#markets-without-a-p_true)). Pages show
+  its p_true as `market`. The form needs exactly one of the two. It refuses
+  a blank p_true with the box unticked, and a p_true with the box ticked. A
+  sole bid needs a p_true, so it also refuses **Follow the market** with
+  **Allow sole bid** ticked. A market approved to follow opens with the box
+  ticked. The naked budget starts at $10 for a new market. A blank capital means the farmer's `capital` setting.
   On a market that is already approved, the same form edits those terms.
   After a decision on a candidate, the console opens the next undecided
   candidate. After an edit, it opens the market's page.
@@ -73,8 +80,8 @@ rows and its funnel in one transaction and never changes your decisions.
     outside the band. That score is measured against the midpoint the capped
     bid creates.
   - The live preview below the check shows the price the farmer would pick
-    under that cap and its net per day. Until you type a p_true, it values
-    the market at the book midpoint, as the scan does.
+    under that cap and its net per day. With **Follow the market** ticked, it
+    shows the market capped at the book midpoint.
   - The preview's fills come from the history the scan stored and the stored
     fill prior. A market the scan did not read is valued on the prior alone,
     and the preview says so. With no prior stored yet, it says to run a scan.
@@ -103,8 +110,9 @@ rows and its funnel in one transaction and never changes your decisions.
   button shows how many are undecided. Once you approve or reject a sole
   candidate, it lists like any other market. The Review page of a sole
   candidate opens with "Allow sole bid" ticked. Until you type a p_true, the
-  live preview caps the sole bid by the ask alone, as the scan does. Your
-  p_true then caps it, and can leave no sole bid to rest. The EV check says
+  live preview caps the sole bid by the ask alone, as the scan does, and says
+  that a sole bid needs a p_true. Your p_true then caps it, and can leave no
+  sole bid to rest. The EV check says
   whether the scanned sole bid is within your cap. It does not re-score a
   sole bid that is over the cap, because the live preview shows where the
   farmer would rest it. Nothing values a sole bid's fills, so the page shows

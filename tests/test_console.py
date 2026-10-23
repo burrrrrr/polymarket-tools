@@ -27,7 +27,7 @@ ECONOMICS = {"net_per_day": 4.2, "reward_per_day": 5.0, "fills_per_day": 8.0,
 
 
 def metrics(slug, est=10.0, v=0.035, mode="FLOOR"):
-    return {"est_daily_usd": est, "plan": {"mode": mode},
+    return {"est_daily_usd": est, "plan": {"mode": mode, "low_price": 0.001, "low_size": 1000.0},
             "market": {"slug": slug, "question": f"{slug}?", "fav_outcome": "No", "v": v,
                        "min_size": 50.0, "tick": 0.001, "fav_token_id": "t",
                        "end_date": (NOW + timedelta(days=100)).isoformat(),

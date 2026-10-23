@@ -17,6 +17,7 @@ python -m farm.reward_screener scan --exclude sports,politics
 python -m farm.reward_screener list --status approved
 python -m farm.reward_screener approve <slug-or-condition-id> --p-true 0.97 --budget 25
 python -m farm.reward_screener approve <slug-or-condition-id> --p-true 0.97 --capital 200
+python -m farm.reward_screener approve <slug-or-condition-id> --follow-market --budget 25
 python -m farm.reward_screener reject <slug-or-condition-id> --note "resolution risk"
 ```
 
@@ -125,16 +126,25 @@ yield.
 
 ## Approve a market
 
-`approve` takes your probability that the favorite wins (`--p-true`) and the
-longshot risk budget outside the free zone (`--budget`, default $25). `--capital` sets the most USD
+`approve` takes the longshot risk budget outside the free zone (`--budget`,
+default $25) and exactly one of these:
+
+- `--p-true`: your probability that the favorite wins.
+- `--follow-market`: no p_true. The market follows the book. The farmer caps
+  its bid at the book midpoint with no EV margin, and `list` shows its p_true
+  as `market` (see
+  [Markets without a p_true](farmer.md#markets-without-a-p_true)).
+
+`approve` refuses a call with both or with neither. `--capital` sets the most USD
 the farmer may bid on this market's favorite, in place of the farmer's
 `--capital`.
 Without it, a market keeps the capital it already has, or uses the farmer's
 default if it has none. `approve` warns, but still approves,
 when the planned favorite bid is at or above `--p-true`, because a fill would
-lose money. It also warns when a planned longshot leg outside the free zone
-costs more than the budget. The zone is the one the leg's price falls in today:
-a leg planned in the free zone leaves it as the end date nears.
+lose money. `--follow-market` skips that warning. `approve` also warns when a
+planned longshot leg outside the free zone costs more than the budget. The
+zone is the one the leg's price falls in today: a leg planned in the free
+zone leaves it as the end date nears.
 
 ## Decided markets
 

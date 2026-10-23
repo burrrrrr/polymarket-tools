@@ -62,6 +62,9 @@ def routes(ctx):
         ev_margin = ctx.effective(conn, "ev_margin")
         values = values or {
             "p_true": views.number_text(market.p_true * 100) if market.p_true is not None else "",
+            # A market approved once keeps its budget, so one without a
+            # p_true then was approved to follow the market.
+            "follow_market": market.p_true is None and market.naked_budget_usd is not None,
             "naked_budget": views.number_text(market.naked_budget_usd
                                               if market.naked_budget_usd is not None
                                               else reward_screener.DEFAULT_NAKED_BUDGET),
@@ -79,9 +82,8 @@ def routes(ctx):
             "queue_mode": mode, "skipped": skipped,
             "sole_count": len(farm_db.candidate_queue(conn, farm_db.SOLE)),
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
-            "ev": views.ev_check(market.metrics, forms.parse_p_true(values["p_true"]),
-                                 values["naked_budget"], ev_margin,
-                                 views.years_left(market, now)),
+            "ev": views.ev_check(market.metrics, values["p_true"], values["follow_market"],
+                                 values["naked_budget"], ev_margin, views.years_left(market, now)),
             "p_true_start": views.p_true_start(market.metrics),
             "ev_margin": ev_margin, "farmer_capital": ctx.effective(conn, "capital"),
             "values": values, "errors": errors or {},
@@ -117,7 +119,7 @@ def routes(ctx):
     def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
                  capital=None, sole_bid=False):
         """(views.live_review of a market row with these terms against the live
-        book, its views.rewards_state); p_true None values it at the book midpoint."""
+        book, its views.rewards_state); p_true None follows the market."""
         terms = {"p_true": p_true, "naked_budget_usd": budget,
                  "capital_usd": capital, "paused": 0, "naked_paused": 0,
                  "sole_bid": int(sole_bid)}
@@ -179,21 +181,22 @@ def routes(ctx):
 
     @router.get("/partials/review/{condition_id}/ev", response_class=HTMLResponse)
     def review_ev(request: Request, condition_id: str, p_true: str = "",
-                  naked_budget: str = ""):
+                  follow_market: str = "", naked_budget: str = ""):
         with closing(ctx.connect()) as conn:
             market = ctx.find(conn, condition_id)
-            ev = views.ev_check(market.metrics, forms.parse_p_true(p_true), naked_budget,
+            ev = views.ev_check(market.metrics, p_true, follow_market == "1", naked_budget,
                                 ctx.effective(conn, "ev_margin"),
                                 views.years_left(market, ctx.clock()))
         return ctx.templates.TemplateResponse(request, "partials/review_ev.html", {"ev": ev})
 
     @router.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
     def review_live(request: Request, condition_id: str, p_true: str = "",
-                    naked_budget: str = "", capital: str = "", sole_bid: str = "",
-                    mode: Optional[str] = None):
+                    follow_market: str = "", naked_budget: str = "", capital: str = "",
+                    sole_bid: str = "", mode: Optional[str] = None):
         mode = parse_mode(mode)
         p, budget, cap = forms.preview_terms(
-            {"p_true": p_true, "naked_budget": naked_budget, "capital": capital})
+            {"p_true": p_true, "follow_market": follow_market, "naked_budget": naked_budget,
+             "capital": capital})
         with closing(ctx.connect()) as conn:
             row = farm_db.find_market(conn, condition_id)
             if row is None:
@@ -210,6 +213,7 @@ def routes(ctx):
         scan = json.loads(row["metrics"])
         return ctx.templates.TemplateResponse(request, "partials/review_live.html", {
             "live": live, "error": error, "p_true_missing": p is None,
+            "following": follow_market == "1",
             "scan_share": scan.get("share"), "scan_daily": scan.get("est_daily_usd"),
             "budget_missing": budget is None, "candidate": candidate,
             "left_queue": candidate and active is False,
@@ -274,7 +278,9 @@ def routes(ctx):
             market = ctx.find(conn, condition_id)
             if errors:
                 return review_page(request, conn, condition_id, 422,
-                                   values={**form, "note": form.get("note", "")},
+                                   values={**form, "p_true": form.get("p_true", ""),
+                                           "follow_market": form.get("follow_market") == "1",
+                                           "note": form.get("note", "")},
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
@@ -294,6 +300,7 @@ def routes(ctx):
             if errors:
                 return review_page(request, conn, condition_id, 422,
                                    values={**form, "p_true": form.get("p_true", ""),
+                                           "follow_market": form.get("follow_market") == "1",
                                            "naked_budget": form.get("naked_budget", ""),
                                            "capital": form.get("capital", "")},
                                    errors=errors, mode=mode)

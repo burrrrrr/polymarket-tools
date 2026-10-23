@@ -251,6 +251,10 @@ therefore agree wherever you start each one.
   [Import the old snapshot files](docs/orders.md#import-the-old-snapshot-files).
 - `python -m analysis.triage_eval` finds `farm.db` the same way.
   `python -m analysis.exit_backtest fetch` has no default: give it `--db`.
+- `python -m analysis.queue_fit fetch` has no default either: give it `--db`
+  and `--books`. `python -m analysis.queue_fit fit` needs `--books`.
+- `python -m analysis.pricing_backtest fetch` and `run` need `--db` and
+  `--books` too.
 
 ## Run the processes
 

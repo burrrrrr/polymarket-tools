@@ -48,7 +48,7 @@ class Context:
         self.templates = Jinja2Templates(directory=HERE / "templates")
         versions = {f.name: int(f.stat().st_mtime) for f in (HERE / "static").iterdir()}
         for name in ("cents", "usd", "shares", "score", "clock", "stamp_local", "span",
-                     "number_text", "human_volume"):
+                     "number_text", "human_volume", "p_true_text"):
             self.templates.env.filters[name] = getattr(views, name)
         self.templates.env.globals.update(
             PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE, JOB_TONE=views.JOB_TONE,

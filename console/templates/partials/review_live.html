@@ -10,7 +10,11 @@
 <div class="note-box small">{{ l.note }}</div>
 {%- endif %}
 {%- if l.orders and p_true_missing %}
-<div class="note-box small">Enter your p_true to apply the EV cap. Until then {{ 'only the ask caps the sole bid, as in the scan' if l.sole else 'the favorite bid is valued at the book midpoint, as the scan values it' }}.</div>
+<div class="note-box small">
+  {%- if l.sole %}A sole bid needs your p_true. {% if following %}Untick Follow the market or Allow sole bid.{% else %}Until you enter one only the ask caps it, as in the scan.{% endif %}
+  {%- elif following %}Following the market: the favorite bid is capped at the book midpoint, with no EV margin, and a fill is valued there.
+  {%- else %}Enter your p_true or tick Follow the market. Until then the preview follows the market, capped at the book midpoint.{% endif -%}
+</div>
 {%- endif %}
 {%- if budget_missing %}
 <div class="note-box small">Enter a naked budget. Until then a longshot bid outside the free zone is planned with $0, which also stops the favorite bid it would balance.</div>

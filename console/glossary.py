@@ -108,7 +108,13 @@ GLOSSARY = {
     "p_true": Term("p_true", "Your probability that the favorite wins, as a whole percent "
                              "from 1 to 99. The favorite bid "
                              "never goes above p_true minus the EV margin, so any fill is +EV "
-                             "by your own estimate."),
+                             "by your own estimate. Tick Follow the market instead to farm "
+                             "without one."),
+    "follow_market": Term("Follow the market", "No p_true: each cycle the favorite bid is "
+                                               "capped at the book midpoint, with no EV "
+                                               "margin, and a fill is valued there. The "
+                                               "market holds no sole bid. Pages show its "
+                                               "p_true as market."),
     "naked_budget": Term("Naked budget", "The most USD the longshot side may risk outside the "
                                          "free zone: a resting longshot bid whose fill would "
                                          "give a favorite buyer 5% a year or more, plus longshot "
@@ -127,7 +133,8 @@ GLOSSARY = {
                                        "default."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
                                  "the EV margin. The farmer never bids above that cap, and "
-                                 "below it picks the price with the best net of fill costs."),
+                                 "below it picks the price with the best net of fill costs. "
+                                 "Following the market, the cap is the book midpoint."),
 
     # live state
     "mid_effective": Term("Mid (effective)", "The reward midpoint including our own favorite "
@@ -164,7 +171,8 @@ GLOSSARY = {
                                            "market's rewards we are currently earning."),
     "edge_vs_p_true": Term("Edge vs p_true", "p_true minus the fill price. Positive means the "
                                              "fill was +EV by your estimate. Approximate, "
-                                             "because fill prices are inferred."),
+                                             "because fill prices are inferred. Blank for a "
+                                             "market that follows the book."),
     "book_in_band": Term("Book inside the band", "Resting orders close enough to the midpoint "
                                                  "to earn rewards. Our longshot orders appear "
                                                  "at their mirror price, 1 minus the price."),
@@ -178,7 +186,8 @@ GLOSSARY = {
                                  "favorite bid there instead, at full size, as the only bid "
                                  "in the reward band, until another bid returns. Every sale "
                                  "into the book fills that bid, so allow it only on a market "
-                                 "you are near certain of."),
+                                 "you are near certain of. It needs your p_true, so it cannot "
+                                 "go with Follow the market."),
 
     # order slots and their decisions
     "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price and the "
@@ -248,7 +257,9 @@ GLOSSARY = {
     "min_capture": Term("Min capture", "No exit, favorite or longshot, sells below average cost "
                                        "plus this, in price."),
     "ev_margin": Term("EV margin", "The favorite bid never goes above p_true minus this, so "
-                                   "every fill keeps at least this much edge."),
+                                   "every fill keeps at least this much edge. A market with no "
+                                   "p_true follows the book and has no margin: its bid is "
+                                   "capped at the book midpoint."),
     "min_fav": Term("Min favorite mid", "Markets whose favorite trades below this are skipped "
                                         "by the screener and pulled to BELOW_RANGE by the "
                                         "farmer."),

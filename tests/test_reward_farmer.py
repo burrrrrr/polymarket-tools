@@ -411,6 +411,76 @@ class TargetOrdersTest(unittest.TestCase):
         self.assertEqual((target.mid, target.intents), (None, []))
 
 
+def following(book, **changes):
+    """A market with no p_true, following the book, with this book read."""
+    return reward_farmer.with_book_mid(market(p_true=None, **changes), book)
+
+
+NO_FILLS = curve(0.0)
+
+
+class FollowMarketTest(unittest.TestCase):
+    """A market with no p_true is worth the 99.0c midpoint of FLOOR_BOOK."""
+
+    def test_the_bid_is_capped_at_the_book_midpoint_with_no_margin(self):
+        # A 1c max_lead allows bids to 99.4c, a tick under the ask. With no
+        # fills the highest price earns the most: the 99.0c midpoint itself,
+        # where a 99.5c view keeps the 1c margin and stops at 98.5c.
+        cfg = CFG._replace(max_lead=0.01)
+
+        def bid(fm):
+            return by_slot(plan(fm, FLOOR_BOOK, cfg=cfg, fills=NO_FILLS))[Slot.FAV_BID].price
+
+        self.assertEqual(bid(following(FLOOR_BOOK)), 0.990)
+        self.assertEqual(bid(market(p_true=0.995)), 0.985)
+
+    def test_a_fill_is_valued_at_the_book_midpoint(self):
+        # A sweep fills the 98.5c bid daily. Its share sells at the 99.9c ask,
+        # credited at most the market's worth, or is worth that at the end:
+        # 99.0c here, as under a view of 99.0c, and 0.9c a share less than
+        # under a 99.9c view inflated to clear the margin, discounted alike.
+        follow = bid_value(following(FLOOR_BOOK), FLOOR_BOOK, 0.985, fills=SWEPT)
+        self.assertEqual(follow, bid_value(market(p_true=0.990), FLOOR_BOOK, 0.985, fills=SWEPT))
+        inflated = bid_value(market(p_true=0.999), FLOOR_BOOK, 0.985, fills=SWEPT)
+        years = fill_cost.years_until(NOW + timedelta(days=100), NOW)
+        per_unit = fill_cost.share_value(1.0, 1.0, fill_cost.sales_per_day(follow.size), years,
+                                         CFG.hurdle_rate)
+        self.assertAlmostEqual(follow.loss_per_share - inflated.loss_per_share, 0.009 * per_unit)
+        self.assertGreater(follow.fills_per_day, 0)
+        self.assertLess(follow.net_per_day, inflated.net_per_day)
+
+    def test_the_worth_moves_with_the_book_midpoint(self):
+        higher = FLOOR_BOOK._replace(bids=[(0.987, 1000.0)], asks=[(0.997, 1000.0)])
+        fm = following(FLOOR_BOOK)
+        self.assertEqual((fm.worth, ev_cap(fm, CFG)), (0.990, 0.990))
+        fm = reward_farmer.with_book_mid(fm, higher)
+        self.assertEqual((fm.worth, ev_cap(fm, CFG)), (0.992, 0.992))
+        # A view stays the view, its margin under it.
+        view = reward_farmer.with_book_mid(market(), higher)
+        self.assertEqual((view.worth, ev_cap(view, CFG)), (0.995, 0.985))
+
+    def test_with_no_book_midpoint_no_favorite_bid_rests_but_the_exit_does(self):
+        held = Position(fav_shares=100.0, fav_avg=0.97)
+        unread = market(p_true=None)
+        self.assertIsNone(ev_cap(unread, CFG))
+        target = plan(unread, FLOOR_BOOK, held)
+        self.assertEqual((list(by_slot(target)), target.fav.reason),
+                         ([Slot.FAV_ASK], "no p_true or book midpoint"))
+        # The bid a cycle with a midpoint planned does not stay once there is none.
+        bid = by_slot(plan(following(FLOOR_BOOK), FLOOR_BOOK))[Slot.FAV_BID]
+        resting = live("a", Slot.FAV_BID, bid.price, bid.size)
+        planned = plan(following(FLOOR_BOOK), FLOOR_BOOK, resting=[resting])
+        self.assertIsNone(keep_failure(resting, bid, planned, following(FLOOR_BOOK), Position(),
+                                       CFG))
+        self.assertEqual(keep_failure(resting, bid, planned, unread, Position(), CFG),
+                         "above the EV cap")
+        one_sided = Levels(bids=[(0.985, 1000.0)], asks=[], tick=0.001)
+        self.assertEqual(plan(following(one_sided), one_sided, held).intents, [])
+
+    def test_a_market_following_the_book_never_holds_a_sole_bid(self):
+        self.assertIsNone(sole(fm=THIN._replace(p_true=None)))
+
+
 class NetPricingTest(unittest.TestCase):
     def outlook(self, fm, history):
         return market_outlook(fm, None, history, PRIOR, CFG, NOW)
@@ -2861,6 +2931,45 @@ class FarmerCycleTest(FarmerHarness):
         self.started_farmer()
         self.assertEqual([r["at"] for r in self.query("SELECT at FROM farm_mids")],
                          [farm_db.stamp(now - timedelta(days=6))])
+
+
+class FollowMarketFarmerTest(FarmerHarness):
+    def setUp(self):
+        super().setUp()
+        farm_db.set_approval(self.ui, CID, None, 25.0, None, now=NOW)
+
+    def bid_and_worth(self, farmer):
+        _, slots = self.farm_state()
+        return slots["FAV_BID"]["target"]["price"], farmer.markets[CID].fm.worth
+
+    def test_a_market_without_p_true_is_managed_at_the_book_midpoint_of_each_cycle(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.assertIn("Managing test-market: No p_true market,",
+                      [e["message"][:39] for e in self.events()])
+        bid, worth = self.bid_and_worth(farmer)
+        self.assertEqual(worth, 0.990)
+        self.assertLessEqual(bid, worth)
+
+        self.book = FLOOR_BOOK._replace(bids=[(0.987, 1000.0)], asks=[(0.997, 1000.0)])
+        farmer.cycle()
+        bid, worth = self.bid_and_worth(farmer)
+        self.assertEqual(worth, 0.992)
+        self.assertLessEqual(bid, worth)
+
+    def test_a_market_without_p_true_never_holds_a_sole_bid(self):
+        # The opted-in market of FarmerCycleTest's sole bid, its only other bid
+        # gone to 80c: an 89.75c midpoint is under min_fav.
+        farm_db.set_sole_bid(self.ui, CID, True)
+        self.assertFalse(reward_farmer.farm_market(farm_db.find_market(self.ui, CID), INFO,
+                                                   CFG, NOW).sole_bid)
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.book = FarmerCycleTest.UNSUPPORTED
+        farmer.cycle()
+        row, slots = self.farm_state()
+        self.assertEqual(row["phase"], "BELOW_RANGE")
+        self.assertIsNone(slots["FAV_BID"]["target"])
 
 
 class FreeDwellFarmerTest(FarmerHarness):

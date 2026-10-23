@@ -10,3 +10,14 @@ document.addEventListener("click", (event) => {
   else input.stepDown();
   input.dispatchEvent(new Event("input", { bubbles: true }));
 });
+
+// A checkbox with data-disables turns off that input and its - and +
+// buttons while it is ticked, so the form sends no value for it.
+document.addEventListener("change", (event) => {
+  const box = event.target.closest("input[data-disables]");
+  if (!box) return;
+  const id = box.dataset.disables;
+  for (const el of document.querySelectorAll(`#${id}, button[aria-controls="${id}"]`)) {
+    el.disabled = box.checked;
+  }
+});

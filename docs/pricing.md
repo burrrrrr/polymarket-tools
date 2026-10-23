@@ -3,6 +3,9 @@
 The screener and the farmer price the same two bids by the same rules. The
 screener prices them once, from the book at scan time. The farmer prices them
 again every cycle, with your `p_true`, your budget, and the shares it holds.
+A market with no `p_true` follows the book: each cycle the farmer uses the
+book midpoint as its `p_true`, with no EV margin under it (see
+[Markets without a p_true](farmer.md#markets-without-a-p_true)).
 Q_one, Q_two, and the slot names used here are defined in
 [The four slots](farmer.md#the-four-slots).
 
@@ -193,7 +196,8 @@ what it balances, whatever the capital. A scan sizes its bid at all of
 
 A scan holds no shares and has no p_true, so it values a fill with an
 inventory of the bid alone and the book midpoint as p_true. The farmer's ask
-rests over the midpoint, so a scan's a(b) is the midpoint.
+rests over the midpoint, so a scan's a(b) is the midpoint. The farmer values
+a market that follows the book the same way, with the shares it holds.
 
 The measurement is the table `SOLD` in `farm/fill_cost.py`, next to the command
 that produced it. No fill under 53 days from resolution was replayed for the

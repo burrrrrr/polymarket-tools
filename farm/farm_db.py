@@ -506,16 +506,21 @@ REJECT_LABELS = {
 }
 
 
+_OWN_P_TRUE = object()
+
+
 def _log_decision(conn, condition_id, decision, now, statuses, reason=None, note=None,
-                  p_true=None):
+                  p_true=_OWN_P_TRUE):
     """Append a decisions row if the market's status is in statuses, with its
-    metrics as they are now; p_true None records the market's own."""
+    metrics as they are now and the market's own p_true, or the p_true given:
+    an approval's, None for a market that follows the book."""
+    own = p_true is _OWN_P_TRUE
     conn.execute(
         "INSERT INTO decisions (condition_id, at, decision, reason, note, p_true, metrics) "
-        "SELECT condition_id, ?, ?, ?, ?, COALESCE(?, p_true), metrics FROM markets "
+        f"SELECT condition_id, ?, ?, ?, ?, {'p_true' if own else '?'}, metrics FROM markets "
         f"WHERE condition_id = ? AND status IN ({', '.join('?' * len(statuses))})",
-        (stamp(now), decision, reason and reason.value, note, p_true, condition_id,
-         *statuses),
+        (stamp(now), decision, reason and reason.value, note, *(() if own else (p_true,)),
+         condition_id, *statuses),
     )
 
 
@@ -525,7 +530,8 @@ _UNAPPROVED = tuple(s for s in STATUSES if s != "approved")
 
 
 def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, now):
-    """Approve with the human's terms; capital_usd None keeps the current one."""
+    """Approve with the human's terms; p_true None follows the market, and
+    capital_usd None keeps the current one."""
     with conn:
         _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
@@ -536,7 +542,8 @@ def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, now)
 
 
 def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *, now):
-    """Approve with exactly these terms; capital_usd None means the farmer's capital.
+    """Approve with exactly these terms; p_true None follows the market, and
+    capital_usd None means the farmer's capital.
 
     paused sets the pause flag in the same write, so the farmer previews the
     orders instead of placing them; False leaves the flag as it was.

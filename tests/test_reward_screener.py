@@ -32,6 +32,7 @@ from farm.reward_screener import (
     parse_buys,
     parse_gamma,
     parse_hits,
+    parse_sells,
     plan_at,
     plan_quotes,
     price_offering,
@@ -1090,6 +1091,41 @@ class ParseBuysTest(unittest.TestCase):
                          [Sweep(self.AT, (Piece(0.95, 10.0),))])
 
 
+class ParseSellsTest(unittest.TestCase):
+    AT = HISTORY_NOW.timestamp() - 60
+
+    def test_a_sell_is_the_ladder_of_maker_bids_it_filled_highest_first(self):
+        # 60 at 0.95 and 40 at 0.94 print a 0.946 taker row.
+        taker = [priced("SELL", FAV_TOKEN, 0.946, wallet="0xtaker", size=100.0)]
+        makers = [priced("BUY", FAV_TOKEN, 0.95, wallet="0xm1", size=60.0),
+                  priced("SELL", LONG_TOKEN, 0.06, wallet="0xm2", size=25.0),
+                  priced("BUY", FAV_TOKEN, 0.94, wallet="0xm3", size=15.0),
+                  priced("BUY", FAV_TOKEN, 0.90, tx="0xother", wallet="0xm4")]
+        [sell] = parse_sells(taker, taker + makers, FAV_TOKEN)
+        self.assertEqual(sell.at, self.AT)
+        self.assertEqual([p.price for p in sell.pieces], [0.95, 0.94])
+        self.assertEqual([p.size for p in sell.pieces], [60.0, 40.0])
+
+    def test_buying_the_other_outcome_sells_the_favorite_at_one_minus_its_price(self):
+        taker = [priced("BUY", LONG_TOKEN, 0.06, size=30.0)]
+        self.assertEqual(parse_sells(taker, taker, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.94, 30.0),))])
+
+    def test_taker_buys_of_the_favorite_are_not_sells(self):
+        buy = [priced("BUY", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xtaker"),
+               priced("SELL", LONG_TOKEN, 0.02, tx="0xlong", wallet="0xtaker")]
+        makers = [priced("SELL", FAV_TOKEN, 0.97, tx="0xbuy", wallet="0xm")]
+        self.assertEqual(parse_sells(buy, buy + makers, FAV_TOKEN), [])
+
+    def test_malformed_rows_are_dropped(self):
+        good = priced("SELL", FAV_TOKEN, 0.95)
+        bad = [{**good, "transactionHash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
+               {**good, "price": 1.0}, {**good, "timestamp": None}, "row", None]
+        self.assertEqual(parse_sells(bad, bad, FAV_TOKEN), [])
+        broken_maker = {**priced("BUY", FAV_TOKEN, 0.90, wallet="0xm"), "size": -5}
+        self.assertEqual(parse_sells([good] + bad, [good, broken_maker] + bad, FAV_TOKEN),
+                         [Sweep(self.AT, (Piece(0.95, 10.0),))])
+
 DAY_S = 86400
 
 
@@ -1411,9 +1447,10 @@ class StoreTest(unittest.TestCase):
 class ApproveTest(unittest.TestCase):
     """approve warns when the budget is short of the longshot leg the scan planned."""
 
-    def approve(self, low_price, low_size, budget, low_score=0.2, days=90):
+    def approve(self, low_price, low_size, budget, low_score=0.2, days=90, p_true="0.97"):
         """What approve prints for a row whose scan planned this longshot
-        leg on a book with a 0.99 midpoint, ending `days` from today."""
+        leg on a book with a 0.99 midpoint, ending `days` from today, and
+        the market's p_true after; p_true None approves with --follow-market."""
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         path = os.path.join(tmp.name, "farm.db")
@@ -1427,11 +1464,35 @@ class ApproveTest(unittest.TestCase):
             SCAN_NOW)
         conn.close()
         args = reward_screener.build_parser().parse_args(
-            ["approve", "test-market", "--db", path, "--p-true", "0.97", "--budget", str(budget)])
+            ["approve", "test-market", "--db", path, "--budget", str(budget)]
+            + (["--p-true", p_true] if p_true else ["--follow-market"]))
         printed = io.StringIO()
         with contextlib.redirect_stdout(printed):
             reward_screener.cmd_approve(args)
+        conn = farm_db.open_db(path)
+        self.p_true = farm_db.find_market(conn, "0xc0nd")["p_true"]
+        conn.close()
         return printed.getvalue()
+
+    def test_a_p_true_under_the_planned_bid_warns(self):
+        self.assertIn("Warning: planned favorite bid 95.0c is at or above p_true 94.0c",
+                      self.approve(0.001, 30000.0, 25.0, p_true="0.94"))
+        self.assertEqual(self.p_true, 0.94)
+
+    def test_follow_market_approves_with_no_p_true_and_no_ev_warning(self):
+        printed = self.approve(0.001, 30000.0, 25.0, p_true=None)
+        self.assertNotIn("Warning", printed)
+        self.assertIn("Approved test-market (p_true market,", printed)
+        self.assertIsNone(self.p_true)
+
+    def test_approve_takes_exactly_one_of_p_true_and_follow_market(self):
+        for choice in ([], ["--p-true", "0.97", "--follow-market"]):
+            err = io.StringIO()
+            with self.subTest(choice=choice), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit) as raised:
+                    reward_screener.build_parser().parse_args(["approve", "m", *choice])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--follow-market", err.getvalue())
 
     def test_a_budget_under_a_longshot_bid_outside_the_free_zone_warns(self):
         # 90 days out a 2c bid offers a favorite buyer 8.5% a year.

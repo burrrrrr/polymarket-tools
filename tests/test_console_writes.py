@@ -455,7 +455,8 @@ class ReviewTest(Writes):
                        "Approve and start quoting",
                        "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
-                       'hx-include="#d-p_true, #d-naked_budget, #d-capital, #d-sole_bid"'):
+                       'hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, '
+                       '#d-sole_bid"'):
             self.assertIn(needle, page)
         self.assertIn('hx-trigger="input changed delay:300ms"', page)
 
@@ -599,7 +600,7 @@ class ReviewTest(Writes):
         capped = self.live(capital="100")
         self.assertNotEqual(re.findall(r"FAV_BID ([\d,.]+)</td>", full),
                             re.findall(r"FAV_BID ([\d,.]+)</td>", capped))
-        self.assertIn("Enter your p_true to apply the EV cap", self.live(p_true=""))
+        self.assertIn("Enter your p_true or tick Follow the market.", self.live(p_true=""))
         self.assertIn("Enter a naked budget. Until then a longshot bid outside the free zone "
                       "is planned with $0", self.live(naked_budget="x"))
         self.assertIn("Buy No 94.0c", self.live(p_true="96"))
@@ -642,11 +643,15 @@ class ReviewTest(Writes):
         self.assertIn("Buy No", text)
         self.assertNotIn("Could not read the live book", text)
 
-    def test_live_plan_without_p_true_values_the_market_at_the_book_midpoint(self):
-        # p_true 96.0c, the book midpoint, less the 2c margin caps the bid at 94.0c.
-        text = self.live(p_true="")
-        self.assertIn("Buy No 94.0c", text)
-        self.assertIn("valued at the book midpoint", text)
+    def test_live_plan_without_p_true_follows_the_market(self):
+        # The 96.0c book midpoint caps the bid with no margin, over the 95.5c
+        # that max_lead allows above the 95.0c best bid of the reward minimum.
+        # A view of 96% keeps the 2c margin and caps it at 94.0c.
+        text = self.live(p_true="", follow_market="1")
+        self.assertIn("Buy No 95.5c", text)
+        self.assertIn("Following the market: the favorite bid is capped at the book midpoint, "
+                      "with no EV margin", text)
+        self.assertIn("Buy No 94.0c", self.live(p_true="96"))
 
     def preview(self, **stored):
         """(live_review, the farmer's own target) of 0xddd with these metrics keys stored."""
@@ -697,6 +702,39 @@ class ReviewTest(Writes):
         row = self.row("0xddd")
         self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"], row["capital_usd"]),
                          ("approved", 0.97, 30.0, None))
+
+    def test_approve_following_the_market_stores_no_p_true(self):
+        self.assertIn("No p_true: the farmer follows the market.",
+                      self.ev("0xddd", "", follow_market="1"))
+        self.assertIn("Enter a whole percent from 1 to 99, or tick Follow the market.",
+                      self.ev("0xddd", ""))
+        resp = self.post("/review/0xddd/approve", naked_budget="30", capital="",
+                         follow_market="1")
+        self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/review/0xeee"))
+        row = self.row("0xddd")
+        self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"]),
+                         ("approved", None, 30.0))
+        self.assertEqual([d.p_true for d in farm_db.read_decisions(self.db)
+                          if d.condition_id == "0xddd"], [None])
+        for url in ("/markets", "/markets/0xddd"):
+            with self.subTest(url=url):
+                self.assertIn("p_true market", self.client.get(url).text)
+        # Its edit form opens with the box ticked and the p_true field empty and off.
+        page = self.client.get("/review/0xddd").text
+        self.assertRegex(page, r'name="follow_market" value="1"[^>]* checked')
+        self.assertIn('name="p_true" value="" disabled', page)
+
+    def test_a_sole_bid_needs_a_p_true(self):
+        resp = self.post("/review/0xddd/approve", naked_budget="30", capital="",
+                         follow_market="1", sole_bid="1")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("A sole bid needs your p_true. Untick Follow the market or Allow sole "
+                      "bid.", resp.text)
+        self.assertEqual(self.row("0xddd")["status"], "candidate")
+        sole = {"market": {"tick": 0.001}, "plan": {"mode": "sole", "fav_bid_price": 0.961}}
+        self.assertEqual(views.ev_check(sole, "", True, "25", 0.02, 0.25).lines,
+                         ["A sole bid needs your p_true. Following the market, the farmer "
+                          "holds none."])
 
     def test_approve_start_paused_pauses_and_goes_to_the_market(self):
         self.assertIn('name="start_paused"', self.client.get("/review/0xddd").text)
@@ -801,7 +839,8 @@ class ReviewTest(Writes):
         self.assertIn("the farmer would hold a sole bid", text)
         self.assertIn("Buy No 96.1c", text)
         self.assertIn("Buy Yes 0.1c", text)
-        self.assertIn("Until then only the ask caps the sole bid, as in the scan.", text)
+        self.assertIn("A sole bid needs your p_true. Until you enter one only the ask caps it, "
+                      "as in the scan.", text)
         self.assertNotIn("Wouldn't quote now", text)
         self.assertNotIn("None", text)
         # A p_true caps it as it caps the farmer's: 97% less the 2c margin is under 96.1c.
@@ -934,6 +973,7 @@ class ReviewTest(Writes):
         page = self.client.get(f"/review/{A}").text
         self.assertIn('value="200"', page)
         self.assertIn('name="p_true" value="99"', page)
+        self.assertNotRegex(page, r'name="follow_market" value="1"[^>]* checked')
         self.assertIn("Save terms", page)
         resp = self.post(f"/review/{A}/approve", p_true="98", naked_budget="10", capital="")
         self.assertEqual(resp.headers["location"], f"/markets/{A}")
@@ -965,6 +1005,9 @@ class ReviewTest(Writes):
             ({"p_true": "97.5", "naked_budget": "25"}, "whole percent from 1 to 99"),
             ({"p_true": "abc", "naked_budget": "25"}, "whole percent from 1 to 99"),
             ({"p_true": "nan", "naked_budget": "25"}, "whole percent from 1 to 99"),
+            ({"p_true": "", "naked_budget": "25"}, "or tick Follow the market"),
+            ({"p_true": "97", "naked_budget": "25", "follow_market": "1"},
+             "Clear p_true or untick Follow the market."),
             ({"p_true": "97", "naked_budget": "-1"}, "0 or more"),
             ({"p_true": "97", "naked_budget": ""}, "0 or more"),
             ({"p_true": "97", "naked_budget": "25", "capital": "0"}, "positive amount"),
@@ -980,9 +1023,9 @@ class ReviewTest(Writes):
         self.assertIn("under 500 characters", resp.text)
         self.assertEqual(self.snapshot_markets(), before)
 
-    def ev(self, cid, p_true, budget="25"):
+    def ev(self, cid, p_true, budget="25", **choice):
         return self.client.get(f"/partials/review/{cid}/ev",
-                               params={"p_true": p_true, "naked_budget": budget}).text
+                               params={"p_true": p_true, "naked_budget": budget, **choice}).text
 
     def test_ev_check_uncapped_capped_and_out_of_band(self):
         uncapped = self.ev("0xddd", "98")
@@ -1004,12 +1047,12 @@ class ReviewTest(Writes):
         metrics = {"market": {"tick": 0.001, "v": 0.085}, "best_bid": 0.934, "best_ask": 0.99,
                    "plan": {"fav_bid_price": 0.97, "mid": 0.98, "fav_bid_score": 0.779,
                             "low_price": 0.001, "low_size": 100.0, "mode": "floor"}}
-        text = " ".join(views.ev_check(metrics, 0.96, "25", 0.01, 0.25).lines)
+        text = " ".join(views.ev_check(metrics, "96", False, "25", 0.01, 0.25).lines)
         self.assertIn("capped at 95.0c (p_true − 1.0c): scores 0.585, not 0.779", text)
         self.assertNotIn("0.419", text)
         del metrics["best_bid"], metrics["best_ask"]
         self.assertIn("scores 0.419, not 0.779",
-                      " ".join(views.ev_check(metrics, 0.96, "25", 0.01, 0.25).lines))
+                      " ".join(views.ev_check(metrics, "96", False, "25", 0.01, 0.25).lines))
 
     def test_ev_check_warns_when_budget_is_below_the_longshot_leg(self):
         plan = json.loads(self.row("0xddd")["metrics"])["plan"]

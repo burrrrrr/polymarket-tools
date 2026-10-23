@@ -3,7 +3,7 @@
 {% block title %}Review · {{ (market.question or market.slug or '') | truncate(40, True) }}{% endblock %}
 {% block content %}
 {%- set cid = market.condition_id -%}
-{%- set ev_inputs = "[name='p_true'],[name='naked_budget']" -%}
+{%- set ev_inputs = "[name='p_true'],[name='follow_market'],[name='naked_budget']" -%}
 <nav class="actions" aria-label="Review queue">
   <span class="lbl" style="margin-right: 6px">Queue</span>
   <div class="seg" role="group" aria-label="Queue mode filter">
@@ -70,7 +70,7 @@
         <h2>Live orders and book{{ tip('band_strip') }}</h2>
         <span class="streaming"><span class="dot" style="width: 6px; height: 6px; background: #63D3A6"></span>live, every {{ LIVE_POLL_S }}s</span>
       </div>
-      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-naked_budget, #d-capital, #d-sole_bid" hx-swap="innerHTML">
+      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, #d-sole_bid" hx-swap="innerHTML">
         <span class="small muted">Reading the live book...</span>
       </div>
     </section>
@@ -98,11 +98,14 @@
       <div class="field">
         <div class="label-row"><label class="lbl" for="d-p_true">Your p_true for the favorite (%)</label>{{ tip('p_true') }}</div>
         <div class="stepper">
-          <button class="btn" type="button" data-step="down" aria-controls="d-p_true" aria-label="Lower p_true by 1%">&minus;</button>
-          <input class="inp mono" id="d-p_true" name="p_true" value="{{ values.p_true }}" type="number" min="1" max="99" step="1"{% if p_true_start %} data-start="{{ p_true_start }}"{% endif %} autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
-          <button class="btn" type="button" data-step="up" aria-controls="d-p_true" aria-label="Raise p_true by 1%">+</button>
+          {%- set off = ' disabled' if values.follow_market else '' %}
+          <button class="btn" type="button" data-step="down" aria-controls="d-p_true" aria-label="Lower p_true by 1%"{{ off }}>&minus;</button>
+          <input class="inp mono" id="d-p_true" name="p_true" value="{{ values.p_true }}"{{ off }} type="number" min="1" max="99" step="1"{% if p_true_start %} data-start="{{ p_true_start }}"{% endif %} autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
+          <button class="btn" type="button" data-step="up" aria-controls="d-p_true" aria-label="Raise p_true by 1%"{{ off }}>+</button>
         </div>
         {{ field_error(errors, 'p_true') }}
+        <label class="check"><input type="checkbox" id="d-follow_market" name="follow_market" value="1" data-disables="d-p_true"{{ ' checked' if values.follow_market }} hx-get="/partials/review/{{ cid }}/ev" hx-trigger="change delay:100ms" hx-target="#ev" hx-include="{{ ev_inputs }}"> Follow the market{{ tip('follow_market') }}</label>
+        {{ field_error(errors, 'follow_market') }}
       </div>
       <div class="field">
         <div class="label-row"><span class="lbl">EV check</span>{{ tip('ev_check') }}</div>

@@ -70,8 +70,8 @@ class Piece(NamedTuple):
 
 
 class Sweep(NamedTuple):
-    """One taker buy of the favorite: its unix time and its pieces, highest
-    price first."""
+    """One taker buy or sell of the favorite: its unix time and its pieces,
+    highest price first. A BuyTape holds buys."""
 
     at: float
     pieces: tuple

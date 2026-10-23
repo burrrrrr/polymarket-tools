@@ -1158,44 +1158,65 @@ def parse_hits(taker_rows, all_rows, fav_token_id):
     the other outcome at 1 - price. A hit's deepest price is the lowest of its
     own and of its transaction's maker fills. Malformed rows are dropped.
     """
-    taker = [t for t in map(parse_trade, taker_rows) if t]
-    unmatched = Counter(t[:6] for t in taker)
+    taker, makers = _taker_and_makers(taker_rows, all_rows)
     deepest = {}
-    for t in filter(None, map(parse_trade, all_rows)):
-        if unmatched[t[:6]]:
-            unmatched[t[:6]] -= 1
-        elif (t.side == "BUY") == (t.asset == fav_token_id):
+    for t in makers:
+        if _fav_side(t, fav_token_id) == "BUY":
             deepest[t.tx] = min(deepest.get(t.tx, 1.0), _fav_price(t, fav_token_id))
     return [fill_cost.Hit(t.at, min(_fav_price(t, fav_token_id), deepest.get(t.tx, 1.0)))
-            for t in taker if (t.side == "SELL") == (t.asset == fav_token_id)]
+            for t in taker if _fav_side(t, fav_token_id) == "SELL"]
 
 
 def parse_buys(taker_rows, all_rows, fav_token_id):
+    """[exit_value.Sweep] of the taker buys of the favorite, as
+    _parse_sweeps reads them."""
+    return _parse_sweeps(taker_rows, all_rows, fav_token_id, "BUY")
+
+
+def parse_sells(taker_rows, all_rows, fav_token_id):
+    """[exit_value.Sweep] of the taker sells of the favorite, the sweeps of
+    its bids, as _parse_sweeps reads them."""
+    return _parse_sweeps(taker_rows, all_rows, fav_token_id, "SELL")
+
+
+def _parse_sweeps(taker_rows, all_rows, fav_token_id, side):
     """[exit_value.Sweep] from a market's /trades rows, oldest first, read as
-    parse_hits reads them: one sweep per transaction whose taker bought the
-    favorite, or sold the other outcome at 1 - price.
+    parse_hits reads them: one sweep per transaction whose taker took side
+    on the favorite, directly or through the other outcome at 1 - price.
 
     A taker row prints the volume-weighted price of its fills, so a sweep's
-    pieces are its transaction's maker fills that sold the favorite, or bought
-    the other outcome at 1 - price, shares summed per price. A transaction
+    pieces are its transaction's maker fills on the other side of the
+    favorite, shares summed per favorite-equivalent price. A transaction
     listed without such makers is pieced from its taker rows instead.
     Malformed rows are dropped.
     """
+    taker, every_maker = _taker_and_makers(taker_rows, all_rows)
+    makers = {}
+    for t in every_maker:
+        if _fav_side(t, fav_token_id) != side:
+            makers.setdefault(t.tx, []).append(t)
+    swept = {}
+    for t in taker:
+        if _fav_side(t, fav_token_id) == side:
+            swept.setdefault(t.tx, []).append(t)
+    return sorted((exit_value.Sweep(min(t.at for t in rows),
+                                    _pieces(makers.get(tx) or rows, fav_token_id))
+                   for tx, rows in swept.items()), key=lambda s: s.at)
+
+
+def _taker_and_makers(taker_rows, all_rows):
+    """([TradeRow] of taker_rows, [TradeRow] of the makers): all_rows less
+    taker_rows, as a multiset on their first six fields. Malformed rows are
+    dropped."""
     taker = [t for t in map(parse_trade, taker_rows) if t]
     unmatched = Counter(t[:6] for t in taker)
-    makers = {}
+    makers = []
     for t in filter(None, map(parse_trade, all_rows)):
         if unmatched[t[:6]]:
             unmatched[t[:6]] -= 1
-        elif (t.side == "SELL") == (t.asset == fav_token_id):
-            makers.setdefault(t.tx, []).append(t)
-    buys = {}
-    for t in taker:
-        if (t.side == "BUY") == (t.asset == fav_token_id):
-            buys.setdefault(t.tx, []).append(t)
-    return sorted((exit_value.Sweep(min(t.at for t in rows),
-                                    _pieces(makers.get(tx) or rows, fav_token_id))
-                   for tx, rows in buys.items()), key=lambda s: s.at)
+        else:
+            makers.append(t)
+    return taker, makers
 
 
 def _pieces(trades, fav_token_id):
@@ -1210,6 +1231,14 @@ def _pieces(trades, fav_token_id):
 
 def _fav_price(trade, fav_token_id):
     return trade.price if trade.asset == fav_token_id else 1 - trade.price
+
+
+def _fav_side(trade, fav_token_id):
+    """The side the trade took on the favorite: a pair is minted or merged
+    across the outcomes, so buying the other outcome sells the favorite."""
+    if trade.asset == fav_token_id:
+        return trade.side
+    return "SELL" if trade.side == "BUY" else "BUY"
 
 
 # ---------------------------------------------------------------------------
@@ -1740,7 +1769,7 @@ def cmd_list(args):
         live = ("R" if row["rewards_active"] else "-") + (
             "*" if row["last_scanned"] == latest else " "
         )
-        p_true = f"{row['p_true']:.3f}" if row["p_true"] is not None else "--"
+        p_true = f"{row['p_true']:.3f}" if row["p_true"] is not None else "market"
         budget = (
             f"{row['naked_budget_usd']:.0f}"
             if row["naked_budget_usd"] is not None else "--"
@@ -1756,7 +1785,7 @@ def cmd_list(args):
 
 
 def cmd_approve(args):
-    if not 0 < args.p_true < 1:
+    if args.p_true is not None and not 0 < args.p_true < 1:
         print("Error: --p-true must be strictly between 0 and 1")
         sys.exit(2)
     if args.capital is not None and not args.capital > 0:
@@ -1770,7 +1799,7 @@ def cmd_approve(args):
 
     metrics = json.loads(row["metrics"])
     plan = metrics["plan"]
-    if plan["fav_bid_price"] >= args.p_true:
+    if args.p_true is not None and plan["fav_bid_price"] >= args.p_true:
         print(
             f"Warning: planned favorite bid {plan['fav_bid_price'] * 100:.1f}c is "
             f"at or above p_true {args.p_true * 100:.1f}c; a fill would be -EV"
@@ -1789,7 +1818,8 @@ def cmd_approve(args):
     capital = farm_db.find_market(conn, row["condition_id"])["capital_usd"]
     conn.close()
     capital = f"${capital:.2f}" if capital is not None else "the farmer's --capital"
-    print(f"Approved {row['slug']} (p_true {args.p_true}, budget ${args.budget:.2f}, "
+    p_true = "market" if args.p_true is None else args.p_true
+    print(f"Approved {row['slug']} (p_true {p_true}, budget ${args.budget:.2f}, "
           f"capital {capital})")
 
 
@@ -1850,8 +1880,12 @@ Examples:
 
     approve = sub.add_parser("approve", parents=[db], help="Approve a market to farm")
     approve.add_argument("market", help="Slug or condition id")
-    approve.add_argument("--p-true", type=float, required=True,
-                         help="Your probability the favorite resolves YES")
+    p_true = approve.add_mutually_exclusive_group(required=True)
+    p_true.add_argument("--p-true", type=float,
+                        help="Your probability the favorite resolves YES")
+    p_true.add_argument("--follow-market", action="store_true",
+                        help="No p_true: the farmer caps the bid at the book midpoint with "
+                             "no EV margin, and a fill is valued there")
     approve.add_argument("--budget", type=float, default=25.0,
                          help="Naked USD risk allowed on the longshot leg where a fill gives "
                               "the favorite buyer 5%% a year or more (default: 25)")

@@ -627,6 +627,16 @@ class DecisionsTest(ScratchDb):
                          [("approved", 0.96, NOW + timedelta(hours=3)),
                           ("approved", 0.97, NOW)])
 
+    def test_an_approval_that_follows_the_market_logs_no_p_true(self):
+        farm_db.approve_market(self.conn, "0xa", 0.97, 25.0, now=NOW)
+        farm_db.retire_market(self.conn, "0xa", "done")
+        farm_db.set_approval(self.conn, "0xa", None, 10.0, None, now=NOW + timedelta(hours=1))
+        self.assertIsNone(farm_db.find_market(self.conn, "0xa")["p_true"])
+        farm_db.reject_market(self.conn, "0xa", None, farm_db.RejectReason.OTHER,
+                              NOW + timedelta(hours=2))
+        self.assertEqual([(d.decision, d.p_true) for d in farm_db.read_decisions(self.conn)],
+                         [("rejected", None), ("approved", None), ("approved", 0.97)])
+
     def test_unreject_moves_only_a_rejected_market_back_to_the_queue(self):
         farm_db.reject_market(self.conn, "0xa", None, farm_db.RejectReason.OTHER, NOW)
         farm_db.approve_market(self.conn, "0xb", 0.97, 25.0, now=NOW)
