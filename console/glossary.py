@@ -234,10 +234,10 @@ GLOSSARY = {
                                        "Exits of shares held stay."),
     "PAUSED": Term("Paused", "You paused this market. All orders are pulled until you resume "
                              "it."),
-    "UNREWARDED": Term("Unrewarded", "Polymarket's reward listing no longer pays this "
-                                     "market. The bids are pulled, and quoting resumes on "
-                                     "its own if rewards return. Exits of shares held "
-                                     "stay."),
+    "UNREWARDED": Term("Unrewarded", "Polymarket's reward listing pays this market under "
+                                     "$1 a day, or not at all. The bids are pulled, and "
+                                     "quoting resumes on its own if the pool grows. Exits "
+                                     "of shares held stay."),
     "RETIRED": Term("Retired", "The farmer stopped managing this market: market closed or "
                                "decided, expiry cutoff reached, or you retired it."),
     "WAITING": Term("Waiting", "Approved, but the farmer hasn't picked it up yet. It starts "

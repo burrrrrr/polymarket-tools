@@ -806,11 +806,11 @@ class RoutesTest(Console):
         self.assertIn('<span class="mono value">$8.25</span>', text)
 
     def test_an_unrewarded_market_lists_under_its_own_phase(self):
-        self.publish(states=[state(A, "UNREWARDED", "rewards removed")._replace(
+        self.publish(states=[state(A, "UNREWARDED", "pool under $1/day")._replace(
             updated_at=self.now)])
         resp = self.client.get("/markets?phase=UNREWARDED")
         self.assertEqual(resp.status_code, 200)
-        for needle in ("alpha?", "rewards removed", 'data-tip="UNREWARDED"'):
+        for needle in ("alpha?", "pool under $1/day", 'data-tip="UNREWARDED"'):
             self.assertIn(needle, resp.text)
         self.assertNotIn("bravo?", resp.text)
 

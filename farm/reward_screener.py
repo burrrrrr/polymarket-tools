@@ -411,7 +411,7 @@ class ScreenConfig(NamedTuple):
     max_lead: float = 0.005
     min_low_score: float = 0.10
     naked_budget: float = DEFAULT_NAKED_BUDGET
-    min_rate: float = 0.0
+    min_rate: float = 1.0
     fragile_drop: float = 0.03
     hurdle_rate: float = 0.40
     # How many markets read their fill history; the key predates histories.

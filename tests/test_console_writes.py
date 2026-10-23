@@ -892,7 +892,7 @@ class ReviewTest(Writes):
         self.rewards_end_for("0xeee")
         text = self.live("0xeee")
         self.assertIn("Wouldn't quote now", text)
-        self.assertIn("The farmer would not quote: rewards removed. "
+        self.assertIn("The farmer would not quote: pool under $1/day. "
                       "It has left the review queue.", text)
         self.assertIn('href="/review/0xeee/next-quotable">Skip to next quotable', text)
         self.assertEqual(self.row("0xeee")["rewards_active"], 0)
@@ -905,7 +905,7 @@ class ReviewTest(Writes):
         farm_db.set_rewards_active(self.db, "0xeee", False)
         self.rewards_end_for()
         text = self.live("0xeee")
-        self.assertNotIn("rewards removed", text)
+        self.assertNotIn("pool under $1/day", text)
         self.assertIn("Buy No", text)
         self.assertEqual(self.row("0xeee")["rewards_active"], 1)
         self.assertEqual(farm_db.candidate_queue(self.db), ["0xddd", "0xeee", "0xfff"])
@@ -936,7 +936,7 @@ class ReviewTest(Writes):
         self.addCleanup(self.remote.totals_gate.set)
         self.assertIsNone(self.app.state.total_rates.get())
         text = self.live("0xeee")
-        self.assertNotIn("rewards removed", text)
+        self.assertNotIn("pool under $1/day", text)
         self.assertIn("Buy No", text)
         self.live("0xfff")
         self.assertEqual((self.row("0xeee")["rewards_active"], self.row("0xfff")["rewards_active"]),

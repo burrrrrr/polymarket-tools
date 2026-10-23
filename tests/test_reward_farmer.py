@@ -958,10 +958,10 @@ class StepStateTest(unittest.TestCase):
 
     def test_rewards_ending_pulls_the_quotes_without_retiring(self):
         state = step_state(QUOTING, observe(rewards_active=False), NOW, CFG)
-        self.assertEqual(state, State(Phase.UNREWARDED, reason="rewards removed"))
+        self.assertEqual(state, State(Phase.UNREWARDED, reason="pool under $1/day"))
 
     def test_rewards_returning_go_through_the_normal_checks(self):
-        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        unrewarded = State(Phase.UNREWARDED, reason="pool under $1/day")
         self.assertEqual(step_state(unrewarded, observe(rewards_active=False), NOW, CFG),
                          unrewarded)
         self.assertEqual(step_state(unrewarded, observe(), NOW, CFG), QUOTING)
@@ -1041,7 +1041,7 @@ class StepStateTest(unittest.TestCase):
 
     def test_retire_beats_rewards_ending_and_pause(self):
         paused = State(Phase.PAUSED, reason="paused by operator")
-        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        unrewarded = State(Phase.UNREWARDED, reason="pool under $1/day")
         obs = observe(closed=True, paused=True, rewards_active=False)
         for state in (QUOTING, paused, unrewarded):
             self.assertEqual(step_state(state, obs, NOW, CFG),
@@ -1052,10 +1052,10 @@ class StepStateTest(unittest.TestCase):
         obs = observe(paused=True, rewards_active=False)
         for state in (QUOTING, paused):
             self.assertEqual(step_state(state, obs, NOW, CFG),
-                             State(Phase.UNREWARDED, reason="rewards removed"))
+                             State(Phase.UNREWARDED, reason="pool under $1/day"))
 
     def test_rewards_returning_to_a_paused_market_leave_it_paused(self):
-        unrewarded = State(Phase.UNREWARDED, reason="rewards removed")
+        unrewarded = State(Phase.UNREWARDED, reason="pool under $1/day")
         self.assertEqual(step_state(unrewarded, observe(paused=True), NOW, CFG),
                          State(Phase.PAUSED, reason="paused by operator"))
 
@@ -2046,6 +2046,11 @@ class BoundaryTest(unittest.TestCase):
         self.assertTrue(rewards_active(info, "0xc0nd", None))
         self.assertFalse(rewards_active(info, "0xc0nd", {"0xother": 2.1}))
         self.assertFalse(rewards_active(info._replace(v=0.0), "0xc0nd", None))
+
+    def test_a_pool_under_a_dollar_a_day_is_not_worth_farming(self):
+        info = MarketInfo((FAV, LONG), 0.085, 50.0, 0.001, False, True, False)
+        self.assertFalse(rewards_active(info, "0xc0nd", {"0xc0nd": 0.001}))
+        self.assertTrue(rewards_active(info, "0xc0nd", {"0xc0nd": 1.0}))
 
     def test_rewards_end_when_the_listing_drops_the_market(self):
         info = MarketInfo((FAV, LONG), 0.085, 20.0, 0.001, False, True, False)

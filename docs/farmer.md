@@ -160,10 +160,11 @@ Each market is in one of seven states:
 - `PAUSED`: you set `paused = 1` on the market. All orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
-- `UNREWARDED`: the market left the total reward listing. Its own CLOB
-  record keeps showing the old rate after rewards end, so only the listing
-  counts. The bids come down, but the farmer keeps managing the market.
-  When the listing pays it again, the market goes through the checks above,
+- `UNREWARDED`: the total reward listing pays the market under $1 a day, or
+  the market left the listing. Its own CLOB record keeps showing the old
+  rate after rewards end, so only the listing counts. The bids come down,
+  but the farmer keeps managing the market. When the listing pays it $1 a
+  day again, the market goes through the checks above,
   the pause included, and quotes again unless one of them holds it. This
   check wins over a pause.
 - `RETIRED`: the market closed or stopped accepting orders, you no longer

@@ -100,8 +100,9 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                moment the flag clears and goes through the checks above.
                When resuming would quote, the orders it would place are
                published to farm_state as a preview and never sent.
-  UNREWARDED   the total reward listing no longer pays the market; its own
-               market record keeps showing the old rate after rewards end.
+  UNREWARDED   the total reward listing pays the market under MIN_POOL a day,
+               or not at all; its own market record keeps showing the old
+               rate after rewards end.
                Checked before the pause. When rewards return it goes through
                the pause and the checks above.
   RETIRED      market closed or not accepting orders, no longer approved, or
@@ -1451,7 +1452,7 @@ def step_state(state, obs, now, cfg):
         if applies(obs, now):
             return State(Phase.RETIRED, reason=reason)
     if not obs.rewards_active:
-        return State(Phase.UNREWARDED, reason="rewards removed")
+        return State(Phase.UNREWARDED, reason="pool under $1/day")
     if obs.paused:
         return State(Phase.PAUSED, reason="paused by operator")
     if state.phase in (Phase.PAUSED, Phase.UNREWARDED):
@@ -1717,9 +1718,12 @@ def parse_market_info(entry):
     )
 
 
+MIN_POOL = 1.0
+
+
 def rewards_active(info, condition_id, total_rates):
     """Whether the total listing, which leaves out markets paid only by
-    sponsors, still pays the market.
+    sponsors, still pays the market at least MIN_POOL a day.
 
     The market record keeps its native rates after its rewards end, so only
     the listing decides. total_rates is None until the first fetch of the slow
@@ -1727,7 +1731,7 @@ def rewards_active(info, condition_id, total_rates):
     """
     if info.v <= 0:
         return False
-    return total_rates is None or total_rates.get(condition_id, 0) > 0
+    return total_rates is None or total_rates.get(condition_id, 0) >= MIN_POOL
 
 
 def farm_market(row, info, cfg, now):
