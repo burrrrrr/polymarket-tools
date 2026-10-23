@@ -120,8 +120,9 @@ class AlertRuleTest(unittest.TestCase):
                  [market(A, "a")])
         found = views.alerts(s, NOW)
         self.assertEqual([a.kind for a in found], ["Cooldown"])
-        self.assertIn("ask drop until", found[0].text)
-        self.assertEqual(found[0].href, f"/markets/{A}")
+        self.assertEqual((found[0].condition_id, found[0].name), (A, "a?"))
+        self.assertIn("Ask drop until", found[0].text)
+        self.assertNotIn("a?", found[0].text)
 
     def test_below_range_fires(self):
         self.assertEqual(kinds(snap([state(A, "BELOW_RANGE")], [market(A, "a")])),
@@ -129,8 +130,8 @@ class AlertRuleTest(unittest.TestCase):
 
     def test_sole_bid_fires_and_says_the_bid_rests(self):
         found = views.alerts(snap([state(A, "SOLE_BID")], [market(A, "a", sole_bid=True)]), NOW)
-        self.assertEqual([(a.kind, a.tone, a.href) for a in found],
-                         [("Sole bid", "t-c", f"/markets/{A}")])
+        self.assertEqual([(a.kind, a.tone, a.condition_id) for a in found],
+                         [("Sole bid", "t-c", A)])
         self.assertIn("the only bid in the reward band", found[0].text)
         self.assertNotIn("orders are down", found[0].text)
 
@@ -391,11 +392,9 @@ class CardsTest(unittest.TestCase):
                          [(A, "QUOTING"), (B, "WAITING")])
         self.assertEqual(cards[1].phase_reason, "waiting for farmer")
 
-    def test_phase_filter_and_cutoff(self):
-        s = snap([state(A), state(B, "PAUSED", slots={})], [market(A, "a"), market(B, "b")])
-        page = views.markets_page(s, "PAUSED", NOW)
-        self.assertEqual([c.condition_id for c in page.cards], [B])
-        self.assertEqual(page.cards[0].cutoff_in_s, timedelta(days=93).total_seconds())
+    def test_cutoff_is_the_end_date_less_the_expiry_buffer(self):
+        c = views.card(market(A, "a"), state(A), status(), NOW)
+        self.assertEqual(c.cutoff_in_s, timedelta(days=93).total_seconds())
 
     def test_card_band_uses_resting_bids(self):
         c = views.card(market(A, "a", v=0.04), state(A, mid=0.95), status(), NOW)
@@ -708,10 +707,11 @@ class Console(unittest.TestCase):
 
 class RoutesTest(Console):
     PAGES = {
-        "/": ["Needs attention", "Tracked markets", "alpha?", "PLACE FAV_BID 98.0c alpha"],
-        "/markets": ["alpha?", "bravo?", "WAITING", f'hx-post="/markets/{A}/paused"',
-                     'class="mk fav_bid"'],
+        "/": ["Needs you", "Where the markets are", "Top earners", "alpha?",
+              "PLACE FAV_BID 98.0c alpha"],
+        "/markets": ["alpha?", "bravo?", "WAITING", "2 tracked, 1 earning"],
         "/markets?phase=WAITING": ["bravo?"],
+        f"/partials/markets/{A}/card": [f'hx-post="/markets/{A}/paused"', 'class="mk fav_bid"'],
         f"/markets/{A}": ["alpha?", "Order slots", "Book inside the band", "Lifecycle",
                           'class="fav-bid"', "FILL alpha FAV_BID"],
         f"/markets/{B}": ["bravo?", "waiting for the farmer"],
@@ -721,8 +721,9 @@ class RoutesTest(Console):
         "/activity?tab=log": ['<span class="kind">PLACE</span><span class="c-fav">FAV_BID 98.0c alpha', "Reward farmer: DRY RUN"],
         "/activity?tab=log&kind=FILL": ["alpha FAV_BID 5 shares"],
         "/partials/overview/kpis": ["Capital in bids", "$98.00"],
-        "/partials/overview/alerts": ["Needs attention"],
-        "/partials/overview/tracked": ["alpha?"],
+        "/partials/overview/needs": ["Needs you"],
+        "/partials/overview/phases": ["Quoting"],
+        "/partials/overview/top": ["alpha?"],
         "/partials/overview/events": ["PLACE FAV_BID 98.0c alpha"],
         "/partials/chrome/status": ["DRY RUN", "cycle 5s"],
         "/partials/chrome/banner": [],
@@ -810,8 +811,9 @@ class RoutesTest(Console):
             updated_at=self.now)])
         resp = self.client.get("/markets?phase=UNREWARDED")
         self.assertEqual(resp.status_code, 200)
-        for needle in ("alpha?", "pool under $1/day", 'data-tip="UNREWARDED"'):
+        for needle in ("alpha?", 'data-tip="UNREWARDED"'):
             self.assertIn(needle, resp.text)
+        self.assertIn("pool under $1/day", self.client.get(f"/partials/markets/{A}/card").text)
         self.assertNotIn("bravo?", resp.text)
 
     def test_a_sole_bid_market_lists_under_its_own_phase_as_a_warning(self):
@@ -819,13 +821,14 @@ class RoutesTest(Console):
                              ._replace(updated_at=self.now)])
         resp = self.client.get("/markets?phase=SOLE_BID")
         self.assertEqual(resp.status_code, 200)
-        for needle in ("alpha?", 'href="/markets?phase=SOLE_BID">Sole Bid</a>',
+        for needle in ("alpha?", '<a class="chip on" href="/markets?phase=SOLE_BID" '
+                                 'aria-current="page">Sole bid',
                        '<span class="badge t-c">SOLE BID<button type="button" class="tip"',
                        'data-tip="SOLE_BID"'):
             self.assertIn(needle, resp.text)
         self.assertNotIn("bravo?", resp.text)
-        self.assertIn("alpha?: no other bid supports the midpoint. Its favorite bid is the only "
-                      "bid in the reward band", self.client.get("/partials/overview/alerts").text)
+        self.assertIn("No other bid supports the midpoint. Its favorite bid is the only "
+                      "bid in the reward band", self.client.get("/partials/markets/look").text)
 
     def test_log_kind_filter_excludes_other_kinds(self):
         text = self.client.get("/activity?tab=log&kind=FILL").text
@@ -847,7 +850,7 @@ class RoutesTest(Console):
         with mock.patch.object(farm_db, "read_farm_states",
                                wraps=farm_db.read_farm_states) as reads:
             for url in ("/partials/chrome/status", "/partials/chrome/banner",
-                        "/partials/overview/kpis", "/partials/overview/tracked"):
+                        "/partials/overview/kpis", "/partials/overview/top"):
                 self.assertEqual(self.client.get(url).status_code, 200)
             self.assertEqual(reads.call_count, 1)
             self.publish(stopped=self.now)
@@ -869,11 +872,12 @@ class RoutesTest(Console):
         over = state(A, naked_used=30.0,
                      slots=quoting_slots(long=(0.001, 30000.0), free=True, offers=0.0042))
         self.publish(states=[over._replace(updated_at=self.now)])
-        self.assertNotIn("Budget bound", self.client.get("/partials/overview/alerts").text)
-        card = self.client.get("/partials/markets").text
-        self.assertIn("$0.00 / $25.00", card)
-        self.assertIn("$30.00 outside the budget: a fill gives a buyer 0.4% a year", card)
-        self.assertIn("$0.00 of $25 budget", self.client.get("/partials/overview/tracked").text)
+        self.assertNotIn("budget bound", self.client.get("/partials/overview/needs").text)
+        row = self.client.get("/partials/markets").text
+        self.assertIn("$0.00 / $25.00", row)
+        self.assertIn("+$30.00 free bid", row)
+        self.assertIn("$30.00 outside the budget: a fill gives a buyer 0.4% a year",
+                      self.client.get(f"/partials/markets/{A}/card").text)
         self.assertIn("$0.00 of it counts against $25.00 budget",
                       self.client.get("/partials/overview/kpis").text)
         self.assertIn("$0.00 of $25.00 budget; the longshot bid is outside it. A fill gives a "
@@ -883,10 +887,8 @@ class RoutesTest(Console):
         above = state(A, naked_used=10.0,
                       slots=quoting_slots(long=(0.02, 500.0), offers=0.0911))
         self.publish(states=[above._replace(updated_at=self.now)])
-        card = self.client.get("/partials/markets").text
-        self.assertIn("$10.00 / $25.00", card)
-        self.assertNotIn("a fill gives a buyer", card)
-        self.assertIn("$10.00 of $25 budget", self.client.get("/partials/overview/tracked").text)
+        self.assertIn("$10.00 / $25.00", self.client.get("/partials/markets").text)
+        self.assertNotIn("a fill gives a buyer", self.client.get(f"/partials/markets/{A}/card").text)
         self.assertIn("$10.00 of it counts against $25.00 budget",
                       self.client.get("/partials/overview/kpis").text)
         page = self.client.get(f"/markets/{A}").text
@@ -896,29 +898,217 @@ class RoutesTest(Console):
     def test_paused_market_shows_alert_and_badge(self):
         self.publish(states=[state(A, "PAUSED", "paused by operator", slots={})
                              ._replace(updated_at=self.now)])
-        self.assertIn("paused by operator", self.client.get("/partials/overview/alerts").text)
+        self.assertIn("paused by operator", self.client.get("/partials/overview/needs").text)
         self.assertIn('<span class="badge t-n">PAUSED<button type="button" class="tip"',
                       self.client.get("/partials/markets").text)
 
-    def test_a_cycle_sends_only_the_cards_that_changed(self):
+
+def earning(reward):
+    """Quoting slots whose favorite bid the farmer prices at reward $/day."""
+    slots = quoting_slots()
+    slots["FAV_BID"]["economics"] = {**ECONOMICS, "reward_per_day": reward}
+    return slots
+
+
+def row_ids(text):
+    return re.findall(r'<tr id="row-(\w+)"', text)
+
+
+class LiveMarketsTest(Console):
+    """alpha quotes at $1/day, bravo at $5/day with its naked budget used up,
+    and charlie has no reward pool."""
+
+    def setUp(self):
+        super().setUp()
+        farm_db.approve_market(self.db, C, 0.99, 25.0, now=self.now)
+        self.seed()
+
+    def seed(self, a=None, b=None, c=None, events=()):
+        bound = earning(5.0)
+        bound["LONG_BID"] = slot("hold", (0.02, 1250.0))
+        self.publish(states=[s._replace(updated_at=self.now) for s in (
+            a or state(A, slots=earning(1.0)), b or state(B, slots=bound),
+            c or state(C, "UNREWARDED", "pool under $1/day", slots={}))], events=events)
+
+    def test_the_unfiltered_view_ranks_by_rate_and_folds_the_unrewarded_away(self):
+        page = self.client.get("/markets").text
+        self.assertEqual(row_ids(page), [B, A])
+        self.assertIn("3 tracked, 2 earning", page)
+        self.assertIn("1 market without a reward pool", page)
+        self.assertIn('href="/markets?phase=UNREWARDED">List them</a>', page)
+        for chip in ('href="/markets" aria-current="page">All <span class="badge t-n mono">3',
+                     'href="/markets?phase=QUOTING">Quoting <span class="badge t-q mono">2',
+                     'href="/markets?phase=UNREWARDED">Unrewarded <span class="badge t-n mono">1',
+                     'href="/markets?flag=budget-bound">Budget bound <span class="mono">1',
+                     'href="/markets?flag=inventory">Holding inventory <span class="mono">3'):
+            self.assertIn(chip, page)
+        self.assertNotIn("Sole bid <span", page)
+
+    def test_phase_flag_and_search_narrow_the_rows_but_not_the_counts(self):
+        for query, shown in (("phase=UNREWARDED", [C]), ("flag=budget-bound", [B]),
+                             ("q=BRAV", [B]), ("q=charlie", [C]), ("phase=QUOTING&q=alpha", [A]),
+                             ("flag=cutoff-soon", [])):
+            with self.subTest(query=query):
+                page = self.client.get(f"/markets?{query}").text
+                self.assertEqual(row_ids(page), shown)
+                self.assertIn("All <span class=\"badge t-n mono\">3", page)
+                self.assertNotIn("without a reward pool", page)
+        self.assertIn("No markets match.", self.client.get("/markets?flag=cutoff-soon").text)
+
+    def test_a_cutoff_inside_fourteen_days_flags_an_earning_market(self):
+        # Ten days to the end date less the 7-day expiry buffer.
+        farm_db.store_scan(self.db, [farm_db.ScanRow(
+            A, "alpha", "alpha?", (self.now + timedelta(days=10)).isoformat(), 1.0,
+            json.dumps(metrics("alpha")))], [A, B, C], self.now)
+        page = self.client.get("/markets?flag=cutoff-soon").text
+        self.assertEqual(row_ids(page), [A])
+        self.assertIn('<td class="mono num c-warn">2d 23h', page)
+        self.assertIn("1 quoting market reaches its cutoff within 14 days.",
+                      self.client.get("/partials/overview/phases").text)
+
+    def test_sort_and_limit_page_the_rows_and_every_link_keeps_the_rest(self):
+        self.assertEqual(row_ids(self.client.get("/markets?sort=name").text), [A, B])
+        page = self.client.get("/markets?sort=name&limit=1").text
+        self.assertEqual(row_ids(page), [A])
+        self.assertIn("Showing 1 of 2", page)
+        self.assertIn('href="/markets?sort=name&amp;limit=51">Show 50 more</a>', page)
+        self.assertIn('href="/markets?phase=QUOTING&amp;sort=name&amp;limit=1"', page)
+        self.assertIn('<input type="hidden" name="sort" value="name">', page)
+        self.assertNotIn("Show 50 more", self.client.get("/markets").text)
+
+    def test_a_bad_filter_is_refused(self):
+        for query in ("flag=nope", "sort=nope", "limit=0", "limit=ten", "phase=NOPE"):
+            with self.subTest(query=query):
+                self.assertEqual(self.client.get(f"/markets?{query}").status_code, 400)
+                self.assertEqual(self.client.get(f"/partials/markets?{query}").status_code, 400)
+
+    def test_needs_a_look_offers_each_alert_its_control(self):
+        self.seed(a=state(A, "COOLDOWN", "ask drop", until=self.now + timedelta(minutes=5),
+                          slots={}),
+                  b=state(B, slots=earning(5.0)),
+                  c=state(C, "PAUSED", "paused by operator", slots={}),
+                  events=[Event(self.now, EventKind.FILL, "FILL bravo LONG_BID", B, "LONG_BID",
+                                0.02, 40.0)])
+        look = self.client.get("/partials/markets/look").text
+        self.assertLess(look.index("bravo?"), look.index("alpha?"))
+        self.assertIn("Longshot bid filled 40 shares at", look)
+        for cid, path, value, label in ((B, "naked-paused", "1", "Pause naked leg"),
+                                        (A, "end-cooldown", None, "End cooldown")):
+            vals = f""" hx-vals='{{"value": "{value}"}}'""" if value else ""
+            self.assertIn(f'hx-post="/markets/{cid}/{path}"{vals} hx-swap="none">{label}</button>',
+                          look)
+        # charlie is resumed already but the farmer has not quoted it yet,
+        # so the card says so instead of offering Resume.
+        self.assertIn("Resumed", look)
+        self.assertNotIn(">Resume</button>", look)
+        farm_db.set_paused(self.db, C, True)
+        farm_db.set_naked_paused(self.db, B, True)
+        look = self.client.get("/partials/markets/look").text
+        self.assertIn(f"""hx-post="/markets/{C}/paused" hx-vals='{{"value": "0"}}' """
+                      'hx-swap="none">Resume</button>', look)
+        self.assertIn("Naked leg paused", look)
+        self.assertNotIn("Pause naked leg", look)
+        self.assertIn("Needs a look", self.client.get("/markets").text)
+        self.assertNotIn('id="needs-a-look"', self.client.get("/markets?phase=COOLDOWN").text)
+        self.assertEqual(set(row_ids(self.client.get("/markets?flag=needs-look").text)),
+                         set(re.findall(r'href="/markets/(\w+)">Details', look)))
+
+    def test_a_cycle_sends_only_the_rows_that_changed_in_place(self):
         full = self.client.get("/partials/markets").text
-        order = re.search(r'data-order="(\w+)"', full)[1]
-        held = dict(re.findall(r'id="card-(\w+)"[^>]*data-v="(\w+)"', full))
-        have = ".".join(held.values())
+        ids = re.search(r'data-ids="(\w+)"', full)[1]
+        held = dict(re.findall(r'<tr id="row-(\w+)" [^>]*data-v="(\w+)"', full))
         self.assertEqual(held.keys(), {A, B})
-        self.assertEqual(self.client.get("/partials/markets",
-                                         params={"order": order, "have": have}).status_code, 204)
-        self.publish(states=[state(A, "PAUSED", "paused by operator", slots={})
-                             ._replace(updated_at=self.now)])
-        resp = self.client.get("/partials/markets", params={"order": order, "have": have})
+        params = {"ids": ids, "have": ".".join(held.values())}
+        self.assertEqual(self.client.get("/partials/markets", params=params).status_code, 204)
+        # A paused bravo earns nothing, so a fresh table ranks it last; the
+        # page keeps its order and swaps bravo's row in place.
+        self.seed(b=state(B, "PAUSED", "paused by operator", slots={}))
+        self.assertEqual(row_ids(self.client.get("/partials/markets").text), [A, B])
+        resp = self.client.get("/partials/markets", params=params)
         self.assertEqual(resp.headers["hx-reswap"], "none")
-        self.assertIn(f'id="card-{A}"', resp.text)
+        self.assertTrue(resp.text.lstrip().startswith("<template>"))
+        self.assertIn(f'<tr id="row-{B}" data-condition-id="{B}"', resp.text)
         self.assertIn('hx-swap-oob="true"', resp.text)
-        self.assertIn("paused by operator", resp.text)
-        self.assertNotIn(f'id="card-{B}"', resp.text)
-        stale = self.client.get("/partials/markets", params={"order": "0", "have": have})
-        self.assertIn('<section class="cards"', stale.text)
-        self.assertNotIn("hx-swap-oob", stale.text)
+        self.assertIn("PAUSED", resp.text)
+        self.assertNotIn(f"row-{A}", resp.text)
+
+    def test_an_open_row_gets_its_detail_and_stays_open(self):
+        full = self.client.get("/partials/markets").text
+        ids = re.search(r'data-ids="(\w+)"', full)[1]
+        have = re.findall(r'data-v="(\w+)"', full)
+        detail = self.client.get(f"/partials/markets/{A}/card").text
+        self.assertIn(f'<tr class="detail" id="detail-{A}"', detail)
+        self.assertIn(f'hx-post="/markets/{A}/paused"', detail)
+        params = {"ids": ids, "have": ".".join(have), "expanded": A}
+        # The page holds alpha's row already and lacks only its detail.
+        resp = self.client.get("/partials/markets", params=params)
+        self.assertIn(f'<tr class="detail" id="detail-{A}"', resp.text)
+        self.assertEqual(row_ids(resp.text), [])
+        params["have"] += "." + ".".join(re.findall(r'data-v="(\w+)"', resp.text))
+        self.assertEqual(self.client.get("/partials/markets", params=params).status_code, 204)
+        # A row joins the table, so it comes whole, with alpha still open.
+        self.seed(c=state(C, slots=earning(3.0)))
+        table = self.client.get("/partials/markets", params=params).text
+        self.assertEqual(row_ids(table), [B, C, A])
+        self.assertIn(f'<tr class="detail" id="detail-{A}"', table)
+        self.assertEqual(table.count('aria-expanded="true"'), 1)
+        self.assertEqual(self.client.get("/partials/markets/0xnope/card").status_code, 404)
+
+    def test_the_api_serves_the_page_model(self):
+        body = self.client.get("/api/markets?sort=name").json()
+        self.assertEqual([r["condition_id"] for r in body["rows"]], [A, B])
+        self.assertEqual([r["daily_usd"] for r in body["rows"]], [1.0, 5.0])
+        self.assertEqual((body["total"], body["unrewarded"], body["query"]["sort"]), (2, 1, "name"))
+
+
+class OverviewTest(Console):
+    def setUp(self):
+        super().setUp()
+        farm_db.approve_market(self.db, C, 0.99, 25.0, now=self.now)
+
+    def test_needs_you_lists_by_severity_and_counts_the_routine_kinds(self):
+        bound = quoting_slots(long=(0.02, 1250.0))
+        backoff = {f"SLOT{i}": {"until": farm_db.stamp(self.now), "attempts": 1}
+                   for i in range(6)}
+        self.publish(states=[s._replace(updated_at=self.now) for s in (
+            state(A, "PAUSED", "paused by operator", slots={}),
+            state(B, slots=bound, backoff=backoff),
+            state(C, "COOLDOWN", "ask drop", slots={}))],
+            events=[Event(self.now, EventKind.FILL, "FILL alpha", A, "LONG_BID", 0.02, 9.0)])
+        needs = self.client.get("/partials/overview/needs").text
+        order = [needs.index(f'<span class="badge {tone}">{kind}</span>')
+                 for kind, tone in (("Naked fill", "t-r"), ("Cooldown", "t-c"),
+                                    ("Backoff", "t-r"), ("Paused", "t-n"))]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("3 markets, most urgent first", needs)
+        self.assertIn("and 1 more", needs)
+        self.assertEqual(needs.count("SLOT"), 5)
+        self.assertIn('href="/markets?phase=COOLDOWN">View in Live markets</a>', needs)
+        self.assertIn('Routine, not listed:', needs)
+        self.assertIn('<a href="/markets?flag=budget-bound">1 budget bound</a>', needs)
+        self.assertNotIn("Budget bound</span>", needs)
+        # The routine link lists the same market.
+        self.assertEqual(row_ids(self.client.get("/markets?flag=budget-bound").text), [B])
+
+    def test_nothing_needs_you_while_everything_quotes(self):
+        self.publish(states=[state(A)._replace(updated_at=self.now)])
+        needs = self.client.get("/partials/overview/needs").text
+        self.assertIn("Nothing needs you.", needs)
+        self.assertNotIn("Routine", needs)
+
+    def test_top_earners_rank_by_rate_and_phases_count_every_market(self):
+        self.publish(states=[s._replace(updated_at=self.now) for s in (
+            state(A, slots=earning(1.0)), state(B, slots=earning(5.0)),
+            state(C, "UNREWARDED", slots={}))])
+        top = self.client.get("/partials/overview/top").text
+        self.assertLess(top.index("bravo?"), top.index("alpha?"))
+        self.assertNotIn("charlie?", top)
+        self.assertIn("$5.00", top)
+        self.assertIn("All 3 in Live markets", top)
+        phases = self.client.get("/partials/overview/phases").text
+        self.assertIn('aria-label="2 quoting, 1 unrewarded"', phases)
+        self.assertIn('href="/markets?phase=UNREWARDED"', phases)
+        self.assertIn("0 quoting markets reach their cutoff within 14 days.", phases)
 
 
 class ApiTest(Console):
@@ -927,11 +1117,14 @@ class ApiTest(Console):
         self.assertEqual(body["chrome"]["liveness"]["mode"], "DRY RUN")
         self.assertEqual(body["overview"]["totals"]["quoting"], 1)
         self.assertEqual(body["overview"]["totals"]["fav_bid_usd"], 98.0)
-        self.assertEqual([m["phase"] for m in body["overview"]["markets"]], ["QUOTING", "WAITING"])
+        self.assertEqual([(p["phase"], p["count"]) for p in body["overview"]["phases"]],
+                         [("QUOTING", 1), ("WAITING", 1)])
+        self.assertEqual([c["condition_id"] for c in body["overview"]["top"]], [A])
 
     def test_markets_json_and_detail(self):
-        cards = self.client.get("/api/markets").json()["cards"]
-        self.assertEqual(cards[0]["band"]["marks"][1]["kind"], "mid")
+        rows = self.client.get("/api/markets").json()["rows"]
+        self.assertEqual([r["condition_id"] for r in rows], [A, B])
+        self.assertEqual(rows[0]["band"]["marks"][1]["kind"], "mid")
         detail = self.client.get(f"/api/markets/{A}").json()
         self.assertEqual(len(detail["mids"]), 3)
         self.assertEqual(detail["mids"][0]["fav_bid"], 0.98)

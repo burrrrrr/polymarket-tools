@@ -1,16 +1,36 @@
 {% extends "base.html" %}
 {% block title %}Live markets{% endblock %}
 {% block content %}
+{%- set visible = "[document.visibilityState === 'visible']" %}
 <header class="page-head">
   <div>
     <h1>Live markets</h1>
-    <p class="sub">Updates every farmer cycle. The band strip is in favorite price; orange is the longshot bid at its mirror.</p>
+    <p class="sub">{{ vm.tracked }} tracked, {{ vm.earning }} earning. Updates every farmer cycle.</p>
   </div>
-  <nav class="actions" aria-label="Phase filter">
-    {%- for f in vm.filters %}
-    <a class="chip {{ 'on' if f == vm.phase }}" href="/markets{{ '?phase=' ~ f if f }}">{{ (f or 'All') | replace('_', ' ') | title }}</a>
+  <form class="field" method="get" action="/markets" role="search">
+    <label class="lbl" for="q">Find a market</label>
+    {%- for k, v in vm.keep.items() %}
+    <input type="hidden" name="{{ k }}" value="{{ v }}">
+    {%- endfor %}
+    <input class="inp search" id="q" name="q" type="search" placeholder="Name or slug" value="{{ vm.query.q }}">
+  </form>
+</header>
+<div class="stack">
+  <nav class="chip-row" aria-label="Phase">
+    <span class="lbl">Phase</span>
+    {%- for c in vm.phases %}
+    <a class="chip {{ 'on' if c.on }}" href="{{ c.href }}"{{ ' aria-current="page"' | safe if c.on }}>{{ c.label }} <span class="badge {{ c.tone }} mono">{{ c.count }}</span></a>
     {%- endfor %}
   </nav>
-</header>
-<div hx-get="/partials/markets{{ '?phase=' ~ vm.phase if vm.phase }}" hx-trigger="sse:cycle[document.visibilityState === 'visible'], {{ CONTROLS_EVENT }} from:body" hx-swap="innerHTML" hx-vals="js:{order: document.querySelector('.cards')?.dataset.order ?? '', have: [...document.querySelectorAll('.card')].map((c) => c.dataset.v).join('.')}">{% include "partials/cards.html" %}</div>
+  <nav class="chip-row" aria-label="Only">
+    <span class="lbl">Only</span>
+    {%- for c in vm.flags %}
+    <a class="chip flag {{ 'on' if c.on }}" href="{{ c.href }}"{{ ' aria-current="page"' | safe if c.on }}>{{ c.label }} <span class="mono">{{ c.count }}</span></a>
+    {%- endfor %}
+  </nav>
+</div>
+{%- if vm.query.unfiltered %}
+<div class="contents" hx-get="/partials/markets/look" hx-trigger="sse:cycle{{ visible }}, {{ CONTROLS_EVENT }} from:body" hx-swap="innerHTML">{% include "partials/look.html" %}</div>
+{%- endif %}
+<div class="contents" hx-get="{{ vm.refresh }}" hx-trigger="sse:cycle{{ visible }}, {{ CONTROLS_EVENT }} from:body" hx-swap="innerHTML" hx-vals="js:{ids: document.getElementById('rows')?.dataset.ids ?? '', have: [...document.querySelectorAll('#rows tr[data-v]')].map((r) => r.dataset.v).join('.'), expanded: [...document.querySelectorAll('#rows tr.detail')].map((r) => r.dataset.conditionId).join('.')}">{% include "partials/market_table.html" %}</div>
 {% endblock %}

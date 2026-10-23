@@ -1,0 +1,35 @@
+{%- if look %}
+<section class="stack" id="needs-a-look" aria-labelledby="look-head">
+  <div class="panel-head flush">
+    <h2 id="look-head">Needs a look</h2>
+    <span class="mono small muted">{{ look | length }}</span>
+    {%- if look | length > LOOK_SHOWN %}
+    <a class="push" href="/markets?flag=needs-look">Show all {{ look | length }}</a>
+    {%- endif %}
+  </div>
+  <div class="look-grid">
+    {%- for m in look[:LOOK_SHOWN] %}
+    <article class="panel look-card">
+      <div class="actions">{% for a in m.alerts | unique(attribute='kind') %}<span class="badge {{ a.tone }}">{{ a.kind }}</span>{% endfor %}</div>
+      <a class="title" href="/markets/{{ m.condition_id }}">{{ m.name }}</a>
+      {%- for a in m.alerts %}
+      <p>{{ a.text }}</p>
+      {%- endfor %}
+      <div class="actions">
+        {%- for k in m.controls %}
+        {%- if k.post %}
+        <button class="btn" type="button" hx-post="{{ k.path }}"{% if k.value is not none %} hx-vals='{"value": "{{ k.value }}"}'{% endif %} hx-swap="none">{{ k.label }}</button>
+        {%- else %}
+        <a class="btn" href="{{ k.path }}">{{ k.label }}</a>
+        {%- endif %}
+        {%- endfor %}
+        {%- for d in m.done %}
+        <span class="small muted">{{ d }}</span>
+        {%- endfor %}
+        <a class="btn" href="/markets/{{ m.condition_id }}">Details</a>
+      </div>
+    </article>
+    {%- endfor %}
+  </div>
+</section>
+{%- endif %}

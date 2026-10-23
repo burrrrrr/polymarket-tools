@@ -1,0 +1,79 @@
+{% from "_macros.html" import market_controls, polymarket_link %}
+{#- A Live markets row's cells, and the detail row's, which market_table.html
+    wraps in their <tr>s. -#}
+{%- macro cells(c, open) %}
+<td class="name"><a href="/markets/{{ c.condition_id }}" title="{{ c.name }}">{{ c.name }}</a>
+  <span class="small muted">{{ c.mode or '--' }}{% if c.mode %}{{ tip(c.mode | lower) }}{% endif %}
+    {%- if c.status != 'approved' %} <span class="badge t-r">{{ c.status }}</span>{% endif %}
+    {%- if c.paused %} <span class="badge t-n">paused</span>{% endif %}
+    {%- if c.naked_paused %} <span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
+    {%- if c.sole_bid %} <span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}</span></td>
+<td><span class="badge {{ c.phase_tone }}">{{ c.phase | replace('_', ' ') }}{{ tip(c.phase) }}</span></td>
+<td class="mono num">{{ c.mid | cents }}</td>
+<td class="mono c-fav">{% if c.fav_bid %}{{ c.fav_bid.price | cents }} × {{ c.fav_bid.size | whole }}{% else %}--{% endif %}</td>
+<td class="mono c-long">{% if c.long_bid %}{{ c.long_bid.price | cents }} × {{ c.long_bid.size | whole }}{% else %}--{% endif %}</td>
+<td class="budget"><span class="mono">{{ c.budget_used_usd | usd }} / {{ c.budget_usd | usd }}</span>
+  <div class="bar"><div class="naked" style="width: {{ c.naked_pct }}%"></div></div>
+  {%- if c.free_bid_usd %}<span class="small muted">+{{ c.free_bid_usd | usd }} free bid</span>{% endif %}</td>
+<td class="mono num">{% if c.farm_fav %}<span class="c-fav">{{ c.farm_fav | shares }}</span>{% else %}<span class="muted">--</span>{% endif %}
+  {%- if c.farm_long %}<span class="small c-long">+{{ c.farm_long | shares }} long</span>{% endif %}</td>
+<td class="mono num">{{ c.daily_usd | usd }}</td>
+<td class="mono num {{ 'c-warn' if c.cutoff_soon }}">{{ c.cutoff_in_s | cutoff_text }}</td>
+<td class="expand-cell"><button type="button" class="expand" id="expand-{{ c.condition_id }}" aria-expanded="{{ 'true' if open else 'false' }}" aria-controls="detail-{{ c.condition_id }}" aria-label="{{ 'Collapse' if open else 'Expand' }} {{ c.name }}"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg></button></td>
+{%- endmacro %}
+{%- macro favorite(c) %}<span class="small muted">{{ c.fav_outcome or '--' }} is the favorite · p_true {{ c.p_true | p_true_text }}</span>{% endmacro %}
+{%- macro detail(c) %}
+{%- if c.phase == 'WAITING' %}
+<div class="stack">
+  <div class="empty">Approved, waiting for the farmer. It starts managing the market on its next cycle once the CLOB market record loads.</div>
+  {{ favorite(c) }}
+</div>
+{%- else %}
+<div class="detail-grid">
+  <div class="stack">
+    <span class="lbl">Reward band{{ tip('band_strip') }}</span>
+    {%- if c.band %}
+    <div>
+      <div class="strip" role="img" aria-label="Reward band from {{ c.band.lo | cents }} to {{ c.band.hi | cents }}">
+        {%- for k in c.band.marks %}
+        <div class="mk {{ k.kind }}" style="left: {{ k.left }}%" title="{{ k.kind | replace('_', ' ') }} {{ k.price | cents }}"></div>
+        {%- endfor %}
+      </div>
+      <div class="strip-axis mono"><span>{{ c.band.lo | cents }}</span><span>{{ c.band.hi | cents }}</span></div>
+    </div>
+    {%- endif %}
+    <span class="small muted">Mid {{ c.mid | cents }}{{ tip('mid_effective') }} · book mid {{ c.book_mid | cents }}{{ tip('book_mid') }}{% if c.phase_reason %} · {{ c.phase_reason }}{% endif %}{% if c.phase_until %} until {{ c.phase_until | clock }}{% endif %}</span>
+    {{ favorite(c) }}
+  </div>
+  <div>
+    {%- for s in c.slots %}
+    <div class="slot">
+      <span class="slot-name"><span class="badge {{ s.tone if s.order or s.target else 't-n' }}">{{ s.slot }}</span>{{ tip(s.slot) }}</span>
+      <span class="mono order">{% if s.order %}{{ s.order.price | cents }} × {{ s.order.size | shares }}{% elif s.target %}→ {{ s.target.price | cents }} × {{ s.target.size | shares }}{% else %}--{% endif %}</span>
+      <span class="muted">{{ s.decision }}{% if s.decision in ('hold', 'backoff', 'preview') %}{{ tip(s.decision) }}{% endif %}{% if s.live_score is not none %} · {{ s.live_score | score }}{% elif s.target_score is not none %} · {{ s.target_score | score }}{% endif %}{% if s.reason and s.decision != 'hold' %} · {{ s.reason | truncate(40, True) }}{% endif %}</span>
+    </div>
+    {%- endfor %}
+  </div>
+  <dl class="detail-facts">
+    <dt>Q1 / Q2{{ tip('q1_q2') }}</dt>
+    <dd class="mono">{{ '%.1f' % c.q1 }} / {{ '%.1f' % c.q2 }}<div class="bar" title="balance {{ c.q_balance_pct }}%"><div class="q" style="width: {{ c.q_balance_pct }}%"></div></div></dd>
+    {%- if c.position %}
+    <dt>Farm{{ tip('farm_inventory') }} / baseline{{ tip('baseline') }}</dt>
+    <dd class="mono">{{ c.farm_fav | shares }} / {{ c.farm_long | shares }} · {{ c.position.baseline.fav | shares }} / {{ c.position.baseline.long | shares }} <span class="muted">(fav / long)</span></dd>
+    {%- endif %}
+    <dt>Cutoff{{ tip('expiry_cutoff') }}</dt>
+    <dd class="mono">{% if c.cutoff %}{{ c.cutoff.strftime('%Y-%m-%d') }}, {% if c.cutoff_in_s > 0 %}in {{ c.cutoff_in_s | span }}{% else %}passed{% endif %}{% else %}no end date{% endif %}</dd>
+    {%- if c.free_bid_usd %}
+    <dt>Free bid{{ tip('naked_budget') }}</dt>
+    <dd>{{ c.free_bid_usd | usd }} outside the budget{% if c.long_return is not none %}: a fill gives a buyer {{ '%.1f' % (c.long_return * 100) }}% a year{% endif %}</dd>
+    {%- endif %}
+  </dl>
+</div>
+{%- endif %}
+<div class="actions">
+  {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused, c.sole_bid) }}
+  <span class="spacer"></span>
+  <a class="btn" href="/markets/{{ c.condition_id }}">Details</a>
+  {{ polymarket_link(c.slug, "btn") }}
+</div>
+{%- endmacro %}

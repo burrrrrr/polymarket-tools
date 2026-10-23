@@ -15,15 +15,9 @@
 
 {% call region("/partials/overview/kpis") %}{% include "partials/kpis.html" %}{% endcall %}
 
-{% call region("/partials/overview/alerts") %}{% include "partials/alerts.html" %}{% endcall %}
-
 <div class="row">
-  <section class="panel pad-table grow">
-    <div class="head">
-      <h2>Tracked markets</h2>
-      <a href="/markets" style="font-size: 13px">Open live view</a>
-    </div>
-    {% call region("/partials/overview/tracked") %}{% include "partials/tracked.html" %}{% endcall %}
+  <section class="panel pad-table grow" aria-label="Needs you">
+    {% call region("/partials/overview/needs") %}{% include "partials/needs.html" %}{% endcall %}
   </section>
   <section class="panel pad feed-panel stack">
     <div style="display: flex; justify-content: space-between; align-items: center">
@@ -32,6 +26,15 @@
     </div>
     {% call region("/partials/overview/events", "sse:farm-event") %}{% include "partials/events.html" %}{% endcall %}
     <a href="/activity?tab=log" style="font-size: 13px; margin-top: 4px">Full activity log</a>
+  </section>
+</div>
+
+<div class="row">
+  <section class="panel pad phases-panel" aria-label="Where the markets are">
+    {% call region("/partials/overview/phases") %}{% include "partials/phases.html" %}{% endcall %}
+  </section>
+  <section class="panel pad-table grow" aria-label="Top earners">
+    {% call region("/partials/overview/top") %}{% include "partials/top.html" %}{% endcall %}
   </section>
 </div>
 {% endblock %}

@@ -1,0 +1,39 @@
+{%- set cap = 5 %}
+<div class="panel-head">
+  <h2>Needs you</h2>
+  {%- if vm.needs_markets %}
+  <span class="small muted">{{ vm.needs_markets }} market{{ 's' if vm.needs_markets != 1 }}, most urgent first</span>
+  {%- endif %}
+</div>
+{%- for g in vm.needs %}
+<div class="group">
+  <div class="group-head">
+    <span class="badge {{ g.tone }}">{{ g.kind }}</span>
+    <span class="mono">{{ g.alerts | length }}</span>
+    <span class="muted">{{ g.about }}</span>
+    <a href="{{ g.href }}">{{ g.action }}</a>
+  </div>
+  {%- for a in g.alerts[:cap] %}
+  <div class="group-item">
+    {%- if a.condition_id %}
+    <a href="/markets/{{ a.condition_id }}" title="{{ a.name }}">{{ a.name }}</a><span class="c-mut">{{ a.brief }}</span>
+    {%- else %}
+    <span>{{ a.text }}</span>
+    {%- endif %}
+  </div>
+  {%- endfor %}
+  {%- if g.alerts | length > cap %}
+  <div class="group-item muted">and {{ g.alerts | length - cap }} more</div>
+  {%- endif %}
+</div>
+{%- else %}
+<div class="group"><div class="empty">Nothing needs you. No market has a naked fill, a stall, or a pause to look at.</div></div>
+{%- endfor %}
+{%- if vm.routine %}
+<div class="group routine">
+  <span>Routine, not listed:</span>
+  {%- for g in vm.routine %}
+  <a href="{{ g.href }}">{{ g.alerts | length }} {{ g.kind | lower }}</a>{% if not loop.last %}<span aria-hidden="true">·</span>{% endif %}
+  {%- endfor %}
+</div>
+{%- endif %}

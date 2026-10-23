@@ -1,0 +1,59 @@
+{#- The All markets table; with oob only the rows given, each swapped into
+    place by its id (htmx needs a <template> around a <tr> out of its
+    table); with bare the rows alone. -#}
+{%- macro tr(r) -%}
+{%- if r.detail %}
+<tr class="detail" id="detail-{{ r.condition_id }}" data-condition-id="{{ r.condition_id }}" data-v="{{ r.v }}"{{ ' hx-swap-oob="true"' | safe if oob }}><td colspan="10">{{ r.html }}</td></tr>
+{%- else %}
+<tr id="row-{{ r.condition_id }}" data-condition-id="{{ r.condition_id }}" data-v="{{ r.v }}"{{ ' hx-swap-oob="true"' | safe if oob }}>{{ r.html }}</tr>
+{%- endif %}
+{%- endmacro -%}
+{%- if oob %}
+<template>{% for r in rows %}{{ tr(r) }}{% endfor %}
+</template>
+{%- elif bare %}
+{%- for r in rows %}{{ tr(r) }}{% endfor %}
+{%- else %}
+<section class="panel pad-table">
+  <div class="panel-head">
+    <h2>All markets</h2>
+    <span class="small muted">{{ vm.total }} {{ 'with a reward pool' if vm.query.unfiltered else 'match' }}, sorted by {{ vm.sorted_by }}</span>
+  </div>
+  <div class="scroll">
+    <table class="tbl tight rows" id="rows" data-ids="{{ ids }}">
+      <thead><tr>
+        <th{{ ' aria-sort="ascending"' | safe if vm.query.sort == 'name' }}><a href="{{ vm.sorts.name }}">Market{{ ' ▴' if vm.query.sort == 'name' }}</a></th>
+        <th>Phase</th>
+        <th class="num">Mid{{ tip('mid_effective') }}</th>
+        <th>Fav bid</th>
+        <th>Long bid</th>
+        <th>Naked budget{{ tip('naked_budget') }}</th>
+        <th class="num">Inventory{{ tip('farm_inventory') }}</th>
+        <th class="num"{{ ' aria-sort="descending"' | safe if vm.query.sort == 'daily' }}><a href="{{ vm.sorts.daily }}">$/day{{ ' ▾' if vm.query.sort == 'daily' }}</a></th>
+        <th class="num"{{ ' aria-sort="ascending"' | safe if vm.query.sort == 'cutoff' }}><a href="{{ vm.sorts.cutoff }}">Cutoff{{ ' ▴' if vm.query.sort == 'cutoff' }}</a></th>
+        <th><span class="sr">Expand</span></th>
+      </tr></thead>
+      <tbody>
+        {%- for r in rows %}{{ tr(r) }}
+        {%- else %}
+        <tr><td colspan="10" class="muted">No markets match.</td></tr>
+        {%- endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="pager">
+    <span class="small muted">Showing {{ vm.rows | length }} of {{ vm.total }}</span>
+    {%- if vm.more %}<a class="btn" href="{{ vm.more }}">Show 50 more</a>{% endif %}
+  </div>
+</section>
+{%- if vm.unrewarded %}
+<section class="panel group-line" aria-labelledby="unrewarded">
+  <span class="badge t-n">UNREWARDED</span>
+  <div class="grow">
+    <h2 id="unrewarded">{{ vm.unrewarded }} market{{ 's' if vm.unrewarded != 1 }} without a reward pool</h2>
+    <span class="small muted">They stay approved. The farmer quotes each again as soon as its rewards return.</span>
+  </div>
+  <a class="btn" href="/markets?phase=UNREWARDED">List them</a>
+</section>
+{%- endif %}
+{%- endif %}

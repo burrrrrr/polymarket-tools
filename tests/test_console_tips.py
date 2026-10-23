@@ -87,7 +87,7 @@ class RenderedTipsTest(Writes):
     # Per page, keys whose tips must be there.
     PAGES = {
         "/": {"capital_in_bids", "naked_at_risk", "farm_inventory", "rate_now", "est_daily",
-              "earned_today", "q1_q2", "QUOTING"},
+              "earned_today"},
         "/discover": {"min_fav", "min_rate", "fragile_drop", "mode", "favorite", "pool", "band",
                       "est_daily", "planned_capital", "net_apr", "days", "ahead", "vol24h"},
         "/review/0xddd": {"budget", "band", "min_size", "band_strip", "ahead",
@@ -97,9 +97,11 @@ class RenderedTipsTest(Writes):
         "/partials/review/0xddd/live?p_true=97&naked_budget=25": {
             "score_per_share", "ties_up", "FAV_BID", "LONG_BID", "est_share", "est_daily",
             "fill_cost", "fills_per_day", "net_daily", "planned_capital", "apr", "net_apr"},
-        "/markets": {"QUOTING", "WAITING", "mid_effective", "book_mid", "q1_q2",
-                     "naked_budget", "farm_inventory", "baseline", "FAV_BID", "LONG_ASK",
-                     "hold", "expiry_cutoff", "naked_leg", "sole_bid", "floor"},
+        "/markets": {"QUOTING", "WAITING", "mid_effective", "naked_budget", "farm_inventory",
+                     "floor"},
+        f"/partials/markets/{A}/card": {"band_strip", "mid_effective", "book_mid", "q1_q2",
+                                        "farm_inventory", "baseline", "FAV_BID", "LONG_ASK",
+                                        "hold", "expiry_cutoff", "naked_leg", "sole_bid"},
         f"/markets/{A}": {"QUOTING", "mid_effective", "book_mid", "capital_in_bids",
                           "expiry_cutoff", "net_daily", "backoff", "book_in_band",
                           "score_per_share",

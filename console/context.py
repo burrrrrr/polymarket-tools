@@ -48,7 +48,7 @@ class Context:
         self.templates = Jinja2Templates(directory=HERE / "templates")
         versions = {f.name: int(f.stat().st_mtime) for f in (HERE / "static").iterdir()}
         for name in ("cents", "usd", "shares", "score", "clock", "stamp_local", "span",
-                     "number_text", "human_volume", "p_true_text"):
+                     "number_text", "human_volume", "p_true_text", "cutoff_text", "whole"):
             self.templates.env.filters[name] = getattr(views, name)
         self.templates.env.globals.update(
             PHASE_TONE=views.PHASE_TONE, SLOT_TONE=views.SLOT_TONE, JOB_TONE=views.JOB_TONE,
@@ -56,6 +56,7 @@ class Context:
             TOKEN_FIELD=security.TOKEN_FIELD, TOKEN_HEADER=security.TOKEN_HEADER,
             CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
             polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
+            LOOK_SHOWN=views.LOOK_SHOWN,
             review_url=views.review_url, MODES=views.MODES, mode_tone=views.mode_tone,
             glossary=glossary.GLOSSARY,
             REJECT_REASONS=list(farm_db.RejectReason),

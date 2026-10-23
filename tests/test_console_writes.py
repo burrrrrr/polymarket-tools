@@ -311,7 +311,7 @@ class MarketControlTest(Writes):
         self.assertEqual(resp.headers["HX-Trigger"], "controls")
         self.post(f"/markets/{A}/paused", value="1")
         self.assertEqual(self.row(A)["paused"], 1)
-        card = self.client.get("/partials/markets").text
+        card = self.client.get(f"/partials/markets/{A}/card").text
         self.assertRegex(card, rf'hx-post="/markets/{A}/paused" hx-vals=\'{{"value": "0"}}\''
                                r' hx-swap="none">Resume</button>')
         self.post(f"/markets/{A}/paused", value="0")
@@ -327,12 +327,13 @@ class MarketControlTest(Writes):
     def test_sole_bid_allow_and_stop(self):
         badge = '<span class="badge t-c">sole bid allowed'
         pages = ("/partials/markets", f"/markets/{A}", f"/review/{A}")
+        expanded = f"/partials/markets/{A}/card"
 
         def button(value, label):
             return (f'hx-post="/markets/{A}/sole-bid" hx-vals=\'{{"value": "{value}"}}\''
                     f' hx-swap="none">{label} sole bid</button>')
 
-        self.assertIn(button(1, "Allow"), self.client.get("/partials/markets").text)
+        self.assertIn(button(1, "Allow"), self.client.get(expanded).text)
         for url in pages:
             self.assertNotIn(badge, self.client.get(url).text)
         resp = self.post(f"/markets/{A}/sole-bid", value="1")
@@ -342,18 +343,19 @@ class MarketControlTest(Writes):
         self.assertEqual((self.row(A)["paused"], self.row(A)["naked_paused"]), (0, 0))
         for url in pages:
             self.assertEqual(self.client.get(url).text.count(badge), 1)
-        for url in pages[:2]:
+        for url in (expanded, f"/markets/{A}"):
             self.assertIn(button(0, "Stop"), self.client.get(url).text)
         self.post(f"/markets/{A}/sole-bid", value="0")
         self.assertEqual(self.row(A)["sole_bid"], 0)
 
     def test_retire_asks_first_and_moves_status(self):
-        card = self.client.get("/partials/markets").text
+        card = self.client.get(f"/partials/markets/{A}/card").text
         self.assertIn('hx-confirm="Retire &quot;alpha?&quot;? The farmer cancels', card)
         self.post(f"/markets/{A}/retire")
         self.assertEqual((self.row(A)["status"], self.row(A)["note"]),
                          ("retired", "retired from the console"))
-        self.assertIn(f'href="/review/{A}">Re-approve</a>', self.client.get("/partials/markets").text)
+        self.assertIn(f'href="/review/{A}">Re-approve</a>',
+                      self.client.get(f"/partials/markets/{A}/card").text)
 
     def test_bad_value_or_unknown_market_writes_nothing(self):
         before = self.snapshot_markets()
@@ -373,7 +375,7 @@ class MarketControlTest(Writes):
 
     def test_the_end_cooldown_button_shows_only_while_the_market_cools_down(self):
         button = f'hx-post="/markets/{A}/end-cooldown" hx-swap="none">End cooldown</button>'
-        pages = ("/partials/markets", f"/markets/{A}")
+        pages = (f"/partials/markets/{A}/card", f"/markets/{A}", "/partials/markets/look")
         for url in pages:
             self.assertNotIn("end-cooldown", self.client.get(url).text)
         cooling = state(A, "COOLDOWN", "ask drop", until=self.now + timedelta(minutes=10))
@@ -716,7 +718,7 @@ class ReviewTest(Writes):
                          ("approved", None, 30.0))
         self.assertEqual([d.p_true for d in farm_db.read_decisions(self.db)
                           if d.condition_id == "0xddd"], [None])
-        for url in ("/markets", "/markets/0xddd"):
+        for url in ("/partials/markets/0xddd/card", "/markets/0xddd"):
             with self.subTest(url=url):
                 self.assertIn("p_true market", self.client.get(url).text)
         # Its edit form opens with the box ticked and the p_true field empty and off.
@@ -1421,14 +1423,14 @@ class NavAndAlertsTest(Writes):
 
     def test_alerts_link_to_their_actions(self):
         self.publish(stopped=self.now)
-        alerts = self.client.get("/partials/overview/alerts").text
+        alerts = self.client.get("/partials/overview/needs").text
         self.assertIn('<a href="/settings">Farmer status</a>', alerts)
         farm_db.set_approval(self.db, A, 0.99, 0.5, None, now=self.now)
         # A longshot bid of 25 shares at 2c uses the whole $0.50.
         above = state(A, slots=quoting_slots(long=(0.02, 25.0)))
         self.publish(states=[above._replace(updated_at=self.now)])
-        alerts = self.client.get("/partials/overview/alerts").text
-        self.assertIn(f'<a href="/review/{A}">Edit budget</a>', alerts)
+        alerts = self.client.get("/partials/overview/needs").text
+        self.assertIn('<a href="/markets?flag=budget-bound">1 budget bound</a>', alerts)
 
 
 def settle_triage():

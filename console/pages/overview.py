@@ -8,8 +8,9 @@ from farm import farm_db
 from .. import views
 from ..context import as_json, region_template
 
-OVERVIEW_REGIONS = {"kpis": "partials/kpis.html", "alerts": "partials/alerts.html",
-                    "tracked": "partials/tracked.html", "events": "partials/events.html"}
+OVERVIEW_REGIONS = {"kpis": "partials/kpis.html", "needs": "partials/needs.html",
+                    "phases": "partials/phases.html", "top": "partials/top.html",
+                    "events": "partials/events.html"}
 CHROME_REGIONS = {"status": "partials/status.html", "banner": "partials/banner.html",
                   "worker-banner": "partials/worker_banner.html"}
 

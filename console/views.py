@@ -6,6 +6,7 @@ objects.
 """
 
 import json
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta
 from typing import Callable, Iterable, NamedTuple, Optional
@@ -38,8 +39,11 @@ WAITING = "WAITING"
 STALE_CYCLES = 3
 LOW_SCORE = 0.10
 BUDGET_BOUND = 0.99
+CUTOFF_SOON = timedelta(days=14)
 DEFAULT_EXPIRY_BUFFER_DAYS = 7.0
 FEED_EVENTS = 12
+TOP_EARNERS = 8
+LOOK_SHOWN = 6
 LOG_PAGE = 50
 
 PHASE_TONE = {"QUOTING": "t-q", "SOLE_BID": "t-c", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
@@ -115,6 +119,21 @@ def span(seconds):
     while len(parts) > 1 and parts[0][0] == 0:
         parts.pop(0)
     return " ".join(f"{n}{unit}" for n, unit in parts[:2])
+
+
+def cutoff_text(seconds):
+    """Time to a cutoff: whole days from CUTOFF_SOON on, closer as a span."""
+    if seconds is None:
+        return "--"
+    if seconds <= 0:
+        return "passed"
+    if seconds >= CUTOFF_SOON.total_seconds():
+        return f"{int(seconds // 86400)}d"
+    return span(seconds)
+
+
+def whole(value):
+    return "--" if value is None else f"{value:,.0f}"
 
 
 def market_name(market, condition_id=""):
@@ -428,6 +447,29 @@ class Card:
     fav_reason: str = ""
     history: Optional[fill_cost.History] = None
     long_return: Optional[float] = None
+    daily_usd: Optional[float] = None
+
+    @property
+    def farm_fav(self):
+        return ((self.position or {}).get("farm") or {}).get("fav", 0.0)
+
+    @property
+    def farm_long(self):
+        return ((self.position or {}).get("farm") or {}).get("long", 0.0)
+
+    @property
+    def cutoff_soon(self):
+        return cutoff_soon(self.phase, self.cutoff_in_s)
+
+
+def seconds_to(when, now):
+    return when and (when - now).total_seconds()
+
+
+def cutoff_soon(phase, cutoff_in_s):
+    """An earning market whose expiry cutoff is under CUTOFF_SOON away."""
+    return (phase in EARNING and cutoff_in_s is not None
+            and cutoff_in_s < CUTOFF_SOON.total_seconds())
 
 
 def card(market, state, status, now):
@@ -441,7 +483,7 @@ def card(market, state, status, now):
             condition_id=market.condition_id, name=market_name(market), slug=market.slug,
             mode=metrics.get("plan", {}).get("mode"), fav_outcome=m.get("fav_outcome"),
             p_true=market.p_true, budget_usd=budget, capital_usd=market.capital_usd,
-            cutoff=cutoff, cutoff_in_s=cutoff and (cutoff - now).total_seconds(),
+            cutoff=cutoff, cutoff_in_s=seconds_to(cutoff, now),
             phase=WAITING, phase_tone=PHASE_TONE[WAITING],
             phase_reason="waiting for farmer", phase_until=None, mid=None,
             book_mid=None, band=None, fav_bid=None, long_bid=None, slots=[], q1=0.0,
@@ -459,7 +501,7 @@ def card(market, state, status, now):
         condition_id=market.condition_id, name=market_name(market), slug=market.slug,
         mode=metrics.get("plan", {}).get("mode"), fav_outcome=m.get("fav_outcome"),
         p_true=market.p_true, budget_usd=budget, capital_usd=state.capital_usd,
-        cutoff=cutoff, cutoff_in_s=cutoff and (cutoff - now).total_seconds(),
+        cutoff=cutoff, cutoff_in_s=seconds_to(cutoff, now),
         phase=state.phase, phase_tone=PHASE_TONE.get(state.phase, "t-n"),
         phase_reason=state.phase_reason, phase_until=state.phase_until,
         mid=state.mid, book_mid=state.book_mid,
@@ -476,29 +518,30 @@ def card(market, state, status, now):
         fav_reason=fav_view.get("fav_reason") or "",
         history=fill_cost.history_from_json(fav_view.get("history")),
         long_return=(state.slots.get("LONG_BID") or {}).get("fill_return"),
+        daily_usd=live_daily(state, market),
     )
 
 
-def tracked(snap, now):
-    """Cards of the managed markets, then the approved ones still waiting."""
-    managed = [card(snap.markets[cid], s, snap.status, now)
-               for cid, s in snap.states.items() if cid in snap.markets]
-    waiting = [card(m, None, snap.status, now) for cid, m in snap.markets.items()
+def tracked_states(snap):
+    """(market, farm state) of the managed markets, then (market, None) for
+    the approved ones still waiting."""
+    managed = [(snap.markets[cid], s) for cid, s in snap.states.items()
+               if cid in snap.markets]
+    waiting = [(m, None) for cid, m in snap.markets.items()
                if cid not in snap.states and m.status == "approved"]
     return managed + waiting
 
 
-@dataclass(frozen=True)
-class MarketsPage:
-    phase: Optional[str]
-    filters: list
-    cards: list
+def tracked(snap, now):
+    return [card(m, s, snap.status, now) for m, s in tracked_states(snap)]
 
 
-def markets_page(snap, phase, now):
-    cards = tracked(snap, now)
-    shown = [c for c in cards if phase is None or c.phase == phase]
-    return MarketsPage(phase, [None, *PHASES, WAITING], shown)
+def tracked_card(snap, condition_id, now):
+    """The card of one tracked market, or None."""
+    for m, s in tracked_states(snap):
+        if m.condition_id == condition_id:
+            return card(m, s, snap.status, now)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -596,27 +639,53 @@ def totals(snap, now):
 
 @dataclass(frozen=True)
 class Alert:
+    """One instance of an alert kind. name is its market's, apart from text,
+    the whole sentence; brief is its gist for a one-line list."""
+
     kind: str
     tone: str
-    text: str
     condition_id: Optional[str]
-    href: str
-    action: str
+    name: str
+    text: str
+    brief: str
+
+
+class Control(NamedTuple):
+    """The fix an alert kind offers on its market: a button that posts value
+    to path, or with post False a link to path; {cid} names the market.
+    holds is the (MarketRecord field, value) that already makes it so, and
+    done what to say then in place of the button."""
+
+    label: str
+    path: str
+    value: Optional[str] = None
+    post: bool = True
+    holds: Optional[tuple] = None
+    done: str = ""
 
 
 class AlertRule(NamedTuple):
-    """A kind of alert: find yields (condition_id or None, text) per instance;
-    href is where its action is, with {cid} for the market."""
+    """A kind of alert: find yields (condition_id or None, text, brief) per
+    instance. about says what the kind means in a group heading, and href,
+    behind the label action, lists its markets. A routine kind is counted,
+    not listed."""
 
     kind: str
     tone: str
-    action: str
+    about: str
     find: Callable[[Snapshot, datetime], Iterable[tuple]]
-    href: str = "/markets/{cid}"
+    href: str
+    action: str = "View in Live markets"
+    routine: bool = False
+    control: Optional[Control] = None
 
 
 def _name(snap, cid):
     return market_name(snap.markets.get(cid), cid)
+
+
+def _sentence(text):
+    return text[:1].upper() + text[1:]
 
 
 def _in_phase(phase, default_reason, effect="Its bids are down."):
@@ -624,8 +693,8 @@ def _in_phase(phase, default_reason, effect="Its bids are down."):
         for cid, s in snap.states.items():
             if s.phase == phase:
                 until = f" until {clock(s.phase_until)}" if s.phase_until else ""
-                yield cid, (f"{_name(snap, cid)}: {s.phase_reason or default_reason}"
-                            f"{until}. {effect}")
+                brief = f"{s.phase_reason or default_reason}{until}"
+                yield cid, f"{_sentence(brief)}. {effect}", brief
     return find
 
 
@@ -637,82 +706,333 @@ def _budget_bound(snap, now):
         budget = (market.naked_budget_usd if market else None) or 0.0
         used = budget_used(s)
         if budget > 0 and used >= BUDGET_BOUND * budget and free_bid(s) is None:
-            yield cid, (f"{_name(snap, cid)}: the naked longshot leg uses "
-                        f"{usd(used)} of its {usd(budget)} budget, so the "
-                        f"favorite bid is trimmed to match.")
+            yield cid, (f"The naked longshot leg uses {usd(used)} of its {usd(budget)} "
+                        f"budget, so the favorite bid is trimmed to match."), \
+                f"{usd(used)} of {usd(budget)}"
 
 
 def _low_score(snap, now):
     for cid, s in snap.states.items():
         target = (s.slots.get("FAV_BID") or {}).get("target")
         if target and target["score"] < LOW_SCORE:
-            yield cid, (f"{_name(snap, cid)}: the favorite bid at {cents(target['price'])} "
-                        f"scores {target['score']:.3f} per share, under {LOW_SCORE:g}.")
+            price, score_ = cents(target["price"]), f"{target['score']:.3f}"
+            yield cid, (f"The favorite bid at {price} scores {score_} per share, "
+                        f"under {LOW_SCORE:g}."), f"{score_} per share at {price}"
 
 
 def _backoff(snap, now):
     for cid, s in snap.states.items():
         for slot, b in sorted(s.backoff.items()):
             until = datetime.fromisoformat(b["until"]) if b.get("until") else None
-            yield cid, (f"{_name(snap, cid)}: {slot} was rejected {b.get('attempts', 1)} "
-                        f"time(s) and waits until {clock(until)}.")
+            yield cid, (f"{slot} was rejected {b.get('attempts', 1)} time(s) and waits "
+                        f"until {clock(until)}."), f"{slot} until {clock(until)}"
 
 
 def _naked_fill(snap, now):
     for e in snap.fills:
         if e.slot == "LONG_BID" and now - e.at <= timedelta(hours=24):
-            yield e.condition_id, (f"{_name(snap, e.condition_id)}: longshot bid filled "
-                                   f"{shares(e.size)} shares at {clock(e.at)}.")
+            brief = f"{shares(e.size)} shares at {clock(e.at)}"
+            yield e.condition_id, f"Longshot bid filled {brief}.", brief
 
 
 def _not_running(snap, now):
     live = liveness(snap.status, now)
     if not live.running:
-        yield None, live.message
+        yield None, live.message, live.message
 
 
+# Most severe first.
 ALERT_RULES = (
-    AlertRule("Not running", "t-r", "Farmer status", _not_running, "/settings"),
-    AlertRule("Naked fill", "t-r", "Naked leg controls", _naked_fill),
-    AlertRule("Sole bid", "t-c", "View market",
+    AlertRule("Not running", "t-r", "the farmer is not cycling", _not_running, "/settings",
+              "Farmer status"),
+    AlertRule("Naked fill", "t-r", "longshot bids filled in the last 24 hours", _naked_fill,
+              "/markets?flag=needs-look", "Naked leg controls",
+              control=Control("Pause naked leg", "/markets/{cid}/naked-paused", "1",
+                              holds=("naked_paused", True), done="Naked leg paused")),
+    AlertRule("Sole bid", "t-c", "the only bid in the reward band",
               _in_phase("SOLE_BID", "no other bid supports the midpoint",
                         "Its favorite bid is the only bid in the reward band, so every "
-                        "sale into the book fills it.")),
-    AlertRule("Cooldown", "t-c", "View market", _in_phase("COOLDOWN", "ask drop")),
-    AlertRule("Below range", "t-b", "View market",
-              _in_phase("BELOW_RANGE", "the mid is under min_fav")),
-    AlertRule("Paused", "t-n", "Resume",
-              _in_phase("PAUSED", "paused", "All its orders are down.")),
-    AlertRule("Budget bound", "t-b", "Edit budget", _budget_bound, "/review/{cid}"),
-    AlertRule("Low score", "t-n", "Edit p_true", _low_score, "/review/{cid}"),
-    AlertRule("Backoff", "t-r", "View market", _backoff),
+                        "sale into the book fills it."),
+              "/markets?phase=SOLE_BID",
+              control=Control("Pause", "/markets/{cid}/paused", "1", holds=("paused", True),
+                              done="Paused")),
+    AlertRule("Cooldown", "t-c", "orders down after an ask drop",
+              _in_phase("COOLDOWN", "ask drop"), "/markets?phase=COOLDOWN",
+              control=Control("End cooldown", "/markets/{cid}/end-cooldown")),
+    AlertRule("Backoff", "t-r", "slots waiting to retry a rejected order", _backoff,
+              "/markets?flag=needs-look"),
+    AlertRule("Below range", "t-b", "mid under the favorite range",
+              _in_phase("BELOW_RANGE", "the mid is under min_fav"),
+              "/markets?phase=BELOW_RANGE",
+              control=Control("Edit p_true / budget", "/review/{cid}", post=False)),
+    AlertRule("Paused", "t-n", "paused, every order down",
+              _in_phase("PAUSED", "paused", "All its orders are down."),
+              "/markets?phase=PAUSED",
+              control=Control("Resume", "/markets/{cid}/paused", "0", holds=("paused", False),
+                              done="Resumed")),
+    AlertRule("Budget bound", "t-b", "favorite bid trimmed to the naked budget",
+              _budget_bound, "/markets?flag=budget-bound", routine=True),
+    AlertRule("Low score", "t-n", f"favorite bid scores under {LOW_SCORE:g} per share",
+              _low_score, "/markets?flag=low-score", routine=True),
 )
+RULES = {rule.kind: rule for rule in ALERT_RULES}
 
 
 def alerts(snap, now):
     return [
-        Alert(rule.kind, rule.tone, text, cid, rule.href.format(cid=cid), rule.action)
+        Alert(rule.kind, rule.tone, cid, _name(snap, cid) if cid else "", text, brief)
         for rule in ALERT_RULES
-        for cid, text in rule.find(snap, now)
+        for cid, text, brief in rule.find(snap, now)
     ]
+
+
+@dataclass(frozen=True)
+class AlertGroup:
+    kind: str
+    tone: str
+    routine: bool
+    about: str
+    href: str
+    action: str
+    alerts: list
+
+
+def alert_groups(found):
+    """found by kind, most severe kind first."""
+    by_kind = {}
+    for a in found:
+        by_kind.setdefault(a.kind, []).append(a)
+    return [AlertGroup(r.kind, r.tone, r.routine, r.about, r.href, r.action, by_kind[r.kind])
+            for r in ALERT_RULES if r.kind in by_kind]
+
+
+@dataclass(frozen=True)
+class Look:
+    """A market with alerts that are not routine, most severe first; the
+    controls they offer, and done for each whose state already holds."""
+
+    condition_id: str
+    name: str
+    alerts: list
+    controls: list
+    done: list
+
+
+def needs_a_look(groups, snap):
+    found = {}
+    for g in groups:
+        for a in g.alerts:
+            if not g.routine and a.condition_id:
+                found.setdefault(a.condition_id, []).append(a)
+    looks = []
+    for cid, its in found.items():
+        market = snap.markets.get(cid)
+        controls, done = [], []
+        for control in dict.fromkeys(RULES[a.kind].control for a in its):
+            if control is None or market is None:
+                continue
+            if control.holds and getattr(market, control.holds[0]) == control.holds[1]:
+                done.append(control.done)
+            else:
+                controls.append(control._replace(path=control.path.format(cid=cid)))
+        looks.append(Look(cid, its[0].name, its, controls, done))
+    return looks
+
+
+@dataclass(frozen=True)
+class PhaseCount:
+    phase: str
+    label: str
+    tone: str
+    count: int
+
+
+def phase_counts(phases):
+    """How many of phases are in each, in PHASES order, the ones present."""
+    counts = Counter(phases)
+    return [PhaseCount(p, p.replace("_", " ").capitalize(), PHASE_TONE[p], counts[p])
+            for p in (*PHASES, WAITING) if counts[p]]
 
 
 @dataclass(frozen=True)
 class Overview:
     totals: Totals
     mode: Optional[str]
-    alerts: list
-    markets: list
+    # The groups that are not routine, listed as needs you, and the routine
+    # ones, counted; needs_markets is how many markets the first name.
+    needs: list
+    routine: list
+    needs_markets: int
+    tracked: int
+    phases: list
+    cutoff_soon: int
+    top: list
     events: list
 
 
 def overview(snap, events, now):
+    """Only what the Overview shows: cards for the top earners alone."""
+    pairs = tracked_states(snap)
+    groups = alert_groups(alerts(snap, now))
+    needs = [g for g in groups if not g.routine]
+    earning = [(m, s) for m, s in pairs if s is not None and s.phase in EARNING]
+    ranked = sorted(earning, key=lambda p: (-live_daily(p[1], p[0]),
+                                            market_name(p[0]).casefold()))
     return Overview(
         totals=totals(snap, now),
         mode=liveness(snap.status, now).mode,
-        alerts=alerts(snap, now),
-        markets=tracked(snap, now),
+        needs=needs,
+        routine=[g for g in groups if g.routine],
+        needs_markets=len({a.condition_id for g in needs for a in g.alerts if a.condition_id}),
+        tracked=len(pairs),
+        phases=phase_counts(s.phase if s else WAITING for _, s in pairs),
+        cutoff_soon=sum(cutoff_soon(s.phase, seconds_to(expiry_cutoff(m, snap.status), now))
+                        for m, s in earning),
+        top=[card(m, s, snap.status, now) for m, s in ranked[:TOP_EARNERS]],
         events=[event_view(e) for e in events[:FEED_EVENTS]],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Live markets
+# ---------------------------------------------------------------------------
+
+MARKETS_PAGE = 50
+
+
+class Sort(NamedTuple):
+    label: str
+    key: Callable[[Card], tuple]
+
+
+SORTS = {
+    "daily": Sort("est. $/day", lambda c: (c.daily_usd is None, -(c.daily_usd or 0.0),
+                                           c.name.casefold())),
+    "cutoff": Sort("cutoff", lambda c: (c.cutoff is None, c.cutoff, c.name.casefold())),
+    "name": Sort("name", lambda c: (c.name.casefold(),)),
+}
+
+
+class Flag(NamedTuple):
+    """An "Only" filter of Live markets: has(card, kinds) with the kinds of
+    the market's alerts."""
+
+    key: str
+    label: str
+    has: Callable[[Card, set], bool]
+
+
+def _kind_flag(rule):
+    return Flag(rule.kind.lower().replace(" ", "-"), rule.kind,
+                lambda c, kinds: rule.kind in kinds)
+
+
+FLAGS = {f.key: f for f in (
+    Flag("needs-look", "Needs a look",
+         lambda c, kinds: any(not RULES[k].routine for k in kinds)),
+    *(_kind_flag(r) for r in ALERT_RULES if r.routine),
+    Flag("inventory", "Holding inventory", lambda c, kinds: c.farm_fav > 0 or c.farm_long > 0),
+    Flag("cutoff-soon", f"Cutoff under {CUTOFF_SOON.days} days",
+         lambda c, kinds: c.cutoff_soon),
+)}
+
+
+@dataclass(frozen=True)
+class MarketsQuery:
+    """Live markets' filters, parsed at the URL. q matches a name or slug."""
+
+    phase: Optional[str] = None
+    flag: Optional[str] = None
+    q: str = ""
+    sort: str = "daily"
+    limit: int = MARKETS_PAGE
+
+    @property
+    def unfiltered(self):
+        return self.phase is None and self.flag is None and not self.q
+
+    def params(self, **changes):
+        """The query with changes, less its defaults."""
+        default = asdict(MarketsQuery())
+        return {k: v for k, v in asdict(replace(self, **changes)).items() if v != default[k]}
+
+    def url(self, path="/markets", **changes):
+        params = self.params(**changes)
+        return path + (f"?{urlencode(params)}" if params else "")
+
+
+@dataclass(frozen=True)
+class Chip:
+    label: str
+    count: int
+    tone: str
+    href: str
+    on: bool
+
+
+@dataclass(frozen=True)
+class MarketsPage:
+    """rows are the first query.limit of the total cards that match, sorted.
+    The unfiltered view leaves out the unrewarded markets, which it counts
+    instead, and is the only one with look. Chip counts are over every
+    tracked market. keep are the filters the search form carries along."""
+
+    query: MarketsQuery
+    tracked: int
+    earning: int
+    phases: list
+    flags: list
+    look: list
+    rows: list
+    total: int
+    unrewarded: int
+    sorts: dict
+    sorted_by: str
+    more: Optional[str]
+    refresh: str
+    keep: dict
+
+
+def markets_page(snap, query, now):
+    cards = tracked(snap, now)
+    groups = alert_groups(alerts(snap, now))
+    kinds = {}
+    for g in groups:
+        for a in g.alerts:
+            kinds.setdefault(a.condition_id, set()).add(a.kind)
+    flagged = {key: {c.condition_id for c in cards if f.has(c, kinds.get(c.condition_id, set()))}
+               for key, f in FLAGS.items()}
+    needle = query.q.casefold()
+
+    def shown(c):
+        if query.phase is None:
+            in_phase = not (query.unfiltered and c.phase == "UNREWARDED")
+        else:
+            in_phase = c.phase == query.phase
+        return (in_phase and (query.flag is None or c.condition_id in flagged[query.flag])
+                and (needle in c.name.casefold() or needle in (c.slug or "").casefold()))
+
+    found = sorted(filter(shown, cards), key=SORTS[query.sort].key)
+    phases = phase_counts(c.phase for c in cards)
+    return MarketsPage(
+        query=query,
+        tracked=len(cards),
+        earning=sum(c.phase in EARNING for c in cards),
+        phases=[Chip("All", len(cards), "t-n", query.url(phase=None), query.phase is None),
+                *(Chip(p.label, p.count, p.tone, query.url(phase=p.phase),
+                       query.phase == p.phase) for p in phases)],
+        flags=[Chip(f.label, len(flagged[key]), "t-n",
+                    query.url(flag=None if query.flag == key else key), query.flag == key)
+               for key, f in FLAGS.items()],
+        look=needs_a_look(groups, snap) if query.unfiltered else [],
+        rows=found[:query.limit],
+        total=len(found),
+        unrewarded=sum(c.phase == "UNREWARDED" for c in cards) if query.unfiltered else 0,
+        sorts={key: query.url(sort=key) for key in SORTS},
+        sorted_by=SORTS[query.sort].label,
+        more=query.url(limit=query.limit + MARKETS_PAGE) if len(found) > query.limit else None,
+        refresh=query.url("/partials/markets"),
+        keep=query.params(q="", limit=MARKETS_PAGE),
     )
 
 

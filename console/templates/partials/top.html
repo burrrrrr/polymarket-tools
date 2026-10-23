@@ -1,0 +1,21 @@
+<div class="panel-head">
+  <h2>Top earners</h2>
+  <span class="small muted">est. $/day</span>
+  <a class="push" href="/markets">All {{ vm.tracked }} in Live markets</a>
+</div>
+<table class="tbl tight">
+  <thead><tr><th>Market</th><th class="num">Mid</th><th>Fav bid</th><th class="num">$/day</th><th class="num">Cutoff</th></tr></thead>
+  <tbody>
+    {%- for c in vm.top %}
+    <tr>
+      <td class="name"><a href="/markets/{{ c.condition_id }}" title="{{ c.name }}">{{ c.name }}</a></td>
+      <td class="mono num">{{ c.mid | cents }}</td>
+      <td class="mono c-fav">{% if c.fav_bid %}{{ c.fav_bid.price | cents }} × {{ c.fav_bid.size | whole }}{% else %}--{% endif %}</td>
+      <td class="mono num">{{ c.daily_usd | usd }}</td>
+      <td class="mono num {{ 'c-warn' if c.cutoff_soon }}">{{ c.cutoff_in_s | cutoff_text }}</td>
+    </tr>
+    {%- else %}
+    <tr><td colspan="5" class="muted">No market is earning.</td></tr>
+    {%- endfor %}
+  </tbody>
+</table>

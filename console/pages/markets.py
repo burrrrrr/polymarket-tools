@@ -21,8 +21,12 @@ MARKET_REGIONS = {"summary": "partials/market_summary.html",
 
 
 @dataclass(frozen=True)
-class RenderedCard:
+class RenderedRow:
+    """A <tr> of the Live markets table: a market's row, or its detail row
+    while it is open. v fingerprints what it shows."""
+
     condition_id: str
+    detail: bool
     html: Markup
     v: str
 
@@ -31,8 +35,8 @@ def fingerprint(text):
     return hashlib.blake2b(text.encode(), digest_size=4).hexdigest()
 
 
-def order_of(cards):
-    return fingerprint(",".join(c.condition_id for c in cards))
+def ids_of(cards):
+    return fingerprint(",".join(sorted(c.condition_id for c in cards)))
 
 
 def parse_phase(phase):
@@ -41,6 +45,18 @@ def parse_phase(phase):
     if phase not in (*views.PHASES, views.WAITING):
         raise HTTPException(400, f"no phase {phase!r}")
     return phase
+
+
+def parse_query(phase, flag, q, sort, limit):
+    if flag and flag not in views.FLAGS:
+        raise HTTPException(400, f"no flag {flag!r}")
+    if sort and sort not in views.SORTS:
+        raise HTTPException(400, f"no sort {sort!r}")
+    if limit and not (limit.isdigit() and int(limit) > 0):
+        raise HTTPException(400, f"limit {limit!r} is not a positive whole number")
+    return views.MarketsQuery(parse_phase(phase), flag or None, (q or "").strip(),
+                              sort or views.MarketsQuery.sort,
+                              int(limit) if limit else views.MARKETS_PAGE)
 
 
 def chart_of(vm, now):
@@ -61,51 +77,98 @@ def level(form):
 def routes(ctx):
     router = APIRouter()
 
-    def markets_vm(conn, now, phase):
+    def markets_vm(conn, now, query):
         snap = ctx.snapshot(conn, now)
-        return snap, views.markets_page(snap, parse_phase(phase), now)
+        return snap, views.markets_page(snap, query, now)
 
-    def rendered(vm):
-        card = ctx.templates.env.get_template("partials/card.html").module.card
-        return [RenderedCard(c.condition_id, html, fingerprint(html))
-                for c in vm.cards for html in (card(c),)]
+    def row_macros():
+        return ctx.templates.env.get_template("partials/market_row.html").module
+
+    def detail_of(macros, c):
+        html = macros.detail(c)
+        return RenderedRow(c.condition_id, True, html,
+                           fingerprint(f"detail {c.condition_id} {html}"))
+
+    def rows_of(vm, expanded):
+        """Each row closed, fingerprinted so; an expanded one open, with its
+        detail row after it."""
+        macros = row_macros()
+        rows = []
+        for c in vm.rows:
+            closed = macros.cells(c, False)
+            is_open = c.condition_id in expanded
+            rows.append(RenderedRow(c.condition_id, False,
+                                    macros.cells(c, True) if is_open else closed,
+                                    fingerprint(f"{c.condition_id} {closed}")))
+            if is_open:
+                rows.append(detail_of(macros, c))
+        return rows
 
     @router.get("/markets", response_class=HTMLResponse)
-    def markets_page(request: Request, phase: Optional[str] = None):
+    def markets_page(request: Request, phase: Optional[str] = None,
+                     flag: Optional[str] = None, q: Optional[str] = None,
+                     sort: Optional[str] = None, limit: Optional[str] = None):
+        query = parse_query(phase, flag, q, sort, limit)
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
-            snap, vm = markets_vm(conn, now, phase)
-        cards = rendered(vm)
+            snap, vm = markets_vm(conn, now, query)
         return ctx.render(request, "markets.html", now, snap, vm=vm, page="markets",
-                          cards=cards, order=order_of(cards))
+                          look=vm.look, rows=rows_of(vm, set()), ids=ids_of(vm.rows))
 
     @router.get("/partials/markets", response_class=HTMLResponse)
     def markets_partial(request: Request, phase: Optional[str] = None,
-                        order: Optional[str] = None, have: Optional[str] = None):
-        """All the cards, or when the page holds the same cards in the same
-        order (order), only those whose version differs from the page's, in
-        have, joined by dots. A farmer cycle changes a few of hundreds."""
+                        flag: Optional[str] = None, q: Optional[str] = None,
+                        sort: Optional[str] = None, limit: Optional[str] = None,
+                        ids: Optional[str] = None, have: Optional[str] = None,
+                        expanded: Optional[str] = None):
+        """The whole table, or when the page holds the same rows (ids) only
+        the rows it holds no version of (have, dot-joined), each swapped in
+        place, so rows never re-sort under the reader. A farmer cycle changes
+        a few. expanded, dot-joined, are the rows open on the page."""
+        query = parse_query(phase, flag, q, sort, limit)
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
-            snap, vm = markets_vm(conn, now, phase)
-        cards = rendered(vm)
-        held = have.split(".") if have else []
-        if order != order_of(cards) or len(held) != len(cards):
-            return ctx.render(request, "partials/cards.html", now, snap, vm=vm,
-                              cards=cards, order=order_of(cards))
-        changed = [c for c, v in zip(cards, held) if c.v != v]
+            snap, vm = markets_vm(conn, now, query)
+        rows = rows_of(vm, set(expanded.split(".")) if expanded else set())
+        if ids != ids_of(vm.rows):
+            return ctx.render(request, "partials/market_table.html", now, snap, vm=vm,
+                              rows=rows, ids=ids_of(vm.rows))
+        held = set(have.split(".")) if have else set()
+        changed = [r for r in rows if r.v not in held]
         if not changed:
             return Response(status_code=204)
-        response = ctx.render(request, "partials/cards.html", now, snap, vm=vm,
-                              cards=changed, oob=True)
+        response = ctx.render(request, "partials/market_table.html", now, snap, vm=vm,
+                              rows=changed, oob=True)
         response.headers["HX-Reswap"] = "none"
         return response
 
-    @router.get("/api/markets")
-    def markets_api(phase: Optional[str] = None):
+    @router.get("/partials/markets/look", response_class=HTMLResponse)
+    def look_partial(request: Request):
         now = ctx.clock()
         with closing(ctx.connect()) as conn:
-            _, vm = markets_vm(conn, now, phase)
+            snap = ctx.snapshot(conn, now)
+        look = views.needs_a_look(views.alert_groups(views.alerts(snap, now)), snap)
+        return ctx.render(request, "partials/look.html", now, snap, look=look)
+
+    @router.get("/partials/markets/{condition_id}/card", response_class=HTMLResponse)
+    def detail_partial(request: Request, condition_id: str):
+        now = ctx.clock()
+        with closing(ctx.connect()) as conn:
+            snap = ctx.snapshot(conn, now)
+        c = views.tracked_card(snap, condition_id, now)
+        if c is None:
+            raise HTTPException(404, f"no tracked market {condition_id}")
+        return ctx.render(request, "partials/market_table.html", now, snap,
+                          rows=[detail_of(row_macros(), c)], bare=True)
+
+    @router.get("/api/markets")
+    def markets_api(phase: Optional[str] = None, flag: Optional[str] = None,
+                    q: Optional[str] = None, sort: Optional[str] = None,
+                    limit: Optional[str] = None):
+        query = parse_query(phase, flag, q, sort, limit)
+        now = ctx.clock()
+        with closing(ctx.connect()) as conn:
+            _, vm = markets_vm(conn, now, query)
         return as_json(vm)
 
     def market_vm(conn, now, condition_id):

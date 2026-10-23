@@ -1,0 +1,14 @@
+{%- set n = vm.cutoff_soon %}
+<div class="panel-head flush">
+  <h2>Where the markets are</h2>
+  <span class="small muted">{{ vm.tracked }} tracked</span>
+</div>
+<div class="phasebar" role="img" aria-label="{% for p in vm.phases %}{{ p.count }} {{ p.label | lower }}{{ ', ' if not loop.last }}{% endfor %}">
+  {%- for p in vm.phases %}<span class="{{ p.tone }}" style="flex-grow: {{ p.count }}"></span>{% endfor -%}
+</div>
+<div class="phase-list">
+  {%- for p in vm.phases %}
+  <a href="/markets?phase={{ p.phase }}"><span class="swatch box {{ p.tone }}"></span><span class="grow">{{ p.label }}</span><span class="mono">{{ p.count }}</span></a>
+  {%- endfor %}
+</div>
+<span class="small muted">{{ n }} quoting market{{ 's reach' if n != 1 else ' reaches' }} {{ 'their' if n != 1 else 'its' }} cutoff within 14 days.{% if n %} <a href="/markets?flag=cutoff-soon">View them</a>{% endif %}</span>
