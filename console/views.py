@@ -148,9 +148,9 @@ def review_url(condition_id, mode=None, skipped=0):
     return f"/review/{condition_id}" + (f"?{query}" if query else "")
 
 
-def polymarket_url(slug):
-    """polymarket.com redirects /market/<slug> to the market inside its event."""
-    return f"https://polymarket.com/market/{quote(slug)}" if slug else None
+def betmoar_url(slug):
+    """A market's page on betmoar.fun, which keys markets by their Polymarket slug."""
+    return f"https://www.betmoar.fun/market/{quote(slug)}" if slug else None
 
 
 # ---------------------------------------------------------------------------

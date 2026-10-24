@@ -55,7 +55,7 @@ class Context:
             token=token, tools_db=tools_db,
             TOKEN_FIELD=security.TOKEN_FIELD, TOKEN_HEADER=security.TOKEN_HEADER,
             CONTROLS_EVENT=CONTROLS_EVENT, tip=glossary.tip,
-            polymarket_url=views.polymarket_url, LIVE_POLL_S=LIVE_POLL_S,
+            betmoar_url=views.betmoar_url, LIVE_POLL_S=LIVE_POLL_S,
             LOOK_SHOWN=views.LOOK_SHOWN,
             review_url=views.review_url, MODES=views.MODES, mode_tone=views.mode_tone,
             glossary=glossary.GLOSSARY,

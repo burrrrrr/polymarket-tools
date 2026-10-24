@@ -1,4 +1,4 @@
-{% from "_macros.html" import market_controls, polymarket_link %}
+{% from "_macros.html" import market_controls, betmoar_link %}
 {#- A Live markets row's cells, and the detail row's, which market_table.html
     wraps in their <tr>s. -#}
 {%- macro cells(c, open) %}
@@ -74,6 +74,6 @@
   {{ market_controls(c.condition_id, c.name, c.status, c.phase, c.paused, c.naked_paused, c.sole_bid) }}
   <span class="spacer"></span>
   <a class="btn" href="/markets/{{ c.condition_id }}">Details</a>
-  {{ polymarket_link(c.slug, "btn") }}
+  {{ betmoar_link(c.slug, "btn") }}
 </div>
 {%- endmacro %}

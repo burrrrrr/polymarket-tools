@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import token_field, field_error, polymarket_link %}
+{% from "_macros.html" import token_field, field_error, betmoar_link %}
 {% block title %}Discover{% endblock %}
 {% block content %}
 {%- set f = vm.filters -%}
@@ -113,7 +113,7 @@
           <td class="mono">{{ '%.1f' % r.ahead if r.ahead is not none else '--' }}</td>
           <td class="mono">{{ r.volume }}</td>
           <td><span class="badge {{ r.status_tone }}">{{ r.status }}</span></td>
-          <td class="wrap" style="min-width: 260px"><a href="{{ review_url(r.condition_id, f.mode) }}">{{ r.name }}</a>{{ polymarket_link(r.slug, "ext", "↗") }}</td>
+          <td class="wrap" style="min-width: 260px"><a href="{{ review_url(r.condition_id, f.mode) }}">{{ r.name }}</a>{{ betmoar_link(r.slug, "ext", "↗") }}</td>
           <td><a class="chip" href="{{ review_url(r.condition_id, f.mode) }}">Review</a></td>
         </tr>
         {%- else %}

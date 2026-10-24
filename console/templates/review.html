@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% from "_macros.html" import region, token_field, field_error, polymarket_link %}
+{% from "_macros.html" import region, token_field, field_error, betmoar_link %}
 {% block title %}Review · {{ (market.question or market.slug or '') | truncate(40, True) }}{% endblock %}
 {% block content %}
 {%- set cid = market.condition_id -%}
@@ -44,7 +44,7 @@
     {%- if market.paused %}<span class="badge t-n">paused flag set</span>{% endif %}
     {%- if market.naked_paused %}<span class="badge t-b">naked leg paused{{ tip('naked_leg') }}</span>{% endif %}
     {%- if market.sole_bid %}<span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}
-    {{ polymarket_link(market.slug) }}
+    {{ betmoar_link(market.slug) }}
   </div>
   {%- if m.event_slug or m.tags %}
   <form class="actions" method="post" action="/review/{{ cid }}/mute" style="gap: 8px">
