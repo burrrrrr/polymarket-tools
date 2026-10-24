@@ -146,6 +146,18 @@ class Liveness:
     last_cycle_at: Optional[datetime]
     stopped_at: Optional[datetime]
     message: str
+    # Free cash and the hurdle it set, as the farmer last published them.
+    cash: str = ""
+
+
+def cash_text(free_cash, hurdle):
+    """"Free cash $10,000 · hurdle 150%", the hurdle alone without a wallet
+    read, or nothing from a farmer that published neither."""
+    if hurdle is None:
+        return ""
+    if free_cash is None:
+        return f"Hurdle {hurdle:.0%}"
+    return f"Free cash ${free_cash:,.0f} · hurdle {hurdle:.0%}"
 
 
 def liveness(status, now):
@@ -155,7 +167,8 @@ def liveness(status, now):
                         "The farmer has never run against this database.")
     mode = "LIVE" if status.mode == "live" else "DRY RUN"
     base = dict(mode=mode, interval_s=status.interval_s,
-                last_cycle_at=status.last_cycle_at, stopped_at=status.stopped_at)
+                last_cycle_at=status.last_cycle_at, stopped_at=status.stopped_at,
+                cash=cash_text(status.free_cash_usd, status.effective_hurdle))
     if status.stopped_at is not None:
         ago = span((now - status.stopped_at).total_seconds())
         return Liveness(False, message=f"The farmer is not running. It stopped {ago} ago.",
@@ -1217,10 +1230,19 @@ def rewards_state(info, condition_id, total_rates):
     return active
 
 
-def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
+def preview_hurdle(status, cfg, now):
+    """The hurdle a preview values fills at: the one a running farmer last
+    published, else the base setting."""
+    if status is None or status.effective_hurdle is None or not liveness(status, now).running:
+        return cfg.hurdle_rate
+    return status.effective_hurdle
+
+
+def live_review(row, info, levels, total_rates, cfg, hurdle, now, managed, prior):
     """row: the market's farm.db row carrying the terms to preview; levels: the
     favorite token's live book; total_rates: as reward_farmer.rewards_active
-    takes it; prior: the stored fill prior. Planning is the farmer's own, from
+    takes it; hurdle: the rate fills are valued at (preview_hurdle); prior:
+    the stored fill prior. Planning is the farmer's own, from
     a zero farm position, since a new market's holdings become its baseline.
     A market the farmer already manages gets the book without a plan.
 
@@ -1271,7 +1293,8 @@ def live_review(row, info, levels, total_rates, cfg, now, managed, prior):
                     "It earns the whole pool while no other maker scores, and nothing here "
                     "values its fills.")
         elif state.phase is reward_farmer.Phase.QUOTING:
-            outlook = reward_farmer.market_outlook(fm, total_rates, history, prior, cfg, now)
+            outlook = reward_farmer.market_outlook(fm, total_rates, history, prior, cfg, now,
+                                                   hurdle=hurdle)
             pool = outlook.rate_per_day
             target = reward_farmer.target_orders(fm, levels, reward_farmer.Position(), cfg, True,
                                                  outlook, bid_without_history=True)

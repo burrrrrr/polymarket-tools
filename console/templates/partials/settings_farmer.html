@@ -20,6 +20,7 @@
     <div><dt>Last cycle</dt><dd class="mono">{{ status.last_cycle_at | stamp_local }}</dd></div>
     <div><dt>Interval</dt><dd class="mono">{{ status.interval_s | number_text }}s</dd></div>
     <div><dt>Heartbeat{{ tip('heartbeat') }}</dt><dd class="mono">{{ 'on' if status.heartbeat else 'off' }}</dd></div>
+    {%- if live.cash %}<div><dt>Fills valued at{{ tip('cash_buffer') }}</dt><dd class="mono">{{ live.cash }}</dd></div>{% endif %}
     {%- if status.stopped_at %}<div><dt>Stopped</dt><dd class="mono">{{ status.stopped_at | stamp_local }}</dd></div>{% endif %}
   </dl>
   {%- endif %}

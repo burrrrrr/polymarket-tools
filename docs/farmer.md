@@ -14,6 +14,9 @@ posts real orders.
 Both modes publish what the farmer does to `farm_state`, `farmer_status`,
 `farm_events`, and `farm_mids` in `farm.db`, so a dry run shows up in the
 console the same way a live run does. A dry run still never writes to `markets`.
+`farmer_status` carries the free cash and the hurdle rate of each cycle, and
+the console's farmer status shows them as `Free cash $10,000 · hurdle 150%`. A
+dry run reads no wallet, so it shows the hurdle alone, at `--hurdle-rate`.
 
 ```bash
 python -m farm.reward_farmer                       # dry run on farm.db, forever
@@ -233,7 +236,7 @@ while it exists.
 - **Keys.** The keys are the option names with underscores, and the seconds
   options end in `_s`: `capital`, `max_lead`, `ask_offset`, `min_capture`,
   `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`, `hurdle_rate`,
-  `drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
+  `cash_buffer`, `drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
   `expiry_buffer_days`. Each value is a JSON number.
 - **Bad values.** `farm_db.put_setting` refuses an unknown key or an
   out-of-range value. A bad row written another way is ignored, with an
@@ -357,7 +360,8 @@ it does not manage.
 | `--min-fav` | 0.90 | Stop quoting below this favorite midpoint |
 | `--min-low-score` | 0.10 | The longshot bid never sits above the cheapest price scoring this per share |
 | `--keep-ratio` | 0.8 | Keep an order that scores at least this share of its target, a favorite bid that nets, at its own price and size, at least this share of the best bid's |
-| `--hurdle-rate` | 0.40 | Yearly return capital must beat; a filled share costs its price minus what it sells for, discounted at this rate over the weeks the sale takes |
+| `--hurdle-rate` | 0.40 | Yearly return capital must beat while free cash is plenty; a filled share costs its price minus what it sells for, discounted at the hurdle over the weeks the sale takes |
+| `--cash-buffer` | 15000 | Free cash, in USD, at which fills are valued at a 100% hurdle. The hurdle is this over free cash, and never under `--hurdle-rate`. Free cash is the USDC balance less your own open bids. 0 keeps the hurdle at `--hurdle-rate` |
 | `--drop-threshold` | 0.03 | Fall in the favorite's ask, where its asks add up to three reward minimums, that starts a cooldown |
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |
@@ -402,9 +406,12 @@ cancels the orders 10 seconds after the heartbeats stop.
    the book.
 2. Run a dry run on the same database and read the output for a few cycles.
    Check the prices, sizes, and the `holding` lines.
-3. Make sure the wallet holds enough USDC. At startup the live farmer compares
-   your collateral balance with the favorite bids it plans and warns if the
-   balance is short.
+3. Make sure the wallet holds enough USDC. The CLOB lets bids rest beyond the
+   cash that funds them, so the farmer does not stop at any balance. It reads
+   free cash every 30 seconds and values fills at a hurdle that rises as free
+   cash falls, to 100% at `--cash-buffer`, which pushes its bids behind the book
+   (see [The hurdle follows free cash](pricing.md#the-hurdle-follows-free-cash)).
+   Each time the hurdle moves by a tenth or more it logs a `Free cash` line.
 4. Start `python -m farm.reward_farmer --live`. It checks the region it
    connects from and does not start from a place where Polymarket rejects new
    orders. It then reads the wallet key from the environment or from

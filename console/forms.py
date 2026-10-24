@@ -53,6 +53,7 @@ SETTING_FIELDS = {
     "min_low_score": Field("Min longshot score", QUOTING),
     "keep_ratio": Field("Keep ratio", QUOTING),
     "hurdle_rate": Field("Hurdle rate", QUOTING),
+    "cash_buffer": Field("Cash buffer ($)", QUOTING),
     "drop_threshold": Field("Ask drop threshold", SAFETY),
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),

@@ -19,7 +19,8 @@ FLOOR = 0.90
 CFG = FarmConfig(capital=500.0, max_lead=0.005, ask_offset=0.01, min_capture=0.005,
                  ev_margin=0.01, min_fav=FLOOR, min_low_score=0.10, keep_ratio=0.8,
                  drop_threshold=0.03, drop_window_s=60.0, cooldown_s=600.0,
-                 naked_cooldown_s=3600.0, expiry_buffer_days=7.0, hurdle_rate=0.30)
+                 naked_cooldown_s=3600.0, expiry_buffer_days=7.0, hurdle_rate=0.30,
+                 cash_buffer=0.0)
 END = datetime.fromtimestamp(T0, timezone.utc) + timedelta(days=100)
 FM = FarmMarket(condition_id="c1", slug="m", question="?", end_date=END, neg_risk=False,
                 tick=0.001, fav_token_id="fav", fav_outcome="No", rate_per_day=100.0, v=0.035,

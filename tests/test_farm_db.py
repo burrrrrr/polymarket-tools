@@ -135,6 +135,20 @@ class MigrationTest(ScratchDb):
             writer.rollback()
             writer.close()
 
+    def test_a_status_table_from_before_free_cash_gains_its_columns(self):
+        conn = sqlite3.connect(self.path)
+        conn.execute("CREATE TABLE farmer_status (id INTEGER PRIMARY KEY CHECK (id = 1), "
+                     "mode TEXT NOT NULL, pid INTEGER, started_at TEXT, last_cycle_at TEXT, "
+                     "interval_s REAL, heartbeat INTEGER, managed INTEGER, config TEXT, "
+                     "stopped_at TEXT)")
+        conn.execute("INSERT INTO farmer_status VALUES (1, 'live', 7, ?, ?, 5.0, 0, 3, '{}', "
+                     "NULL)", (NOW.isoformat(), NOW.isoformat()))
+        conn.commit()
+        conn.close()
+        status = farm_db.read_farmer_status(self.open())
+        self.assertEqual((status.mode, status.managed, status.free_cash_usd,
+                          status.effective_hurdle), ("live", 3, None, None))
+
     def test_migrating_twice_changes_nothing(self):
         self.make_old_db(PRE_CHANGE_MARKETS, [{"condition_id": "0xa", "status": "approved"}])
         farm_db.open_db(self.path).close()
@@ -163,6 +177,9 @@ class SettingsTest(ScratchDb):
         self.assertEqual(farm_db.parse_setting("max_lead", "0.015"), 0.015)
         self.assertEqual(farm_db.parse_setting("cooldown_s", "0"), 0.0)
         self.assertEqual(farm_db.parse_setting("capital", "250"), 250.0)
+        # A buffer of 0 turns the cash scaling of the hurdle off.
+        self.assertEqual(farm_db.parse_setting("cash_buffer", "0"), 0.0)
+        self.assertEqual(farm_db.parse_setting("cash_buffer", "15000"), 15000.0)
 
     def test_parse_rejects_bad_values(self):
         for key, text in (
@@ -180,6 +197,7 @@ class SettingsTest(ScratchDb):
             ("drop_window_s", "0"),
             ("hurdle_rate", "-0.1"),
             ("hurdle_rate", "10.5"),
+            ("cash_buffer", "-1"),
             ("depth_haircut", "0.5"),
             ("stuck_share", "0.25"),
             ("no_such_key", "1"),
@@ -488,6 +506,16 @@ class PublishTest(ScratchDb):
         farm_db.publish(conn, self.status(), None)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM farm_state").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM farmer_status").fetchone()[0], 1)
+
+    def test_the_status_carries_free_cash_and_the_hurdle_it_set(self):
+        conn = self.open()
+        farm_db.publish(conn, self.status()._replace(free_cash_usd=6600.0,
+                                                     effective_hurdle=2.25), None)
+        read = farm_db.read_farmer_status(conn)
+        self.assertEqual((read.free_cash_usd, read.effective_hurdle), (6600.0, 2.25))
+        farm_db.publish(conn, self.status(), None)
+        read = farm_db.read_farmer_status(conn)
+        self.assertEqual((read.free_cash_usd, read.effective_hurdle), (None, None))
 
     def test_prune_drops_events_older_than_thirty_days(self):
         conn = self.open()

@@ -89,9 +89,9 @@ def holding_long(shares, avg):
             "farm": {"fav": 0.0, "long": shares}, "avg_cost": {"fav": 0.0, "long": avg}}
 
 
-def status(last_cycle=NOW, interval=5.0, stopped=None, mode="dry"):
+def status(last_cycle=NOW, interval=5.0, stopped=None, mode="dry", free_cash=None, hurdle=None):
     return FarmerStatus(mode, 1, NOW - timedelta(hours=1), last_cycle, interval, False, 1,
-                        CONFIG, stopped)
+                        CONFIG, stopped, free_cash, hurdle)
 
 
 def stored(id, kind, cid=None, slot_name=None, at=NOW, price=None, size=None, message="m"):
@@ -241,6 +241,13 @@ class LivenessTest(unittest.TestCase):
 
     def test_never_ran(self):
         self.assertFalse(views.liveness(None, NOW).running)
+
+    def test_free_cash_and_the_hurdle_it_sets(self):
+        live = views.liveness(status(mode="live", free_cash=6600.0, hurdle=15 / 6.6), NOW)
+        self.assertEqual(live.cash, "Free cash $6,600 · hurdle 227%")
+        # A dry run reads no wallet: its fills take the base hurdle.
+        self.assertEqual(views.liveness(status(hurdle=0.3), NOW).cash, "Hurdle 30%")
+        self.assertEqual(views.liveness(None, NOW).cash, "")
 
 
 class TotalsTest(unittest.TestCase):
@@ -699,9 +706,9 @@ class Console(unittest.TestCase):
         return {}
 
     def publish(self, events=(), mids=(), stopped=None, states=None, last_cycle=None,
-                conn=None):
+                conn=None, free_cash=None, hurdle=None):
         st = FarmerStatus("dry", 1, self.now, last_cycle or self.now, 5.0, False, 1, CONFIG,
-                          stopped)
+                          stopped, free_cash, hurdle)
         farm_db.publish(conn or self.db, st, [state(A)._replace(updated_at=self.now)]
                         if states is None else states, list(events), list(mids))
 
@@ -744,6 +751,12 @@ class RoutesTest(Console):
                 self.assertEqual(resp.status_code, 200)
                 for needle in needles:
                     self.assertIn(needle, resp.text)
+
+    def test_the_farmer_status_shows_free_cash_and_the_hurdle(self):
+        self.publish(free_cash=6600.0, hurdle=15 / 6.6)
+        for url in ("/partials/chrome/status", "/settings"):
+            with self.subTest(url=url):
+                self.assertIn("Free cash $6,600 · hurdle 227%", self.client.get(url).text)
 
     def test_the_summary_shows_the_fill_history_and_passes_over_an_old_tape(self):
         for behind, shown in (({"history": fill_cost.history_to_json(HISTORY)},

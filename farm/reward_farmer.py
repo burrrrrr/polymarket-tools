@@ -20,8 +20,15 @@ farmer rests on both sides, in four slots per market:
             are held, or until the market resolves first. So it costs the
             price less, discounted at the hurdle rate over that hold, what
             the share sells for: the ask the fill would leave resting, never
-            credited over p_true, and p_true for what is unsold at
-            resolution (farm/fill_cost.py has the measurements). The bid rests at
+            credited over the share's fill worth, and that worth for what
+            is unsold at resolution (farm/fill_cost.py has the
+            measurements). The fill worth is p_true while cash is plenty,
+            and slides toward the book midpoint as the hurdle rises: a
+            fill arrives when sellers do (FarmMarket.fill_worth).
+            The hurdle is --hurdle-rate, raised as free cash (the USDC
+            balance less the operator's own open bids) runs short, to 100%
+            at --cash-buffer and more below it (cash_hurdle), so a farmer
+            short of cash rests its bids further behind the book. The bid rests at
             the price in the band, and the size at or under the market's
             capital, whose rewards net of expected fills (from the market's
             fill history, shrunk toward the last scan's cross-market prior)
@@ -345,6 +352,7 @@ NET_KEEP_SLACK_USD = 0.02
 DROP_DEPTH = 3
 
 POSITIONS_S = 60
+BALANCE_S = 30
 MARKET_INFO_S = 300
 MARKET_INFO_RETRY_S = 60
 MARKET_INFO_TICK_S = 5
@@ -369,6 +377,12 @@ BOOKS_JOIN_S = 10
 # each further rejection up to the cap.
 BACKOFF_START_S = 30
 BACKOFF_MAX_S = 900
+
+# The hurdle when free cash is down to cash_buffer: the operator's own
+# trading returns roughly 50-130% a year on capital.
+SCARCE_HURDLE = 1.0
+# A hurdle change is logged once it moves this share of the last one logged.
+HURDLE_LOG_STEP = 0.10
 
 # Most orders the CLOB accepts in one batch POST.
 POST_BATCH_LIMIT = 15
@@ -462,6 +476,15 @@ class FarmMarket(NamedTuple):
         else this cycle's book midpoint, else None, and then no favorite bid
         rests."""
         return self.book_mid if self.p_true is None else self.p_true
+
+    def fill_worth(self, edge_weight):
+        """What a filled favorite share is worth: this cycle's book midpoint
+        plus edge_weight of the worth above it (edge_weight_at), or the worth
+        when it is under the midpoint. A fill arrives when sellers do, so a
+        view over the book is trusted only as far as capital is plenty."""
+        if self.book_mid is None or self.worth is None or self.worth <= self.book_mid:
+            return self.worth
+        return self.book_mid + (self.worth - self.book_mid) * edge_weight
 
     def token(self, role):
         return self.fav_token_id if role is Role.FAV else self.long_token_id
@@ -632,7 +655,9 @@ class FarmConfig(NamedTuple):
     cooldown_s: float
     naked_cooldown_s: float
     expiry_buffer_days: float
+    # The base hurdle; cash_hurdle raises it as free cash falls under cash_buffer.
     hurdle_rate: float
+    cash_buffer: float
 
 
 # ---------------------------------------------------------------------------
@@ -909,9 +934,31 @@ def live_rate(fm, total_rates):
     return fm.rate_per_day if rate is None else rate
 
 
-def market_outlook(fm, total_rates, history, prior, cfg, now, any_floor=False):
+def cash_hurdle(base, free_cash, buffer):
+    """The hurdle rate a fill is valued at: base, or SCARCE_HURDLE scaled by
+    how far free cash falls under buffer when that is higher, capped at the
+    hurdle_rate setting's bound. Capital a fill ties up is capital the
+    operator's own trading goes without, and the less cash is free the more
+    it is worth. No free cash at all takes the cap. No reading of free cash,
+    or no buffer, leaves base."""
+    if free_cash is None or buffer <= 0:
+        return base
+    cap = farm_db.SETTINGS["hurdle_rate"].high
+    if free_cash <= 0:
+        return cap
+    return min(cap, max(base, SCARCE_HURDLE * buffer / free_cash))
+
+
+def edge_weight_at(base, hurdle):
+    """The share of a view's edge over the book a fill is credited at this
+    hurdle: all of it at the base hurdle, base over hurdle above it."""
+    return 1.0 if hurdle <= base else base / hurdle
+
+
+def market_outlook(fm, total_rates, history, prior, cfg, now, *, hurdle, any_floor=False):
     """The Outlook a favorite bid on this market is valued with: fills from its
-    history shrunk toward prior, or prior alone without a history.
+    history shrunk toward prior, or prior alone without a history, at this
+    hurdle rate (cash_hurdle of the cycle).
 
     any_floor values a history read at another min_fav as a reader with that
     floor would. The farmer asks for it: a min_fav change leaves every history
@@ -919,7 +966,7 @@ def market_outlook(fm, total_rates, history, prior, cfg, now, any_floor=False):
     them would cancel every favorite bid for that long."""
     floor = history.floor if any_floor and history is not None else cfg.min_fav
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   fill_cost.fill_curve(history, prior, floor), cfg.hurdle_rate)
+                   fill_cost.fill_curve(history, prior, floor), hurdle)
 
 
 def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
@@ -937,14 +984,15 @@ def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
 def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
     """value_quote of a planned set of orders, its favorite bid included, a
     fill adding to the favorite shares the position holds and sold at its
-    fill_exit_price."""
+    fill_exit_price, and worth fm.fill_worth at the outlook's hurdle."""
     by = {i.slot: i for i in target.intents}
     bid = by.get(Slot.FAV_BID)
     capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
     sale_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
+    worth = fm.fill_worth(edge_weight_at(cfg.hurdle_rate, outlook.hurdle_rate))
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
-                       bid and (bid.price, bid.size), capital, fm.worth, outlook,
+                       bid and (bid.price, bid.size), capital, worth, outlook,
                        position.fav_shares, sale_price)
 
 
@@ -1222,6 +1270,8 @@ def scan_sole_bid(market, levels, config, now):
         capital=config.capital, max_lead=config.max_lead, min_fav=config.min_fav,
         min_low_score=config.min_low_score, expiry_buffer_days=config.expiry_buffer_days,
         hurdle_rate=config.hurdle_rate, ev_margin=0.0,
+        # A scan reads no wallet, so its hurdle never scales with cash.
+        cash_buffer=0.0,
         # A plan from no position prices no exit and keeps no order.
         ask_offset=0.0, min_capture=0.0, keep_ratio=0.0, drop_threshold=0.0,
         drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0)
@@ -1780,6 +1830,15 @@ def position_for(fm, holdings):
     return Position(fav[0], fav[1], long[0], long[1])
 
 
+def open_bid_usd(entry):
+    """The USD an open order listing entry ties up: what is left of a BUY at
+    its price, nothing for a SELL."""
+    if str(entry.get("side") or "").upper() != BUY:
+        return 0.0
+    left = (as_float(entry.get("original_size")) or 0) - (as_float(entry.get("size_matched")) or 0)
+    return (as_float(entry.get("price")) or 0) * max(left, 0.0)
+
+
 def parse_open_order(entry, fm):
     """A CLOB open order on a managed market as a LiveOrder, or None."""
     token_id = str(entry.get("asset_id") or "")
@@ -2076,7 +2135,11 @@ class Farmer:
         self.mids = []
         self.book_samples = []
         self.scoring = {}
-        self.positions_at = self.rewards_at = self.resolutions_at = 0.0
+        self.positions_at = self.rewards_at = self.resolutions_at = self.balance_at = 0.0
+        # USD of collateral less the operator's own open bids, from the last
+        # good read; None before one, and always in a dry run.
+        self.free_cash = None
+        self.logged_hurdle = None
         self.resolutions = {}
         self.started_at = self.last_cycle_at = datetime.now(timezone.utc)
         self.sim_ids = 0
@@ -2093,6 +2156,11 @@ class Farmer:
 
     def active(self):
         return [m for m in self.markets.values() if m.state.phase is not Phase.RETIRED]
+
+    @property
+    def hurdle(self):
+        """The hurdle rate this cycle's fills are valued at."""
+        return cash_hurdle(self.cfg.hurdle_rate, self.free_cash, self.cfg.cash_buffer)
 
     def emit(self, kind, line, condition_id=None, slot=None, price=None, size=None,
              score=None, data=None):
@@ -2122,6 +2190,8 @@ class Farmer:
             managed=len(self.active()),
             config=self.cfg._asdict(),
             stopped_at=stopped_at,
+            free_cash_usd=self.free_cash,
+            effective_hurdle=self.hurdle,
         )
         farm_db.publish(self.db, status, states, self.events, self.mids)
         self.events, self.mids = [], []
@@ -2157,8 +2227,6 @@ class Farmer:
         self.positions_at = time.monotonic() + POSITIONS_S
         if not self.markets:
             log(f"No approved markets in {self.args.db}; waiting for approvals")
-        if self.live:
-            self.check_collateral()
         self.flush()
 
     def seed_watches(self, now):
@@ -2444,17 +2512,41 @@ class Farmer:
                 for token_id in (m.fm.fav_token_id, m.fm.long_token_id)}
 
     def open_orders(self):
-        """{condition_id: [LiveOrder]} for every managed market; one listing live."""
+        """({condition_id: [LiveOrder]} for every managed market, the USD the
+        operator's own open bids tie up), from one listing live. A dry run
+        lists nothing, so the second is None."""
         if not self.live:
-            return {cid: list(m.sim_orders) for cid, m in self.markets.items()}
+            return {cid: list(m.sim_orders) for cid, m in self.markets.items()}, None
         orders = {cid: [] for cid in self.markets}
         market_of = self.market_of_token()
+        manual = 0.0
         for entry in self.client.get_open_orders():
             cid = market_of.get(str(entry.get("asset_id") or ""))
-            order = parse_open_order(entry, self.markets[cid].fm) if cid else None
+            if cid is None:
+                manual += open_bid_usd(entry)
+                continue
+            order = parse_open_order(entry, self.markets[cid].fm)
             if order is not None:
                 orders[cid].append(order)
-        return orders
+        return orders, manual
+
+    def refresh_free_cash(self, manual):
+        """Free cash: the collateral balance less the manual bids' USD. A
+        failed read keeps the last value."""
+        try:
+            resp = self.client.get_balance_allowance(
+                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            balance = int(resp["balance"]) / 1e6
+        except Exception as e:
+            log(f"Warning: collateral balance unavailable ({e}); keeping the last free cash")
+            return
+        self.free_cash = balance - manual
+        hurdle = self.hurdle
+        logged = self.logged_hurdle
+        if logged is None or abs(hurdle - logged) > HURDLE_LOG_STEP * logged:
+            log(f"Free cash ${self.free_cash:,.2f}: collateral ${balance:,.2f} less "
+                f"${manual:,.2f} of your own bids; fills valued at a hurdle {hurdle:.0%}")
+            self.logged_hurdle = hurdle
 
     def cycle(self):
         now = self.last_cycle_at = datetime.now(timezone.utc)
@@ -2473,12 +2565,15 @@ class Farmer:
             self.rewards_at = time.monotonic() + REWARDS_S
 
         try:
-            orders = self.open_orders()
+            orders, manual = self.open_orders()
         except Exception as e:
             # Planning on no orders would duplicate the ones actually resting.
             log(f"Warning: open orders unavailable ({e}); planning no market")
             self.flush()
             return
+        if self.live and time.monotonic() >= self.balance_at:
+            self.refresh_free_cash(manual)
+            self.balance_at = time.monotonic() + BALANCE_S
         active = self.active()
         books = fetch_levels(self.http, [m.fm.fav_token_id for m in active])
         plans = []
@@ -2575,7 +2670,7 @@ class Farmer:
             planned = target_orders(
                 fm, book, managed.position, self.cfg, naked_allowed(obs, now),
                 market_outlook(fm, self.total_rates.rates, self.history(fm), self.prior,
-                               self.cfg, now, any_floor=True),
+                               self.cfg, now, hurdle=self.hurdle, any_floor=True),
                 fill_mid=managed.fill_mid, resting=orders,
             )
             if previewing:
@@ -2818,24 +2913,6 @@ class Farmer:
             line = f"{fm.label}: retired ({reason}); dry run leaves markets unchanged"
         self.emit(EventKind.RETIRE, line, fm.condition_id, data={"reason": reason})
 
-    def check_collateral(self):
-        planned = sum(capital_room(m.fm, m.position)
-                      for m in self.active() if m.position is not None)
-        try:
-            resp = self.client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            balance = int(resp["balance"]) / 1e6
-        except Exception as e:
-            log(f"Warning: collateral balance check failed ({e})")
-            return
-        log(f"Collateral ${balance:,.2f}; favorite bids plan up to ${planned:,.2f}")
-        if balance < planned:
-            self.emit(EventKind.ALERT,
-                      "Warning: collateral is short of the planned favorite bids; "
-                      "the CLOB will reject the bids it cannot fund",
-                      data={"balance_usd": balance, "planned_usd": planned})
-
     def cancel_managed(self):
         """Cancel every open order on a managed market: one listing, one cancel.
 
@@ -2950,6 +3027,7 @@ def config_from(args):
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
+        cash_buffer=args.cash_buffer,
     )
 
 
@@ -3023,6 +3101,11 @@ Examples:
                                        "costs its price minus what it sells for, "
                                        "discounted at this rate over the weeks the sale "
                                        "takes"),
+        ("--cash-buffer", float, 15000.0, "USD of free cash at which fills are valued at a "
+                                          "100%% hurdle; the hurdle is this over free cash, "
+                                          "never under --hurdle-rate. Free cash is the "
+                                          "collateral less your own open bids. 0 keeps the "
+                                          "hurdle at --hurdle-rate"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

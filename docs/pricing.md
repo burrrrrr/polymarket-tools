@@ -126,13 +126,15 @@ buyer 5% a year or more, plus the longshot shares held, at cost.
 ## The fill-cost model
 
 A favorite share bought by a fill ties up capital that could earn the hurdle
-rate r (`--hurdle-rate`) elsewhere, until it leaves. The farmer offers it back
+rate r elsewhere, until it leaves. r is `--hurdle-rate` while free cash is
+plenty and rises as it runs short (see
+[The hurdle follows free cash](#the-hurdle-follows-free-cash)). The farmer offers it back
 through `FAV_ASK`, and that ask sells slowly. Measured on 2026-10-10 by
 replaying the sweeps of 169 markets against the buys that followed them, the
 ask the farmer rests after a fill sold 67.4% of a 100-share fill and 41.9%
 of a 1,000-share fill in 30 days. So a share sells after a hold T, taken as
 exponential with rate λ a year and cut short at resolution, Y years out,
-where a share still unsold is worth p_true. λ is the rate that sells the
+where a share still unsold is worth w. λ is the rate that sells the
 measured fraction in 30 days. The fraction runs in a straight line in the
 log of the inventory through the two measured sizes, stays at 67.4% under
 100 shares and never goes under 5%. The line gives 2,000 shares 34.2%,
@@ -143,7 +145,7 @@ costs more than the first.
 In the replay the shares that sold went at about the ask's price. So a share
 bought at b is credited a sale at
 
-    a(b) = min(ask(b), p_true)
+    a(b) = min(ask(b), w)
 
 where ask(b) is the `FAV_ASK` the farmer would rest once the bid fills. That
 ask is the midpoint plus `--ask-offset`, or the midpoint an earlier fill
@@ -151,7 +153,7 @@ found plus `--ask-offset` while the midpoint is still under it. It is never
 under the average cost of the inventory with the fill added plus
 `--min-capture`. With δ = ln(1 + r) and k = λ + δ, the fill loses
 
-    L(b) = b - (a(b) * λ/k * (1 - e^(-kY)) + p_true * e^(-kY))
+    L(b) = b - (a(b) * λ/k * (1 - e^(-kY)) + w * e^(-kY))
 
 today. For each favorite bid price b on the tick grid inside the reward band,
 with the size Q it rests at once the quotes are balanced,
@@ -164,6 +166,61 @@ that reaches your bid fills all of it. On a short-dated market, or far under
 the midpoint, L(b) is negative: the share is worth more than the bid pays.
 A bid rests for its reward, so that fill costs nothing and is never counted
 as income.
+
+w is what a filled share is worth. With m the book midpoint without your
+orders and r the hurdle of the next section,
+
+    w = m + (p_true - m) * hurdle_rate / r     when p_true is over m
+    w = p_true                                 otherwise
+
+So while free cash is plenty, r is `hurdle_rate` and a fill is worth
+p_true. As cash runs short, w slides toward the midpoint: at a 100% hurdle
+from a 30% base it keeps 30% of the edge, at 227% about 13%. A fill
+arrives when sellers do, and a view above the book makes every fill look
+like a gain. A p_true of 0.97 against a 93.8c book 11 days from the end
+prices each fill at about 4% in 11 days. When this rule came in, 145 of the
+296 resting favorite bids expected fills but were charged no fill cost, 98
+of them because p_true sat above the midpoint, while the farmer's inventory
+stayed flat at the day's prices. Trusting the view while cash is plenty
+keeps those bids, and their rewards, until the cash they spend is worth
+more than the hurdle. The EV cap still comes from p_true less
+`--ev-margin`. A market that follows the book already has w at the
+midpoint.
+
+### The hurdle follows free cash
+
+The CLOB lets bids rest far beyond the cash that funds them, and rejects
+none for want of balance. Before this rule, fills drained most of the
+wallet's free cash within two weeks and left none for your own trades. So the
+farmer values each fill at a hurdle that rises as free cash falls:
+
+    r = min(10, max(hurdle_rate, 1.0 * cash_buffer / free_cash))
+
+Free cash is the wallet's USDC balance less what your own open bids tie up:
+the price times the size left of each open BUY on a token the farmer does
+not manage. The farmer's own bids are not subtracted. The 1.0 is
+`SCARCE_HURDLE` in `farm/reward_farmer.py`: your own trading makes roughly
+50% to 130% a year on capital, so cash that is short earns about that. 10 is
+the upper bound of the `hurdle_rate` setting, and free cash of zero or less
+takes it. With `hurdle_rate` 0.30 and `cash_buffer` 15,000:
+
+| Free cash | Hurdle |
+|---|---|
+| $50,000 or more | 30% |
+| $15,000 | 100% |
+| $10,000 | 150% |
+| $5,000 | 300% |
+
+So `cash_buffer` is the free cash at which the hurdle reaches 100%. The
+hurdle starts to rise at `cash_buffer` over `hurdle_rate`, $50,000 here.
+There is no stop at any cash level. The rising hurdle makes each fill cost
+more, so bids move behind the book and shrink where fills are likely. A
+live farmer reads the balance every 30 seconds and takes the manual bids
+from the open order listing it plans that cycle with. A failed read keeps
+the last value. A dry run reads no wallet, and before the first read the
+hurdle is `hurdle_rate`. A `cash_buffer` of 0 turns the scaling off. The farmer
+publishes free cash and the hurdle each cycle, and the console's Review
+preview values fills at the hurdle a running farmer last published.
 
 A bid behind a deep book is charged no fills. The model fills the whole bid
 whatever rests ahead of it, but a sweep has to take the shares bid above your

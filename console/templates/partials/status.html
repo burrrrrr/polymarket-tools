@@ -7,6 +7,9 @@
       <span style="font-size: 13px; font-weight: 500">Farmer · {{ live.mode or 'never ran' }}{% if not live.running and live.mode %} · stopped{% endif %}</span>
     </div>
     <div class="mono small muted">{% if live.interval_s %}cycle {{ '%g' % live.interval_s }}s · {% endif %}last {{ live.last_cycle_at | clock }}</div>
+    {%- if live.cash %}
+    <div class="mono small muted">{{ live.cash }}</div>
+    {%- endif %}
   </div>
   <div style="display: flex; flex-direction: column; gap: 6px">
     <div style="display: flex; align-items: center; gap: 8px">

@@ -30,6 +30,7 @@ from farm.reward_farmer import (
     ask_dropped,
     build_parser,
     capital_room,
+    cash_hurdle,
     config_from,
     drop_ask,
     ev_cap,
@@ -86,6 +87,7 @@ CFG = FarmConfig(
     naked_cooldown_s=3600.0,
     expiry_buffer_days=7.0,
     hurdle_rate=0.40,
+    cash_buffer=15000.0,
 )
 
 
@@ -170,9 +172,11 @@ NO_SWEEPS = History((0,) * len(DISTANCES), 60.0, NOW, 0.90, 0, 0.0)
 NO_BUYS = BuyTape((), NOW, NOW.timestamp() - 60 * 86400)
 
 
-def outlook_with(fm, fills, cfg=CFG):
-    """The market's Outlook at the scan's rate, with these fills."""
-    return market_outlook(fm, None, None, PRIOR, cfg, NOW)._replace(fills=fills)
+def outlook_with(fm, fills, cfg=CFG, hurdle=None):
+    """The market's Outlook at the scan's rate, with these fills, at the base
+    hurdle unless one is given."""
+    return market_outlook(fm, None, None, PRIOR, cfg, NOW,
+                          hurdle=cfg.hurdle_rate if hurdle is None else hurdle)._replace(fills=fills)
 
 
 def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET, resting=()):
@@ -182,11 +186,13 @@ def plan(fm, book, position=Position(), cfg=CFG, naked=True, fills=QUIET, restin
                          resting=resting)
 
 
-def bid_value(fm, book, price, size=None, position=Position(), fills=QUIET, fill_mid=None):
+def bid_value(fm, book, price, size=None, position=Position(), fills=QUIET, fill_mid=None,
+              hurdle=None):
     """The QuoteValue of the orders planned around a favorite bid at price,
     of all the capital left unless a size is given."""
     target = quotes_at(fm, book, position, CFG, True, price, size, fill_mid)
-    return value_of(target, fm, book, position, CFG, outlook_with(fm, fills), fill_mid)
+    return value_of(target, fm, book, position, CFG, outlook_with(fm, fills, hurdle=hurdle),
+                    fill_mid)
 
 
 class BalancingTest(unittest.TestCase):
@@ -481,9 +487,83 @@ class FollowMarketTest(unittest.TestCase):
         self.assertIsNone(sole(fm=THIN._replace(p_true=None)))
 
 
+class FillWorthTest(unittest.TestCase):
+    """A view above the book is trusted for a fill in full while cash is
+    plenty, and less as the hurdle rises over its base."""
+
+    def view(self, p_true=0.999):
+        # Eleven days out a 99.9c view makes a 98.5c fill a gain.
+        return reward_farmer.with_book_mid(market(p_true=p_true,
+                                                  end_date=NOW + timedelta(days=11)),
+                                           FLOOR_BOOK)
+
+    def test_at_the_base_hurdle_a_view_above_the_midpoint_values_the_fill(self):
+        valued = bid_value(self.view(), FLOOR_BOOK, 0.985, fills=SWEPT)
+        self.assertEqual(valued.fill_cost_per_day, 0)
+        self.assertLess(valued.loss_per_share, 0)
+
+    def test_a_higher_hurdle_trusts_that_share_of_the_view_over_the_midpoint(self):
+        # Twice the base hurdle keeps half of the 0.9c the view sits over the
+        # 99.0c midpoint: the fill is valued as under a 99.45c view.
+        hurdle = 2 * CFG.hurdle_rate
+        self.assertAlmostEqual(self.view().fill_worth(0.5), 0.9945)
+        follow = following(FLOOR_BOOK, end_date=NOW + timedelta(days=11))
+        self.assertLess(bid_value(self.view(), FLOOR_BOOK, 0.985, fills=SWEPT,
+                                  hurdle=hurdle).loss_per_share,
+                        bid_value(follow, FLOOR_BOOK, 0.985, fills=SWEPT,
+                                  hurdle=hurdle).loss_per_share)
+
+    def test_cash_running_out_values_the_fill_at_the_midpoint(self):
+        # At the setting's cap the view keeps 4% of its edge, so the fill
+        # costs money, close to a market following the book.
+        cap = farm_db.SETTINGS["hurdle_rate"].high
+        follow = following(FLOOR_BOOK, end_date=NOW + timedelta(days=11))
+        charged = bid_value(self.view(), FLOOR_BOOK, 0.985, fills=SWEPT, hurdle=cap)
+        self.assertGreater(charged.fill_cost_per_day, 0)
+        self.assertAlmostEqual(charged.loss_per_share,
+                               bid_value(follow, FLOOR_BOOK, 0.985, fills=SWEPT,
+                                         hurdle=cap).loss_per_share, places=3)
+
+    def test_without_a_book_read_the_view_is_the_worth(self):
+        unread = market(p_true=0.999, end_date=NOW + timedelta(days=11))
+        self.assertEqual(unread.fill_worth(0.0), 0.999)
+
+    def test_a_view_under_the_midpoint_values_the_fill(self):
+        below = reward_farmer.with_book_mid(market(p_true=0.986), FLOOR_BOOK)
+        self.assertEqual(bid_value(below, FLOOR_BOOK, 0.980, fills=SWEPT),
+                         bid_value(market(p_true=0.986), FLOOR_BOOK, 0.980, fills=SWEPT))
+
+    def test_the_view_still_caps_the_bid_with_its_margin(self):
+        view = reward_farmer.with_book_mid(market(p_true=0.999), FLOOR_BOOK)
+        self.assertEqual(ev_cap(view, CFG), 0.989)
+
+
+class CashHurdleTest(unittest.TestCase):
+    """The hurdle a fill is valued at, raised as free cash runs short."""
+
+    def test_the_hurdle_rises_as_free_cash_falls_under_the_buffer(self):
+        for free, hurdle in ((80_000.0, 0.30), (50_000.0, 0.30), (15_000.0, 1.0),
+                             (10_000.0, 1.5), (6_600.0, 15 / 6.6)):
+            with self.subTest(free=free):
+                self.assertAlmostEqual(cash_hurdle(0.30, free, 15_000.0), hurdle)
+
+    def test_no_free_cash_takes_the_cap_of_the_setting(self):
+        cap = farm_db.SETTINGS["hurdle_rate"].high
+        for free in (0.0, -500.0, 100.0):
+            with self.subTest(free=free):
+                self.assertEqual(cash_hurdle(0.30, free, 15_000.0), cap)
+
+    def test_no_reading_or_no_buffer_keeps_the_base(self):
+        self.assertEqual(cash_hurdle(0.30, None, 15_000.0), 0.30)
+        self.assertEqual(cash_hurdle(0.30, 1_000.0, 0.0), 0.30)
+
+    def test_a_base_over_the_scarce_rate_holds(self):
+        self.assertEqual(cash_hurdle(3.0, 15_000.0, 15_000.0), 3.0)
+
+
 class NetPricingTest(unittest.TestCase):
     def outlook(self, fm, history):
-        return market_outlook(fm, None, history, PRIOR, CFG, NOW)
+        return market_outlook(fm, None, history, PRIOR, CFG, NOW, hurdle=CFG.hurdle_rate)
 
     def test_no_history_places_no_favorite_bid_but_keeps_the_exits(self):
         fm, held = market(), Position(long_shares=200.0, long_avg=0.005)
@@ -550,23 +630,28 @@ class NetPricingTest(unittest.TestCase):
         self.assertLess(target.fav.best.loss_per_share, 0)
         self.assertEqual(by_slot(target)[Slot.FAV_BID].price, 0.985)
 
-    def test_the_outlook_takes_the_live_rate_the_end_date_and_the_fill_curve(self):
+    def test_the_outlook_takes_the_live_rate_the_end_date_the_fill_curve_and_the_hurdle(self):
+        # The hurdle is the cycle's, not the base setting: cash_hurdle of free cash.
         fm = market(rate_per_day=100.0, end_date=NOW + timedelta(days=365.25))
-        outlook = market_outlook(fm, {"0xc0nd": 40.0}, NO_SWEEPS, PRIOR, CFG, NOW)
+        outlook = market_outlook(fm, {"0xc0nd": 40.0}, NO_SWEEPS, PRIOR, CFG, NOW, hurdle=1.5)
         self.assertEqual((outlook.rate_per_day, outlook.years_left, outlook.hurdle_rate),
-                         (40.0, 1.0, CFG.hurdle_rate))
+                         (40.0, 1.0, 1.5))
         self.assertEqual(outlook.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, CFG.min_fav))
         self.assertTrue(outlook.fills.from_history)
-        unread = market_outlook(fm, {"0xother": 40.0}, None, PRIOR, CFG, NOW)
+        unread = market_outlook(fm, {"0xother": 40.0}, None, PRIOR, CFG, NOW,
+                                hurdle=CFG.hurdle_rate)
         self.assertEqual(unread.rate_per_day, 100.0)
         self.assertEqual(unread.fills, fill_cost.fill_curve(None, PRIOR, CFG.min_fav))
 
     def test_the_outlook_drops_a_history_read_at_another_floor_unless_any_floor(self):
         fm, lower = market(), CFG._replace(min_fav=0.85)
-        self.assertFalse(market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW).fills.from_history)
-        kept = market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW, any_floor=True)
+        self.assertFalse(market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW,
+                                         hurdle=CFG.hurdle_rate).fills.from_history)
+        kept = market_outlook(fm, None, NO_SWEEPS, PRIOR, lower, NOW, hurdle=CFG.hurdle_rate,
+                              any_floor=True)
         self.assertEqual(kept.fills, fill_cost.fill_curve(NO_SWEEPS, PRIOR, 0.90))
-        unread = market_outlook(fm, None, None, PRIOR, lower, NOW, any_floor=True)
+        unread = market_outlook(fm, None, None, PRIOR, lower, NOW, hurdle=CFG.hurdle_rate,
+                                any_floor=True)
         self.assertEqual(unread.fills, fill_cost.fill_curve(None, PRIOR, 0.85))
 
 
@@ -2426,6 +2511,8 @@ class FarmerCycleTest(FarmerHarness):
         status = self.query("SELECT * FROM farmer_status")[0]
         self.assertEqual((status["mode"], status["managed"], status["stopped_at"]), ("dry", 1, None))
         self.assertIsNotNone(status["last_cycle_at"])
+        # A dry run has no wallet to read, so its fills take the base hurdle.
+        self.assertEqual((status["free_cash_usd"], status["effective_hurdle"]), (None, 0.40))
         places = [(e["slot"], e["price"]) for e in self.events() if e["kind"] == "PLACE"]
         self.assertEqual(places, [("FAV_BID", 0.975), ("LONG_BID", 0.001)])
         market_row = farm_db.find_market(self.ui, CID)
@@ -3495,6 +3582,85 @@ class LiveFarmerTest(FarmerHarness):
         self.assertEqual({cid: sorted(o.token_id for o in m.orders)
                           for cid, m in farmer.markets.items()},
                          {CID: sorted([FAV, LONG]), CID2: sorted([FAV2, LONG2])})
+
+    def manual_order(self, side, price, size, matched="0"):
+        """An order of the operator's own, on a token no managed market holds."""
+        order_id = f"manual{len(self.resting)}"
+        self.resting[order_id] = {
+            "id": order_id, "market": "0xmine", "asset_id": f"mine-{order_id}", "side": side,
+            "price": price, "original_size": size, "size_matched": matched,
+        }
+
+    def cash(self, usd):
+        self.client.get_balance_allowance.return_value = {"balance": str(int(usd * 1e6))}
+
+    def status(self):
+        row = self.query("SELECT * FROM farmer_status")[0]
+        return row["free_cash_usd"], row["effective_hurdle"]
+
+    def hurdle_lines(self):
+        return [c.args[0] for c in reward_farmer.log.call_args_list if "hurdle" in c.args[0]]
+
+    def test_free_cash_is_the_balance_less_the_operators_own_bids(self):
+        # $20,000 of USDC. The 8,000 shares left of a manual 50c bid tie up
+        # $4,000; a manual ask and the farmer's own bids tie up none of it.
+        self.cash(20_000)
+        self.manual_order("BUY", "0.5", "10000", "2000")
+        self.manual_order("SELL", "0.9", "100")
+        with mock.patch.object(reward_farmer, "BALANCE_S", 0):
+            farmer = self.started_farmer(client=self.client)
+            farmer.cycle()
+            farmer.cycle()
+        self.assertEqual(self.status(), (16_000.0, 15_000 / 16_000))
+        self.assertEqual([e["message"] for e in self.events() if e["kind"] == "ALERT"], [])
+
+    def test_the_balance_is_read_on_its_own_cadence(self):
+        self.cash(6_600)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(self.client.get_balance_allowance.call_count, 1)
+
+    def test_a_failed_balance_read_keeps_the_last_free_cash(self):
+        self.cash(6_600)
+        with mock.patch.object(reward_farmer, "BALANCE_S", 0):
+            farmer = self.started_farmer(client=self.client)
+            farmer.cycle()
+            self.client.get_balance_allowance.side_effect = httpx.ConnectError("down")
+            farmer.cycle()
+        self.assertEqual(self.client.get_balance_allowance.call_count, 2)
+        self.assertEqual(self.status(), (6_600.0, 15_000 / 6_600))
+
+    def test_a_hurdle_change_is_logged_once_per_step(self):
+        self.cash(100_000)
+        with mock.patch.object(reward_farmer, "BALANCE_S", 0):
+            farmer = self.started_farmer(client=self.client)
+            farmer.cycle()
+            farmer.cycle()
+            self.assertEqual(len(self.hurdle_lines()), 1)
+            self.cash(99_000)
+            farmer.cycle()
+            self.assertEqual(len(self.hurdle_lines()), 1)
+            self.cash(6_600)
+            farmer.cycle()
+        self.assertEqual(len(self.hurdle_lines()), 2)
+        self.assertIn("hurdle 227%", self.hurdle_lines()[-1])
+
+    def fav_bid_after_a_cycle(self, usd):
+        """The favorite bid's economics a fresh live farmer plans with this much free cash."""
+        self.resting.clear()
+        self.cash(usd)
+        self.started_farmer(client=self.client).cycle()
+        return self.farm_state()[1]["FAV_BID"]["economics"]
+
+    def test_a_favorite_bid_is_valued_at_the_hurdle_free_cash_sets(self):
+        # The $100/day pool outearns the fills either way, so the bid holds
+        # at 97.5c; at a 227% hurdle each fill of it loses about 10c, five
+        # times what it does at the 40% base.
+        rich, poor = self.fav_bid_after_a_cycle(100_000), self.fav_bid_after_a_cycle(6_600)
+        self.assertEqual(self.status(), (6_600.0, 15_000 / 6_600))
+        self.assertEqual((poor["price"], poor["size"]), (rich["price"], rich["size"]))
+        self.assertGreater(poor["loss_per_share"], 4 * rich["loss_per_share"])
 
     def test_a_failed_listing_plans_no_market_until_it_reads_again(self):
         farmer = self.started_farmer(client=self.client)

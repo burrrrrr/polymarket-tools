@@ -15,13 +15,15 @@ QUOTABLE_SCAN = 40
 QUOTABLE_BATCH = 8
 
 
-def farmer_config(conn):
-    """The FarmConfig the farmer runs with now, as Context.effective reads each field."""
+def farmer_config(conn, now):
+    """(The FarmConfig the farmer runs with now, as Context.effective reads
+    each field; the hurdle its fills are valued at, views.preview_hurdle)."""
     overrides, _ = farm_db.load_settings(conn)
     status = farm_db.read_farmer_status(conn)
-    return reward_farmer.FarmConfig(**{
+    cfg = reward_farmer.FarmConfig(**{
         key: views.setting_value(key, status, overrides, FARMER_DEFAULTS)[0]
         for key in reward_farmer.FarmConfig._fields})
+    return cfg, views.preview_hurdle(status, cfg, now)
 
 
 def parse_mode(mode):
@@ -116,10 +118,12 @@ def routes(ctx):
         with closing(ctx.connect()) as conn:
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
-    def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
+    def plan_now(row, farmer, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
                  capital=None, sole_bid=False):
         """(views.live_review of a market row with these terms against the live
-        book, its views.rewards_state); p_true None follows the market."""
+        book, its views.rewards_state); farmer is farmer_config's (cfg, hurdle),
+        and p_true None follows the market."""
+        cfg, hurdle = farmer
         terms = {"p_true": p_true, "naked_budget_usd": budget,
                  "capital_usd": capital, "paused": 0, "naked_paused": 0,
                  "sole_bid": int(sole_bid)}
@@ -127,15 +131,15 @@ def routes(ctx):
         info, rates = ctx.infos.get(cid), ctx.total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
         live = views.live_review({**dict(row), **terms}, info, ctx.books.get(fav_token), rates,
-                                 cfg, ctx.clock(), row["status"] == "approved", prior)
+                                 cfg, hurdle, ctx.clock(), row["status"] == "approved", prior)
         return live, views.rewards_state(info, cid, rates)
 
-    def quotable(row, cfg, prior):
+    def quotable(row, farmer, prior):
         """(whether the farmer would quote this candidate now, its rewards state),
         with a sole bid allowed where the scan planned one. A market whose book
         cannot be read counts, so its page can show why."""
         try:
-            live, active = plan_now(row, cfg, prior,
+            live, active = plan_now(row, farmer, prior,
                                     sole_bid=views.sole_plan(json.loads(row["metrics"])))
         except Exception:
             return True, None
@@ -158,13 +162,13 @@ def routes(ctx):
         mode = parse_mode(mode)
         with closing(ctx.connect()) as conn:
             ids = farm_db.candidate_queue(conn, mode, after=condition_id)
-            cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
+            farmer, prior = farmer_config(conn, ctx.clock()), reward_screener.load_prior(conn)
             rows = [farm_db.find_market(conn, cid) for cid in ids[:QUOTABLE_SCAN]]
         skipped, checked, found = 0, [], None
         with ThreadPoolExecutor(QUOTABLE_BATCH) as pool:
             for i in range(0, len(rows), QUOTABLE_BATCH):
                 batch = rows[i:i + QUOTABLE_BATCH]
-                for row, (ok, active) in zip(batch, pool.map(lambda r: quotable(r, cfg, prior),
+                for row, (ok, active) in zip(batch, pool.map(lambda r: quotable(r, farmer, prior),
                                                              batch)):
                     checked.append((row, active))
                     if ok:
@@ -201,9 +205,9 @@ def routes(ctx):
             row = farm_db.find_market(conn, condition_id)
             if row is None:
                 raise HTTPException(404, f"no market {condition_id!r}")
-            cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
+            farmer, prior = farmer_config(conn, ctx.clock()), reward_screener.load_prior(conn)
         try:
-            (live, active), error = plan_now(row, cfg, prior, p,
+            (live, active), error = plan_now(row, farmer, prior, p,
                                              0.0 if budget is None else budget, cap,
                                              sole_bid == "1"), None
         except Exception as e:
