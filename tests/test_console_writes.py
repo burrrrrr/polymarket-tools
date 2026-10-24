@@ -496,7 +496,7 @@ class ReviewTest(Writes):
         row = {**dict(self.row("0xddd")), "p_true": p_true, "naked_budget_usd": 25.0,
                "capital_usd": capital}
         return views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
-                                 self.now, False, prior)
+                                 cfg.hurdle_rate, self.now, False, prior)
 
     def test_the_preview_prices_the_longshot_bid_by_the_time_to_the_end_date(self):
         # 40 days from the end date the longshot bid rests at 1.7c, the
@@ -510,7 +510,8 @@ class ReviewTest(Writes):
             row = {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
                    "end_date": (self.now + timedelta(days=days)).isoformat()}
             live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
-                                     self.now, False, fill_cost.DEFAULT_PRIOR)
+                                     cfg.hurdle_rate, self.now, False,
+                                     fill_cost.DEFAULT_PRIOR)
             return next(o.price for o in live.orders if o.slot == "LONG_BID")
 
         self.assertEqual(longshot_bid(40), 0.017)
@@ -579,12 +580,14 @@ class ReviewTest(Writes):
     def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
         text = self.live()
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
-        fm = reward_farmer.farm_market(
+        # The farmer reads the book's midpoint before it values a fill.
+        fm = reward_farmer.with_book_mid(reward_farmer.farm_market(
             {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
-             "capital_usd": None}, self.remote.info("0xddd"), cfg, self.now)
+             "capital_usd": None}, self.remote.info("0xddd"), cfg, self.now), BUDGET_BOOK)
         target = reward_farmer.target_orders(
             fm, BUDGET_BOOK, reward_farmer.Position(), cfg, True,
-            reward_farmer.market_outlook(fm, None, None, fill_cost.DEFAULT_PRIOR, cfg, self.now),
+            reward_farmer.market_outlook(fm, None, None, fill_cost.DEFAULT_PRIOR, cfg, self.now,
+                                         hurdle=cfg.hurdle_rate),
             bid_without_history=True)
         self.assertEqual([i.slot.name for i in target.intents], ["FAV_BID", "LONG_BID"])
         for intent in target.intents:
@@ -612,6 +615,17 @@ class ReviewTest(Writes):
         farm_db.put_settings(self.db, {"hurdle_rate": 10.0, "ev_margin": 0.024}, self.now)
         self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
                                                  r"bid pays: best net -\$\d+\.\d\d/day at 92\.6c\.")
+
+    def test_live_plan_values_fills_at_the_hurdle_the_running_farmer_published(self):
+        # Short of cash the farmer values fills at a 1,000% hurdle, and at a
+        # 2.4c margin no 92.6c bid pays there. Once the farmer stops, the
+        # preview falls back to the base setting and the bid rests.
+        farm_db.put_settings(self.db, {"ev_margin": 0.024}, self.now)
+        self.publish(free_cash=100.0, hurdle=10.0)
+        self.assertIn("The farmer would place nothing: no favorite bid pays",
+                      self.live(p_true="95"))
+        self.publish(free_cash=100.0, hurdle=10.0, last_cycle=self.now - timedelta(hours=1))
+        self.assertIn("Buy No 92.6c", self.live(p_true="95"))
 
     def test_live_plan_follows_the_sole_bid_box_when_no_other_bid_supports_the_market(self):
         # The only bid left is 80c under a 97c ask: an 88.5c midpoint.
@@ -661,11 +675,12 @@ class ReviewTest(Writes):
         row.update(p_true=0.97, naked_budget_usd=25.0, capital_usd=None,
                    metrics=json.dumps({**metrics, **stored}))
         live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
-                                 self.now, False, fill_cost.DEFAULT_PRIOR)
-        fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg, self.now)
+                                 cfg.hurdle_rate, self.now, False, fill_cost.DEFAULT_PRIOR)
+        fm = reward_farmer.with_book_mid(
+            reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg, self.now), BUDGET_BOOK)
         history = fill_cost.history_from_json(stored.get("history"))
         outlook = reward_farmer.market_outlook(fm, None, history, fill_cost.DEFAULT_PRIOR, cfg,
-                                               self.now)
+                                               self.now, hurdle=cfg.hurdle_rate)
         return live, reward_farmer.target_orders(fm, BUDGET_BOOK, reward_farmer.Position(),
                                                  cfg, True, outlook, bid_without_history=True)
 
@@ -1356,6 +1371,15 @@ class SettingsTest(Writes):
                          (303, "/settings?saved=Quoting"))
         self.assertEqual(farm_db.load_settings(self.db), ({"max_lead": 0.02}, {}))
         self.assertIn("Saved Quoting", self.client.get("/settings?saved=Quoting").text)
+
+    def test_the_cash_buffer_saves_and_zero_turns_the_scaling_off(self):
+        self.assertRegex(self.client.get("/settings").text,
+                         r'(?s)name="cash_buffer" value="15000".*?>default<')
+        self.assertEqual(self.save("Quoting", cash_buffer="0").status_code, 303)
+        self.assertEqual(farm_db.load_settings(self.db), ({"cash_buffer": 0.0}, {}))
+        resp = self.save("Quoting", cash_buffer="-5")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("cash_buffer: -5 is out of range", resp.text)
 
     def test_invalid_values_show_inline_and_write_nothing(self):
         resp = self.save("Quoting", max_lead="0.9", keep_ratio="abc", capital="300")

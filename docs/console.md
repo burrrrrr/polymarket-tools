@@ -24,7 +24,9 @@ the data directory (see
 relative `--db` or `--tools-db` path is read from the current directory.
 
 Run it next to the farmer on the same `farm.db` and next to the worker on the
-same `tools.db`. The sidebar lists both processes. A farm page shows a banner
+same `tools.db`. The sidebar lists both processes, the farmer with its free
+cash and the hurdle its fills are valued at, as `Free cash $10,000 · hurdle
+150%`. A farm page shows a banner
 when the farmer is not running, and a tool page shows one when the worker is
 not. The console reads `POLYMARKET_FUNDER_ADDRESS` from `.env` to show your
 holdings on the Review page. It never reads or handles a private key.
@@ -39,7 +41,7 @@ Pages:
 | Live markets (`/markets?phase=`) | One card per managed market: phase, midpoint, the reward band with your bids marked, the four slots, Q1/Q2 and naked budget bars, inventory, and the expiry cutoff. Approved markets the farmer has not picked up yet show as waiting | Pause or resume quoting, pause or resume the naked leg, allow or stop a sole bid, edit p_true and budget, retire, end a cooldown |
 | Market detail (`/markets/<condition_id>`) | Stat tiles, a 24-hour midpoint chart with the band, your bids and fill and phase markers, the slots, the book inside the band, the position, the lifecycle, fills, and the market's events | The same controls as the card |
 | Activity (`/activity?tab=`) | `rewards`: earnings per day and market, the live rate from Polymarket's scoring share of each pool, and the week's earnings in farmer-managed markets against the screener estimate. `fills`: each fill with its approximate edge against `p_true`. `inventory`: wallet, baseline, farm shares, and exit orders. `log`: every farm event, filterable by kind and market | None |
-| Settings (`/settings`) | The farmer process (mode, pid, start, last cycle, interval, heartbeat) and every setting with its effective value and where it comes from: your override, the farmer's own value, or the built-in default | Stop the farmer, save or reset settings, cancel all managed orders |
+| Settings (`/settings`) | The farmer process (mode, pid, start, last cycle, interval, heartbeat, free cash and hurdle) and every setting with its effective value and where it comes from: your override, the farmer's own value, or the built-in default | Stop the farmer, save or reset settings, cancel all managed orders |
 | Orders (`/orders`) | The snapshot job in progress and every stored snapshot. A snapshot's page (`/orders/snapshots/<id>`) shows its orders and its newest preview or restore | Take a snapshot, preview a restore, place it |
 | Sniper (`/sniper`) | A search over the open markets and every watch with the quote the worker last saw, its outcome, and its log. `/sniper/arm` is the form that arms one outcome | Arm a watch, disarm it |
 

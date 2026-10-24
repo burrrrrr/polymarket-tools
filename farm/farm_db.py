@@ -131,7 +131,9 @@ CREATE TABLE IF NOT EXISTS farmer_status (
     heartbeat INTEGER,
     managed INTEGER,
     config TEXT,
-    stopped_at TEXT
+    stopped_at TEXT,
+    free_cash_usd REAL,
+    effective_hurdle REAL
 );
 
 CREATE TABLE IF NOT EXISTS farm_events (
@@ -235,6 +237,10 @@ ADDED_COLUMNS = {
         ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
         ("capital_usd", "REAL"),
         ("sole_bid", "INTEGER NOT NULL DEFAULT 0"),
+    ),
+    "farmer_status": (
+        ("free_cash_usd", "REAL"),
+        ("effective_hurdle", "REAL"),
     ),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
@@ -700,6 +706,7 @@ SETTINGS = {
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
+    "cash_buffer": Bound(0),
 }
 
 
@@ -966,6 +973,10 @@ class FarmerStatus(NamedTuple):
     managed: int
     config: dict
     stopped_at: Optional[datetime] = None
+    # USD of collateral less the operator's own open bids, None without a
+    # wallet read; and the hurdle rate the farmer's fills were valued at.
+    free_cash_usd: Optional[float] = None
+    effective_hurdle: Optional[float] = None
 
 
 def resting_order(view):
@@ -1021,11 +1032,12 @@ def publish(conn, status, states=None, events=(), mids=()):
         )
         conn.execute(
             "INSERT OR REPLACE INTO farmer_status (id, mode, pid, started_at, "
-            "last_cycle_at, interval_s, heartbeat, managed, config, stopped_at) "
-            "VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "last_cycle_at, interval_s, heartbeat, managed, config, stopped_at, "
+            "free_cash_usd, effective_hurdle) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (status.mode, status.pid, stamp(status.started_at),
              stamp(status.last_cycle_at), status.interval_s, int(status.heartbeat),
-             status.managed, json.dumps(status.config), stamp(status.stopped_at)),
+             status.managed, json.dumps(status.config), stamp(status.stopped_at),
+             status.free_cash_usd, status.effective_hurdle),
         )
 
 
@@ -1145,6 +1157,7 @@ def read_farmer_status(conn):
         last_cycle_at=_time(row["last_cycle_at"]), interval_s=row["interval_s"],
         heartbeat=bool(row["heartbeat"]), managed=row["managed"],
         config=_load(row["config"]) or {}, stopped_at=_time(row["stopped_at"]),
+        free_cash_usd=row["free_cash_usd"], effective_hurdle=row["effective_hurdle"],
     )
 
 
