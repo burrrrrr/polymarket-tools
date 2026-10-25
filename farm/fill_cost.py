@@ -23,10 +23,13 @@ counts, at each distance in DISTANCES, the sweeps that reached that far below
 the mid they found, over its last HISTORY_DAYS days of trades, at most one an
 hour. Few markets see enough sweeps to be rated alone, so each count is
 shrunk toward a Prior that a scan pools across markets, by as many days of
-evidence as the markets' spread around the pooled rate is worth. A bid of Q
-shares then fills Q times the FillCurve's rate at its distance a day: a sweep
-that reaches it fills all of it. reward_screener.value_quote charges a bid
-behind more than DEPTH_FREE_SHARES no fills at all.
+evidence as the markets' spread around the pooled rate is worth. A sweep
+that reaches a bid of Q shares fills min(Q, its size) of it, and sweep sizes
+are heavy-tailed, so a bid of Q shares fills sweep_fill(Q), the mean of
+min(Q, X) over SWEEP_SIZES, times the FillCurve's rate at its distance a
+day: about Q for a small bid, and little more than the typical sweep for a
+large one. reward_screener.value_quote charges a bid behind more than
+DEPTH_FREE_SHARES no fills at all.
 
 A History also times how long the mid took to be back where each sweep at
 EXIT_DISTANCE found it (exits, held_days), a Prior pools that
@@ -99,6 +102,26 @@ SOLD = ((100.0, 0.674), (1000.0, 0.419))
 # The line through SOLD passes this near 28,000 shares, far past the largest
 # fill replayed, and turns negative past 44,000.
 MIN_SOLD = 0.05
+
+# How many shares a sweep sells past a bid it reaches: the means of 40
+# equal-probability bins of the shares each sell burst sold more than
+# EXIT_DISTANCE under the mid before it, from a mid of at least 0.90.
+# Measured on 2026-10-25 from 2,627 bursts on 479 of 635 cached markets by
+#   python -m analysis.pricing_backtest sizes --cache <dir>
+SWEEP_SIZES = (
+    0.3, 1.2, 2.7, 4.9, 6.3, 8.8, 10.4, 12.6, 15.4, 18.7,
+    20, 20, 20, 21, 24.1, 28.4, 31.7, 38.1, 41.3, 47.1,
+    50, 53, 60.5, 69.7, 82.9, 95.9, 103.1, 119.5, 141.8, 169,
+    198.5, 239.6, 299.6, 374.6, 482.9, 637.9, 881.4, 1310.3, 2318.3, 10613.4,
+)
+# A table under which every sweep fills the whole bid: sweep_fill(q) is q.
+WHOLE_BID = (math.inf,)
+
+
+def sweep_fill(shares, sizes=SWEEP_SIZES):
+    """The shares of a resting bid of `shares` that one sweep reaching it
+    fills, on average: the mean of min(shares, x) over the sweep sizes."""
+    return sum(min(shares, x) for x in sizes) / len(sizes)
 
 
 def share_value(p_true, sale_price, per_day, years, hurdle_rate):
@@ -182,16 +205,19 @@ class FillCurve(NamedTuple):
     """Events a day that sweep past a bid at each DISTANCES point,
     non-increasing in distance. from_history says the market's own history
     went into it; False is the prior alone. exit_per_day is how often a day
-    the mid was back where a sweep found it, which no valuation reads."""
+    the mid was back where a sweep found it, which no valuation reads.
+    sweep_sizes is the table sweep_fill draws a sweep's size from: the
+    measured SWEEP_SIZES, or another for a backtest's arm."""
 
     rates: tuple
     from_history: bool
     exit_per_day: float
+    sweep_sizes: tuple = SWEEP_SIZES
 
     def per_day(self, distance):
         """Events a day reaching past a bid `distance` below the mid, linear
         between grid points and flat outside them. A bid of Q shares fills
-        Q * per_day(distance) a day: an event fills the whole bid."""
+        sweep_fill(Q) * per_day(distance) a day."""
         i = bisect.bisect_right(DISTANCES, distance)
         if i == 0:
             return self.rates[0]
@@ -200,6 +226,10 @@ class FillCurve(NamedTuple):
         lo, hi = DISTANCES[i - 1], DISTANCES[i]
         weight = (distance - lo) / (hi - lo)
         return self.rates[i - 1] + weight * (self.rates[i] - self.rates[i - 1])
+
+    def sweep_fill(self, shares):
+        """The shares of a bid of `shares` one sweep fills, by this curve's table."""
+        return sweep_fill(shares, self.sweep_sizes)
 
 
 # fit_prior over 256 markets of the 2026-10-05 backtest cache whose favorite

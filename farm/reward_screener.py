@@ -207,7 +207,7 @@ SCAN_HELP = {
     "expiry_buffer_days": "Stop farming this many days before end",
     "min_window_days": "Minimum farmable days left",
     "horizon_cap_days": "Cap on days counted toward rank",
-    "capital": "USD behind the favorite bid",
+    "capital": "USD of favorite inventory a market may hold",
     "max_lead": "Most the favorite bid may sit above the best bid already in the book. "
                 "0 joins it",
     "min_low_score": "The longshot bid never sits above the cheapest price scoring this per "
@@ -359,13 +359,17 @@ class Assessment(NamedTuple):
 
 class Outlook(NamedTuple):
     """What valuing a quote needs beyond the book, worked out by the caller:
-    the daily pool, the years to resolution, the fill curve and the hurdle
-    rate a filled share is discounted at."""
+    the daily pool, the years to resolution, the fill curve, the hurdle
+    rate a filled share is discounted at, and what a filled share is worth:
+    the farmer's FarmMarket.worth (p_true, or the book midpoint without
+    one), a scan's book midpoint. Whoever builds the Outlook decides what a
+    fill is credited."""
 
     rate_per_day: float
     years_left: float
     fills: fill_cost.FillCurve
     hurdle_rate: float
+    worth: Optional[float]
 
 
 class QuoteValue(NamedTuple):
@@ -759,7 +763,7 @@ def shares_ahead(levels, price):
     return sum(s for p, s in levels.bids if p > price + 1e-9)
 
 
-def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outlook, held=0.0,
+def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, outlook, held=0.0,
                 sale_price=None):
     """What a configuration of our quotes earns per day, net of what its fills cost.
 
@@ -767,15 +771,16 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
     quotes join it, my_q our Q_min there, bid the favorite bid's (price,
     size), or None, and held the favorite shares already in inventory: none
     for a scan or a preview. The reward is our share of the pool against
-    competing_score. The whole bid fills each time a sweep reaches past its
-    distance below mid: a sweep would find our bid in the book, so mid is the
-    one our quotes create. A bid with more than DEPTH_FREE_SHARES ahead of it
-    in levels (shares_ahead) is charged no fills, and its loss_per_share
-    still says what a filled share would lose. A fill loses its price less
-    fill_cost.share_value: the share sells at sale_price, the ask the farmer
-    would rest for it, credited never over p_true, or at p_true without one,
-    at the rate that ask sells the inventory the fill leaves,
-    fill_cost.sales_per_day of held plus the bid.
+    competing_score. Each sweep reaching past the bid's distance below mid
+    fills outlook.fills.sweep_fill of it: a sweep would find our bid in the
+    book, so mid is the one our quotes create. A bid with more than
+    DEPTH_FREE_SHARES ahead of it in levels (shares_ahead) is charged no
+    fills, and its loss_per_share still says what a filled share would lose.
+    A fill loses its price less fill_cost.share_value: the share sells at
+    sale_price, the ask the farmer would rest for it, credited never over
+    outlook.worth, or at that worth without one, at the rate that ask sells
+    the inventory the fill leaves, fill_cost.sales_per_day of held plus what
+    one sweep fills.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
@@ -783,15 +788,16 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
         return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0)
     price, size = bid
     deep = shares_ahead(levels, price) > DEPTH_FREE_SHARES
+    filled, worth = outlook.fills.sweep_fill(size), outlook.worth
     return QuoteValue(
         price=price,
         size=size,
         capital_usd=capital_usd,
         reward_per_day=reward,
-        fills_per_day=0.0 if deep else size * outlook.fills.per_day(mid - price),
+        fills_per_day=0.0 if deep else filled * outlook.fills.per_day(mid - price),
         loss_per_share=price - fill_cost.share_value(
-            p_true, p_true if sale_price is None else min(sale_price, p_true),
-            fill_cost.sales_per_day(held + size), outlook.years_left, outlook.hurdle_rate),
+            worth, worth if sale_price is None else min(sale_price, worth),
+            fill_cost.sales_per_day(held + filled), outlook.years_left, outlook.hurdle_rate),
     )
 
 
@@ -837,7 +843,7 @@ def plan_at(market, levels, config, fav_price, years_left):
     )
 
 
-def plan_quotes(market, levels, config, outlook, p_true):
+def plan_quotes(market, levels, config, outlook):
     """The plan whose favorite bid earns the most net of its fill cost.
     (QuotePlan, QuoteValue) or Skip.
 
@@ -856,7 +862,7 @@ def plan_quotes(market, levels, config, outlook, p_true):
                      plan.mid)
         capital = plan.fav_bid_size * plan.fav_bid_price + plan.low_size * plan.low_price
         value = value_quote(levels, plan.mid, market.v, market.min_size, my_q,
-                            (price, plan.fav_bid_size), capital, p_true, outlook)
+                            (price, plan.fav_bid_size), capital, outlook)
         if best is None or value.net_per_day >= best[1].net_per_day - 1e-12:
             best = plan, value
     if best is None:
@@ -890,8 +896,9 @@ def assess(market, levels, config, now, prior, history=None):
         return Skip("fragile midpoint")
 
     outlook = Outlook(market.rate_per_day, fill_cost.years_until(market.end_date, now),
-                      fill_cost.fill_curve(history, prior, config.min_fav), config.hurdle_rate)
-    planned = plan_quotes(market, levels, config, outlook, book_mid)
+                      fill_cost.fill_curve(history, prior, config.min_fav), config.hurdle_rate,
+                      book_mid)
+    planned = plan_quotes(market, levels, config, outlook)
     if isinstance(planned, Skip):
         return planned
     plan, value = planned
@@ -1791,6 +1798,10 @@ def cmd_approve(args):
     if args.capital is not None and not args.capital > 0:
         print("Error: --capital must be positive")
         sys.exit(2)
+    if args.bid_multiple is not None and not farm_db.SETTINGS["bid_multiple"].admits(
+            args.bid_multiple):
+        print("Error: --bid-multiple must be from 1 to 20")
+        sys.exit(2)
     conn = farm_db.open_db(args.db)
     row = farm_db.find_market(conn, args.market)
     if row is None:
@@ -1814,7 +1825,7 @@ def cmd_approve(args):
         )
 
     farm_db.approve_market(conn, row["condition_id"], args.p_true, args.budget, args.capital,
-                           now=datetime.now(timezone.utc))
+                           bid_multiple=args.bid_multiple, now=datetime.now(timezone.utc))
     capital = farm_db.find_market(conn, row["condition_id"])["capital_usd"]
     conn.close()
     capital = f"${capital:.2f}" if capital is not None else "the farmer's --capital"
@@ -1890,8 +1901,12 @@ Examples:
                          help="Naked USD risk allowed on the longshot leg where a fill gives "
                               "the favorite buyer 5%% a year or more (default: 25)")
     approve.add_argument("--capital", type=float,
-                         help="USD behind this market's favorite bid (default: keep the "
+                         help="USD of favorite inventory this market may hold (default: keep the "
                               "current value, else the farmer's --capital)")
+    approve.add_argument("--bid-multiple", type=float,
+                         help="Most this market's favorite bid may rest, as a multiple of "
+                              "the capital left, 1 to 20 (default: keep the current value, "
+                              "else the farmer's --bid-multiple)")
 
     reject = sub.add_parser("reject", parents=[db], help="Reject a market")
     reject.add_argument("market", help="Slug or condition id")

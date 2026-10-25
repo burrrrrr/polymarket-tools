@@ -92,7 +92,7 @@ class RenderedTipsTest(Writes):
                       "est_daily", "planned_capital", "net_apr", "days", "ahead", "vol24h"},
         "/review/0xddd": {"budget", "band", "min_size", "band_strip", "ahead",
                           "holding_rewards", "p_true", "naked_budget", "capital_cap",
-                          "ev_check", "start_paused", "sole_bid"},
+                          "bid_multiple", "ev_check", "start_paused", "sole_bid"},
         "/review/0x777": {"sole", "sole_bid"},
         "/partials/review/0xddd/live?p_true=97&naked_budget=25": {
             "score_per_share", "ties_up", "FAV_BID", "LONG_BID", "est_share", "est_daily",
@@ -103,7 +103,7 @@ class RenderedTipsTest(Writes):
                                         "farm_inventory", "baseline", "FAV_BID", "LONG_ASK",
                                         "hold", "expiry_cutoff", "naked_leg", "sole_bid"},
         f"/markets/{A}": {"QUOTING", "mid_effective", "book_mid", "capital_in_bids",
-                          "expiry_cutoff", "net_daily", "backoff", "book_in_band",
+                          "bid_multiple", "expiry_cutoff", "net_daily", "backoff", "book_in_band",
                           "score_per_share",
                           "baseline", "longshot", "edge_vs_p_true"},
         "/activity": {"earned_today", "scoring_share", "est_daily", "rate_now", "earned_total"},

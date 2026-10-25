@@ -46,6 +46,7 @@ SETTING_GROUPS = (QUOTING, SAFETY)
 
 SETTING_FIELDS = {
     "capital": Field("Capital per market ($)", QUOTING),
+    "bid_multiple": Field("Bid multiple of capital", QUOTING),
     "max_lead": Field("Max lead", QUOTING),
     "ask_offset": Field("Ask offset", QUOTING),
     "min_capture": Field("Min capture", QUOTING),
@@ -74,6 +75,9 @@ def _number(text):
 P_TRUE_ERROR = "Enter a whole percent from 1 to 99, or tick Follow the market."
 FOLLOW_AND_P_TRUE_ERROR = "Clear p_true or untick Follow the market."
 FOLLOW_SOLE_ERROR = "A sole bid needs your p_true. Untick Follow the market or Allow sole bid."
+BID_MULTIPLE = farm_db.SETTINGS["bid_multiple"]
+BID_MULTIPLE_ERROR = (f"Enter a multiple from {BID_MULTIPLE.low:g} to {BID_MULTIPLE.high:g}, "
+                      f"or leave blank for the farmer's.")
 
 
 def parse_p_true(text, follow_market):
@@ -97,13 +101,16 @@ class Decision(NamedTuple):
     capital: Optional[float]
     start_paused: bool
     sole_bid: bool
+    # None is the farmer's setting.
+    bid_multiple: Optional[float]
 
 
 def parse_decision(form):
     """Approval terms: p_true as a whole percent, or Follow the market ticked
-    instead, a budget of 0 or more, and an optional positive capital (blank
-    means the farmer's capital), whether to start paused, and whether a sole
-    bid is allowed, which needs a p_true."""
+    instead, a budget of 0 or more, an optional positive capital and an
+    optional bid multiple within farm_db's bound (blank means the farmer's),
+    whether to start paused, and whether a sole bid is allowed, which needs a
+    p_true."""
     errors = {}
     follow_market = form.get("follow_market") == "1"
     sole_bid = form.get("sole_bid") == "1"
@@ -121,23 +128,31 @@ def parse_decision(form):
         capital = _number(form.get("capital"))
         if capital is None or not capital > 0:
             errors["capital"] = "Enter a positive amount, or leave blank for the farmer's."
+    bid_multiple = None
+    if (form.get("bid_multiple") or "").strip():
+        bid_multiple = _number(form.get("bid_multiple"))
+        if bid_multiple is None or not BID_MULTIPLE.admits(bid_multiple):
+            errors["bid_multiple"] = BID_MULTIPLE_ERROR
     start_paused = form.get("start_paused") == "1"
-    return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid)), errors
+    return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid,
+                                         bid_multiple)), errors
 
 
 def preview_terms(form):
-    """(p_true, naked budget, capital) from a decision form still being typed:
-    each is None when blank or invalid, so a preview can plan around it."""
+    """(p_true, naked budget, capital, bid multiple) from a decision form still
+    being typed: each is None when blank or invalid, so a preview can plan
+    around it."""
     decision, errors = parse_decision(form)
     if decision:
-        return decision.p_true, decision.naked_budget, decision.capital
+        return decision.p_true, decision.naked_budget, decision.capital, decision.bid_multiple
     try:
         p_true = parse_p_true(form.get("p_true"), form.get("follow_market") == "1")
     except ValueError:
         p_true = None
     return (p_true,
             None if "naked_budget" in errors else _number(form.get("naked_budget")),
-            None if "capital" in errors else _number(form.get("capital")))
+            None if "capital" in errors else _number(form.get("capital")),
+            None if "bid_multiple" in errors else _number(form.get("bid_multiple")))
 
 
 class Rejection(NamedTuple):

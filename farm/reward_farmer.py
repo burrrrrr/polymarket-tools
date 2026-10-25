@@ -21,18 +21,23 @@ farmer rests on both sides, in four slots per market:
             price less, discounted at the hurdle rate over that hold, what
             the share sells for: the ask the fill would leave resting, never
             credited over p_true, and p_true for what is unsold at
-            resolution (farm/fill_cost.py has the measurements). The bid rests at
-            the price in the band, and the size at or under the market's
-            capital, whose rewards net of expected fills (from the market's
-            fill history, shrunk toward the last scan's cross-market prior)
-            are highest, never above p_true minus a margin, and only when
-            that net beats the orders without it. A bid with more than
+            resolution (farm/fill_cost.py has the measurements). A sweep
+            fills only what it sells past the bid (fill_cost.sweep_fill). The bid rests at the lowest price,
+            in the band, among the prices and sizes whose rewards net of
+            expected fills (from the market's fill history, shrunk toward
+            the last scan's cross-market prior) are within --tie-band of
+            the highest (pick_bid), at a size up to the bid room,
+            --bid-multiple times the capital left (bid_room); capital
+            stays the most inventory the market holds. It is never above
+            bid_cap: p_true minus a margin, lowered to the ceiling the
+            market's own fills set (farm/fill_watch.py), and it rests only
+            when its net beats the orders without it. A bid with more than
             reward_screener.DEPTH_FREE_SHARES bid above it is charged no
-            fills, so it rests at all of the capital left. Until the
-            market's history is read it does not rest at all. p_true is
-            the operator's view of the favorite, or none: a market without
-            one follows the book, and its p_true each cycle is the midpoint
-            of the book without our orders, with no margin under it
+            fills, so it rests at all of the bid room. Until the market's
+            history is read it does not rest at all. p_true is the
+            operator's view of the favorite, or none: a market without one
+            follows the book, and its p_true each cycle is the midpoint of
+            the book without our orders, with no margin under it
             (FarmMarket.worth, ev_cap). A one-sided book rests it no bid.
   LONG_ASK  longshot SELL, Q_one, covered by longshot shares. Sells off
             longshot inventory from an unwanted fill, at the mirror of the
@@ -79,6 +84,11 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                filled right before the news arrives. A bid leaving never
                cools down: it looks the same cancelled or sold into, and the
                plan just follows the bids that remain.
+  FILLED       a favorite bid of ours left the book without our cancel, or a
+               cancel found it matched: it filled, and the positions read
+               that shows the shares lags by up to a minute. No favorite bid
+               rests until it does, or FILL_CONFIRM_S passes and an alert
+               says positions show no fill. Checked after a cooldown.
   BELOW_RANGE  the midpoint fell under --min-fav, where the strategy does not
                apply; it resumes a little above the threshold.
   SOLE_BID     on a market a human opted in (markets.sole_bid) with a p_true
@@ -92,6 +102,9 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                longshot bid scoring, and the longshot bid as it rests, or
                higher, up to SOLE_BID_FREE_RETURN a year, when the favorite
                bid cannot rest its full lead around it.
+               Our own favorite ask is left out of that lowest price, so an
+               exit never lifts the bid. A sole bid rests the capital left,
+               not the bid room.
                With no other maker scoring, that earns the whole pool. It lasts
                until the other bids have supported a favorite bid again for
                five minutes without a break, an ask drop cools the market
@@ -112,7 +125,7 @@ Each market has a lifecycle, advanced every cycle by `step_state`:
                with fresh runtime state, through the same checks.
 
 Every state but QUOTING and SOLE_BID wants no bids, so the same reconcile step that
-maintains quotes also cancels them. COOLDOWN, BELOW_RANGE and UNREWARDED leave
+maintains quotes also cancels them. COOLDOWN, FILLED, BELOW_RANGE and UNREWARDED leave
 the two exits resting, priced as in any plan: they only sell inventory, at or
 over its exit floor. PAUSED and RETIRED take down every order. Separately, a longshot fill (longshot
 shares went up) pauses the naked LONG_BID for --naked-cooldown seconds, and
@@ -192,6 +205,7 @@ directory POLYMARKET_DATA_DIR names, or the repo directory.
 
 import argparse
 import getpass
+import itertools
 import json
 import math
 import os
@@ -210,9 +224,10 @@ import httpx
 from dotenv import load_dotenv
 
 import data_dir
-from farm import farm_books, farm_db, fill_cost
+from farm import farm_books, farm_db, fill_cost, fill_watch
 from farm.exit_value import TAPE_ROWS_FARMER, tape_from_json, tape_to_json
 from farm.farm_db import EventKind, stamp
+from farm.fill_watch import SIZE_STEP, Ceiling
 from py_clob_client_v2.clob_types import (
     AssetType,
     BalanceAllowanceParams,
@@ -288,9 +303,6 @@ SOLE_BID_FREE_RETURN = 0.07
 # scores nothing for ~30 seconds with no other maker scoring.
 SOLE_BID_KEEP_ABOVE = 0.01
 
-# The fractions of the capital left that a favorite bid is planned at.
-SIZE_LADDER = (1.0, 0.75, 0.5, 0.25, 0.125)
-
 # An order whose size left this band around the target gets replaced.
 KEEP_SIZE_RANGE = (0.8, 1.25)
 
@@ -328,10 +340,6 @@ LONG_PRICE_SLACK_TICKS = 2
 # ticks of it: the target moves a tick with each tick of mid, and a cheaper
 # ask out-scores it, so score alone never lifts an ask to a dearer target.
 ASK_PRICE_SLACK_TICKS = 2
-
-# The CLOB lists some orders one size step (0.01 share) under the size placed,
-# so a cover check exact to the share would replace them every cycle.
-SIZE_STEP = 0.01
 
 # The smallest order the CLOB takes. An exit rests down to this size, under
 # the reward minimum too, so a partial fill never strands what it leaves.
@@ -455,6 +463,11 @@ class FarmMarket(NamedTuple):
     # The adjusted midpoint of this cycle's book without our orders, set by
     # with_book_mid; None before a book is read and in a one-sided book.
     book_mid: Optional[float] = None
+    # A scan or a sole bid plans at 1 (bid_room).
+    bid_multiple: float = 1.0
+    # Set by step_market each cycle; None in a plan with no fills behind it,
+    # as the console's preview or a scan.
+    bid_ceiling: Optional[Ceiling] = None
 
     @property
     def worth(self):
@@ -508,12 +521,15 @@ class FavChoice(NamedTuple):
     each favorite bid resting to the QuoteValue of the orders planned around
     it as it rests, at its own price and size; a bid no plan can rest, off
     the candidate prices or with nothing to balance it, has no entry.
-    baseline_per_day is what the plan with no favorite bid earns."""
+    baseline_per_day is what the plan with no favorite bid earns. band_floor
+    is the lowest net inside the tie band (tie_floor of the best net), which
+    a resting bid priced over the chosen one must keep (keep_failure)."""
 
     best: Optional[QuoteValue] = None
     resting: MappingProxyType = NOTHING_RESTING
     baseline_per_day: float = 0.0
     reason: str = ""
+    band_floor: float = 0.0
 
 
 class Target(NamedTuple):
@@ -557,6 +573,7 @@ class Phase(Enum):
     COOLDOWN = "COOLDOWN"
     BELOW_RANGE = "BELOW_RANGE"
     SOLE_BID = "SOLE_BID"
+    FILLED = "FILLED"
     PAUSED = "PAUSED"
     UNREWARDED = "UNREWARDED"
     RETIRED = "RETIRED"
@@ -565,7 +582,7 @@ class Phase(Enum):
 # The phases that take the bids down and leave the exits resting: a sale of
 # inventory at or over its exit floor buys nothing and frees its capital,
 # whatever stopped the quoting. A pause and a retirement take down every order.
-EXITS_REST = (Phase.COOLDOWN, Phase.BELOW_RANGE, Phase.UNREWARDED)
+EXITS_REST = (Phase.COOLDOWN, Phase.BELOW_RANGE, Phase.UNREWARDED, Phase.FILLED)
 
 
 class State(NamedTuple):
@@ -589,6 +606,8 @@ class Observation(NamedTuple):
     are the human's flags on the market row; naked_cooldown_until is set by
     the farmer after a longshot fill. sole_bid says the market opted in, no
     other bid supports a favorite bid, and sole_bid_target has orders to rest.
+    fill_pending says a favorite bid of ours left the book and positions have
+    not shown the fill yet.
     """
 
     mid: Optional[float]
@@ -604,6 +623,7 @@ class Observation(NamedTuple):
     naked_cooldown_until: Optional[datetime] = None
     resolution: Optional[str] = None
     sole_bid: bool = False
+    fill_pending: bool = False
 
 
 class MarketInfo(NamedTuple):
@@ -633,6 +653,8 @@ class FarmConfig(NamedTuple):
     naked_cooldown_s: float
     expiry_buffer_days: float
     hurdle_rate: float
+    bid_multiple: float
+    tie_band: float
 
 
 # ---------------------------------------------------------------------------
@@ -671,6 +693,17 @@ def ev_cap(fm, cfg):
     return None if fm.book_mid is None else floor_to_tick(fm.book_mid, fm.tick)
 
 
+def bid_cap(fm, cfg):
+    """The highest favorite bid this cycle: ev_cap, lowered to the market's
+    post-fill ceiling. The quoting plan, the sole-bid plan and the keep rule
+    read this one cap. supported() keeps ev_cap: it asks whether the other
+    makers' book supports a bid, which our own fills do not change."""
+    cap = ev_cap(fm, cfg)
+    if cap is None or fm.bid_ceiling is None:
+        return cap
+    return min(cap, fm.bid_ceiling.price)
+
+
 def with_book_mid(fm, book):
     """fm with book_mid read from this cycle's favorite book without our orders."""
     return fm._replace(book_mid=adjusted_mid(book.bids, book.asks, fm.min_size))
@@ -687,8 +720,30 @@ def long_exit_floor(position, fm, cfg):
 
 
 def capital_room(fm, position):
-    """USD of favorite bid the capital still allows after favorite shares held, at cost."""
+    """USD of favorite inventory the capital still allows after the favorite
+    shares held, at cost: the most one sweep may still add. Holding, the
+    exits and a sole bid's size go by it."""
     return max(0.0, fm.capital - position.fav_shares * position.fav_avg)
+
+
+def bid_room(fm, position):
+    """USD a quoting favorite bid may rest: fm.bid_multiple times
+    capital_room. A sweep fills only part of a bid, so a bid larger than the
+    capital left earns more reward for about the same fills; one sweep can
+    still fill all of it. Nothing once inventory at cost reaches capital."""
+    return fm.bid_multiple * capital_room(fm, position)
+
+
+def bid_sizes(room_usd, price, min_size):
+    """The sizes a favorite bid at price is planned at, largest first: all of
+    room_usd, three quarters of it, then a half, a quarter and so on, while a
+    size buys the reward minimum and the CLOB's smallest order."""
+    sizes = []
+    for fraction in itertools.chain((1.0, 0.75), (0.5 ** k for k in itertools.count(1))):
+        size = round_size_down(fraction * room_usd / price)
+        if size < max(min_size, ORDER_MIN_SHARES):
+            return sizes
+        sizes.append(size)
 
 
 def naked_room(fm, position):
@@ -818,7 +873,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     The favorite ask prices off fill_mid per plan_fav_ask_price.
 
     `levels` is the favorite book without our own resting orders. The bid
-    starts at fav_size, or at all of capital_room without one. Sizes are
+    starts at fav_size, or at all of bid_room without one. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
     LONG_BID, at the cheapest free price whatever the rest costs, or else at
     the cheapest price that covers the rest within the budget, no higher
@@ -841,7 +896,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
 
     fav_bid = None
     if fav_price is not None and fav_size is None:
-        fav_size = round_size_down(capital_room(fm, position) / fav_price)
+        fav_size = round_size_down(bid_room(fm, position) / fav_price)
     if fav_price is not None:
         fav_bid = fav_price, fav_size
     long_ask = fav_ask = None
@@ -911,7 +966,8 @@ def live_rate(fm, total_rates):
 
 def market_outlook(fm, total_rates, history, prior, cfg, now, any_floor=False):
     """The Outlook a favorite bid on this market is valued with: fills from its
-    history shrunk toward prior, or prior alone without a history.
+    history shrunk toward prior, or prior alone without a history, and a
+    filled share worth fm.worth.
 
     any_floor values a history read at another min_fav as a reader with that
     floor would. The farmer asks for it: a min_fav change leaves every history
@@ -919,14 +975,15 @@ def market_outlook(fm, total_rates, history, prior, cfg, now, any_floor=False):
     them would cancel every favorite bid for that long."""
     floor = history.floor if any_floor and history is not None else cfg.min_fav
     return Outlook(live_rate(fm, total_rates), fill_cost.years_until(fm.end_date, now),
-                   fill_cost.fill_curve(history, prior, floor), cfg.hurdle_rate)
+                   fill_cost.fill_curve(history, prior, floor), cfg.hurdle_rate, fm.worth)
 
 
 def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
     """The favorite ask the farmer would rest once `bid` fills: on the
     inventory with the bid's shares added at its price, anchored at the mid
     before the fill, the book's now, or fill_mid when higher, as
-    plan_fav_ask_price takes them. None if that ask would cross."""
+    plan_fav_ask_price takes them. None if that ask would cross. value_of
+    passes the shares one sweep fills, not the whole bid."""
     book_mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
     shares = position.fav_shares + bid.size
     filled = position._replace(fav_shares=shares, fav_avg=(
@@ -936,42 +993,72 @@ def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
 
 def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
     """value_quote of a planned set of orders, its favorite bid included, a
-    fill adding to the favorite shares the position holds and sold at its
-    fill_exit_price."""
+    fill of what one sweep takes (FillCurve.sweep_fill) adding to the
+    favorite shares the position holds and sold at its fill_exit_price."""
     by = {i.slot: i for i in target.intents}
     bid = by.get(Slot.FAV_BID)
     capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
-    sale_price = bid and fill_exit_price(fm, levels, position, cfg, bid, fill_mid)
+    sale_price = bid and fill_exit_price(
+        fm, levels, position, cfg, bid._replace(size=outlook.fills.sweep_fill(bid.size)),
+        fill_mid)
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
-                       bid and (bid.price, bid.size), capital, fm.worth, outlook,
+                       bid and (bid.price, bid.size), capital, outlook,
                        position.fav_shares, sale_price)
+
+
+def tie_floor(net, tie_band):
+    """The lowest net a bid may have and still tie a best net of `net`."""
+    return net - tie_band * abs(net)
+
+
+def pick_bid(valued, baseline, tie_band):
+    """The (plan, QuoteValue) to rest out of `valued`, or None when none nets
+    more than the baseline. Every bid netting at least tie_floor of the best
+    net ties with it, and the lowest price among them rests, at its best net
+    there, then its smaller size. The optimum is flat (several prices and
+    sizes net within a few percent of the best), and of bids that earn about
+    the same, the lowest costs least when it fills. tie_band 0 ties only
+    exact nets."""
+    if not valued:
+        return None
+    floor = tie_floor(max(value.net_per_day for _, value in valued), tie_band)
+    band = [c for c in valued
+            if c[1].net_per_day >= floor - 1e-12 and c[1].net_per_day > baseline]
+    if not band:
+        return None
+    low = min(value.price for _, value in band)
+    at_low = [c for c in band if c[1].price <= low + 1e-9]
+    best = max(value.net_per_day for _, value in at_low)
+    return min((c for c in at_low if c[1].net_per_day >= best - 1e-12),
+               key=lambda c: c[1].size)
 
 
 def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without_history=False,
                   fill_mid=None, resting=()):
-    """The orders this market should rest, with the favorite bid at the price
-    and size that earn the most net of what its fills cost.
+    """The orders this market should rest, with the favorite bid at the
+    lowest price and size that earn within the tie band of the most net of
+    what its fills cost.
 
-    Every price from fav_bid_candidates, capped at ev_cap, is planned with
-    quotes_at at each SIZE_LADDER fraction of capital_room that buys the
-    reward minimum, and valued with value_quote on the plan as balanced. The
-    capital is the most the bid may be: reward is a share of the pool, so
-    each further share earns less, while a fill costs more a share the more
-    inventory it leaves. The baseline is the plan with no favorite bid:
-    nothing, or the exits alone. The best bid is quoted only when its net
-    beats the baseline's reward, and a tie goes to the lower price, then to
-    the smaller size. Fills not drawn from the market's own history quote the
-    baseline, so real money is never bid on the prior alone, unless
-    bid_without_history (a preview of a market the farmer has not read yet).
+    Every price from fav_bid_candidates, capped at bid_cap, is planned with
+    quotes_at at each bid_sizes size of bid_room, and valued with
+    value_quote on the plan as balanced. The bid room is the most the bid
+    may be: reward is a share of the pool, so each further share earns
+    less, while a sweep fills more of a larger bid and a fill costs more a
+    share the more inventory it leaves. The baseline is the plan with no
+    favorite bid: nothing, or the exits alone. pick_bid chooses among the
+    bids that beat the baseline's reward. Fills not drawn from the market's
+    own history quote the baseline, so real money is never bid on the prior
+    alone, unless bid_without_history (a preview of a market the farmer has
+    not read yet).
 
     Not every size is planned. A smaller bid at a price earns no more reward
     than a larger one there, and a fill never pays, so once a size's reward
-    is under the best net found, no smaller size at its price can be chosen.
-    Every price is valued at its full size first, which sets that bar high
-    before any smaller size is tried. A price where the full size rests no
-    bid rests no smaller one: the naked budget trims every size it cannot
-    balance to the same bid.
+    is under the tie_floor of the best net found, no smaller size at its
+    price can tie. Every price is valued at its full size first, which sets
+    that bar high before any smaller size is tried. A price where the full
+    size rests no bid rests no smaller one: the naked budget trims every
+    size it cannot balance to the same bid.
 
     resting is the orders the market rests now. Each favorite bid among them
     at a candidate price is planned and valued the same way at its own price
@@ -987,7 +1074,7 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
 
     if not outlook.fills.from_history and not bid_without_history:
         return no_bid("no fill history yet")
-    cap = ev_cap(fm, cfg)
+    cap = bid_cap(fm, cfg)
     if cap is None:
         return no_bid("no p_true or book midpoint")
 
@@ -1000,26 +1087,31 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
         return None
 
     prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead, cap)
-    room = capital_room(fm, position)
+    room = bid_room(fm, position)
     full = [valued(price, round_size_down(room / price)) for price in prices]
     bar = max((value.net_per_day for _, value in filter(None, full)), default=None)
-    best = None
+    every = []
     for price, choice in zip(prices, full):
-        smaller = (round_size_down(fraction * room / price) for fraction in SIZE_LADDER[1:])
+        smaller = iter(bid_sizes(room, price, fm.min_size)[1:])
         while choice:
-            if best is None or choice[1].net_per_day >= best[1].net_per_day - 1e-12:
-                best = choice
+            every.append(choice)
             bar = max(bar, choice[1].net_per_day)
             size = next(smaller, 0.0)
-            if size < fm.min_size or choice[1].reward_per_day < bar - 1e-12:
+            if (size < fm.min_size
+                    or choice[1].reward_per_day < tie_floor(bar, cfg.tie_band) - 1e-12):
                 break
             choice = valued(price, size)
+    if not every:
+        held = fm.bid_ceiling
+        under = (f" under the {cents(held.price, fm.tick)} ceiling: {held.why}"
+                 if held is not None and cap <= held.price + 1e-9 else "")
+        return no_bid("no scoring favorite bid" + under)
+    best = pick_bid(every, baseline, cfg.tie_band)
     if best is None:
-        return no_bid("no scoring favorite bid")
+        top = max(every, key=lambda c: c[1].net_per_day)[1]
+        return no_bid(f"no favorite bid pays: best net {signed_usd(top.net_per_day)}/day at "
+                      f"{cents(top.price, fm.tick)}")
     plan, value = best
-    if value.net_per_day <= baseline:
-        return no_bid(f"no favorite bid pays: best net {signed_usd(value.net_per_day)}/day at "
-                      f"{cents(value.price, fm.tick)}")
     rested = {}
     for order in resting:
         price = round(order.price, tick_decimals(fm.tick))
@@ -1027,7 +1119,8 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
             around = valued(price, order.size_remaining)
             if around:
                 rested[order.id] = around[1]
-    return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline))
+    return plan._replace(fav=FavChoice(value, MappingProxyType(rested), baseline,
+                                       band_floor=tie_floor(bar, cfg.tie_band)))
 
 
 def supported(levels, fm, position, cfg, fill_mid=None):
@@ -1092,7 +1185,7 @@ def sole_bid_target(fm, levels, position, cfg, orders, fill_mid=None):
 
     The longshot bid moves up from there only when the favorite bid cannot
     rest its full SOLE_BID_LEAD_TICKS over the lowest paying price around it:
-    under a low ask, or where ev_cap or the ask would hold the bid at the
+    under a low ask, or where bid_cap or the ask would hold the bid at the
     highest price it may have. It then goes to the highest price
     sole_long_allowed that naked_room buys min_size of and that keeps the
     midpoint over TWO_SIDED_ABOVE, where one-sided quotes earn nothing. The
@@ -1135,25 +1228,25 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
                     fill_mid=None, full_lead=False):
     """sole_bid_target's plan around a longshot bid of long_size at
     long_price, which is the resting order `long` or a new one (None). None
-    when no favorite bid can rest around it, and with full_lead when ev_cap
+    when no favorite bid can rest around it, and with full_lead when bid_cap
     or the ask would hold it under its full lead.
 
     The favorite bid rests SOLE_BID_LEAD_TICKS above the lowest price whose
     midpoint keeps that longshot bid inside the band, with all of
-    capital_room, and never above ev_cap. Nothing here values its fills: the
+    capital_room, and never above bid_cap. Nothing here values its fills: the
     human opted the market in knowing that every sale into the book fills
     this bid. A favorite bid resting between the lowest scoring price and
     SOLE_BID_KEEP_ABOVE over the target stays, at any size the capital
     allows. The exits rest as in any plan, the favorite ask anchored at the
     midpoint the longshot bid needs.
 
-    None when the market has no ev_cap, the book no ask of min_size, the
-    favorite bid would cross, top ev_cap or leave the midpoint under
-    min_fav, either bid would score nothing, or the capital buys less than
-    min_size.
+    None when the market has no bid_cap, the book no ask of min_size, the
+    favorite bid would cross, top bid_cap or leave the midpoint under
+    min_fav, the favorite bid or both the longshot bid and our favorite ask
+    would score nothing, or the capital buys less than min_size.
     """
     tick, v, decimals = fm.tick, fm.v, tick_decimals(fm.tick)
-    best_ask, cap = best_price(levels.asks, fm.min_size), ev_cap(fm, cfg)
+    best_ask, cap = best_price(levels.asks, fm.min_size), bid_cap(fm, cfg)
     if best_ask is None or cap is None:
         return None
     # The longshot bid scores while the favorite midpoint is above this.
@@ -1163,17 +1256,21 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     if position.fav_shares >= ORDER_MIN_SHARES:
         fav_ask = plan_fav_ask_price(fm, levels, edge_mid, position, cfg, fill_mid)
     # The longshot bid shows in the favorite book as an ask at its mirror,
-    # and is the best ask when it rests inside the spread. An ask under the
-    # reward minimum does not move the reward midpoint.
+    # and is the best ask when it rests inside the spread. Our own favorite
+    # ask is left out of the lowest price: as it fell to sell inventory it
+    # would lift the bid that bought it. It still sets the midpoint the plan
+    # scores at, and the bid stays under it. An ask under the reward minimum
+    # does not move the reward midpoint.
     ask = min(best_ask, mirror(long_price, tick))
+    mid_ask = ask
     if fav_ask is not None and position.fav_shares >= fm.min_size:
-        ask = min(ask, fav_ask)
+        mid_ask = min(ask, fav_ask)
 
     # A bid at p makes the midpoint (p + ask) / 2: over edge_mid above the
     # first price, and within v of the bid itself above the second.
     lowest = max(tick, round(
         floor_to_tick(max(2 * edge_mid - ask, ask - 2 * v), tick) + tick, decimals))
-    ceiling = min(cap, floor_to_tick(min(levels.asks[0][0], ask) - tick, tick))
+    ceiling = min(cap, floor_to_tick(min(levels.asks[0][0], mid_ask) - tick, tick))
     price = round(lowest + SOLE_BID_LEAD_TICKS * tick, decimals)
     if price > ceiling + 1e-9:
         if full_lead:
@@ -1195,7 +1292,7 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
         if size < fm.min_size:
             return None
 
-    mid = created_mid(price, best_price(levels.bids, fm.min_size) or 0.0, ask)
+    mid = created_mid(price, best_price(levels.bids, fm.min_size) or 0.0, mid_ask)
     sized = {Slot.FAV_BID: (price, size), Slot.LONG_BID: (long_price, long_size)}
     if position.long_shares >= ORDER_MIN_SHARES:
         sized[Slot.LONG_ASK] = (plan_long_ask_price(fm, levels, price, position, cfg),
@@ -1205,7 +1302,9 @@ def sole_bid_around(fm, levels, position, cfg, orders, long_price, long_size, lo
     intents = {slot: Intent(slot, fm.token(slot.role), slot.side, at, round_size_down(shares),
                             sized_score(slot, at, shares, mid, fm))
                for slot, (at, shares) in sized.items()}
-    if mid < cfg.min_fav or min(intents[Slot.FAV_BID].score, intents[Slot.LONG_BID].score) <= 1e-9:
+    two = max(intents[Slot.LONG_BID].score,
+              intents[Slot.FAV_ASK].score if Slot.FAV_ASK in intents else 0.0)
+    if mid < cfg.min_fav or min(intents[Slot.FAV_BID].score, two) <= 1e-9:
         return None
     return Target(mid, [intents[slot] for slot in Slot if slot in intents],
                   FavChoice(reason="sole bid"),
@@ -1221,7 +1320,7 @@ def scan_sole_bid(market, levels, config, now):
     cfg = FarmConfig(
         capital=config.capital, max_lead=config.max_lead, min_fav=config.min_fav,
         min_low_score=config.min_low_score, expiry_buffer_days=config.expiry_buffer_days,
-        hurdle_rate=config.hurdle_rate, ev_margin=0.0,
+        hurdle_rate=config.hurdle_rate, ev_margin=0.0, bid_multiple=1.0, tie_band=0.0,
         # A plan from no position prices no exit and keeps no order.
         ask_offset=0.0, min_capture=0.0, keep_ratio=0.0, drop_threshold=0.0,
         drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0)
@@ -1248,10 +1347,11 @@ def keep_failure(order, intent, target, fm, position, cfg):
     it rests (target.fav.resting) rather than by its score or the target's
     size: the net-best price moves a tick with every wiggle of the midpoint,
     while the net of the bid resting barely changes. It stays while that net
-    is within the keep margin of the best net and above the baseline, the
+    is within the keep margin of the chosen bid's net, or, priced over the
+    chosen bid, inside the tie band (band_floor), and above the baseline, the
     plan around it still rests at least 80% of it (a budget-trimmed bid's
     size moves a third between neighboring prices), and it is no more than
-    25% over the capital left.
+    25% over the bid room.
     A longshot bid is judged by the score it covers rather than its size: near
     the band edge a half-tick of mid moves its per-share score, and so the
     covering size, by a third. Score is min(Q_one, Q_two), so a shortfall
@@ -1302,8 +1402,12 @@ def keep_failure(order, intent, target, fm, position, cfg):
             return "outside the bid candidates"
         size = value.size
         slack = max((1 - cfg.keep_ratio) * abs(fav.best.net_per_day), NET_KEEP_SLACK_USD)
-        if (value.net_per_day < fav.best.net_per_day - slack
-                or value.net_per_day <= fav.baseline_per_day):
+        if cfg.tie_band > 0 and order.price > intent.price + 1e-9:
+            if value.net_per_day < fav.band_floor - 1e-12:
+                return "net below the tie band"
+        elif value.net_per_day < fav.best.net_per_day - slack:
+            return "net below keep ratio"
+        if value.net_per_day <= fav.baseline_per_day:
             return "net below keep ratio"
     elif order.slot is Slot.LONG_BID:
         if over_max_return(order.price, fm.zones.years_left):
@@ -1333,12 +1437,12 @@ def keep_failure(order, intent, target, fm, position, cfg):
             low * size - 1e-9 <= order.size_remaining <= high * size + 1e-9):
         return "size out of range"
     if order.slot is Slot.FAV_BID:
-        cap = ev_cap(fm, cfg)
+        cap = bid_cap(fm, cfg)
         if cap is None or order.price > cap + 1e-9:
-            return "above the EV cap"
+            return "above the bid cap"
     if order.slot is Slot.FAV_BID and order.price * order.size_remaining > (
-            high * capital_room(fm, position) + 1e-9):
-        return "over the capital"
+            high * bid_room(fm, position) + 1e-9):
+        return "over the bid room"
     if order.slot is Slot.FAV_ASK and order.price < exit_floor(position, fm, cfg) - 1e-9:
         return "below the exit floor"
     if order.slot is Slot.LONG_ASK and order.price < (
@@ -1463,6 +1567,8 @@ def step_state(state, obs, now, cfg):
         return State(Phase.COOLDOWN, now + timedelta(seconds=cfg.cooldown_s), "ask drop")
     if state.phase is Phase.COOLDOWN and now < state.until:
         return state
+    if obs.fill_pending:
+        return State(Phase.FILLED, reason="FAV_BID left the book; waiting for positions")
     if obs.sole_bid:
         return State(Phase.SOLE_BID)
     if obs.mid < cfg.min_fav:
@@ -1544,6 +1650,66 @@ def next_backoff(previous, now):
     return Backoff(now + timedelta(seconds=delay), delay, previous.attempts + 1)
 
 
+# What cancel_orders says of an order that was no longer resting.
+CANCEL_GONE = ("matched", "already canceled")
+
+
+def without_gone_bid(actions, orders, failed):
+    """The actions without their favorite bid place when the cancel of a
+    favorite bid among orders failed because that order was no longer
+    resting (CANCEL_GONE): it filled, and positions do not show it yet."""
+    bids = {o.id for o in orders if o.slot is Slot.FAV_BID}
+    if not any(order_id in bids and any(word in str(why).lower() for word in CANCEL_GONE)
+               for order_id, why in failed.items()):
+        return actions
+    return [a for a in actions if not (isinstance(a, Place) and a.intent.slot is Slot.FAV_BID)]
+
+
+def expected_orders(listed, actions, failed, placed):
+    """The orders that should rest once a market's actions land: those
+    listed, less the ones a cancel removed (its id not in failed), plus the
+    LiveOrders the CLOB took, as posted ({slot: LiveOrder}, None for one
+    refused), each with the id the CLOB gave it."""
+    removed = {order_id for a in actions if isinstance(a, Cancel)
+               for order_id in a.order_ids if order_id not in failed}
+    return [o for o in listed if o.id not in removed] + [
+        o for o in placed.values() if o is not None and o.id]
+
+
+def held_cost(position, baseline):
+    """(favorite shares the farm holds, when they rest an exit, else 0; their
+    average cost, or None when shares held before the farm managed the
+    market blend the wallet's average): what fill_watch's inventory ceiling
+    reads."""
+    held = position.fav_shares if position.fav_shares >= ORDER_MIN_SHARES else 0.0
+    blended = baseline is not None and baseline.fav > 0
+    return held, None if blended else position.fav_avg
+
+
+def stored_fills(events):
+    """The fill_watch.Fills of a market's FILL events, the favorite ones
+    with a price."""
+    side = {Slot.FAV_BID.name: BUY, Slot.FAV_ASK.name: SELL}
+    fills = []
+    for e in events:
+        if e.slot in side and e.price is not None:
+            data = e.data or {}
+            at = datetime.fromisoformat(data["filled_at"]) if data.get("filled_at") else e.at
+            fills.append(fill_watch.Fill(side[e.slot], e.price, at, e.at))
+    return fills
+
+
+def fill_data(slot, priced, fill_mid):
+    """The data of the FILL event of a fill priced as `priced` (a
+    fill_watch.Filled): where the price came from and when the fill left the
+    book, what stored_fills reads back."""
+    data = {"price_source": priced.source, "order_id": priced.order_id,
+            "filled_at": stamp(priced.at)}
+    if slot is Slot.FAV_BID:
+        data["fill_mid"] = fill_mid
+    return data
+
+
 def without_backed_off(actions, backoffs, now):
     """Drop places into slots still waiting out a rejection."""
     def waiting(action):
@@ -1597,8 +1763,8 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
 
     preview is what a paused market would place on resume; its intents show
     as the target with decision "preview" and are never acted on. FAV_BID
-    also carries the economics of the bid chosen (or previewed) and the fill
-    history behind them. LONG_BID carries, for the bid it rests once the
+    also carries the economics of the bid chosen (or previewed), the fill
+    history behind them, and the post-fill ceiling on it. LONG_BID carries, for the bid it rests once the
     cycle's actions land, the annual return a fill would give the favorite
     buyer and whether the naked budget leaves it alone (free_of_budget).
     """
@@ -1642,9 +1808,11 @@ def slot_views(state, orders, target, preview, actions, backoffs, fm, position, 
             "reason": reason,
         }
     fav = (preview or target).fav
+    ceiling = fm.bid_ceiling
     views[Slot.FAV_BID.name].update(
         economics=economics_view(fav), fav_reason=fav.reason,
-        history=fill_cost.history_to_json(history) if history else None)
+        history=fill_cost.history_to_json(history) if history else None,
+        ceiling=ceiling and {"price": ceiling.price, "why": ceiling.why})
     low = views[Slot.LONG_BID.name]
     rests = farm_db.resting_order(low)
     offers = fill_return(rests[0], fm.zones.years_left) if rests else None
@@ -1734,6 +1902,14 @@ def rewards_active(info, condition_id, total_rates):
     return total_rates is None or total_rates.get(condition_id, 0) >= MIN_POOL
 
 
+def approved_terms(row, cfg):
+    """(capital, bid_multiple) of an approved markets row: its own where set,
+    else the farmer's. The one place a blank term means the setting."""
+    capital, multiple = row["capital_usd"], row["bid_multiple"]
+    return (cfg.capital if capital is None else capital,
+            cfg.bid_multiple if multiple is None else multiple)
+
+
 def farm_market(row, info, cfg, now):
     """An approved DB row plus its market record as a FarmMarket, or Skip,
     with the time its end date leaves at now."""
@@ -1743,6 +1919,7 @@ def farm_market(row, info, cfg, now):
     if fav not in info.token_ids or len(others) != 1:
         return Skip("favorite token not in the market's two tokens")
     end_date = parse_time(row["end_date"]) or parse_time(market["end_date"])
+    capital, bid_multiple = approved_terms(row, cfg)
     return FarmMarket(
         condition_id=row["condition_id"],
         slug=row["slug"] or market["slug"],
@@ -1759,13 +1936,14 @@ def farm_market(row, info, cfg, now):
         p_true=row["p_true"],
         naked_budget_usd=row["naked_budget_usd"] or 0.0,
         expires_at=end_date - timedelta(days=cfg.expiry_buffer_days),
-        capital=row["capital_usd"] if row["capital_usd"] is not None else cfg.capital,
+        capital=capital,
         zones=Zones(fill_cost.years_until(end_date, now)),
         paused=bool(row["paused"]),
         naked_paused=bool(row["naked_paused"]),
         # A sole bid rests on the operator's view alone: a market following
         # the book has no price to hold it to while no other bid supports it.
         sole_bid=bool(row["sole_bid"]) and row["p_true"] is not None,
+        bid_multiple=bid_multiple,
     )
 
 
@@ -2037,12 +2215,17 @@ class Managed:
         self.mid_watch = None
         self.naked_paused_until = None
         self.fill_mid = None
+        self.fill_watch = fill_watch.NO_FILLS
         # Since when the book has supported a favorite bid without a break,
         # on a market that opted into a sole bid (support_held).
         self.supported_since = None
         self.held = None
         self.position = None
+        # The orders that should rest after the last cycle: its listing less
+        # the orders its cancels removed, plus the places the CLOB accepted,
+        # whose ids are posted. One missing from the next listing traded.
         self.orders = []
+        self.posted = frozenset()
         self.sim_orders = []
         self.snapshot = None
         self.mid_sampled_at = None
@@ -2171,6 +2354,13 @@ class Farmer:
             samples = farm_db.read_mids(self.db, managed.fm.condition_id, since)
             managed.mid_watch = seeded_watch([(s.at, s.book_mid) for s in samples], now)
 
+    def seeded_fill_watch(self, condition_id):
+        """A market's fill watch rebuilt from its FILL events, so a market
+        that joins the managed set, at start or approved later, keeps the
+        ceilings its stored fills set."""
+        return fill_watch.seeded_fill_watch(stored_fills(farm_db.read_events(
+            self.db, condition_id=condition_id, kinds=(EventKind.FILL,), limit=100)))
+
     def seed_histories(self, now):
         """Take each wanted market's history from its farm_state row, and its
         buy tape from fav_buys, while each is fresh, so the first cycle keeps
@@ -2295,7 +2485,8 @@ class Farmer:
                 continue
             self.skips.pop(cid, None)
             if managed is None:
-                self.markets[cid] = Managed(fm, info, row_baseline(row))
+                managed = self.markets[cid] = Managed(fm, info, row_baseline(row))
+                managed.fill_watch = self.seeded_fill_watch(cid)
                 self.emit(EventKind.PHASE,
                           f"Managing {fm.label}: {fm.fav_outcome} "
                           f"p_true {p_true_text(fm.p_true)}, "
@@ -2356,11 +2547,29 @@ class Farmer:
                         f"long {baseline.long:g} (never sold); farming fav "
                         f"{current.fav_shares:g}, long {current.long_shares:g}")
                 continue
-            for slot, shares in fill_events(previous, current):
+            events = fill_events(previous, current)
+            shares_of = dict(events)
+            resting = {o.slot: o for o in managed.orders}
+            seen = fill_watch.watch_positions(
+                managed.fill_watch, shares_of.get(Slot.FAV_BID, 0.0),
+                shares_of.get(Slot.FAV_ASK, 0.0), resting.get(Slot.FAV_BID),
+                resting.get(Slot.FAV_ASK), now)
+            managed.fill_watch = seen.watch
+            for gone in seen.stale:
+                what = "fill" if gone.side == BUY else "sale"
+                slot = Slot.FAV_BID if gone.side == BUY else Slot.FAV_ASK
+                self.emit(EventKind.ALERT,
+                          f"ALERT {fm.label}: {slot.name} {gone.order_id} "
+                          f"{cents(gone.price, fm.tick)} x {gone.shares:g} left the book "
+                          f"{(now - gone.at).total_seconds():.0f}s ago; positions show no "
+                          f"{what}", fm.condition_id, slot, data={"order_id": gone.order_id})
+            for slot, shares in events:
                 if slot is Slot.FAV_BID:
                     mids = [m for m in (managed.fill_mid, self.fill_mid_seen(fm, now)) if m]
                     managed.fill_mid = max(mids, default=None)
-                self.record_fill(managed, slot, shares)
+                priced = {Slot.FAV_BID: seen.bid, Slot.FAV_ASK: seen.ask}.get(slot)
+                self.record_fill(managed, slot, shares, priced or fill_watch.rested(
+                    resting.get(slot), now))
                 if slot is Slot.LONG_BID:
                     managed.naked_paused_until = now + timedelta(
                         seconds=self.cfg.naked_cooldown_s
@@ -2389,23 +2598,21 @@ class Farmer:
                 if m]
         return max(mids, default=None)
 
-    def record_fill(self, managed, slot, shares):
-        """A fill inferred from a position change, priced at the slot's resting order.
+    def record_fill(self, managed, slot, shares, priced):
+        """A fill inferred from a position change, priced as fill_watch
+        priced it (a fill_watch.Filled).
 
         The data API gives no fill price, so the price is that of the order
-        resting in the slot at the last cycle, if there was one.
+        the listing showed leaving the book, else that of the order resting in
+        the slot at the last cycle, if there was one. The event records what
+        a restart's fill watch is rebuilt from (fill_data).
         """
         fm = managed.fm
-        resting = next((o for o in managed.orders if o.slot is slot), None)
-        price = resting.price if resting else None
-        at = f" @ {cents(price, fm.tick)}" if resting else ""
-        data = {"price_source": "resting order at the last cycle" if resting
-                else "unknown: no order rested in the slot",
-                "order_id": resting.id if resting else None}
-        if slot is Slot.FAV_BID:
-            data["fill_mid"] = managed.fill_mid
+        price = priced.price
+        at = f" @ {cents(price, fm.tick)}" if price is not None else ""
         self.emit(EventKind.FILL, f"FILL {fm.label} {slot.name} {shares:g} shares{at}",
-                  fm.condition_id, slot, price, shares, data=data)
+                  fm.condition_id, slot, price, shares,
+                  data=fill_data(slot, priced, managed.fill_mid))
 
     def refresh_rewards(self, now):
         """Live only, best effort: our scoring share per market and today's earnings."""
@@ -2492,13 +2699,13 @@ class Farmer:
             if plan is not None:
                 plans.append(plan)
         try:
-            placed = self.execute(plans)
+            plans, placed, failed = self.execute(plans)
         except Exception as e:
             log(f"Error executing the cycle's orders: {e}")
-            placed = {}
+            placed, failed = {}, {}
         for plan in plans:
             try:
-                self.settle(plan, placed, now)
+                self.settle(plan, placed, failed, now)
             except Exception as e:
                 log(f"Error on {plan.managed.fm.label}: {e}")
         self.flush()
@@ -2515,10 +2722,20 @@ class Farmer:
         if levels.tick:
             fm = managed.fm = fm._replace(tick=levels.tick)
 
-        managed.orders = orders
+        gone = fill_watch.orders_gone(managed.orders, orders, fm.fav_token_id, now,
+                                      managed.posted)
+        managed.fill_watch = watch = fill_watch.watch_listing(managed.fill_watch, gone, now)
+        managed.orders, managed.posted = orders, frozenset()
+        for g in gone:
+            slot = Slot.FAV_BID if g.side == BUY else Slot.FAV_ASK
+            log(f"{fm.label}: {slot.name} {cents(g.price, fm.tick)} x {g.shares:g} left the book")
+        if fill_watch.fill_pending(watch):
+            self.positions_at = 0.0
         book = strip_own(levels, orders, fm) if self.live else levels
         fm = with_book_mid(fm, book)
         book_mid = fm.book_mid
+        fm = fm._replace(bid_ceiling=fill_watch.inventory_ceiling(
+            watch, *held_cost(managed.position, managed.baseline), fm.tick, now))
         book_ask = drop_ask(book.asks, fm.min_size)
         managed.mid_watch = watch_mid(managed.mid_watch, book_mid, now)
         fm = managed.fm = fm._replace(
@@ -2537,6 +2754,7 @@ class Farmer:
             naked_paused=fm.naked_paused,
             naked_cooldown_until=managed.naked_paused_until,
             resolution=self.resolutions.get(fm.condition_id),
+            fill_pending=fill_watch.fill_pending(watch),
         )
         managed.fill_mid = held_fill_mid(managed.fill_mid, book_mid, managed.position, fm)
         sole = None
@@ -2591,14 +2809,19 @@ class Farmer:
         self.report(managed, target, orders, actions)
         return Plan(managed, levels, book_mid, target, preview, orders, actions)
 
-    def settle(self, plan, placed, now):
-        """Back off rejected slots, publish the market's view, and retire it if due."""
+    def settle(self, plan, placed, failed, now):
+        """Back off rejected slots, note the orders that should rest now,
+        publish the market's view, and retire it if due. placed maps each
+        place to the LiveOrder posted, None when the CLOB refused it."""
         managed = plan.managed
         fm = managed.fm
+        posted = {slot: order for (cid, slot), order in placed.items() if cid == fm.condition_id}
+        managed.orders = expected_orders(plan.orders, plan.actions, failed, posted)
+        managed.posted = frozenset(o.id for o in posted.values() if o is not None)
         for (condition_id, slot), accepted in placed.items():
             if condition_id != fm.condition_id:
                 continue
-            if accepted:
+            if accepted is not None:
                 managed.backoffs.pop(slot, None)
                 continue
             backoff = managed.backoffs[slot] = next_backoff(managed.backoffs.get(slot), now)
@@ -2682,56 +2905,77 @@ class Farmer:
                           fm.condition_id, i.slot, i.price, i.size, i.score)
 
     def execute(self, plans):
-        """Carry out every plan's actions, all cancels before any place.
+        """Carry out every plan's actions, all cancels before any place. A
+        market whose favorite bid cancel found the order gone places no
+        favorite bid this cycle (without_gone_bid).
 
-        Returns {(condition_id, slot): whether its place was accepted}.
+        Returns (the plans as carried out, {(condition_id, slot): the
+        LiveOrder its place posted, None when refused}, {order_id: why its
+        cancel failed}).
         """
-        placed = {(p.managed.fm.condition_id, a.intent.slot): False
+        failed = {}
+        if self.live:
+            failed = self.cancel_planned(plans)
+            kept = []
+            for p in plans:
+                actions = without_gone_bid(p.actions, p.orders, failed)
+                if actions != p.actions:
+                    log(f"{p.managed.fm.label}: FAV_BID not placed; the bid it replaces "
+                        f"filled and positions do not show it yet")
+                kept.append(p._replace(actions=actions))
+            plans = kept
+        placed = {(p.managed.fm.condition_id, a.intent.slot): None
                   for p in plans for a in p.actions if isinstance(a, Place)}
         if not self.live:
             for p in plans:
-                self.simulate(p.managed, p.actions)
-            return dict.fromkeys(placed, True)
-        self.cancel_planned(plans)
-        for fm, i in self.post_planned(plans):
-            placed[(fm.condition_id, i.slot)] = True
-        return placed
+                for order in self.simulate(p.managed, p.actions):
+                    placed[(p.managed.fm.condition_id, order.slot)] = order
+            return plans, placed, failed
+        for fm, order in self.post_planned(plans):
+            placed[(fm.condition_id, order.slot)] = order
+        return plans, placed, failed
 
     def simulate(self, managed, actions):
-        """Dry run: carry the actions out on the market's simulated orders."""
+        """Dry run: carry the actions out on the market's simulated orders;
+        the orders placed."""
         cancelled = {i for a in actions if isinstance(a, Cancel) for i in a.order_ids}
         kept = [o for o in managed.sim_orders if o.id not in cancelled]
+        placed = []
         for a in actions:
             if isinstance(a, Place):
                 self.sim_ids += 1
                 i = a.intent
-                kept.append(LiveOrder(f"sim-{self.sim_ids}", i.slot, i.token_id,
-                                      i.side, i.price, i.size))
-        managed.sim_orders = kept
+                placed.append(LiveOrder(f"sim-{self.sim_ids}", i.slot, i.token_id, i.side,
+                                        i.price, i.size))
+        managed.sim_orders = kept + placed
+        return placed
 
     def cancel_planned(self, plans):
-        """Every plan's cancels in one call."""
+        """Every plan's cancels in one call; {order_id: why} of the ones
+        that failed, every id when the call itself did."""
         fm_of = {order_id: p.managed.fm for p in plans for a in p.actions
                  if isinstance(a, Cancel) for order_id in a.order_ids}
         if not fm_of:
-            return
+            return {}
         try:
             resp = self.client.cancel_orders(list(fm_of))
         except Exception as e:
             for fm in {fm.condition_id: fm for fm in fm_of.values()}.values():
                 self.emit(EventKind.ALERT, f"  cancel failed on {fm.label}: {e}",
                           fm.condition_id)
-            return
-        failed = (resp or {}).get("not_canceled") or {}
-        for order_id, why in dict(failed).items():
+            return {order_id: str(e) for order_id in fm_of}
+        failed = dict((resp or {}).get("not_canceled") or {})
+        for order_id, why in failed.items():
             fm = fm_of.get(order_id)
             self.emit(EventKind.ALERT, f"  cancel {order_id} failed: {why}",
                       fm.condition_id if fm else None, data={"order_id": order_id})
+        return failed
 
     def post_planned(self, plans):
         """Sign every plan's places and post them in shared batches.
 
-        Returns the (fm, intent) of each place the CLOB accepted.
+        Returns (fm, LiveOrder) of each place the CLOB accepted, as posted,
+        with the id the CLOB gave it ("" when it gave none).
         """
         signed = []
         for p in plans:
@@ -2777,7 +3021,8 @@ class Farmer:
                               fm.condition_id, i.slot, i.price, i.size, i.score,
                               data={"response": resp if isinstance(resp, dict) else str(resp)})
                 else:
-                    accepted.append((fm, i))
+                    accepted.append((fm, LiveOrder(resp.get("orderID") or "", i.slot,
+                                                   i.token_id, i.side, i.price, i.size)))
         return accepted
 
     def sellable(self, fm, intent):
@@ -2819,8 +3064,13 @@ class Farmer:
         self.emit(EventKind.RETIRE, line, fm.condition_id, data={"reason": reason})
 
     def check_collateral(self):
-        planned = sum(capital_room(m.fm, m.position)
-                      for m in self.active() if m.position is not None)
+        """Alert when the wallet cannot fund the capital left on every market:
+        the inventory the farm could hold. A resting bid over it is by
+        design and the CLOB has not refused one for balance, so the bid room
+        is only logged."""
+        positioned = [m for m in self.active() if m.position is not None]
+        planned = sum(capital_room(m.fm, m.position) for m in positioned)
+        resting = sum(bid_room(m.fm, m.position) for m in positioned)
         try:
             resp = self.client.get_balance_allowance(
                 BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -2829,7 +3079,8 @@ class Farmer:
         except Exception as e:
             log(f"Warning: collateral balance check failed ({e})")
             return
-        log(f"Collateral ${balance:,.2f}; favorite bids plan up to ${planned:,.2f}")
+        log(f"Collateral ${balance:,.2f}; favorite bids plan up to ${planned:,.2f} of "
+            f"inventory, resting up to ${resting:,.2f}")
         if balance < planned:
             self.emit(EventKind.ALERT,
                       "Warning: collateral is short of the planned favorite bids; "
@@ -2950,6 +3201,8 @@ def config_from(args):
         naked_cooldown_s=args.naked_cooldown,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
+        bid_multiple=args.bid_multiple,
+        tie_band=args.tie_band,
     )
 
 
@@ -2998,9 +3251,9 @@ Examples:
     )
     for flag, kind, default, help_text in (
         ("--interval", float, 5.0, "Seconds between cycles"),
-        ("--capital", float, 500.0, "Most USD a market's favorite bid may be, favorite "
-                                    "inventory at cost included. The farmer rests the "
-                                    "size at or under it that nets the most"),
+        ("--capital", float, 500.0, "Most USD of favorite inventory a market may hold, at "
+                                    "cost; its favorite bid may rest --bid-multiple "
+                                    "times what is left"),
         ("--max-lead", float, 0.005, "Most the favorite bid may sit above the best bid "
                                      "already in the book. 0 joins it"),
         ("--ask-offset", float, 0.01, "Favorite ask distance above the midpoint"),
@@ -3023,6 +3276,11 @@ Examples:
                                        "costs its price minus what it sells for, "
                                        "discounted at this rate over the weeks the sale "
                                        "takes"),
+        ("--bid-multiple", float, 4.0, "Most a quoting favorite bid may rest, as a multiple "
+                                        "of the capital left; capital stays the most "
+                                        "inventory a market holds"),
+        ("--tie-band", float, 0.05, "Favorite bids netting within this fraction of the "
+                                    "best net are tied, and the lowest price rests"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")
