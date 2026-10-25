@@ -24,12 +24,15 @@ the mid they found, over its last HISTORY_DAYS days of trades, at most one an
 hour. Few markets see enough sweeps to be rated alone, so each count is
 shrunk toward a Prior that a scan pools across markets, by as many days of
 evidence as the markets' spread around the pooled rate is worth. A sweep
-that reaches a bid of Q shares fills min(Q, X) of it, X what the seller
-wanted beyond the bids ahead, and X is heavy-tailed, so a bid of Q shares
-fills sweep_fill(Q), the mean of min(Q, X) over SWEEP_SIZES, times the
-FillCurve's rate at its distance a day: about Q for a small bid, and little
-more than the typical seller for a large one. reward_screener.value_quote
-charges a bid behind more than DEPTH_FREE_SHARES no fills at all.
+counted at a bid's distance brings Sweeps.sellers sellers to it, each
+selling X shares, and of the A shares bid ahead of the bid, counting no
+more than DEPTH_CREDIT_MAX, the share Sweeps.hold holds, so each fills
+min(Q, max(0, X - hold * A)) of a bid of Q. X is heavy-tailed, so a bid of
+Q shares fills SWEEPS.fill(Q, A) times the FillCurve's rate at its distance
+a day: about Q per seller for a small
+bid at the front of the book, little more than the typical seller for a
+large one, and less the deeper the book ahead. The tail cap's sweep is one
+seller selling X's TAIL_QUANTILE quantile (Sweeps.dump).
 
 A History also times how long the mid took to be back where each sweep at
 EXIT_DISTANCE found it (exits, held_days), a Prior pools that
@@ -47,6 +50,7 @@ make_history and fit_prior.
 import bisect
 import math
 from datetime import datetime
+from statistics import NormalDist
 from typing import Iterable, NamedTuple, Optional
 
 # Hits chain into one sweep while each lands within SWEEP_GAP_S of the last
@@ -103,23 +107,94 @@ SOLD = ((100.0, 0.674), (1000.0, 0.419))
 # fill replayed, and turns negative past 44,000.
 MIN_SOLD = 0.05
 
-# Shares one FILL event takes of a bid it reaches, 40 bin means of a censored
-# lognormal fit to 272 fills on 127 markets, from
-#   python -m analysis.fill_calibration fit --db data\farm.db --until 2026-10-25T09:45:00Z
-SWEEP_SIZES = (
-    1.9, 4.3, 6.6, 9, 11.5, 14.1, 17, 20.1, 23.5, 27.1,
-    31, 35.3, 39.9, 45, 50.6, 56.7, 63.3, 70.7, 78.8, 87.8,
-    97.8, 109, 121.6, 135.7, 151.7, 170, 190.9, 215.2, 243.6, 277.2,
-    317.5, 366.7, 427.8, 505.9, 609.1, 751.9, 963.7, 1314.8, 2039.5, 6638.2,
-)
-# A table under which every sweep fills the whole bid: sweep_fill(q) is q.
-WHOLE_BID = (math.inf,)
+TAIL_QUANTILE = 0.99
+# No more of the shares bid ahead than this hold in front of a bid. The
+# farmer's bids behind more were still filled, whole ones included, where
+# the hold of all of them would stop every seller (fill_calibration report,
+# by shares ahead).
+DEPTH_CREDIT_MAX = 10_000.0
+_NORMAL = NormalDist()
 
 
-def sweep_fill(shares, sizes=SWEEP_SIZES):
-    """The shares of a resting bid of `shares` that one sweep reaching it
-    fills, on average: the mean of min(shares, x) over the sweep sizes."""
-    return sum(min(shares, x) for x in sizes) / len(sizes)
+class Sweeps(NamedTuple):
+    """What one sweep a FillCurve counts at a bid's distance does to the bid.
+    It brings `sellers` sellers to the bid's price, each selling X shares, X
+    lognormal(mu, sigma), sigma 0 being X = exp(mu) every time and mu inf a
+    seller who fills any bid whole. Of the shares bid ahead of the bid, the
+    share `hold` holds in front of it, up to DEPTH_CREDIT_MAX of them, and
+    the rest are cancelled or swept with it, so a seller fills
+    min(Q, max(0, X - held(ahead))) of a bid of Q. The tail is one seller
+    dumping X's quantile-th quantile."""
+
+    mu: float
+    sigma: float
+    hold: float = 0.0
+    sellers: float = 1.0
+    quantile: float = TAIL_QUANTILE
+
+    def survival(self, x):
+        """P(X > x)."""
+        if x <= 0:
+            return 1.0
+        if self.sigma == 0:
+            return 1.0 if math.log(x) < self.mu else 0.0
+        return 0.5 * math.erfc((math.log(x) - self.mu) / self.sigma / math.sqrt(2))
+
+    def _partial(self, x):
+        """E[X; X <= x]."""
+        if x <= 0:
+            return 0.0
+        if self.sigma == 0:
+            return math.exp(self.mu) if self.mu <= math.log(x) else 0.0
+        return (math.exp(self.mu + self.sigma ** 2 / 2)
+                * _NORMAL.cdf((math.log(x) - self.mu - self.sigma ** 2) / self.sigma))
+
+    def held(self, ahead):
+        """The shares of `ahead` that hold in front of the bid."""
+        return self.hold * min(ahead, DEPTH_CREDIT_MAX)
+
+    def fill(self, shares, ahead=0.0):
+        """The shares of a bid of `shares`, `ahead` bid ahead of it, that one
+        sweep's sellers fill on average: sellers times the integral of
+        P(X > x) from held(ahead) over the next `shares`."""
+        lo = self.held(ahead)
+        hi = lo + shares
+        return self.sellers * (hi * self.survival(hi) - lo * self.survival(lo)
+                               + self._partial(hi) - self._partial(lo))
+
+    def events(self, ahead=0.0):
+        """The fills one sweep brings a bid with `ahead` bid ahead of it: its
+        sellers who get past the shares that hold."""
+        return self.sellers * self.survival(self.held(ahead))
+
+    def per_fill(self, shares, ahead=0.0):
+        """The shares one fill takes, on average: the inventory a fill leaves.
+        0 when no seller gets past the bids ahead. Never over `shares`, which
+        far in the tail the ratio of two vanishing terms can pass."""
+        events = self.events(ahead)
+        return min(shares, self.fill(shares, ahead) / events) if events > 0 else 0.0
+
+    @property
+    def dump(self):
+        """The shares the tail's seller brings."""
+        return math.exp(self.mu + self.sigma * _NORMAL.inv_cdf(self.quantile))
+
+    def tail(self, shares, ahead=0.0):
+        """The shares of the bid the tail's seller fills."""
+        return min(shares, max(0.0, self.dump - self.held(ahead)))
+
+
+# What a seller brings to a bid, a censored lognormal, the share of the shares
+# bid ahead of the bid that holds, and the sellers (FILL events) a counted
+# sweep brings, fit jointly to 225 fills on 113 of the 630 markets
+# that rested a bid, shares ahead counted up to 10,000, from
+#   python -m analysis.fill_calibration fit --db data\farm.db --books data\farm_books.db
+#       --cache work\fill-pricing\cache --until 2026-10-25T09:45:00Z
+# against the scan prior fit 2026-10-24T02:40:38.263924+00:00 on 60 markets: sellers
+# scales that prior's rates, so a new prior needs a refit.
+SWEEPS = Sweeps(mu=3.9180, sigma=1.7609, hold=0.1765, sellers=3.1310)
+SWEEPS_PRIOR_AT = datetime.fromisoformat("2026-10-24T02:40:38.263924+00:00")
+WHOLE_BID = Sweeps(math.inf, 0.0)
 
 
 def share_value(p_true, sale_price, per_day, years, hurdle_rate):
@@ -204,18 +279,18 @@ class FillCurve(NamedTuple):
     non-increasing in distance. from_history says the market's own history
     went into it; False is the prior alone. exit_per_day is how often a day
     the mid was back where a sweep found it, which no valuation reads.
-    sweep_sizes is the table sweep_fill draws a sweep's size from: the
-    fitted SWEEP_SIZES, or another for a backtest's arm."""
+    sweeps is what a sweep reaching a bid fills of it: the fitted SWEEPS,
+    or others for a backtest's arm."""
 
     rates: tuple
     from_history: bool
     exit_per_day: float
-    sweep_sizes: tuple = SWEEP_SIZES
+    sweeps: Sweeps = SWEEPS
 
     def per_day(self, distance):
         """Events a day reaching past a bid `distance` below the mid, linear
-        between grid points and flat outside them. A bid of Q shares fills
-        sweep_fill(Q) * per_day(distance) a day."""
+        between grid points and flat outside them. A bid of Q shares with A
+        ahead of it fills sweeps.fill(Q, A) * per_day(distance) a day."""
         i = bisect.bisect_right(DISTANCES, distance)
         if i == 0:
             return self.rates[0]
@@ -224,10 +299,6 @@ class FillCurve(NamedTuple):
         lo, hi = DISTANCES[i - 1], DISTANCES[i]
         weight = (distance - lo) / (hi - lo)
         return self.rates[i - 1] + weight * (self.rates[i] - self.rates[i - 1])
-
-    def sweep_fill(self, shares):
-        """The shares of a bid of `shares` one sweep fills, by this curve's table."""
-        return sweep_fill(shares, self.sweep_sizes)
 
 
 # fit_prior over 256 markets of the 2026-10-05 backtest cache whose favorite

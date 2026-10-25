@@ -258,8 +258,7 @@ class LongshotBidTest(unittest.TestCase):
         self.assertEqual((bid.price, bid.size), (0.022, 454.54))
 
     def test_the_first_score_over_the_bound_at_the_lowest_tick_is_not_limited(self):
-        # v 6.5c and a 0.937 midpoint put 0.1c three ticks inside the band
-        # edge, scoring 0.00213: 234,722.23 shares, $234.72, cover 500.
+        # 0.1c sits three ticks inside the band edge, where no budget limits it.
         book = Levels(bids=[(0.932, 100.0)], asks=[(0.942, 100.0)], tick=0.001)
         mid = (0.932 + 0.942) / 2
         self.assertAlmostEqual(score(0.065, 1 - mid - 0.001), 0.00213, places=5)
@@ -267,8 +266,7 @@ class LongshotBidTest(unittest.TestCase):
         self.assertEqual((bid.price, bid.size), (0.001, 234722.23))
 
     def test_a_score_a_floats_noise_under_the_bound_counts_as_the_bound(self):
-        # A score computed from a midpoint can land a float's noise under a
-        # round bound: 0.01 came out as 0.00999999999999968 on a live book.
+        # A live book's 0.01 bound came out as 0.00999999999999968.
         zones = steady(0.99)
         self.assertTrue(reward_screener.sized_without_budget(0.001, 0.002 - 1e-12, 0.035,
                                                              zones))
@@ -276,12 +274,7 @@ class LongshotBidTest(unittest.TestCase):
                                                               zones))
 
     def test_a_price_is_free_only_where_it_passed_at_the_steady_midpoint_too(self):
-        # 0.1c scores 0.00716 against the Pfizer midpoint now, 0.9395. Three
-        # ticks lower in the last ten minutes it scored 0.0015, so the
-        # budget still limits it, and the bid rests at 0.5c, the cheapest
-        # price that cost at most $0.50 a unit there too. With no midpoint
-        # watched the free zone is closed, and $10 buys the most score at
-        # 0.1c, 10,000 shares.
+        # 0.1c passes at Pfizer's midpoint now but not at the steady one three ticks lower.
         book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
         bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 1000.0, 10.0, 0.1,
                            Zones(YEARS, 0.9365))
@@ -295,10 +288,7 @@ class LongshotBidTest(unittest.TestCase):
                                                              Zones(YEARS, 0.9395)))
 
     def test_a_one_cent_tick_is_free_only_far_from_the_end_date(self):
-        # On a 1c tick the cheapest bid is 1c, where covering 500 takes
-        # 6,722.23 shares, $67. A quarter out 1c offers 4.1% a year and the
-        # budget does not limit it. 60 days out it offers 6.3%, and $10
-        # buys the most score at 2c.
+        # The yield 1c offers a buyer grows as the end date nears.
         book = Levels(bids=[(0.94, 100.0)], asks=[(0.96, 100.0)], tick=0.01)
         bid = longshot_bid(book, 0.95, 0.055, 0.01, 20.0, 500.0, 10.0, 0.1, steady(0.95))
         self.assertEqual((bid.price, bid.size), (0.01, 6722.23))
@@ -307,8 +297,7 @@ class LongshotBidTest(unittest.TestCase):
         self.assertEqual((bid.price, bid.size), (0.02, 500.0))
 
     def test_a_finer_tick_has_free_prices_under_a_tenth_of_a_cent(self):
-        # On a 0.01c tick the cheapest bid is 0.01c, where a share scores
-        # 0.0337. Covering 5,000 takes 148,270 shares, $14.83 on a $10 budget.
+        # Covering 5,000 at 0.01c costs more than the $10 budget.
         book = Levels(bids=[(0.95, 100.0)], asks=[(0.96, 100.0)], tick=0.0001)
         bid = longshot_bid(book, 0.955, 0.055, 0.0001, 20.0, 5000.0, 10.0, 0.1, steady(0.955))
         self.assertEqual(bid.price, 0.0001)
@@ -316,8 +305,7 @@ class LongshotBidTest(unittest.TestCase):
         self.assertGreater(bid.price * bid.size, 10.0)
 
     def test_longshot_shares_awaiting_an_exit_put_every_price_back_under_the_budget(self):
-        # The free zone is closed then. On this book $10 buys 10,000 shares
-        # at 0.1c, 199.3 of the 250 needed.
+        # $10 at 0.1c covers less than the 250 needed.
         self.assertTrue(reward_screener.free_zone_open(19.99, 20.0))
         self.assertFalse(reward_screener.free_zone_open(20.0, 20.0))
         bid = longshot_bid(MISTRAL_BOOK_BID_GONE, 0.926, 0.085, 0.001, 20.0, 250.0, 10.0, 0.1,
@@ -330,16 +318,12 @@ class LongshotBidTest(unittest.TestCase):
                                       CONFIG._replace(min_low_score=0.99), 0.855, YEARS), Skip)
 
     def test_a_budget_under_the_reward_minimum_size_outside_the_free_zone_plans_nothing(self):
-        # $0.30 buys the most score at the 1.7c ceiling: 17.64 shares, under
-        # the 20-share minimum.
+        # $0.30 buys under the 20-share minimum even at the 1.7c ceiling.
         self.assertIsInstance(plan_at(MARKET, TIGHT_BOOK, CONFIG._replace(naked_budget=0.3),
                                       0.949, 37 * DAY), Skip)
 
     def test_the_mode_names_the_zone_of_the_longshot_bid(self):
-        # At a 0.9635 midpoint with v 3.5c a 0.1c bid scores nothing and a
-        # 0.2c bid 0.0002, where 180 shares cover a 20-share favorite bid
-        # for 36 cents. A quarter out 0.2c offers 0.8% a year, the free
-        # zone. 12 days out it offers 6.3%.
+        # 0.2c, the cheapest scoring price, is in the free zone a quarter out, not 12 days out.
         book = Levels(bids=[(0.95, 1000.0)], asks=[(0.977, 1000.0)], tick=0.001)
         plan = plan_at(MARKET, book, CONFIG._replace(capital=10.0), 0.93, YEARS)
         self.assertEqual((plan.low_price, plan.low_size), (0.002, 180.0))
@@ -349,11 +333,7 @@ class LongshotBidTest(unittest.TestCase):
         self.assertEqual(plan.mode, Mode.BUDGET)
 
     def test_a_short_budget_buys_the_most_score_at_the_lowest_tick_near_the_band_edge(self):
-        # The live Pfizer book: favorite midpoint 0.9395, v 0.065. 0.1c scores
-        # 0.00716, so $10 buys 10000 shares and 71.6 of score; the 1.7c ceiling
-        # scores 0.109 and buys 64.4. Neither covers the 72 needed. This is
-        # the search while longshot shares await an exit and the budget
-        # limits every price.
+        # Pfizer's live book, where neither 0.1c nor the 1.7c ceiling covers the 72 needed.
         book = Levels(bids=[(0.934, 100.0)], asks=[(0.945, 100.0)], tick=0.001)
         bid = longshot_bid(book, 0.9395, 0.065, 0.001, 20.0, 72.0, 10.0, 0.1, FAR)
         self.assertEqual((bid.price, bid.size), (0.001, round_size_down(10.0 / 0.001)))
@@ -456,14 +436,18 @@ SCAN_NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 PRIOR = fill_cost.DEFAULT_PRIOR._replace(markets=40, at=SCAN_NOW)
 
 
-def curve(*rates, sizes=fill_cost.WHOLE_BID):
+def curve(*rates, sweeps=fill_cost.WHOLE_BID):
     """A FillCurve with these rates from the first of DISTANCES, the last one
     held to the end, under which a sweep fills the whole bid unless given
-    other sweep sizes."""
-    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0, sizes)
+    other sweeps."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0, sweeps)
 
 
 NO_FILLS = curve(0.0)
+# A sweep of 100 shares, every time.
+FIXED_100 = fill_cost.Sweeps(math.log(100.0), 0.0)
+# A lognormal seller, no bids ahead holding.
+NO_HOLD = fill_cost.Sweeps(4.5289, 1.7226)
 
 
 def outlook(fills=NO_FILLS, years=0.25, rate=100.0, hurdle_rate=0.40, worth=0.98):
@@ -580,48 +564,67 @@ class ValueQuoteTest(unittest.TestCase):
         self.assertAlmostEqual(value.net_per_day, 50.0)
         self.assertAlmostEqual(value.net_apr, 50.0 * 365 / 94.0)
 
-    def test_a_bid_behind_over_20_000_shares_is_charged_no_fills(self):
-        # 12,000 and 8,001 shares rest above the 94c bid. It is valued as a
-        # bid no sweep reaches, and a filled share would lose what it loses
-        # in the thin book, where the same sweeps cost.
-        fills = outlook(curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0), years=1.0, worth=0.96)
+    def test_a_bid_behind_any_depth_is_charged_the_fills_that_get_past_it(self):
+        # 12,000 and 8,001 shares rest above the 94c bid, and 30% of the
+        # first DEPTH_CREDIT_MAX of them hold.
+        sweeps = fill_cost.Sweeps(4.5, 1.7, hold=0.3)
+        rates = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        fills = outlook(curve(*rates, sweeps=sweeps), years=1.0, worth=0.96)
         quote = (0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0)
         deep = self.BOOK._replace(bids=[(0.955, 12_000.0), (0.95, 8_001.0)])
         value = reward_screener.value_quote(deep, *quote, fills)
-        self.assertEqual(value.fills_per_day, 0.0)
-        self.assertEqual(value.fill_cost_per_day, 0.0)
-        self.assertEqual(value, reward_screener.value_quote(deep, *quote,
-                                                            outlook(NO_FILLS, years=1.0, worth=0.96)))
-        self.assertGreater(value.reward_per_day, 0.0)
-        self.assertEqual(value.net_per_day, value.reward_per_day)
+        self.assertAlmostEqual(value.fills_per_day, 0.1 * sweeps.fill(200.0, 20_001.0))
+        self.assertGreater(value.fill_cost_per_day, 0.0)
         thin = reward_screener.value_quote(self.BOOK, *quote, fills)
-        self.assertEqual(value.loss_per_share, thin.loss_per_share)
-        self.assertGreater(thin.fill_cost_per_day, 0.0)
+        self.assertLess(value.fills_per_day, thin.fills_per_day / 10)
 
-    def test_20_000_shares_ahead_or_depth_at_the_bids_own_price_is_charged_its_fills(self):
-        # Exactly 20,000 shares ahead are not over 20,000, and the shares at
-        # the bid's own 94c and under it are not ahead of it.
-        fills = outlook(curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0), years=1.0, worth=0.96)
+    def test_depth_at_the_bids_own_price_and_under_is_not_ahead_of_it(self):
+        fills = outlook(curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0,
+                              sweeps=fill_cost.Sweeps(4.5, 1.7, hold=0.3)), years=1.0, worth=0.96)
         quote = (0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0)
         thin = reward_screener.value_quote(self.BOOK, *quote, fills)
-        books = {"20,000 ahead": [(0.955, 12_000.0), (0.95, 8_000.0)],
-                 "at its own price": [(0.95, 100.0), (0.94, 50_000.0), (0.93, 50_000.0)]}
-        for name, bids in books.items():
-            with self.subTest(name):
-                value = reward_screener.value_quote(self.BOOK._replace(bids=bids), *quote, fills)
-                self.assertEqual((value.fills_per_day, value.loss_per_share),
-                                 (thin.fills_per_day, thin.loss_per_share))
-                self.assertGreater(value.fill_cost_per_day, 0.0)
+        own = self.BOOK._replace(bids=[(0.95, 100.0), (0.94, 50_000.0), (0.93, 50_000.0)])
+        value = reward_screener.value_quote(own, *quote, fills)
+        self.assertEqual((value.fills_per_day, value.loss_per_share),
+                         (thin.fills_per_day, thin.loss_per_share))
 
     def test_a_sweep_fills_the_bid_only_up_to_its_own_size(self):
         # 0.1 sweeps a day reach 2c under the mid.
-        sweeps = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0, sizes=(100.0,))
+        sweeps = curve(0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0, sweeps=FIXED_100)
         value = reward_screener.value_quote(self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q,
                                             (0.94, 200.0), 190.0, outlook(sweeps, years=1.0))
         self.assertAlmostEqual(value.fills_per_day, 10.0)
 
+    def test_the_bids_ahead_that_hold_cut_what_a_sweep_fills(self):
+        # 100 shares rest at 95c, ahead of the 94c bid. A 100-share sweep
+        # reaches 2c under the mid 0.1 times a day; with half the shares
+        # ahead holding it fills 50 of the 200, with none holding 100.
+        rates = (0.5, 0.4, 0.3, 0.25, 0.2, 0.15, 0.1, 0.0)
+        quote = (self.BOOK, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 200.0), 190.0)
+        held = reward_screener.value_quote(
+            *quote, outlook(curve(*rates, sweeps=FIXED_100._replace(hold=0.5)), years=1.0))
+        free = reward_screener.value_quote(*quote, outlook(curve(*rates, sweeps=FIXED_100),
+                                                           years=1.0))
+        self.assertAlmostEqual(held.fills_per_day, 5.0)
+        self.assertAlmostEqual(free.fills_per_day, 10.0)
+
+    def test_a_fill_leaves_what_a_sweep_that_gets_past_the_bids_ahead_takes(self):
+        # 3,000 shares ahead of the bid and 30% of them hold: most sweeps fill
+        # nothing, and the ones that fill leave the shares they took.
+        sweeps = fill_cost.Sweeps(4.5, 1.7, hold=0.3)
+        book = self.BOOK._replace(bids=[(0.955, 3000.0)])
+        quote = (book, 0.96, 0.035, 20.0, self.THEIR_Q, (0.94, 1000.0), 940.0)
+        value = reward_screener.value_quote(*quote, outlook(curve(0.5, sweeps=sweeps), years=1.0,
+                                                            worth=0.96))
+        mean = sweeps.fill(1000.0, 3000.0)
+        taken = mean / sweeps.events(3000.0)
+        self.assertAlmostEqual(value.fills_per_day, 0.5 * mean)
+        worth = fill_cost.share_value(0.96, 0.96, fill_cost.sales_per_day(taken), 1.0, 0.40)
+        self.assertAlmostEqual(value.loss_per_share, 0.94 - worth)
+        self.assertGreater(taken, 5 * mean)
+
     def test_a_fill_leaves_what_one_sweep_takes_to_sell(self):
-        newsom = outlook(curve(0.5, sizes=(100.0,)), years=0.228)
+        newsom = outlook(curve(0.5, sweeps=FIXED_100), years=0.228)
         big = reward_screener.value_quote(*self.NEWSOM, newsom)
         small = reward_screener.value_quote(*self.NEWSOM[:5], (0.960, 100.0), 2000.0,
                                             outlook(curve(0.5), years=0.228))
@@ -643,19 +646,57 @@ class ValueQuoteTest(unittest.TestCase):
 
 
 class TailTest(unittest.TestCase):
-    """The tail is what one sweep filling the whole bid would lose, its
-    shares sold as the inventory it leaves sells."""
+    """The tail is what the tail's seller would lose, its shares sold as the
+    inventory it leaves sells."""
 
     NEWSOM = ValueQuoteTest.NEWSOM
 
+    @staticmethod
+    def loss(shares):
+        """What a filled share of the Newsom bid loses at an inventory of shares."""
+        return 0.960 - fill_cost.share_value(0.98, 0.98, fill_cost.sales_per_day(shares),
+                                             0.228, 0.40)
+
     def test_the_tail_sells_the_whole_bid_where_a_fill_sells_one_sweep(self):
-        newsom = outlook(curve(0.5, sizes=(100.0,)), years=0.228)
+        # The 99th percentile sweep is over 5,000 shares, past the bid.
+        newsom = outlook(curve(0.5, sweeps=NO_HOLD), years=0.228)
         value = reward_screener.value_quote(*self.NEWSOM, newsom)
         whole = reward_screener.value_quote(*self.NEWSOM, outlook(curve(0.5), years=0.228))
         self.assertAlmostEqual(whole.loss_per_share, 0.02342, places=5)
         self.assertAlmostEqual(value.tail_usd, 2083.0 * whole.loss_per_share)
         self.assertEqual(whole.tail_usd, value.tail_usd)
         self.assertLess(value.loss_per_share, whole.loss_per_share)
+
+    def test_the_tail_is_the_dump_less_the_bids_ahead_that_hold(self):
+        # 9,000 shares bid at 96.5c put the 96c bid behind 9,100, half of them
+        # holding. The asks bind the competing score, so the reward is the
+        # same, and the dump fills the bid's 2,083 shares at the front but
+        # only what is left of it, 5,096 - 4,550, behind.
+        sweeps = NO_HOLD._replace(hold=0.5)
+        levels, *quote = self.NEWSOM
+        behind = levels._replace(bids=levels.bids + [(0.965, 9000.0)])
+        newsom = outlook(curve(0.5, sweeps=sweeps), years=0.228)
+        front = reward_screener.value_quote(*self.NEWSOM, newsom)
+        back = reward_screener.value_quote(behind, *quote, newsom)
+        left = sweeps.dump - 0.5 * 9100.0
+        self.assertAlmostEqual(left, 546.0, places=0)
+        self.assertEqual(back.reward_per_day, front.reward_per_day)
+        self.assertAlmostEqual(front.tail_usd, 2083.0 * self.loss(2083.0))
+        self.assertAlmostEqual(back.tail_usd, left * self.loss(left))
+        cap = (front.tail_days + back.tail_days) / 2
+        self.assertEqual((front.within_tail(cap), back.within_tail(cap)), (False, True))
+
+    def test_behind_any_depth_the_tail_is_the_dump_less_the_depth_credit_that_holds(self):
+        sweeps = NO_HOLD._replace(hold=0.3)
+        levels, *quote = self.NEWSOM
+        newsom = outlook(curve(0.5, sweeps=sweeps), years=0.228)
+        left = min(2083.0, sweeps.dump - 0.3 * fill_cost.DEPTH_CREDIT_MAX)
+        self.assertGreater(left, 0.0)
+        for ahead in (fill_cost.DEPTH_CREDIT_MAX, 30_000.0, 1e7):
+            with self.subTest(ahead=ahead):
+                deep = levels._replace(bids=[(0.965, ahead)])
+                value = reward_screener.value_quote(deep, *quote, newsom)
+                self.assertAlmostEqual(value.tail_usd, left * self.loss(left))
 
     def test_shares_already_held_sell_alongside_the_whole_bid(self):
         newsom = outlook(curve(0.5), years=0.228)
@@ -724,7 +765,7 @@ class AssessTest(unittest.TestCase):
     def test_a_scan_values_a_fill_with_nothing_held_and_the_book_mid_as_p_true(self):
         a = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
         price, size = a.plan.fav_bid_price, a.plan.fav_bid_size
-        filled = fill_cost.sweep_fill(size)
+        filled = fill_cost.SWEEPS.per_fill(size, reward_screener.shares_ahead(DEEP_BOOK, price))
         worth = fill_cost.share_value(a.book_mid, a.book_mid, fill_cost.sales_per_day(filled),
                                       fill_cost.years_until(MARKET.end_date, SCAN_NOW), 0.40)
         self.assertGreater(a.fills_per_day, 0)
@@ -737,7 +778,8 @@ class AssessTest(unittest.TestCase):
         self.assertEqual(a.fill_source, "history")
         self.assertEqual(fill_cost.history_from_json(a.history), history)
         fills = fill_cost.fill_curve(history, PRIOR, CONFIG.min_fav)
-        self.assertAlmostEqual(a.fills_per_day, fills.sweep_fill(a.plan.fav_bid_size)
+        ahead = reward_screener.shares_ahead(DEEP_BOOK, a.plan.fav_bid_price)
+        self.assertAlmostEqual(a.fills_per_day, fills.sweeps.fill(a.plan.fav_bid_size, ahead)
                                * fills.per_day(a.mid - a.plan.fav_bid_price))
         prior_only = assess(MARKET, DEEP_BOOK, CONFIG, SCAN_NOW, PRIOR)
         self.assertNotAlmostEqual(a.fills_per_day, prior_only.fills_per_day)
@@ -920,7 +962,9 @@ class RunScanTest(unittest.TestCase):
         unread = {a.market.condition_id: a for a in result.assessments}[unread_id]
         self.assertEqual(unread.fill_source, "prior")
         fills = fill_cost.fill_curve(None, result.prior, CONFIG.min_fav)
-        self.assertAlmostEqual(unread.fills_per_day, fills.sweep_fill(unread.plan.fav_bid_size)
+        ahead = reward_screener.shares_ahead(DEEP_BOOK, unread.plan.fav_bid_price)
+        self.assertAlmostEqual(unread.fills_per_day,
+                               fills.sweeps.fill(unread.plan.fav_bid_size, ahead)
                                * fills.per_day(unread.mid - unread.plan.fav_bid_price))
 
 

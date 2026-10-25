@@ -137,7 +137,7 @@ measured fraction in 30 days. The fraction runs in a straight line in the
 log of the inventory through the two measured sizes, stays at 67.4% under
 100 shares and never goes under 5%. The line gives 2,000 shares 34.2%,
 where the replay measured 30.9%. The inventory is the favorite shares the
-farmer already holds plus what one sweep fills of the bid, so a fill on top
+farmer already holds plus what one fill takes of the bid, so a fill on top
 of earlier fills costs more than the first.
 
 In the replay the shares that sold went at about the ask's price. So a share
@@ -156,42 +156,53 @@ under the average cost of the inventory with the fill added plus
 today. For each favorite bid price b on the tick grid inside the reward band,
 with the size Q it rests at once the quotes are balanced,
 
-    net(b) = reward/day(b, Q) - F(Q) * rate(m - b) * max(L(b), 0)
+    net(b) = reward/day(b, Q) - F(Q, A) * rate(m - b) * max(L(b), 0)
 
-where m is the midpoint once your quotes join the book, and rate(d) is how
-many times a day a sell sweep reaches more than d below the midpoint. A sweep
-that reaches your bid fills min(Q, X), X the shares the seller wanted beyond
-the bids ahead of yours. X is heavy-tailed, so F(Q) is the mean of min(Q, x)
-over a fitted table, `SWEEP_SIZES` in `farm/fill_cost.py`. The table is fit
-to the farmer's own favorite bid fills, because a seller hits many makers and
-the public tape does not say which shares reached you. Each `FILL` event is
-one positions read with a fill, set beside the bid it hit, rebuilt from the
-`PLACE` rows. A fill that took 95% or more of that bid, and no more, only says
-the seller wanted at least that much, so it counts as censored there. A fill
-larger than the bid it was joined to also hit another order, so it says
-nothing about that bid and counts as an exact size. The table is the mean of
-40 equal-probability bins of a lognormal fit by maximum likelihood with that
-censoring. F is about Q for a small bid and grows slowly for a large one.
-Regenerate the table with
-`python -m analysis.fill_calibration fit --db data\farm.db --until TIME` and
-paste it with the provenance it prints, which names the time. Your own fills
-set X only: they are already trades in the public tape, so they never add to
-a market's count. On a short-dated
-market, or far under the midpoint, L(b) is negative: the share is
-worth more than the bid pays. A bid rests for its reward, so that fill costs
-nothing and is never counted as income.
+where m is the midpoint once your quotes join the book, rate(d) is how
+many times a day a sell sweep reaches more than d below the midpoint, and A
+is the shares other makers bid above b. Shares at the bid's own price do not
+count. F is what one counted sweep fills of the bid, from
+`SWEEPS` in `farm/fill_cost.py`:
 
-A bid behind a deep book is charged no fills. The model fills a bid
-whatever rests ahead of it, but a sweep has to take the shares bid above your
-price before it reaches your bid. So a bid with more than 20,000 shares bid
-above its price (`DEPTH_FREE_SHARES` in `farm/reward_screener.py`) is valued
-with a rate of zero, and its net is its reward. Shares at the bid's own price
-do not count. Of the 23 fills of the farmer's favorite bids from 2026-10-10
-to 2026-10-12 whose book was recorded, 19 had at most 1.1 times the bid's
-size ahead, and the deepest of the other four had 12,582 shares ahead. In
-the trade histories of the 273 quoting markets read on 2026-10-12, which
-cover 13,921 market-days, an hour of selling into bids came to over 20,000
-shares 37 times, once in 376 market-days.
+- A counted sweep brings `sellers` sellers to the bid's price. The rate
+  counts sweeps that trade through a price, and most fills are sells at the
+  bid's own price, so a counted sweep brings more than one.
+- Each seller sells X shares, X lognormal (`mu`, `sigma`).
+- A share `hold` of the shares ahead holds in front of the bid, counting no
+  more than `DEPTH_CREDIT_MAX` of them. The rest is cancelled or swept with
+  it. So a seller fills min(Q, max(0, X - hold * min(A, DEPTH_CREDIT_MAX)))
+  of the bid, and F(Q, A) is `sellers` times its mean. The farmer's bids
+  behind more than `DEPTH_CREDIT_MAX` were still filled, whole ones
+  included, so depth past it buys a bid nothing.
+
+These are fit together to the farmer's own favorite bid fills, because a
+seller hits many makers and the public tape does not say which shares
+reached you. Each `FILL` event is one positions read with a fill, set beside
+the bid it hit, rebuilt from the `PLACE` rows, and beside the shares bid
+ahead of it in the `farm_books.db` sample it landed in. A fill that took 95%
+or more of that bid, and no more, only says the seller wanted at least that
+much, so it counts as censored there. A fill larger than the bid it was
+joined to also hit another order, so it counts as an exact size. The fit
+maximises the likelihood of where the fills landed and how much each took,
+over every stretch the farmer rested a bid, with the rate's scale left free:
+the scale is `sellers`. Without the stretches no fill says how often the
+book ahead stopped a seller, and the fit finds no hold at all. F is about Q
+per seller for a small bid at the front of the book, grows slowly for a
+large one, and shrinks the deeper the book ahead. Refit with
+`python -m analysis.fill_calibration fit --db data\farm.db --books
+data\farm_books.db --cache DIR --until TIME` and paste `SWEEPS` with the
+provenance it prints, which names the time and the scan prior the rates
+shrank toward. `sellers` scales that prior's rates, so the report warns once
+the stored prior is another one, and a new prior needs a refit. The report
+prints the fitted values against your fills, by shares ahead among them.
+Your own fills set the sweeps only: they are already trades in the public
+tape, so they never add to a market's count. A filled share loses L(b) at
+the inventory one fill leaves, the shares a seller who gets past the book
+ahead takes on average.
+
+On a short-dated market, or far under the midpoint, L(b) is negative: the
+share is worth more than the bid pays. A bid rests for its reward, so that
+fill costs nothing and is never counted as income.
 
 The farmer chooses Q as well as b. A market's capital is the most favorite
 inventory it may hold, shares already held counted at cost. The resting bid
@@ -206,9 +217,7 @@ and so on while a size buys the reward minimum. The reward is a share of the
 pool, so each further share earns less, while a larger bid fills more and L
 grows with the inventory a fill leaves. So the size that nets the most can be
 under the bid room. Where the fills cost nothing, no smaller size nets more,
-so a bid behind a deep book rests at all of the bid room. At a price with
-more than 20,000 shares ahead no size is charged a fill, and the largest size
-earns the most reward. The naked budget is a separate limit where the
+and a bid behind a deep book costs little. The naked budget is a separate limit where the
 longshot bid sits outside the free zone: a bid it cannot balance shrinks to
 what it balances, whatever the bid room. So on most markets the longshot
 cover, not the multiple, sets how large the bid is, and a larger room lets
@@ -218,27 +227,31 @@ left, not the bid room: it values no fills. A scan sizes its bid at all of
 
 ### The tail cap
 
-One sweep can still fill all of a bid, and sellers that size are common: 19
-of the farmer's fills took 500 shares or more, and they were 47% of the
-shares bought. So a quoting favorite bid also has a tail: what one sweep
-filling all of it would lose, valued the way a fill is, with the inventory
-the whole bid leaves to sell,
+Sellers that take a large bid are common, and a few of them buy much of
+what the farmer is filled (the report's tail share). So a quoting favorite
+bid also has a tail: what one seller dumping X's 99th percentile
+(`TAIL_QUANTILE`, `Sweeps.dump`) would lose, past the share of the bids
+ahead that holds, valued the way a fill is, with the inventory those shares
+leave to sell,
 
-    tail(b, Q) = Q * max(L(b) at an inventory of the shares held plus Q, 0)
+    T(A, Q) = min(Q, max(0, dump - hold * min(A, DEPTH_CREDIT_MAX)))
+    tail(b, Q) = T * max(L(b) at an inventory of the shares held plus T, 0)
 
 The bid may rest only while its tail is at most `--tail-days` (default 30,
 the `tail_days` setting, 0 for no cap) days of the plan's reward. A larger
-bid, a higher price and a later end date each lose more. The tail grows
-faster with the size than the reward does, so at each price the farmer
-passes the sizes over the cap, largest first, and values each size on its
-own: its reward, and the slower sale of a larger inventory. The cap shrinks
-the bid under the bid room, whichever is tighter, and the price cap still
-applies. When the cap stops every bid that would pay, the reason says how
-many days of reward the cheapest tail costs. A resting bid stays while its
-tail is within a quarter over the cap, so a bid the cap sized is not
-replaced each time its reward dips. A sole bid is not capped.
+bid, a higher price and a later end date each lose more, and depth ahead
+past `DEPTH_CREDIT_MAX` lowers the tail no further. The tail grows faster
+with the size than the reward does, so at each price the farmer passes the sizes over the cap,
+largest first, and values each size on its own: its reward, and the slower
+sale of a larger inventory. The cap shrinks the bid under the bid room,
+whichever is tighter, and the price cap still applies. When the cap stops
+every bid that would pay, the reason says how many days of reward the
+cheapest tail costs. A resting bid stays while its tail is within a quarter
+over the cap, so a bid the cap sized is not replaced each time its reward
+dips. A sole bid is not capped.
 `python -m analysis.fill_calibration report` prints what the cap does to the
-markets quoting now, from no position, for the caps and hurdles you ask for.
+markets quoting now, from no position, for the caps, quantiles and hurdles
+you ask for.
 
 ### Choosing among bids that earn about the same
 
@@ -251,7 +264,7 @@ already resting above that price stays while its own net is inside the band,
 and is replaced once it falls out of it.
 
 A scan holds no shares and has no p_true, so it values a fill with an
-inventory of what one sweep fills of the bid and the book midpoint as
+inventory of what one fill takes of the bid and the book midpoint as
 p_true. The farmer's ask rests over the midpoint, so a scan's a(b) is the
 midpoint. The farmer values a market that follows the book the same way,
 with the shares it holds.
@@ -337,22 +350,22 @@ The model leaves out fills of the longshot bid.
 
 `python -m analysis.fill_calibration report --db ... --books ... --cache ...
 --split DATE --until TIME` is the gate for any change to the fill model: the
-size table, the prior rule or `FillCurve`. It scores predicted against
-realized fills over every stretch the farmer rested a favorite bid before
-`--until` (`farm_books.db`), with each market's history rebuilt as it was
-then from the backtest cache. A stretch behind more than 20,000 shares is
-predicted no fills, as the farmer values it. It prints events and shares
-realized over predicted per model, over all the data, before the split and
-from it, with 90% intervals from resampling markets. It breaks them down by
-predicted events per market, by where the rate came from and by fill unit,
-and prints the tail share, the top markets and the tail cap on current
-markets. A change passes when three things hold. The production model's
-interval over all the data includes 1, for events and for shares. A table
-fit before the split, scored from it, has a ratio inside [0.67, 1.5] and an
-interval that reaches it. And the rates are calibrated in the unit the table
-is fit in: one `FILL` event, not an hour of them.
+sweeps, the prior rule or `FillCurve`. It scores predicted against realized
+fills over every stretch the farmer rested a favorite bid before `--until`
+(`farm_books.db`), with each market's history rebuilt as it was then from
+the backtest cache. It prints events, shares and whole-bid fills (95% of the
+bid or more) realized over predicted per model, over all the data, before
+the split and from it, with 90% intervals from resampling markets. It breaks
+them down by predicted events per market, by where the rate came from and by
+the shares ahead of the bid, prints the fit with intervals from refitting
+resampled markets, and prints the tail share, the top markets and the tail
+cap on current markets. A change passes when three things hold. The
+production model's interval over all the data includes 1, for events and
+for shares. Sweeps fit before the split, scored from it, have a ratio inside
+[0.67, 1.5] and an interval that reaches it. And production's whole-bid
+fills over all the data, every depth ahead summed, pass that same band.
 
-Only the size table is refit before the split. The rates shrink toward the
+Only the sweeps are refit before the split. The rates shrink toward the
 stored prior, which the scan fit over the last 60 days of each market's
 trades, a window that overlaps the test window, so the events score from the
 split is not fully held out.

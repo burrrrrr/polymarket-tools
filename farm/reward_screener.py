@@ -154,18 +154,6 @@ DEFAULT_NAKED_BUDGET = 10.0
 # Above this midpoint only two-sided liquidity scores.
 TWO_SIDED_ABOVE = 0.90
 
-# A favorite bid with more than this many shares resting ahead of it is
-# charged no fills (shares_ahead). Any other bid is charged its whole size
-# each time a sweep reaches its price, whatever rests ahead, and behind about
-# 120,000 shares that charge shrank one bid to a quarter of its capital. Of
-# the 23 fills of the farmer's favorite bids from 2026-10-10 to 2026-10-12
-# whose book was recorded, 19 had at most 1.1 times the bid's size ahead, and
-# the deepest of the other four had 12,582 shares ahead. In the trade
-# histories of the 273 quoting markets read on 2026-10-12 (13,921
-# market-days), an hour of selling into bids came to over 20,000 shares 37
-# times, once in 376 market-days. 20,000 is a value chosen by hand.
-DEPTH_FREE_SHARES = 20_000
-
 # The favorite's sampling price is a last-trade-ish hint, not the book; the
 # prefilter only drops markets that are clearly too cheap, and the real
 # midpoint check happens on the book.
@@ -377,7 +365,8 @@ class QuoteValue(NamedTuple):
     bid's, or None for a configuration without one: no fills, and the reward
     the other legs earn alone. loss_per_share is what a filled share loses,
     negative when the share is worth more than its price. tail_usd is what
-    one sweep filling the whole bid would lose, never less than nothing."""
+    the tail's seller (fill_cost.Sweeps.tail) would lose, never less than
+    nothing."""
 
     price: Optional[float]
     size: float
@@ -786,26 +775,25 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, outlook, held=
     size), or None, and held the favorite shares already in inventory: none
     for a scan or a preview. The reward is our share of the pool against
     competing_score. Each sweep reaching past the bid's distance below mid
-    fills outlook.fills.sweep_fill of it: a sweep would find our bid in the
-    book, so mid is the one our quotes create. A bid with more than
-    DEPTH_FREE_SHARES ahead of it in levels (shares_ahead) is charged no
-    fills, and its loss_per_share still says what a filled share would lose.
-    A fill loses its price less fill_cost.share_value: the share sells at
-    sale_price, the ask the farmer would rest for it, credited never over
-    outlook.worth, or at that worth without one, at the rate that ask sells
-    the inventory the fill leaves, fill_cost.sales_per_day of held plus what
-    one sweep fills. The tail values the whole bid filled the same way, its
-    shares sold as held plus the whole bid sells, a deep bid's too: depth
-    ahead makes such a sweep rarer, not smaller.
+    fills outlook.fills.sweeps.fill of it, given the shares ahead of it in
+    levels (shares_ahead): a sweep would find our bid in the book, so mid is
+    the one our quotes create. A fill loses its price less
+    fill_cost.share_value: the share sells at sale_price, the ask the farmer
+    would rest for it, credited never over outlook.worth, or at that worth
+    without one, at the rate that ask sells the inventory the fill leaves,
+    fill_cost.sales_per_day of held plus what one fill takes (per_fill). The
+    tail values the shares the tail's seller fills (Sweeps.tail) the same
+    way, sold as held plus those shares sell.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
     if bid is None:
         return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0, 0.0)
     price, size = bid
-    deep = shares_ahead(levels, price) > DEPTH_FREE_SHARES
-    filled, worth = outlook.fills.sweep_fill(size), outlook.worth
+    ahead = shares_ahead(levels, price)
+    sweeps, worth = outlook.fills.sweeps, outlook.worth
     sale = worth if sale_price is None else min(sale_price, worth)
+    tail = sweeps.tail(size, ahead)
 
     def loss(shares):
         return price - fill_cost.share_value(worth, sale, fill_cost.sales_per_day(held + shares),
@@ -816,9 +804,9 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, outlook, held=
         size=size,
         capital_usd=capital_usd,
         reward_per_day=reward,
-        fills_per_day=0.0 if deep else filled * outlook.fills.per_day(mid - price),
-        loss_per_share=loss(filled),
-        tail_usd=size * max(0.0, loss(size)),
+        fills_per_day=sweeps.fill(size, ahead) * outlook.fills.per_day(mid - price),
+        loss_per_share=loss(sweeps.per_fill(size, ahead)),
+        tail_usd=tail * max(0.0, loss(tail)),
     )
 
 

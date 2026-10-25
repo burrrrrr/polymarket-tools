@@ -303,11 +303,11 @@ if no farmer was running when it was sent.
   most, and rests nothing once the capital is used. One sweep can fill all of
   a resting bid, so a market can hold up to its multiple times its capital
   for a moment; the backtest reports how often.
-- `--tail-days` caps each quoting favorite bid by what one sweep filling all
-  of it would lose: at most that many days of its plan's reward, the filled
-  shares valued as the ask sells that inventory (see
-  [the tail cap](pricing.md#the-tail-cap)). 0 is no cap. A sole bid is not
-  capped.
+- `--tail-days` caps each quoting favorite bid by what a 99th-percentile
+  seller would lose it, past the share of the bids ahead that holds: at most
+  that many days of its plan's reward, the filled shares valued as the ask
+  sells that inventory (see [the tail cap](pricing.md#the-tail-cap)). 0 is
+  no cap. A sole bid is not capped.
 - The approved budget caps the naked longshot leg outside the free zone, and
   no longshot bid rests where a fill would give a favorite buyer over 20% a
   year. [The longshot bid](pricing.md#the-longshot-bid) has both rules.
@@ -388,7 +388,7 @@ it does not manage.
 | `--capital` | 500 | Most USD of favorite inventory a market may hold, at cost |
 | `--bid-multiple` | 4 | Most a quoting favorite bid may rest, as a multiple of the capital left. A sole bid rests the capital left |
 | `--tie-band` | 0.05 | Favorite bids netting within this fraction of the best net are tied, and the lowest price rests |
-| `--tail-days` | 30 | Most days of its plan's reward one sweep filling the whole quoting favorite bid may lose, its shares sold as that inventory sells. 0 is no cap |
+| `--tail-days` | 30 | Most days of its plan's reward the quoting favorite bid may lose if a 99th-percentile seller hits it past the bids ahead that hold, its shares sold as that inventory sells. 0 is no cap |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask and longshot ask minimum above the shares' average cost |

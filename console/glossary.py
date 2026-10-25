@@ -66,14 +66,15 @@ GLOSSARY = {
                                        "plus the longshot bid."),
     "apr": Term("APR", "Estimated $/day ÷ capital × 365, before fill costs. A ranking figure, "
                        "not a forecast."),
-    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: its "
-                                       "size × how often a sell sweep reached that far below "
-                                       "the midpoint in the market's last 60 days, at most "
-                                       "once an hour, shrunk toward the rate the last scan "
-                                       "pooled across markets. Without the market's history "
-                                       "it is that pooled rate alone, and the farmer does not "
-                                       "bid. A bid with more than 20,000 shares bid above it "
-                                       "is charged no fills."),
+    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: how "
+                                       "often a sell sweep reached that far below the "
+                                       "midpoint in the market's last 60 days, at most once an "
+                                       "hour, shrunk toward the rate the last scan pooled "
+                                       "across markets, × what the sellers each sweep brings "
+                                       "fill of the bid. Most of the shares bid above it take "
+                                       "a seller first, so a bid behind a deep book fills "
+                                       "less. Without the market's history the rate is the "
+                                       "pooled one alone, and the farmer does not bid."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
                                        "minus what it is worth today at the hurdle rate. The "
                                        "farmer's ask sells it slowly, measured at 67% of a "
@@ -132,8 +133,9 @@ GLOSSARY = {
                                        "multiple times the capital left, at the size under "
                                        "that which nets the most. Leave blank to use the "
                                        "farmer's default."),
-    "tail_days": Term("Tail cap", "The most days of a market's planned reward that one sell "
-                                  "sweep filling the whole favorite bid may lose. The filled "
+    "tail_days": Term("Tail cap", "The most days of a market's planned reward the favorite "
+                                  "bid may lose if a 99th-percentile seller hits it, past the "
+                                  "share of the bids ahead that holds. The filled "
                                   "shares are valued as the farmer's ask sells that many, "
                                   "discounted at the hurdle rate, and what is still unsold "
                                   "pays out at the end date. A larger bid, a higher price or "

@@ -58,7 +58,7 @@ from analysis import queue_fit
 from analysis.exit_backtest import Mids, _fmt_interval, _utc, changes
 from farm import farm_books, fill_cost, reward_screener
 from farm.exit_value import Piece, Sweep
-from farm.fill_cost import DAY_S, PRE_SWEEP_S, SWEEP_SIZES, WHOLE_BID, YEAR_DAYS, Hit
+from farm.fill_cost import DAY_S, PRE_SWEEP_S, SWEEPS, WHOLE_BID, YEAR_DAYS, Hit
 from farm.fill_watch import (BUY, NO_FILLS, SELL, Gone, inventory_ceiling, watch_listing,
                              watch_positions)
 from farm.reward_farmer import (FarmConfig, FarmMarket, Position, QSide, Role, Slot,
@@ -85,12 +85,12 @@ EPS = 1e-9
 
 class Rules(NamedTuple):
     """Which of the new pricing rules an arm plays, as the data the farmer
-    takes: sweep_sizes (WHOLE_BID fills the whole bid), bid_multiple (None
+    takes: sweeps (WHOLE_BID fills the whole bid), bid_multiple (None
     is the market's), tie_band (None is the config's) and the inventory
     ceiling."""
 
     name: str
-    sweep_sizes: tuple = SWEEP_SIZES
+    sweeps: fill_cost.Sweeps = SWEEPS
     bid_multiple: Optional[float] = None
     tie_band: Optional[float] = None
     inventory_ceiling: bool = True
@@ -102,28 +102,28 @@ class Rules(NamedTuple):
         if self.tie_band is not None:
             cfg = cfg._replace(tie_band=self.tie_band)
         return fm, cfg, outlook._replace(
-            fills=outlook.fills._replace(sweep_sizes=self.sweep_sizes))
+            fills=outlook.fills._replace(sweeps=self.sweeps))
 
     def ceiling(self, watch, held, cost, tick, now):
         """The farmer's bid_ceiling, if this arm plays it."""
         return inventory_ceiling(watch, held, cost, tick, now) if self.inventory_ceiling else None
 
 
-def scaled(sizes, factor):
-    return tuple(x * factor for x in sizes)
+def scaled(sweeps, factor):
+    return sweeps._replace(mu=sweeps.mu + math.log(factor))
 
 
 TODAY = Rules("today", WHOLE_BID, 1.0, 0.0, False)
 COMBINED = Rules("combined")
 ABLATIONS = (
-    COMBINED._replace(name="-sweep fill", sweep_sizes=WHOLE_BID),
+    COMBINED._replace(name="-sweep fill", sweeps=WHOLE_BID),
     COMBINED._replace(name="-bid multiple", bid_multiple=1.0),
     COMBINED._replace(name="-tie band", tie_band=0.0),
     COMBINED._replace(name="-inventory ceiling", inventory_ceiling=False),
 )
 SENSITIVITY = (
-    COMBINED._replace(name="sweep x0.5", sweep_sizes=scaled(SWEEP_SIZES, 0.5)),
-    COMBINED._replace(name="sweep x2", sweep_sizes=scaled(SWEEP_SIZES, 2.0)),
+    COMBINED._replace(name="sweep x0.5", sweeps=scaled(SWEEPS, 0.5)),
+    COMBINED._replace(name="sweep x2", sweeps=scaled(SWEEPS, 2.0)),
 )
 ARMS = (TODAY, COMBINED) + ABLATIONS + SENSITIVITY
 

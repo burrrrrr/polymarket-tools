@@ -78,7 +78,7 @@ class RulesTest(unittest.TestCase):
         fm = with_book_mid(FM, BOOK)
         outlook = market_outlook(fm, None, None, DEFAULT_PRIOR, CFG, END - timedelta(days=100))
         arm_fm, arm_cfg, arm_outlook = pb.TODAY.terms(fm, CFG, outlook)
-        self.assertEqual((arm_fm.bid_multiple, arm_cfg.tie_band, arm_outlook.fills.sweep_sizes),
+        self.assertEqual((arm_fm.bid_multiple, arm_cfg.tie_band, arm_outlook.fills.sweeps),
                          (1.0, 0.0, WHOLE_BID))
         self.assertEqual(pb.COMBINED.terms(fm, CFG, outlook), (fm, CFG, outlook))
         sold = pb.NO_FILLS._replace(last_exit=Priced(0.95, datetime.fromtimestamp(T0, timezone.utc)))

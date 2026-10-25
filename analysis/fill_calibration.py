@@ -1,18 +1,20 @@
 """
 How well the fill model predicts the farmer's own favorite-bid fills, and the
 fit of the shares a seller who hits our bid takes. The gate for any change to
-the fill model: fill_cost.SWEEP_SIZES, the prior rule, FillCurve.
+the fill model: fill_cost.SWEEPS, the prior rule, FillCurve.
 
-  fit     print fill_cost.SWEEP_SIZES from the farmer's own FILL events
-          before --until: a censored lognormal of the shares each fill
-          took, a fill that took CENSOR_FRACTION or more of the resting bid
-          and no more counting as "at least that" (farm.db alone)
-  report  score predicted against realized FAV_BID fills over the bids the
-          farmer rested before --until (farm_books.db), with each History
-          rebuilt as of then from the pricing_backtest cache: per model and
-          window (all, before --split, from it), by predicted events and by
-          fill source, per fill unit, the tail share, the top markets, the
-          tail cap's effect on current markets, and the gate verdict
+  fit     print fill_cost.SWEEPS from the farmer's own FILL events and
+          the bids it rested before --until (farm_books.db), each History
+          rebuilt as of then from the pricing_backtest cache: what a seller
+          brings, lognormal, the share of the bids ahead that holds and the
+          sellers a counted sweep brings, fit jointly, a fill that took
+          CENSOR_FRACTION or more of the resting bid and no more counting as
+          "at least that"
+  report  score predicted against realized FAV_BID fills over the same
+          bids: per model and window (all, before --split, from it), by
+          predicted events, by fill source and by shares ahead, the tail
+          share, the top markets, the tail cap's effect on current markets,
+          and the gate verdict
 
 The resting bid a FILL hit is rebuilt from the FAV_BID PLACE and FILL rows:
 by the order id a PLACE records, or, for a PLACE from before PLACE rows
@@ -31,7 +33,6 @@ import random
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from statistics import NormalDist
 from typing import NamedTuple, Optional
 
 from analysis import pricing_backtest as pb
@@ -41,17 +42,23 @@ from farm.reward_farmer import FarmMarket, Position, market_outlook, target_orde
 from farm.reward_screener import Zones
 
 CENSOR_FRACTION = 0.95
-SIZE_POINTS = 40
-# Fewer fills than this leave a two-parameter fit to noise.
+# Fewer fills than this leave a three-parameter fit to noise.
 MIN_FIT_FILLS = 20
-KM_CHECKS = (50.0, 100.0, 300.0, 1000.0)
 SIZE_CHECKS = (100.0, 300.0, 1000.0, 3000.0)
+AHEAD_CHECKS = (0.0, 500.0, 2000.0, 10_000.0, 20_000.0)
 SIGMA_RANGE = (0.3, 4.0)
 MU_RANGE = (0.0, math.log(1e5))
-FIT_TOL = 1e-4
+HOLD_RANGE = (0.0, 1.0)
+FIT_START = (4.5, 1.7, 0.3)
+FIT_STEP = (0.5, 0.3, 0.2)
+FIT_TOL = 1e-6
+FIT_ITERATIONS = 2000
+FIT_PENALTY = 1e3
+FIT_REPS = 200
+# Shares ahead merge stretches at this many significant digits.
+AHEAD_DIGITS = 2
 PRICE_EPS = 1e-9
 SHARE_EPS = 1e-6
-NORMAL = NormalDist()
 
 BOOK_SAMPLE_S = farm_books.BOOK_SAMPLE_S
 # A farm_books stretch runs to the next sample, at most this long: a longer
@@ -66,8 +73,11 @@ COVER_AFTER_S = 600.0
 HISTORY_EVERY_S = 6 * 3600.0
 BUCKETS = (0.1, 0.5, 2.0)
 BUCKETS_ORDER = ("<0.1", "0.1-0.5", "0.5-2", "2+")
+AHEAD_BUCKETS = (500.0, 2000.0, 10_000.0, 20_000.0)
+AHEAD_ORDER = ("0-500", "500-2k", "2k-10k", "10k-20k", "20k+")
 BIG_FILLS = (500.0, 1000.0)
 TAIL_DAYS = (10.0, 30.0, 60.0)
+TAIL_QUANTILES = (0.95, 0.99)
 HURDLES = (0.3, 1.0)
 CURRENT_S = 3600.0
 TOP_MARKETS = 15
@@ -78,29 +88,34 @@ LEVEL = 0.90
 # reach into it: a model off by half or double from the split fails.
 GATE_BAND = (0.67, 1.5)
 
-# Sweep sizes from the public tape, kept as a model to score: the means of 40
-# equal-probability bins of the shares each taker sell burst sold more than
-# EXIT_DISTANCE under the mid before it, from a mid of at least 0.90.
-BURST_SIZES = (
+
+class Table(NamedTuple):
+    """One seller a sweep, from a table of equal-probability sizes, filling
+    min(Q, size): fill_cost.Sweeps' fill, events and survival with nothing
+    ahead holding."""
+
+    sizes: tuple
+
+    def held(self, ahead):
+        return 0.0
+
+    def survival(self, x):
+        return sum(size > x for size in self.sizes) / len(self.sizes)
+
+    def fill(self, shares, ahead=0.0):
+        return sum(min(shares, x) for x in self.sizes) / len(self.sizes)
+
+    def events(self, ahead=0.0):
+        return 1.0
+
+
+# 40 equal-probability bins of the public tape's taker sell bursts past EXIT_DISTANCE, mid >= 0.90.
+BURST = Table((
     0.3, 1.2, 2.7, 4.9, 6.3, 8.8, 10.4, 12.6, 15.4, 18.7,
     20, 20, 20, 21, 24.1, 28.4, 31.7, 38.1, 41.3, 47.1,
     50, 53, 60.5, 69.7, 82.9, 95.9, 103.1, 119.5, 141.8, 169,
     198.5, 239.6, 299.6, 374.6, 482.9, 637.9, 881.4, 1310.3, 2318.3, 10613.4,
-)
-
-
-class Unit(Enum):
-    """What one fill event is. FILL: one positions read that showed a fill,
-    the event FILL rows log. HOUR: the fills of a market within
-    fill_cost.DECLUSTER_S of the first, as a History declusters sweeps."""
-
-    FILL = "fill"
-    HOUR = "hour"
-
-
-# The unit fill_cost.SWEEP_SIZES is fit in, which unit_check holds to the
-# unit the FillCurve's rates are calibrated in.
-SWEEP_UNIT = Unit.FILL
+))
 
 
 class OwnFill(NamedTuple):
@@ -122,24 +137,14 @@ class OwnFill(NamedTuple):
     def censored(self):
         """The fill took (about) the whole bid and no more: the seller wanted
         at least this much."""
-        return (self.resting is not None and not self.over_bid
-                and self.shares >= CENSOR_FRACTION * self.resting)
+        return self.whole and not self.over_bid
+
+    @property
+    def whole(self):
+        """The fill took CENSOR_FRACTION of the bid it was joined to or more."""
+        return self.resting is not None and self.shares >= CENSOR_FRACTION * self.resting
 
 
-class SizeFit(NamedTuple):
-    """The censored lognormal of the shares our fill events took, in unit."""
-
-    mu: float
-    sigma: float
-    n: int
-    censored: int
-    unit: Unit
-
-    def table(self, points=SIZE_POINTS):
-        return size_table(self, points)
-
-
-# --- reading -----------------------------------------------------------------
 
 def _unix(at):
     return datetime.fromisoformat(at).timestamp()
@@ -181,159 +186,27 @@ def own_fills(events):
     return out
 
 
-# --- the size fit ------------------------------------------------------------
-
-def in_unit(fills, unit):
-    """The fills as events of unit, oldest first. An HOUR event sums the
-    shares of a market's fills from its first to DECLUSTER_S after it, and
-    rests on the first one's bid."""
-    fills = sorted(fills, key=lambda f: f.at)
-    if unit is Unit.FILL:
-        return fills
-    open_, out = {}, []
-    for f in fills:
-        i = open_.get(f.condition_id)
-        if i is not None and f.at - out[i].at <= fill_cost.DECLUSTER_S:
-            out[i] = out[i]._replace(shares=out[i].shares + f.shares)
-        else:
-            open_[f.condition_id] = len(out)
-            out.append(f)
-    return out
-
-
-def _golden(f, lo, hi):
-    """The x in [lo, hi] that maximises a unimodal f, to FIT_TOL."""
-    g = (math.sqrt(5) - 1) / 2
-    c, d = hi - g * (hi - lo), lo + g * (hi - lo)
-    fc, fd = f(c), f(d)
-    while hi - lo > FIT_TOL:
-        if fc >= fd:
-            hi, d, fd = d, c, fc
-            c = hi - g * (hi - lo)
-            fc = f(c)
-        else:
-            lo, c, fc = c, d, fd
-            d = lo + g * (hi - lo)
-            fd = f(d)
-    return (lo + hi) / 2
-
-
-def fit_sizes(fills, unit=SWEEP_UNIT):
-    """SizeFit of the fills with a resting bid, as events of unit: the
-    (mu, sigma) maximising the log density of each uncensored event's
-    log-shares plus the log survival at each censored one's. The censored
-    normal's likelihood is unimodal in each parameter, so a golden-section
-    search over sigma wraps one over mu. ValueError on fewer than
-    MIN_FIT_FILLS events or no uncensored one."""
-    events = [f for f in in_unit(fills, unit) if f.resting is not None and f.shares > 0]
-    exact = [math.log(f.shares) for f in events if not f.censored]
-    at_least = [math.log(f.shares) for f in events if f.censored]
-    if len(events) < MIN_FIT_FILLS or not exact:
-        raise ValueError(f"{len(events)} fill events, {len(exact)} uncensored: too few to fit")
-
-    def loglik(mu, sigma):
-        density = sum(-0.5 * ((x - mu) / sigma) ** 2 for x in exact) - len(exact) * math.log(sigma)
-        survival = sum(math.log(max(1e-300, 0.5 * math.erfc((x - mu) / sigma / math.sqrt(2))))
-                       for x in at_least)
-        return density + survival
-
-    def best_mu(sigma):
-        return _golden(lambda mu: loglik(mu, sigma), *MU_RANGE)
-
-    sigma = _golden(lambda s: loglik(best_mu(s), s), *SIGMA_RANGE)
-    return SizeFit(best_mu(sigma), sigma, len(events), len(at_least), unit)
-
-
-def size_table(fit, points=SIZE_POINTS):
-    """The exact lognormal means of `points` equal-probability bins, smallest
-    first, rounded to 0.1: exp(mu + sigma^2 / 2) * (Phi(b - sigma) -
-    Phi(a - sigma)) * points between the bin's standard-normal quantiles a
-    and b. The table's mean is the distribution's, so its tail fills a large
-    bid as the fit says."""
-    mean = math.exp(fit.mu + fit.sigma ** 2 / 2)
-    edges = [-math.inf] + [NORMAL.inv_cdf(i / points) for i in range(1, points)] + [math.inf]
-
-    def below(z):
-        return 0.0 if z == -math.inf else 1.0 if z == math.inf else NORMAL.cdf(z - fit.sigma)
-
-    return tuple(round(mean * (below(b) - below(a)) * points, 1) for a, b in zip(edges, edges[1:]))
-
-
-def kaplan_meier(fills):
-    """[(x, S(x))] at each uncensored size of the fills with a resting bid,
-    the product-limit estimate of the share of sellers wanting more than x.
-    The mass left at the end lies past the last uncensored size."""
-    events = sorted(((f.shares, f.censored) for f in fills if f.resting is not None),
-                    key=lambda e: e)
-    at_risk, s, out, i = len(events), 1.0, [], 0
-    while i < len(events):
-        x = events[i][0]
-        tied = [c for size, c in events[i:] if size == x]
-        died = sum(not c for c in tied)
-        if died:
-            s *= 1 - died / at_risk
-            out.append((x, s))
-        at_risk -= len(tied)
-        i += len(tied)
-    return out
-
-
-def _survival(curve, x):
-    """S(x) of a kaplan_meier curve."""
-    s = 1.0
-    for size, after in curve:
-        if size > x:
-            break
-        s = after
-    return s
-
-
-def fit_text(fit, fills, until):
-    """fill_cost.SWEEP_SIZES as source text with its provenance, the fills
-    before until (a datetime), then the Kaplan-Meier survival beside the
-    fit's at KM_CHECKS and E[min(Q, X)] at SIZE_CHECKS beside the table it
-    replaces."""
-    table = fit.table()
-    stamp = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    markets = len({f.condition_id for f in fills if f.resting is not None})
-    rows = [", ".join(f"{x:g}" for x in table[i:i + 10]) for i in range(0, len(table), 10)]
-    lines = [
-        f"# Shares one FILL event takes of a bid it reaches, {SIZE_POINTS} bin means of a censored",
-        f"# lognormal fit to {fit.n} fills on {markets} markets, from",
-        f"#   python -m analysis.fill_calibration fit --db data\\farm.db --until {stamp}",
-        "SWEEP_SIZES = (", *(f"    {row}," for row in rows), ")",
-    ]
-    curve = kaplan_meier(in_unit(fills, fit.unit))
-    lognormal = NormalDist(fit.mu, fit.sigma)
-    lines += ["", "S(x), the share of sellers wanting more than x: Kaplan-Meier / fit"]
-    lines += [f"  {x:>7,.0f}: {_survival(curve, x):.3f} / {1 - lognormal.cdf(math.log(x)):.3f}"
-              for x in KM_CHECKS]
-    lines += ["E[min(Q, X)]: this table / fill_cost.SWEEP_SIZES now"]
-    lines += [f"  Q {q:>5,.0f}: {fill_cost.sweep_fill(q, table):7,.0f} / "
-              f"{fill_cost.sweep_fill(q):7,.0f}" for q in SIZE_CHECKS]
-    return "\n".join(lines) + "\n"
-
-
-# --- the bids the farmer rested ------------------------------------------------
 
 class Rested(NamedTuple):
     """A stretch of farm_books samples with our FAV_BID resting unchanged:
     from at, for days, distance = the sample's mid (without our orders) less
     the bid's price, shares = the bid's size, the History a farmer read then
-    (None before the cache's trades are complete), and deep: more than
-    DEPTH_FREE_SHARES bid ahead of it, which value_quote charges no fills."""
+    (None before the cache's trades are complete), and ahead = the others'
+    shares bid above it (reward_screener.shares_ahead) to AHEAD_DIGITS
+    significant digits."""
 
     at: float
     days: float
     distance: float
     shares: float
     history: Optional[fill_cost.History]
-    deep: bool
+    ahead: float
 
 
 class Market(NamedTuple):
     """A market the farmer rested a favorite bid on: its stretches oldest
-    first, the fills inside one (covered), and how many fell outside."""
+    first, the fills inside one (covered) oldest first, and how many fell
+    outside."""
 
     condition_id: str
     slug: str
@@ -346,8 +219,13 @@ def _day(at):
     return int(at // fill_cost.DAY_S)
 
 
+def _rounded(shares):
+    """shares to AHEAD_DIGITS significant digits, so stretches merge."""
+    return round(shares, AHEAD_DIGITS - 1 - math.floor(math.log10(shares))) if shares > 0 else 0.0
+
+
 def rested_of(samples, market, floor):
-    """[(at, days, distance, shares, history, deep)] of each sample with our
+    """[(at, days, distance, shares, history, ahead)] of each sample with our
     FAV_BID, to the next sample and at most MAX_GAP_S, the History rebuilt
     from the cached market every HISTORY_EVERY_S."""
     out, history, read_at = [], None, -math.inf
@@ -363,7 +241,7 @@ def rested_of(samples, market, floor):
         ahead = reward_screener.shares_ahead(pb.others_book(s, pb.tick_of(s, market.fm.tick)),
                                              bid[0])
         out.append((t, min(after, MAX_GAP_S), round(s.mid - bid[0], 6), bid[1], history,
-                    ahead > reward_screener.DEPTH_FREE_SHARES))
+                    _rounded(ahead)))
     return out
 
 
@@ -381,16 +259,16 @@ def covered(raw, fills):
 
 def merged(raw):
     """The raw stretches as Rested, runs of the same distance, size, History
-    and depth within a UTC day summed: a window split at a date splits them
-    exactly."""
+    and shares ahead within a UTC day summed: a window split at a date splits
+    them exactly."""
     out = []
-    for at, seconds, distance, shares, history, deep in raw:
+    for at, seconds, distance, shares, history, ahead in raw:
         last = out[-1] if out else None
-        if (last and (last.distance, last.shares, last.history, last.deep)
-                == (distance, shares, history, deep) and _day(last.at) == _day(at)):
+        if (last and (last.distance, last.shares, last.history, last.ahead)
+                == (distance, shares, history, ahead) and _day(last.at) == _day(at)):
             out[-1] = last._replace(days=last.days + seconds / fill_cost.DAY_S)
         else:
-            out.append(Rested(at, seconds / fill_cost.DAY_S, distance, shares, history, deep))
+            out.append(Rested(at, seconds / fill_cost.DAY_S, distance, shares, history, ahead))
     return tuple(out)
 
 
@@ -427,17 +305,15 @@ def _with_p_true(row):
     return {**row, "p_true": 0.5 if row["p_true"] is None else row["p_true"]}
 
 
-# --- scoring -------------------------------------------------------------------
 
 class Model(NamedTuple):
-    """A fill model as data: the prior fill_curve shrinks toward, the size
-    table sweep_fill draws from, and the unit its events are counted in.
-    Scored by production fill_curve at the farmer's floor."""
+    """A fill model as data: the prior fill_curve shrinks toward, and what a
+    sweep fills (fill_cost.Sweeps or a Table). Scored by production
+    fill_curve at the farmer's floor, a fill event being one FILL row."""
 
     name: str
     prior: fill_cost.Prior
-    sizes: tuple
-    unit: Unit
+    sweeps: object
 
 
 class Window(Enum):
@@ -447,8 +323,12 @@ class Window(Enum):
 
 
 class Tally(NamedTuple):
+    """Fill events, the shares they took, and the events that took the
+    whole bid (OwnFill.whole)."""
+
     events: float
     shares: float
+    whole: float = 0.0
 
 
 class Ratio(NamedTuple):
@@ -465,6 +345,7 @@ class Score(NamedTuple):
     realized: Tally
     events: Ratio
     shares: Ratio
+    whole: Optional[Ratio] = None
 
 
 class Verdict(NamedTuple):
@@ -477,31 +358,47 @@ def in_window(at, window, split):
 
 
 def predicted(market, model, window, split, floor):
-    """Tally of the model over the market's stretches in the window: events
-    = the curve's rate at the bid's distance times the days, shares = that
-    times sweep_fill of the bid's size, the curve fill_curve(history,
-    model.prior, floor). A deep stretch predicts nothing, as value_quote
-    charges it."""
-    curves, fills = {}, {}
-    events = shares = 0.0
+    """Tally of the model over the market's stretches in the window, the
+    sweeps reaching the bid's distance being the curve's rate there times the
+    days, the curve fill_curve(history, model.prior, floor): events = those
+    sweeps times the fills each brings past the shares ahead (events),
+    shares = those sweeps times what they fill of the bid, whole = those
+    sweeps times their sellers who bring CENSOR_FRACTION of the bid past the
+    shares that hold (Sweeps.held)."""
+    return _summed(t for _, t in stretch_tallies(market, model, window, split, floor))
+
+
+def stretch_tallies(market, model, window, split, floor):
+    """[(Rested, the Tally predicted over it)] of the market's stretches in
+    the window, as predicted sums them."""
+    curves, fills, out = {}, {}, []
+    sweeps = model.sweeps
     for r in market.rested:
-        if r.deep or not in_window(r.at, window, split):
+        if not in_window(r.at, window, split):
             continue
         if r.history not in curves:
             curves[r.history] = fill_cost.fill_curve(r.history, model.prior, floor)
-        if r.shares not in fills:
-            fills[r.shares] = fill_cost.sweep_fill(r.shares, model.sizes)
-        expected = curves[r.history].per_day(r.distance) * r.days
-        events += expected
-        shares += expected * fills[r.shares]
-    return Tally(events, shares)
+        key = (r.shares, r.ahead)
+        if key not in fills:
+            whole = sweeps.events(0.0) * sweeps.survival(
+                CENSOR_FRACTION * r.shares + sweeps.held(r.ahead))
+            fills[key] = Tally(sweeps.events(r.ahead), sweeps.fill(r.shares, r.ahead), whole)
+        swept = curves[r.history].per_day(r.distance) * r.days
+        out.append((r, Tally(*(swept * x for x in fills[key]))))
+    return out
 
 
-def realized(market, window, split, unit):
-    """Tally of the market's covered fills in the window: its events in unit,
-    the shares they took."""
-    events = [f for f in in_unit(market.fills, unit) if in_window(f.at, window, split)]
-    return Tally(len(events), sum(f.shares for f in events))
+def _summed(tallies):
+    events = shares = whole = 0.0
+    for t in tallies:
+        events, shares, whole = events + t.events, shares + t.shares, whole + t.whole
+    return Tally(events, shares, whole)
+
+
+def realized(market, window, split):
+    """Tally of the market's covered fills in the window."""
+    events = [f for f in market.fills if in_window(f.at, window, split)]
+    return Tally(len(events), sum(f.shares for f in events), sum(f.whole for f in events))
 
 
 def _ratio(pairs, field, rng_seed, reps):
@@ -516,13 +413,12 @@ def _ratio(pairs, field, rng_seed, reps):
 
 
 def score(markets, model, window, split, floor, reps=REPS, seed=0):
-    """Score of the model over the markets in the window: the totals and both
+    """Score of the model over the markets in the window: the totals and the
     ratios, each interval from the same seeded resamples of markets."""
-    pairs = [(predicted(m, model, window, split, floor), realized(m, window, split, model.unit))
+    pairs = [(predicted(m, model, window, split, floor), realized(m, window, split))
              for m in markets]
-    total = lambda i: Tally(sum(p[i].events for p in pairs), sum(p[i].shares for p in pairs))
-    return Score(model.name, window, total(0), total(1), _ratio(pairs, "events", seed, reps),
-                 _ratio(pairs, "shares", seed, reps))
+    return Score(model.name, window, _summed(p for p, _ in pairs), _summed(r for _, r in pairs),
+                 *(_ratio(pairs, field, seed, reps) for field in Tally._fields))
 
 
 def _bucket(events):
@@ -537,7 +433,7 @@ def by_bucket(markets, model, window, split, floor):
     rows = {}
     for m in markets:
         p = predicted(m, model, window, split, floor).events
-        r = realized(m, window, split, model.unit).events
+        r = realized(m, window, split).events
         if p == 0 and r == 0:
             continue
         row = rows.setdefault(_bucket(p), {"bucket": _bucket(p), "markets": 0,
@@ -580,13 +476,11 @@ def by_source(markets, model, window, split, floor):
     for m in markets:
         if not m.rested:
             continue
-        for r in m.rested:
-            if in_window(r.at, window, split):
-                row = rows[_source(r, model.prior, floor)]
-                tally = predicted(m._replace(rested=(r,)), model, window, split, floor)
-                row["predicted_events"] += tally.events
-                row["predicted_shares"] += tally.shares
-        for f in in_unit(m.fills, model.unit):
+        for r, tally in stretch_tallies(m, model, window, split, floor):
+            row = rows[_source(r, model.prior, floor)]
+            row["predicted_events"] += tally.events
+            row["predicted_shares"] += tally.shares
+        for f in m.fills:
             if in_window(f.at, window, split):
                 row = rows[_source(stretch_of(m, f.at), model.prior, floor)]
                 row["realized_events"] += 1
@@ -594,34 +488,32 @@ def by_source(markets, model, window, split, floor):
     return [rows[s] for s in SOURCES]
 
 
-def unit_check(markets, prior, fills, split, floor, reps=REPS):
-    """Per unit, the rate's TEST events realized/predicted with fills counted
-    in that unit, and the TEST shares of a table fit before split in that
-    unit; the unit whose events the rate predicts best (ratio nearest 1),
-    and whether that is SWEEP_UNIT, the unit fill_cost.SWEEP_SIZES is fit
-    in. A table fit in one unit and paired with a rate calibrated in the
-    other would miss the shares by the events per hour."""
-    rows, train = [], [f for f in fills if f.at < split]
-    for unit in Unit:
-        events = score(markets, Model(unit.value, prior, fill_cost.SWEEP_SIZES, unit),
-                       Window.TEST, split, floor, reps)
-        try:
-            fit = fit_sizes(train, unit)
-            shares = score(markets, Model(unit.value, prior, fit.table(), unit), Window.TEST,
-                           split, floor, reps).shares
-        except ValueError as e:
-            fit, shares = None, None
-            note = str(e)
-        rows.append({"unit": unit.value, "events": _ratio_json(events.events),
-                     "shares": _ratio_json(shares) if shares else None,
-                     "fit": _fit_json(fit) if fit else note})
-    distance = {row["unit"]: abs(math.log(row["events"][0])) if row["events"][0] else math.inf
-                for row in rows}
-    calibrated = min(distance, key=distance.get)
-    return {"rows": rows, "calibrated": calibrated, "passes": calibrated == SWEEP_UNIT.value}
+def _ahead_bucket(ahead):
+    return AHEAD_ORDER[bisect.bisect_right(AHEAD_BUCKETS, ahead)]
 
 
-def _test_miss(r):
+def by_ahead(markets, model, window, split, floor):
+    """Per bucket of the shares ahead of the bid (AHEAD_BUCKETS), the
+    market-days rested and the realized and predicted Tally, a fill
+    counting toward the stretch it landed in."""
+    rows = {b: {"bucket": b, "days": 0.0, "predicted": Tally(0.0, 0.0, 0.0),
+                "realized": Tally(0, 0.0, 0)} for b in AHEAD_ORDER}
+    for m in markets:
+        if not m.rested:
+            continue
+        for r, tally in stretch_tallies(m, model, window, split, floor):
+            row = rows[_ahead_bucket(r.ahead)]
+            row["days"] += r.days
+            row["predicted"] = _summed((row["predicted"], tally))
+        for f in m.fills:
+            if in_window(f.at, window, split):
+                row = rows[_ahead_bucket(stretch_of(m, f.at).ahead)]
+                row["realized"] = _summed((row["realized"], Tally(1, f.shares, f.whole)))
+    return [{**row, "predicted": list(row["predicted"]), "realized": list(row["realized"])}
+            for row in rows.values()]
+
+
+def _miss(r):
     lo, hi = GATE_BAND
     band = f"[{lo:.2f}, {hi:.2f}]"
     if r.interval[1] < lo or r.interval[0] > hi:
@@ -631,38 +523,38 @@ def _test_miss(r):
     return None
 
 
-def gate(candidate_all, candidate_test, unit_ok):
-    """Verdict on a fill model: it passes when, for events and shares, the
-    ALL-window interval includes 1, and the TEST-window ratio lies in
-    GATE_BAND and its interval reaches into it, so a model off by half or
-    double from the split fails; and the size table is fit in the unit the
-    rate is calibrated in."""
+GATED = (("events", "events"), ("shares", "shares"), ("whole", "whole-bid fills"))
+
+
+def gate(scores):
+    """Verdict on a fill model from the sweeps refit before the split, scored
+    over the test window: it passes when its events, shares and whole-bid
+    fills each lie in GATE_BAND with the interval reaching into it, so a
+    model off by half or double from the split fails. No ALL-window score
+    counts: production's sellers is fit to make its events match there, and
+    its sweeps are fit to every fill."""
+    held_out = next((s for s in scores if (s.model, s.window) == ("refit", Window.TEST)), None)
+    if held_out is None:
+        return Verdict(False, ("no held-out size fit",))
     reasons = []
-    for window, score_, miss_of in (
-            ("all", candidate_all,
-             lambda r: None if r.interval[0] <= 1 <= r.interval[1] else "excludes 1"),
-            ("test", candidate_test, _test_miss)):
-        for name in ("events", "shares"):
-            r = getattr(score_, name)
-            if r.interval is None:
-                reasons.append(f"{window} {name}: nothing predicted")
-            elif (miss := miss_of(r)) is not None:
-                reasons.append(f"{window} {name} realized/predicted {r.value:.2f} "
-                               f"[{r.interval[0]:.2f}, {r.interval[1]:.2f}] {miss}")
-    if not unit_ok:
-        reasons.append(f"the rate is calibrated in another unit than {SWEEP_UNIT.value}, the "
-                       f"unit fill_cost.SWEEP_SIZES is fit in")
+    for field, name in GATED:
+        r = getattr(held_out, field)
+        if r is None or r.interval is None:
+            reasons.append(f"test {name}: nothing predicted")
+        elif (miss := _miss(r)) is not None:
+            reasons.append(f"test {name} realized/predicted {r.value:.2f} "
+                           f"[{r.interval[0]:.2f}, {r.interval[1]:.2f}] {miss}")
     return Verdict(not reasons, tuple(reasons))
 
 
 def tail_share(markets, fit):
     """Realized fill events of at least each BIG_FILLS size: how many and
     their share of the filled shares; and the fit's P(X >= the size)."""
-    fills = [f for m in markets for f in in_unit(m.fills, SWEEP_UNIT)]
+    fills = [f for m in markets for f in m.fills]
     total = sum(f.shares for f in fills)
     return [{"size": size, "fills": sum(f.shares >= size for f in fills),
              "share": sum(f.shares for f in fills if f.shares >= size) / total if total else 0.0,
-             "fit_p": 1 - NORMAL.cdf((math.log(size) - fit.mu) / fit.sigma) if fit else None}
+             "fit_p": fit.sweeps().survival(size) if fit else None}
             for size in BIG_FILLS]
 
 
@@ -681,15 +573,222 @@ def stopped_after_big(markets, size=BIG_FILLS[0]):
 
 def top_markets(markets, models, split, floor, n=TOP_MARKETS):
     """The n markets by realized shares, with each model's predicted shares."""
-    top = sorted(markets, key=lambda m: realized(m, Window.ALL, split, SWEEP_UNIT).shares,
+    top = sorted(markets, key=lambda m: realized(m, Window.ALL, split).shares,
                  reverse=True)[:n]
-    return [{"slug": m.slug, "realized": list(realized(m, Window.ALL, split, SWEEP_UNIT)),
+    return [{"slug": m.slug, "realized": list(realized(m, Window.ALL, split)),
              "predicted": {model.name: predicted(m, model, Window.ALL, split, floor).shares
                            for model in models}}
             for m in top]
 
 
-# --- the tail cap on current markets -------------------------------------------
+
+class SweepFit(NamedTuple):
+    """fill_cost.Sweeps fit to n fill events, `censored` of them taking the
+    whole bid: what a seller reaching our bid brings, X
+    lognormal(mu, sigma), the share of the shares bid ahead that holds, and
+    the sellers a sweep the rate counts brings."""
+
+    mu: float
+    sigma: float
+    hold: float
+    sellers: float
+    n: int
+    censored: int
+
+    def sweeps(self, quantile=fill_cost.TAIL_QUANTILE):
+        return fill_cost.Sweeps(self.mu, self.sigma, self.hold, self.sellers, quantile)
+
+
+class FitTerms(NamedTuple):
+    """One market's part of the fit. swept: {shares ahead: the sweeps the
+    rate expects to reach the bid's distance} over its stretches. exact and
+    at_least: (shares, shares ahead) of the fill events that took part of
+    the bid, or about the whole of it; reached: the shares ahead of a fill
+    with no resting bid, which says only that a sweep got past them."""
+
+    swept: dict
+    exact: tuple
+    at_least: tuple
+    reached: tuple
+
+
+def fit_terms(market, prior, floor, window, split):
+    """FitTerms of the market's stretches and fill events in the window, the
+    rate fill_curve(history, prior, floor) and each fill's shares ahead its
+    stretch's (stretch_of)."""
+    swept, curves = {}, {}
+    for r in market.rested:
+        if in_window(r.at, window, split):
+            if r.history not in curves:
+                curves[r.history] = fill_cost.fill_curve(r.history, prior, floor)
+            swept[r.ahead] = swept.get(r.ahead, 0.0) + curves[r.history].per_day(r.distance) * r.days
+    exact, at_least, reached = [], [], []
+    for f in market.fills:
+        if in_window(f.at, window, split) and f.shares > 0:
+            ahead = stretch_of(market, f.at).ahead
+            if f.resting is None:
+                reached.append(ahead)
+            else:
+                (at_least if f.censored else exact).append((f.shares, ahead))
+    return FitTerms(swept, tuple(exact), tuple(at_least), tuple(reached))
+
+
+def _pooled(terms):
+    """The markets' FitTerms as one."""
+    swept = {}
+    for t in terms:
+        for ahead, expected in t.swept.items():
+            swept[ahead] = swept.get(ahead, 0.0) + expected
+    return FitTerms(swept, *(tuple(x for t in terms for x in getattr(t, name))
+                             for name in ("exact", "at_least", "reached")))
+
+
+def _loglik(t, mu, sigma, hold):
+    """The log likelihood of where and how much the fills of FitTerms t took,
+    given how many there were: per fill event the density of a sweep
+    bringing its shares plus the shares ahead that hold (Sweeps.held), the
+    production depth credit included, or more for one that
+    took the whole bid, or getting past them for one of no known bid; less
+    the events times the log of the sweeps expected to fill anything. That
+    is the Poisson likelihood of the fills with the rate's scale profiled
+    out, so a rate off by a constant moves no parameter but the sellers.
+    Without the second term nothing says how many sellers the bids ahead
+    stopped."""
+    sweeps = fill_cost.Sweeps(mu, sigma, hold)
+    total = 0.0
+    for shares, ahead in t.exact:
+        y = shares + sweeps.held(ahead)
+        total -= math.log(sigma * y) + 0.5 * ((math.log(y) - mu) / sigma) ** 2
+    for shares, ahead in t.at_least:
+        total += math.log(max(1e-300, sweeps.survival(shares + sweeps.held(ahead))))
+    for ahead in t.reached:
+        total += math.log(max(1e-300, sweeps.events(ahead)))
+    return total - _events(t) * math.log(max(1e-300, _reaching(t, sweeps)))
+
+
+def _events(t):
+    return len(t.exact) + len(t.at_least) + len(t.reached)
+
+
+def _reaching(t, sweeps):
+    """The fills sweeps predicts over FitTerms t."""
+    return sum(expected * sweeps.events(ahead) for ahead, expected in t.swept.items())
+
+
+def _maximise(f, start, step, bounds):
+    """The point within bounds where f is greatest, by Nelder-Mead on f of the
+    point clamped into bounds less a penalty for the distance outside, run
+    twice so a collapsed simplex starts again from the best point."""
+    def clamp(x):
+        return [min(hi, max(lo, v)) for v, (lo, hi) in zip(x, bounds)]
+
+    def g(x):
+        c = clamp(x)
+        return f(*c) - FIT_PENALTY * sum(abs(a - b) for a, b in zip(x, c))
+
+    best = list(start)
+    for _ in range(2):
+        simplex = [best] + [[v + (s if i == j else 0.0) for j, (v, s) in enumerate(zip(best, step))]
+                            for i in range(len(best))]
+        scored = [(g(x), x) for x in simplex]
+        for _ in range(FIT_ITERATIONS):
+            scored.sort(key=lambda p: -p[0])
+            if scored[0][0] - scored[-1][0] < FIT_TOL:
+                break
+            worst = scored[-1][1]
+            centre = [sum(x[j] for _, x in scored[:-1]) / (len(scored) - 1)
+                      for j in range(len(worst))]
+
+            def towards(t):
+                return [c + t * (w - c) for c, w in zip(centre, worst)]
+
+            reflected = towards(-1.0)
+            fr = g(reflected)
+            if fr > scored[0][0]:
+                expanded = towards(-2.0)
+                fe = g(expanded)
+                scored[-1] = (fe, expanded) if fe > fr else (fr, reflected)
+            elif fr > scored[-2][0]:
+                scored[-1] = (fr, reflected)
+            else:
+                inner = towards(0.5)
+                fi = g(inner)
+                if fi > scored[-1][0]:
+                    scored[-1] = (fi, inner)
+                else:
+                    top = scored[0][1]
+                    scored = [scored[0]] + [(g(x), x) for x in (
+                        [t + 0.5 * (v - t) for t, v in zip(top, p)] for _, p in scored[1:])]
+        best = max(scored, key=lambda p: p[0])[1]
+    return clamp(best)
+
+
+def fit_sweeps(terms):
+    """SweepFit maximising _loglik over the markets' FitTerms, its sellers
+    the profiled rate scale: as many fills as the rate predicts. ValueError on
+    fewer than MIN_FIT_FILLS fill events with a resting bid, no partial one,
+    or no sweep expected over the stretches to scale the sellers by."""
+    t = _pooled(terms)
+    sized = len(t.exact) + len(t.at_least)
+    if sized < MIN_FIT_FILLS or not t.exact:
+        raise ValueError(f"{sized} fill events with a resting bid, {len(t.exact)} partial: "
+                         f"too few to fit")
+    if not any(expected > 0 for expected in t.swept.values()):
+        raise ValueError(f"{_events(t)} fill events but no sweep expected over the rested "
+                         f"stretches: no rate to fit the sellers against")
+    mu, sigma, hold = _maximise(lambda mu, sigma, hold: _loglik(t, mu, sigma, hold),
+                                FIT_START, FIT_STEP, (MU_RANGE, SIGMA_RANGE, HOLD_RANGE))
+    sellers = _events(t) / _reaching(t, fill_cost.Sweeps(mu, sigma, hold))
+    return SweepFit(mu, sigma, hold, sellers, _events(t), len(t.at_least))
+
+
+def fit_intervals(terms, reps=FIT_REPS, seed=0):
+    """{mu, sigma, hold, sellers: its LEVEL interval} over fits to seeded resamples of
+    the markets' FitTerms, None for a resample too small to fit."""
+    rng, draws = random.Random(seed), []
+    for _ in range(reps):
+        try:
+            draws.append(fit_sweeps(rng.choices(terms, k=len(terms))))
+        except ValueError:
+            continue
+    return {name: pb.interval([getattr(d, name) for d in draws], LEVEL) if draws else None
+            for name in ("mu", "sigma", "hold", "sellers")}
+
+
+def fit_text(fit, markets, until, prior):
+    """fill_cost.SWEEPS and SWEEPS_PRIOR_AT as source text with their
+    provenance, the markets' data before until (a datetime) and the stored
+    prior the rates shrank toward, then E[min(Q, X)] at SIZE_CHECKS beside
+    the SWEEPS it replaces, and what the hold leaves of a 1,000-share bid's
+    fill and of the tail's sweep behind AHEAD_CHECKS."""
+    sweeps = fit.sweeps()
+    stamp = until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    filled = sum(1 for m in markets if m.fills)
+    prior_at = prior.at.isoformat() if prior.at else None
+    lines = [
+        "# What a seller brings to a bid, a censored lognormal, the share of the shares",
+        "# bid ahead of the bid that holds, and the sellers (FILL events) a counted",
+        f"# sweep brings, fit jointly to {fit.n} fills on {filled} of the {len(markets)} markets",
+        f"# that rested a bid, shares ahead counted up to {fill_cost.DEPTH_CREDIT_MAX:,.0f}, from",
+        "#   python -m analysis.fill_calibration fit --db data\\farm.db --books data\\farm_books.db",
+        f"#       --cache work\\fill-pricing\\cache --until {stamp}",
+        f"# against the scan prior fit {prior_at} on {prior.markets} markets: sellers",
+        "# scales that prior's rates, so a new prior needs a refit.",
+        f"SWEEPS = Sweeps(mu={fit.mu:.4f}, sigma={fit.sigma:.4f}, hold={fit.hold:.4f}, "
+        f"sellers={fit.sellers:.4f})",
+        "SWEEPS_PRIOR_AT = " + (f'datetime.fromisoformat("{prior_at}")' if prior_at else "None"),
+        "",
+        "What a counted sweep fills of a bid of Q, nothing ahead: this fit / fill_cost.SWEEPS now",
+    ]
+    lines += [f"  Q {q:>5,.0f}: {sweeps.fill(q):7,.0f} / {fill_cost.SWEEPS.fill(q):7,.0f}"
+              for q in SIZE_CHECKS]
+    lines.append(f"Behind A shares, a counted sweep's fill of a 1,000-share bid, its fills, "
+                 f"the tail's shares (dump {sweeps.dump:,.0f} at {sweeps.quantile:g})")
+    lines += [f"  A {a:>6,.0f}: {sweeps.fill(1000.0, a):7,.1f}  {sweeps.events(a):.3f}  "
+              f"{sweeps.tail(math.inf, a):7,.0f}" for a in AHEAD_CHECKS]
+    return "\n".join(lines) + "\n"
+
+
 
 class Current(NamedTuple):
     """A market's latest book sample as the farmer plans from it: its terms
@@ -740,29 +839,35 @@ def current_markets(db_path, books_path, cfg, rows, until):
     return out
 
 
-def tail_effect(current, cfg, prior, hurdles, tail_days_list):
-    """Per hurdle rate and tail_days (0, no cap, first): the production
-    target_orders on each current market from no position, and what the
-    cap does: markets bidding, resting $, planned reward and its share of
-    the uncapped reward, the bids it changes or removes, and the tail $; and
-    per hurdle the TOP_TRIMMED markets losing the most reward at
-    cfg.tail_days."""
+def tail_effect(current, cfg, prior, hurdles, tail_days_list, quantiles):
+    """Per hurdle rate, tail quantile (Sweeps.quantile) and tail_days (no cap
+    first): the production target_orders on each current market from no
+    position, and what the cap does: markets bidding, resting $, planned
+    reward and its share of the uncapped reward, the bids it changes or
+    removes, and the tail $; and per hurdle the TOP_TRIMMED markets losing
+    the most reward at cfg.tail_days and fill_cost.TAIL_QUANTILE."""
     rows, trimmed = [], []
     for hurdle in hurdles:
         at_hurdle = cfg._replace(hurdle_rate=hurdle)
         outlooks = [market_outlook(c.fm, None, c.history, prior, at_hurdle, c.at, any_floor=True)
                     for c in current]
-        best = {}
-        for tail_days in (0.0,) + tuple(t for t in tail_days_list if t > 0):
+
+        def planned(tail_days, quantile):
             capped = at_hurdle._replace(tail_days=tail_days)
-            best[tail_days] = [target_orders(c.fm, c.levels, Position(), capped, True, o).fav.best
-                               for c, o in zip(current, outlooks)]
-        free = best[0.0]
+            return [target_orders(c.fm, c.levels, Position(), capped, True, o._replace(
+                fills=o.fills._replace(sweeps=o.fills.sweeps._replace(quantile=quantile))))
+                .fav.best for c, o in zip(current, outlooks)]
+
+        free = planned(0.0, fill_cost.TAIL_QUANTILE)
+        best = {(None, 0.0): free}
+        for quantile in quantiles:
+            for tail_days in (t for t in tail_days_list if t > 0):
+                best[(quantile, tail_days)] = planned(tail_days, quantile)
         free_reward = sum(b.reward_per_day for b in free if b)
-        for tail_days, chosen in best.items():
+        for (quantile, tail_days), chosen in best.items():
             reward = sum(b.reward_per_day for b in chosen if b)
             rows.append({
-                "hurdle_rate": hurdle, "tail_days": tail_days,
+                "hurdle_rate": hurdle, "quantile": quantile, "tail_days": tail_days,
                 "bidding": sum(b is not None for b in chosen),
                 "resting_usd": sum(b.price * b.size for b in chosen if b),
                 "reward_per_day": reward,
@@ -771,7 +876,7 @@ def tail_effect(current, cfg, prior, hurdles, tail_days_list):
                              if a and (b is None or (b.price, b.size) != (a.price, a.size))),
                 "tail_usd": sum(b.tail_usd for b in chosen if b),
             })
-        at_cfg = best.get(cfg.tail_days)
+        at_cfg = best.get((fill_cost.TAIL_QUANTILE, cfg.tail_days))
         if at_cfg is not None:
             lost = sorted(((a.reward_per_day - (b.reward_per_day if b else 0.0), c, a, b)
                            for c, a, b in zip(current, free, at_cfg) if a),
@@ -782,18 +887,17 @@ def tail_effect(current, cfg, prior, hurdles, tail_days_list):
     return {"markets": len(current), "rows": rows, "trimmed": trimmed}
 
 
-# --- the report ----------------------------------------------------------------
 
 def models_for(prior, fits):
-    """The report's models: DEFAULT_PRIOR with BURST_SIZES, BURST_SIZES on
-    the stored prior, production, the size table refit on the window's
-    fills, and the whole bid. fits maps a window to the SizeFit refit for
-    it, if any."""
-    base = [Model("default prior", fill_cost.DEFAULT_PRIOR, BURST_SIZES, SWEEP_UNIT),
-            Model("burst table", prior, BURST_SIZES, SWEEP_UNIT),
-            Model("production", prior, fill_cost.SWEEP_SIZES, SWEEP_UNIT),
-            Model("whole bid", prior, fill_cost.WHOLE_BID, SWEEP_UNIT)]
-    return {w: base + ([Model("refit", prior, fits[w].table(), SWEEP_UNIT)] if fits.get(w) else [])
+    """The report's models: DEFAULT_PRIOR with BURST, BURST on
+    the stored prior, production, the sweeps refit on the window's fills,
+    and the whole bid. fits maps a window to the SweepFit refit for it, if
+    any."""
+    base = [Model("default prior", fill_cost.DEFAULT_PRIOR, BURST),
+            Model("burst table", prior, BURST),
+            Model("production", prior, fill_cost.SWEEPS),
+            Model("whole bid", prior, fill_cost.WHOLE_BID)]
+    return {w: base + ([Model("refit", prior, fits[w].sweeps())] if fits.get(w) else [])
             for w in Window}
 
 
@@ -804,43 +908,38 @@ def _ratio_json(r):
 def _score_json(s):
     return {"model": s.model, "window": s.window.value, "predicted": list(s.predicted),
             "realized": list(s.realized), "events": _ratio_json(s.events),
-            "shares": _ratio_json(s.shares)}
+            "shares": _ratio_json(s.shares), "whole": _ratio_json(s.whole)}
 
 
 def _fit_json(fit):
-    return {"mu": fit.mu, "sigma": fit.sigma, "n": fit.n, "censored": fit.censored,
-            "unit": fit.unit.value}
+    return {"mu": fit.mu, "sigma": fit.sigma, "hold": fit.hold, "sellers": fit.sellers,
+            "n": fit.n, "censored": fit.censored}
 
 
-def _fit_or_reason(fills):
+def _fit_or_reason(terms):
     try:
-        return fit_sizes(fills), None
+        return fit_sweeps(terms), None
     except ValueError as e:
         return None, str(e)
 
 
 def report(markets, skipped, fills, current, cfg, prior, split, until, tail_days_list,
-           hurdles, reps=REPS):
+           hurdles, quantiles=TAIL_QUANTILES, reps=REPS):
     """The report as a JSON-safe dict, its sections in render's order."""
     floor = cfg.min_fav
-    train = [f for f in fills if f.at < split]
-    fit_all, all_reason = _fit_or_reason(fills)
-    fit_train, train_reason = _fit_or_reason(train)
+    terms = {w: [fit_terms(m, prior, floor, w, split) for m in markets]
+             for w in (Window.ALL, Window.TRAIN)}
+    fit_all, all_reason = _fit_or_reason(terms[Window.ALL])
+    fit_train, train_reason = _fit_or_reason(terms[Window.TRAIN])
     fits = {Window.ALL: fit_all, Window.TRAIN: fit_train, Window.TEST: fit_train}
     by_window = models_for(prior, fits)
     scores = [score(markets, model, w, split, floor, reps) for w in Window for model in by_window[w]]
     production = by_window[Window.ALL][2]
-    find = {(s.model, s.window): s for s in scores}
-    units = unit_check(markets, prior, fills, split, floor, reps)
-    held_out = find.get(("refit", Window.TEST))
-    verdict = gate(find[("production", Window.ALL)],
-                   held_out or find[("production", Window.TEST)], units["passes"])
-    if held_out is None:
-        verdict = Verdict(False, verdict.reasons + (f"no held-out size fit: {train_reason}",))
+    verdict = gate(scores)
+    in_sample = next(s for s in scores if (s.model, s.window) == ("production", Window.ALL))
     rested = [r for m in markets for r in m.rested]
-    tables = {"production": fill_cost.SWEEP_SIZES, "burst table": BURST_SIZES}
-    tables.update({f"fit {w}": f.table() for w, f in (("all", fit_all), ("train", fit_train)) if f})
-    km = kaplan_meier(in_unit(fills, SWEEP_UNIT))
+    tables = {"production": fill_cost.SWEEPS, "burst table": BURST}
+    tables.update({f"fit {w}": f.sweeps() for w, f in (("all", fit_all), ("train", fit_train)) if f})
     return {
         "data": {
             "first": _stamp(min((r.at for r in rested), default=None)),
@@ -851,34 +950,43 @@ def report(markets, skipped, fills, current, cfg, prior, split, until, tail_days
             "uncovered_fills": sum(m.uncovered for m in markets),
             "fills": len(fills), "resolved": sum(f.resting is not None for f in fills),
             "over_bid": sum(f.over_bid for f in fills),
-            "deep_days": sum(r.days for r in rested if r.deep),
-            "deep_fills": sum(stretch_of(m, f.at).deep for m in markets for f in m.fills),
+            "whole": sum(f.whole for m in markets for f in m.fills),
             "until": _stamp(until),
             "prior": {"at": prior.at.isoformat(timespec="minutes") if prior.at else None,
                       "markets": prior.markets, "floor": prior.floor},
+            "warnings": [] if prior.at == fill_cost.SWEEPS_PRIOR_AT else [
+                f"the stored prior was fit {_iso(prior.at)}, fill_cost.SWEEPS against the one "
+                f"fit {_iso(fill_cost.SWEEPS_PRIOR_AT)}: sellers scales that prior's rates, so "
+                f"production's predictions here are off by their ratio until a refit"],
         },
         "size_fit": {
             "all": _fit_json(fit_all) if fit_all else all_reason,
             "train": _fit_json(fit_train) if fit_train else train_reason,
-            "km": [[x, _survival(km, x),
-                    1 - NORMAL.cdf((math.log(x) - fit_all.mu) / fit_all.sigma) if fit_all else None]
-                   for x in KM_CHECKS],
-            "expected_min": {name: [fill_cost.sweep_fill(q, t) for q in SIZE_CHECKS]
+            "intervals": fit_intervals(terms[Window.ALL], reps=min(reps, FIT_REPS))
+            if fit_all else None,
+            "dump": {f"{q:g}": fit_all.sweeps(q).dump for q in quantiles} if fit_all else None,
+            "expected_min": {name: [t.fill(q) for q in SIZE_CHECKS]
                              for name, t in tables.items()},
         },
         "scores": [_score_json(s) for s in scores],
         "buckets": by_bucket(markets, production, Window.ALL, split, floor),
         "buckets_test": by_bucket(markets, production, Window.TEST, split, floor),
         "sources": by_source(markets, production, Window.ALL, split, floor),
-        "units": units,
+        "ahead": {w.value: by_ahead(markets, production, w, split, floor)
+                  for w in (Window.ALL, Window.TEST)},
         "tail_share": tail_share(markets, fit_all),
         "stopped_after_big": stopped_after_big(markets),
         "top_markets": top_markets(markets, by_window[Window.ALL], split, floor),
-        "tail_effect": tail_effect(current, cfg, prior, hurdles, tail_days_list),
+        "tail_effect": tail_effect(current, cfg, prior, hurdles, tail_days_list, quantiles),
         "gate": {"passes": verdict.passes, "reasons": list(verdict.reasons),
-                 "candidate": ["production", "all"] if held_out is None
-                 else [["production", "all"], ["refit", "test"]]},
+                 "candidate": ["refit", "test"],
+                 "in_sample": {field: _ratio_json(getattr(in_sample, field))
+                               for field, _ in GATED}},
     }
+
+
+def _iso(at):
+    return at.isoformat() if at else None
 
 
 def _stamp(at):
@@ -888,6 +996,13 @@ def _stamp(at):
 
 def _num(x, spec):
     return "-" if x is None else format(x, spec)
+
+
+def _over(bucket, i):
+    """realized / predicted of a by_ahead row's Tally field i, None on nothing
+    predicted."""
+    p = bucket["predicted"][i]
+    return bucket["realized"][i] / p if p > 0 else None
 
 
 def _ratio_text(r):
@@ -909,36 +1024,43 @@ def render(r):
              f"{d['fills'] - d['covered_fills'] - d['uncovered_fills']} on markets not scored",
              f"  {d['over_bid']} fills took more than the bid they were joined to: "
              f"counted as exact sizes, not censored",
-             f"  {d['deep_days']:,.1f} market-days rested behind more than "
-             f"{reward_screener.DEPTH_FREE_SHARES:,} shares, which every model charges no "
-             f"fills, as value_quote does; {d['deep_fills']} fills landed there",
+             f"  {d['whole']} of the fills inside a stretch took {CENSOR_FRACTION:.0%} of the "
+             f"bid or more, the whole-bid fills",
              f"  floor {d['floor']:g}; data before {d['until']}; train before {d['split']}, "
              f"test from it",
              f"  rates shrink toward the stored prior, fit {d['prior']['at']} on "
              f"{d['prior']['markets']} markets at floor {d['prior']['floor']:g} over "
-             f"{fill_cost.HISTORY_DAYS:g} days that overlap the test window; only the size "
-             f"table is refit before the split",
-             "", "Size fit (censored lognormal of the shares one fill event took)"]
+             f"{fill_cost.HISTORY_DAYS:g} days that overlap the test window; only the "
+             f"sweeps are refit before the split",
+             *(f"  warning: {w}" for w in d["warnings"]),
+             "", "Sweep fit (what a seller brings, lognormal, the share of the shares ahead "
+                 "that holds, and the sellers a counted sweep brings, fit jointly)"]
     for name in ("all", "train"):
         f = fit[name]
         lines.append(f"  {name:<6}" + (f"n {f['n']} ({f['censored']} censored) mu {f['mu']:.2f} "
-                                       f"sigma {f['sigma']:.2f}, median "
-                                       f"{math.exp(f['mu']):,.0f} shares"
-                                       if isinstance(f, dict) else f))
-    lines.append("  S(x) Kaplan-Meier / fit: " + ", ".join(
-        f"{x:,.0f}: {km:.3f} / {_num(p, '.3f')}" for x, km, p in fit["km"]))
-    lines.append("  E[min(Q, X)] at Q " + ", ".join(f"{q:,.0f}" for q in SIZE_CHECKS))
+                                       f"sigma {f['sigma']:.2f} hold {f['hold']:.3f} sellers "
+                                       f"{f['sellers']:.2f}, median {math.exp(f['mu']):,.0f} "
+                                       f"shares" if isinstance(f, dict) else f))
+    if fit["intervals"]:
+        lines.append(f"  all, {LEVEL:.0%} intervals from fits to resampled markets: " + ", ".join(
+            f"{name} [{lo:.3f}, {hi:.3f}]" for name, (lo, hi) in fit["intervals"].items()))
+    if fit["dump"]:
+        lines.append("  the tail's seller: " + ", ".join(
+            f"{shares:,.0f} shares at quantile {q}" for q, shares in fit["dump"].items()))
+    lines.append("  what a counted sweep fills of a bid of Q, nothing ahead, at Q "
+                 + ", ".join(f"{q:,.0f}" for q in SIZE_CHECKS))
     lines += [f"    {name:<14}" + "".join(f"{x:>8,.0f}" for x in values)
               for name, values in fit["expected_min"].items()]
     lines += ["", "Scores (realized / predicted, 90% intervals from resampling markets; "
-                  f"events counted per {SWEEP_UNIT.value} event)",
+                  "an event is one FILL row)",
               f"  {'model':<14} {'window':<6} {'events':<13} {'r/p [90%]':<20} "
-              f"{'shares':<17} r/p [90%]"]
+              f"{'shares':<17} {'r/p [90%]':<20} {'whole bid':<11} r/p [90%]"]
     for s in r["scores"]:
         lines.append(f"  {s['model']:<14} {s['window']:<6} {s['realized'][0]:>4.0f}/"
                      f"{s['predicted'][0]:<8.1f} {_ratio_text(s['events']):<20} "
                      f"{s['realized'][1]:>8,.0f}/{s['predicted'][1]:<8,.0f} "
-                     f"{_ratio_text(s['shares'])}")
+                     f"{_ratio_text(s['shares']):<20} {s['realized'][2]:>3.0f}/"
+                     f"{s['predicted'][2]:<7.1f} {_ratio_text(s['whole'])}")
     for key, title in (("buckets", "all"), ("buckets_test", "test")):
         lines += ["", f"By predicted events per market, production, {title}"]
         lines += [f"  {b['bucket']:<8} {b['markets']:>4} markets  predicted {b['predicted']:7.1f}  "
@@ -947,13 +1069,17 @@ def render(r):
     lines += [f"  {s['source']:<28} events {s['realized_events']:>4}/{s['predicted_events']:<7.1f}"
               f" shares {s['realized_shares']:>8,.0f}/{s['predicted_shares']:<8,.0f}"
               for s in r["sources"]]
-    u = r["units"]
-    lines += ["", "Unit check (test window: the rate's events, and a table fit before the "
-                  "split in the unit)"]
-    lines += [f"  {row['unit']:<5} events {_ratio_text(row['events']):<20} shares "
-              + (_ratio_text(row["shares"]) if row["shares"] else row["fit"]) for row in u["rows"]]
-    lines.append(f"  the rate is calibrated per {u['calibrated']} event; fill_cost.SWEEP_SIZES is "
-                 f"fit per {SWEEP_UNIT.value} event: {'ok' if u['passes'] else 'MISMATCH'}")
+    for window, rows in r["ahead"].items():
+        lines += ["", f"By shares ahead of the bid, production, {window} (realized/predicted)",
+                  f"  {'ahead':<8} {'days':>7} {'events':>14} {'r/p':>5} {'shares':>17} "
+                  f"{'r/p':>5} {'whole bid':>12} {'r/p':>5}"]
+        lines += [f"  {b['bucket']:<8} {b['days']:>7,.0f} "
+                  f"{b['realized'][0]:>5.0f}/{b['predicted'][0]:<8.1f} "
+                  f"{_num(_over(b, 0), '.2f'):>5} "
+                  f"{b['realized'][1]:>7,.0f}/{b['predicted'][1]:<9,.0f} "
+                  f"{_num(_over(b, 1), '.2f'):>5} "
+                  f"{b['realized'][2]:>4.0f}/{b['predicted'][2]:<7.1f} "
+                  f"{_num(_over(b, 2), '.2f'):>5}" for b in rows]
     lines += ["", "Tail share (realized fill events)"]
     lines += [f"  >= {t['size']:,.0f} shares: {t['fills']} fills, {t['share']:.0%} of filled "
               f"shares; fit P(X >= {t['size']:,.0f}) {_num(t['fit_p'], '.3f')}"
@@ -971,31 +1097,33 @@ def render(r):
               for t in r["top_markets"]]
     te = r["tail_effect"]
     lines += ["", f"Tail cap on current markets ({te['markets']} markets, from no position)",
-              f"  {'hurdle':>6} {'tail days':>9} {'bidding':>7} {'resting $':>10} "
-              f"{'reward $/d':>10} {'kept':>5} {'binds':>5} {'tail $':>8}"]
-    lines += [f"  {row['hurdle_rate']:>6g} {'none' if row['tail_days'] == 0 else format(row['tail_days'], 'g'):>9} "
+              f"  {'hurdle':>6} {'quantile':>8} {'tail days':>9} {'bidding':>7} "
+              f"{'resting $':>10} {'reward $/d':>10} {'kept':>5} {'binds':>5} {'tail $':>8}"]
+    lines += [f"  {row['hurdle_rate']:>6g} {_num(row['quantile'], 'g'):>8} "
+              f"{'none' if row['tail_days'] == 0 else format(row['tail_days'], 'g'):>9} "
               f"{row['bidding']:>7} {row['resting_usd']:>10,.0f} {row['reward_per_day']:>10,.2f} "
               f"{_num(row['kept'], '.0%'):>5} {row['binds']:>5} {row['tail_usd']:>8,.0f}"
               for row in te["rows"]]
     if te["trimmed"]:
-        lines.append("  most reward lost at the farmer's tail_days (price x size, uncapped -> "
-                     "capped):")
+        lines.append(f"  most reward lost at the farmer's tail_days and quantile "
+                     f"{fill_cost.TAIL_QUANTILE:g} (price x size, uncapped -> capped):")
         lines += [f"    {t['hurdle_rate']:>4g} {t['slug'][:44]:<44} -${t['lost_per_day']:.2f}/day  "
                   f"{t['free'][0]:.3f} x {t['free'][1]:,.0f} -> "
                   + (f"{t['capped'][0]:.3f} x {t['capped'][1]:,.0f}" if t["capped"] else "no bid")
                   for t in te["trimmed"]]
     g = r["gate"]
     lines += ["", "Gate",
-              f"  production over all, and the table refit before the split over the test: "
-              f"for events and shares, the 90% interval must include 1 (all), and the ratio "
-              f"lie in [{GATE_BAND[0]:.2f}, {GATE_BAND[1]:.2f}] with its interval reaching it "
-              f"(test)",
+              f"  the sweeps refit before the split, over the test window: events, shares and "
+              f"whole-bid fills realized/predicted must each lie in [{GATE_BAND[0]:.2f}, "
+              f"{GATE_BAND[1]:.2f}] with the {LEVEL:.0%} interval reaching it",
               f"  {'PASS' if g['passes'] else 'FAIL'}"]
     lines += [f"  - {reason}" for reason in g["reasons"]]
+    lines.append("  in sample, not gated (sellers is fit to match production's events over all, "
+                 "its sweeps to every fill): production all " + ", ".join(
+                     f"{name} {_ratio_text(g['in_sample'][field])}" for field, name in GATED))
     return "\n".join(lines) + "\n"
 
 
-# --- CLI -----------------------------------------------------------------------
 
 def read_fills(db_path, until):
     """own_fills of farm.db's events before until (unix)."""
@@ -1023,6 +1151,15 @@ def stored_prior(db_path):
         conn.close()
 
 
+def run_fit(args):
+    until = _until(args.until)
+    cfg, rows = pb.farm_terms(args.db)
+    markets, _ = load_markets(args.books, args.cache, cfg, rows, read_fills(args.db, until), until)
+    prior = stored_prior(args.db)
+    fit = fit_sweeps([fit_terms(m, prior, cfg.min_fav, Window.ALL, until) for m in markets])
+    print(fit_text(fit, markets, datetime.fromtimestamp(until, timezone.utc), prior), end="")
+
+
 def run_report(args):
     split = datetime.fromisoformat(args.split).replace(tzinfo=timezone.utc).timestamp()
     until = _until(args.until)
@@ -1033,7 +1170,7 @@ def run_report(args):
     current = current_markets(args.db, args.books, cfg, rows, until)
     fills = [f for found in by_market.values() for f in found]
     result = report(markets, skipped, fills, current, cfg, prior, split, until, args.tail_days,
-                    args.hurdle_rates, args.reps)
+                    args.hurdle_rates, args.tail_quantiles, args.reps)
     text = render(result)
     print(text, end="")
     if args.report:
@@ -1049,18 +1186,20 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="python -m analysis.fill_calibration",
                                      description=__doc__.strip().splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("fit", help="print fill_cost.SWEEP_SIZES fit to the farmer's own fills")
-    p.add_argument("--db", required=True, help="farm.db")
-    p.add_argument("--until", help=UNTIL_HELP)
+    fit = sub.add_parser("fit", help="print fill_cost.SWEEPS fit to the farmer's own fills")
     p = sub.add_parser("report", help="score the fill model against the farmer's own fills")
-    p.add_argument("--db", required=True, help="farm.db")
-    p.add_argument("--until", help=UNTIL_HELP)
-    p.add_argument("--books", required=True, help="farm_books.db")
-    p.add_argument("--cache", required=True, help="the pricing_backtest fetch cache")
+    for q in (fit, p):
+        q.add_argument("--db", required=True, help="farm.db")
+        q.add_argument("--until", help=UNTIL_HELP)
+        q.add_argument("--books", required=True, help="farm_books.db")
+        q.add_argument("--cache", required=True, help="the pricing_backtest fetch cache")
     p.add_argument("--split", required=True, help="UTC date the test window starts")
     p.add_argument("--tail-days", type=float, nargs="*", default=list(TAIL_DAYS),
                    help=f"tail caps to try on current markets (default: "
                         f"{' '.join(f'{t:g}' for t in TAIL_DAYS)})")
+    p.add_argument("--tail-quantiles", type=float, nargs="*", default=list(TAIL_QUANTILES),
+                   help=f"tail quantiles to try them at (default: "
+                        f"{' '.join(f'{q:g}' for q in TAIL_QUANTILES)})")
     p.add_argument("--hurdle-rates", type=float, nargs="*", default=list(HURDLES),
                    help=f"hurdle rates to try them at (default: "
                         f"{' '.join(f'{h:g}' for h in HURDLES)})")
@@ -1069,10 +1208,7 @@ def main(argv=None):
     p.add_argument("--json", help="also write the result to this file")
     args = parser.parse_args(argv)
     if args.command == "fit":
-        until = _until(args.until)
-        fills = [f for found in read_fills(args.db, until).values() for f in found]
-        print(fit_text(fit_sizes(fills), fills, datetime.fromtimestamp(until, timezone.utc)),
-              end="")
+        run_fit(args)
     else:
         run_report(args)
 

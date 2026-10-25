@@ -22,7 +22,9 @@ farmer rests on both sides, in four slots per market:
             the share sells for: the ask the fill would leave resting, never
             credited over p_true, and p_true for what is unsold at
             resolution (farm/fill_cost.py has the measurements). A sweep
-            fills only what it sells past the bid (fill_cost.sweep_fill). The bid rests at the lowest price,
+            fills only what its sellers bring past the bid and the share of
+            the bids ahead that holds (fill_cost.Sweeps). The bid rests at
+            the lowest price,
             in the band, among the prices and sizes whose rewards net of
             expected fills (from the market's fill history, shrunk toward
             the last scan's cross-market prior) are within --tie-band of
@@ -31,9 +33,7 @@ farmer rests on both sides, in four slots per market:
             stays the most inventory the market holds. It is never above
             bid_cap: p_true minus a margin, lowered to the ceiling the
             market's own fills set (farm/fill_watch.py), and it rests only
-            when its net beats the orders without it. A bid with more than
-            reward_screener.DEPTH_FREE_SHARES bid above it is charged no
-            fills, so it rests at all of the bid room. Until the market's
+            when its net beats the orders without it. Until the market's
             history is read it does not rest at all. p_true is the
             operator's view of the favorite, or none: a market without one
             follows the book, and its p_true each cycle is the midpoint of
@@ -266,6 +266,7 @@ from farm.reward_screener import (
     resolution_signal,
     round_size_down,
     score,
+    shares_ahead,
     sized_without_budget,
     price_offering,
     tick_decimals,
@@ -984,7 +985,7 @@ def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
     inventory with the bid's shares added at its price, anchored at the mid
     before the fill, the book's now, or fill_mid when higher, as
     plan_fav_ask_price takes them. None if that ask would cross. value_of
-    passes the shares one sweep fills, not the whole bid."""
+    passes the shares one fill takes, not the whole bid."""
     book_mid = adjusted_mid(levels.bids, levels.asks, fm.min_size)
     shares = position.fav_shares + bid.size
     filled = position._replace(fav_shares=shares, fav_avg=(
@@ -994,13 +995,15 @@ def fill_exit_price(fm, levels, position, cfg, bid, fill_mid=None):
 
 def value_of(target, fm, levels, position, cfg, outlook, fill_mid=None):
     """value_quote of a planned set of orders, its favorite bid included, a
-    fill of what one sweep takes (FillCurve.sweep_fill) adding to the
-    favorite shares the position holds and sold at its fill_exit_price."""
+    fill of what one fill takes (Sweeps.per_fill, behind the shares ahead of
+    it) adding to the favorite shares the position holds and sold at its
+    fill_exit_price."""
     by = {i.slot: i for i in target.intents}
     bid = by.get(Slot.FAV_BID)
     capital = sum(i.price * i.size for slot, i in by.items() if slot.side == BUY)
     sale_price = bid and fill_exit_price(
-        fm, levels, position, cfg, bid._replace(size=outlook.fills.sweep_fill(bid.size)),
+        fm, levels, position, cfg,
+        bid._replace(size=outlook.fills.sweeps.per_fill(bid.size, shares_ahead(levels, bid.price))),
         fill_mid)
     return value_quote(levels, target.mid, fm.v, fm.min_size,
                        q_min(*q_totals(target.intents), target.mid),
@@ -3320,9 +3323,10 @@ Examples:
                                         "inventory a market holds"),
         ("--tie-band", float, 0.05, "Favorite bids netting within this fraction of the "
                                     "best net are tied, and the lowest price rests"),
-        ("--tail-days", float, 30.0, "Most days of its plan's reward one sweep filling the "
-                                     "whole quoting favorite bid may lose, its shares sold "
-                                     "as that inventory sells. 0 is no cap"),
+        ("--tail-days", float, 30.0, "Most days of its plan's reward the quoting favorite "
+                                     "bid may lose if a 99th-percentile seller hits it past "
+                                     "the bids ahead that hold, its shares sold as that "
+                                     "inventory sells. 0 is no cap"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

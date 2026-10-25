@@ -7,10 +7,12 @@ import threading
 import time
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
 
 import httpx
 
+from console.glossary import GLOSSARY
 from farm import farm_books, farm_db, fill_cost, fill_watch, reward_farmer, reward_screener
 from farm.farm_db import CommandKind
 from farm.reward_farmer import (
@@ -162,11 +164,11 @@ def q_sums(target):
     return q_one, q_two
 
 
-def curve(*rates, sizes=fill_cost.WHOLE_BID):
+def curve(*rates, sweeps=fill_cost.WHOLE_BID):
     """Fills drawn from the market's history: these rates from the first of
     DISTANCES, the last one held to the end. A sweep fills the whole bid
-    unless given other sweep sizes."""
-    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0, sizes)
+    unless given other sweeps."""
+    return FillCurve(rates + rates[-1:] * (len(DISTANCES) - len(rates)), True, 0.0, sweeps)
 
 
 # A quiet market: a sweep reaches a bid at the midpoint about once a month,
@@ -1757,18 +1759,13 @@ class SizeChoiceTest(unittest.TestCase):
         self.assertEqual(best.fill_cost_per_day, 0.0)
         self.assertEqual((best.price, best.size), (0.985, 507.61))
 
-    def test_a_bid_behind_over_20_000_shares_rests_all_its_capital(self):
-        # Behind 20,000 shares at 96.9c half the capital nets the most, at
-        # 96.4c as on POOL_BOOK. One share more there and no bid from 96.8c
-        # down is charged a fill, so all $2,000 rests at 96.8c for its reward.
-        at_limit, over = (POOL_BOOK._replace(bids=[(0.969, shares)])
-                          for shares in (20_000.0, 20_001.0))
-        best = self.chosen(book=at_limit)
-        self.assertEqual((best.price, best.size), (0.964, 1037.34))
-        best = self.chosen(book=over)
-        self.assertEqual((best.price, best.size), (0.968, 2066.11))
-        self.assertEqual(best.fill_cost_per_day, 0.0)
-        self.assertEqual(best.net_per_day, best.reward_per_day)
+    def test_a_bid_behind_a_deep_book_is_charged_the_fills_that_get_past_it(self):
+        fills = curve(*FEW.rates, sweeps=fill_cost.Sweeps(4.5289, 1.7226, hold=0.3))
+        deep, deeper = (self.chosen(book=POOL_BOOK._replace(bids=[(0.969, shares)]), fills=fills)
+                        for shares in (2 * fill_cost.DEPTH_CREDIT_MAX, 60_000.0))
+        self.assertEqual((deep.price, deep.size), (deeper.price, deeper.size))
+        self.assertEqual(deep.fill_cost_per_day, deeper.fill_cost_per_day)
+        self.assertGreater(deeper.fill_cost_per_day, 0.0)
 
     def test_doubling_the_capital_does_not_lower_the_net_chosen(self):
         # $1,000 buys the 1,037 shares that net the most, and more capital
@@ -2122,6 +2119,31 @@ class TailCapTest(unittest.TestCase):
         self.assertAlmostEqual(half.tail_days, 46.4, places=1)
         self.assertLess(plan(POOL, POOL_BOOK, fills=FEW, cfg=CAPPED).fav.best.size, 1037.34)
 
+    # 30% of the shares bid ahead hold, and the tail's seller brings more
+    # than DEPTH_CREDIT_MAX of them hold.
+    DEEP_HOLD = curve(*FEW.rates, sweeps=fill_cost.Sweeps(4.5289, 1.7226, hold=0.3))
+
+    def deep_book(self, ahead):
+        return POOL_BOOK._replace(bids=[(0.969, ahead), (0.950, 5000.0)])
+
+    def test_a_bid_behind_a_deep_book_keeps_the_tail_past_the_depth_credit(self):
+        sweeps = self.DEEP_HOLD.sweeps
+        self.assertGreater(sweeps.dump, sweeps.hold * fill_cost.DEPTH_CREDIT_MAX)
+        values = [bid_value(DISTANT, self.deep_book(ahead), 0.960, 2000.0, fills=self.DEEP_HOLD)
+                  for ahead in (fill_cost.DEPTH_CREDIT_MAX, 30_000.0, 1e6)]
+        self.assertGreater(values[0].tail_usd, 0.0)
+        self.assertEqual({v.tail_usd for v in values}, {values[0].tail_usd})
+        self.assertEqual({v.fills_per_day for v in values}, {values[0].fills_per_day})
+
+    def test_a_bid_behind_30_000_shares_is_capped_when_its_tail_costs_too_much(self):
+        cfg = CFG._replace(hurdle_rate=1.0, tail_days=30.0)
+        book = self.deep_book(30_000.0)
+        free = plan(DISTANT, book, fills=self.DEEP_HOLD, cfg=cfg._replace(tail_days=0.0)).fav.best
+        self.assertGreater(reward_screener.shares_ahead(book, free.price), 30_000.0 - 1e-9)
+        self.assertFalse(free.within_tail(30.0))
+        capped = plan(DISTANT, book, fills=self.DEEP_HOLD, cfg=cfg).fav.best
+        self.assertTrue(capped is None or (capped.within_tail(30.0) and capped.size < free.size))
+
     def test_with_no_bid_within_the_cap_the_reason_names_it(self):
         cfg = CFG._replace(hurdle_rate=1.0, tail_days=30.0)
         target = plan(DISTANT, POOL_BOOK, fills=FEW, cfg=cfg)
@@ -2161,6 +2183,13 @@ class TailCapTest(unittest.TestCase):
         uncapped = plan(DISTANT, POOL_BOOK, fills=FEW, cfg=cfg._replace(tail_days=0.0))
         self.assertIn(Slot.FAV_BID, by_slot(uncapped))
         self.assertFalse(uncapped.fav.best.within_tail(30.0))
+
+    def test_the_cap_texts_name_the_tail_quantiles_percentile(self):
+        named = f"{fill_cost.TAIL_QUANTILE * 100:.0f}th-percentile"
+        flag = next(a for a in build_parser()._actions if "--tail-days" in a.option_strings)
+        farmer_md = Path(__file__).resolve().parents[1] / "docs" / "farmer.md"
+        for text in (flag.help, GLOSSARY["tail_days"].text, farmer_md.read_text(encoding="utf-8")):
+            self.assertIn(named, text)
 
     def test_a_sole_bid_is_not_capped(self):
         capped = sole(cfg=CFG._replace(tail_days=1.0))
@@ -3283,7 +3312,8 @@ class FarmerCycleTest(FarmerHarness):
         self.assertAlmostEqual(economics["net_per_day"], economics["reward_per_day"]
                                - economics["fills_per_day"] * economics["loss_per_share"])
         fills = fill_cost.fill_curve(history, PRIOR, 0.90)
-        self.assertAlmostEqual(economics["fills_per_day"], fills.sweep_fill(target["size"])
+        ahead = reward_screener.shares_ahead(FLOOR_BOOK, target["price"])
+        self.assertAlmostEqual(economics["fills_per_day"], fills.sweeps.fill(target["size"], ahead)
                                * fills.per_day(row["mid"] - target["price"]))
         self.assertEqual(slots["FAV_BID"]["history"], fill_cost.history_to_json(history))
 

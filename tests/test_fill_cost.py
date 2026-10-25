@@ -3,19 +3,22 @@ import math
 import random
 import unittest
 from datetime import datetime, timedelta, timezone
+from statistics import NormalDist
 
 from farm.fill_cost import (
     DEFAULT_PRIOR,
+    DEPTH_CREDIT_MAX,
     DISTANCES,
     EXIT_DISTANCE,
     FLOOR_RATE,
     PRE_SWEEP_S,
     STRENGTHS,
-    SWEEP_SIZES,
+    SWEEPS,
     WHOLE_BID,
     History,
     Hit,
     Prior,
+    Sweeps,
     fill_curve,
     fill_source,
     fit_prior,
@@ -26,7 +29,6 @@ from farm.fill_cost import (
     prior_to_json,
     sales_per_day,
     share_value,
-    sweep_fill,
     years_until,
 )
 
@@ -130,37 +132,112 @@ def at(values, distance):
     return values[DISTANCES.index(distance)]
 
 
-class SweepFillTest(unittest.TestCase):
-    """A sweep that reaches a bid fills min(bid, its size), on average over
-    the measured sweep sizes."""
+def integrated_fill(sweeps, shares, ahead, steps=200_000):
+    """sellers * E[min(shares, max(0, X - hold * A))], A the shares ahead up
+    to DEPTH_CREDIT_MAX, as the integral of P(X > x) from hold * A to that
+    plus shares, summed on a grid."""
+    c, dx = sweeps.hold * min(ahead, DEPTH_CREDIT_MAX), shares / steps
+    return sweeps.sellers * sum(sweeps.survival(c + (i + 0.5) * dx) for i in range(steps)) * dx
 
-    def test_a_bid_fills_the_mean_of_min_bid_and_each_sweep(self):
-        self.assertAlmostEqual(sweep_fill(150.0, (100.0, 200.0, 300.0, 400.0)),
-                               (100 + 150 + 150 + 150) / 4)
 
-    def test_a_bid_under_every_sweep_fills_whole(self):
-        self.assertEqual(sweep_fill(20.0, (100.0, 200.0)), 20.0)
+class SweepsTest(unittest.TestCase):
+    """A sweep reaching a bid's distance brings X shares, lognormal; of the
+    shares bid ahead of it, the hold share holds. It fills
+    min(Q, max(0, X - hold * ahead))."""
 
-    def test_a_bid_over_every_sweep_fills_the_mean_sweep(self):
-        self.assertEqual(sweep_fill(10_000.0, (100.0, 200.0)), 150.0)
+    NO_HOLD = Sweeps(4.5289, 1.7226)
 
-    def test_the_whole_bid_table_fills_any_bid_whole(self):
-        self.assertEqual(sweep_fill(1e6, WHOLE_BID), 1e6)
+    def test_with_no_hold_the_fill_ignores_the_shares_ahead(self):
+        # E[min(Q, X)] of a 40-bin table of this lognormal at Q 100, 300, 1,000, 3,000.
+        for q, table in ((100.0, 67.3), (300.0, 135.2), (1000.0, 233.7), (3000.0, 317.6)):
+            with self.subTest(q=q):
+                self.assertLess(abs(self.NO_HOLD.fill(q) / table - 1), 0.03)
+                self.assertEqual(self.NO_HOLD.fill(q, ahead=5000.0), self.NO_HOLD.fill(q))
+                self.assertEqual(self.NO_HOLD.events(5000.0), 1.0)
 
-    def test_the_measured_table_grows_slower_than_the_bid(self):
-        fills = [sweep_fill(q) for q in (10.0, 100.0, 1000.0, 10_000.0)]
+    def test_the_fill_is_the_mean_of_what_gets_past_the_bids_that_hold(self):
+        sweeps = Sweeps(4.5, 1.7, hold=0.3, sellers=2.5)
+        for q, ahead in ((100.0, 0.0), (1000.0, 2000.0), (300.0, 20_000.0),
+                         (3000.0, 10 * DEPTH_CREDIT_MAX)):
+            with self.subTest(q=q, ahead=ahead):
+                self.assertLess(abs(sweeps.fill(q, ahead) / integrated_fill(sweeps, q, ahead)
+                                    - 1), 1e-4)
+
+    def test_shares_ahead_cut_how_often_and_how_much_a_sweep_fills(self):
+        sweeps = Sweeps(4.5, 1.7, hold=0.3)
+        fills = [sweeps.fill(1000.0, ahead) for ahead in (0.0, 500.0, 2000.0, 20_000.0)]
+        reach = [sweeps.events(ahead) for ahead in (0.0, 500.0, 2000.0, 20_000.0)]
+        self.assertEqual(fills, sorted(fills, reverse=True))
+        self.assertEqual(reach, sorted(reach, reverse=True))
+        self.assertEqual(reach[0], 1.0)
+        self.assertGreater(fills[-1], 0.0)
+        self.assertAlmostEqual(reach[2], 1 - NormalDist(4.5, 1.7).cdf(math.log(600.0)))
+        self.assertAlmostEqual(sweeps.per_fill(1000.0, 2000.0), fills[2] / reach[2])
+
+    def test_more_sellers_a_sweep_fill_more_often_and_take_as_much_each(self):
+        one = Sweeps(4.5, 1.7, hold=0.3)
+        three = one._replace(sellers=3.0)
+        self.assertAlmostEqual(three.fill(1000.0, 2000.0), 3 * one.fill(1000.0, 2000.0))
+        self.assertAlmostEqual(three.events(2000.0), 3 * one.events(2000.0))
+        self.assertAlmostEqual(three.per_fill(1000.0, 2000.0), one.per_fill(1000.0, 2000.0))
+        self.assertEqual((three.dump, three.tail(1e6, 2000.0)), (one.dump, one.tail(1e6, 2000.0)))
+
+    def test_a_fixed_sweep_fills_what_is_left_of_it_past_the_bids_that_hold(self):
+        sweeps = Sweeps(math.log(100.0), 0.0, hold=0.5)
+        self.assertAlmostEqual(sweeps.fill(200.0, ahead=60.0), 70.0)
+        self.assertAlmostEqual(sweeps.fill(50.0, ahead=60.0), 50.0)
+        self.assertEqual((sweeps.events(200.0), sweeps.fill(200.0, ahead=200.0)), (0.0, 0.0))
+        self.assertEqual(sweeps.per_fill(200.0, ahead=200.0), 0.0)
+
+    def test_the_whole_bid_fills_any_bid_whole(self):
+        self.assertEqual(WHOLE_BID.fill(1e6, ahead=1e6), 1e6)
+        self.assertEqual(WHOLE_BID.events(1e6), 1.0)
+        self.assertEqual(WHOLE_BID.per_fill(2083.0, ahead=1e6), 2083.0)
+        for shares, ahead in ((1.0, 0.0), (2083.0, 1e6), (1e9, 1e12)):
+            with self.subTest(shares=shares, ahead=ahead):
+                self.assertEqual(WHOLE_BID.tail(shares, ahead), shares)
+
+    def test_the_tail_is_a_dump_of_the_quantile_less_the_bids_that_hold(self):
+        sweeps = Sweeps(4.5, 1.7, hold=0.3, quantile=0.99)
+        dump = math.exp(4.5 + 1.7 * NormalDist().inv_cdf(0.99))
+        self.assertAlmostEqual(sweeps.dump, dump)
+        self.assertEqual(sweeps.tail(100.0), 100.0)
+        self.assertAlmostEqual(sweeps.tail(10_000.0), dump)
+        self.assertAlmostEqual(sweeps.tail(10_000.0, ahead=5000.0), dump - 1500.0)
+        self.assertEqual(sweeps._replace(hold=1.0).tail(10_000.0, ahead=dump), 0.0)
+        self.assertLess(sweeps._replace(quantile=0.95).dump, dump)
+
+    def test_shares_ahead_past_the_depth_credit_hold_no_more_than_it(self):
+        sweeps = Sweeps(4.5, 1.7, hold=0.3, sellers=2.0)
+        self.assertGreater(sweeps.dump, 0.3 * DEPTH_CREDIT_MAX)
+        at_cap = (sweeps.fill(1000.0, DEPTH_CREDIT_MAX), sweeps.events(DEPTH_CREDIT_MAX),
+                  sweeps.tail(1e6, DEPTH_CREDIT_MAX))
+        self.assertEqual(at_cap[2], sweeps.dump - 0.3 * DEPTH_CREDIT_MAX)
+        for deeper in (1.5 * DEPTH_CREDIT_MAX, 100 * DEPTH_CREDIT_MAX, 1e12):
+            with self.subTest(deeper=deeper):
+                self.assertEqual((sweeps.fill(1000.0, deeper), sweeps.events(deeper),
+                                  sweeps.tail(1e6, deeper)), at_cap)
+        self.assertLess(at_cap[0], sweeps.fill(1000.0, DEPTH_CREDIT_MAX / 2))
+
+    def test_a_fill_never_takes_more_than_the_bid(self):
+        narrow = Sweeps(3.0, 0.5, hold=0.5)
+        for shares in (1.0, 10.0, 100.0):
+            for ahead in (10 ** (e / 4) for e in range(40)):
+                with self.subTest(shares=shares, ahead=ahead):
+                    self.assertTrue(0.0 <= narrow.per_fill(shares, ahead) <= shares)
+
+    def test_the_fitted_sweeps_fill_less_than_the_bid_as_it_grows(self):
+        fills = [SWEEPS.fill(q) for q in (10.0, 100.0, 1000.0, 10_000.0)]
         self.assertEqual(fills, sorted(fills))
         self.assertGreater(fills[0], 0.8 * 10.0)
         self.assertLess(fills[3], 1000.0)
         self.assertLess((fills[3] - fills[2]) / 9000, (fills[2] - fills[1]) / 900)
-        self.assertEqual(len(SWEEP_SIZES), 40)
-        self.assertEqual(list(SWEEP_SIZES), sorted(SWEEP_SIZES))
+        self.assertTrue(0.0 <= SWEEPS.hold <= 1.0)
+        self.assertGreater(SWEEPS.sellers, 0.0)
 
-    def test_a_curve_fills_with_its_own_table_the_measured_one_by_default(self):
+    def test_a_curve_fills_by_the_fitted_sweeps_unless_given_others(self):
         curve = fill_curve(None, DEFAULT_PRIOR, DEFAULT_PRIOR.floor)
-        self.assertEqual(curve.sweep_fill(500.0), sweep_fill(500.0))
-        whole = curve._replace(sweep_sizes=WHOLE_BID)
-        self.assertEqual(whole.sweep_fill(500.0), 500.0)
+        self.assertEqual(curve.sweeps, SWEEPS)
 
 
 class MakeHistoryTest(unittest.TestCase):
