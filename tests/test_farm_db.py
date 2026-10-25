@@ -166,6 +166,8 @@ class SettingsTest(ScratchDb):
         self.assertEqual(farm_db.parse_setting("bid_multiple", "4"), 4.0)
         self.assertEqual(farm_db.parse_setting("bid_multiple", "1"), 1.0)
         self.assertEqual(farm_db.parse_setting("tie_band", "0.05"), 0.05)
+        self.assertEqual(farm_db.parse_setting("tail_days", "30"), 30.0)
+        self.assertEqual(farm_db.parse_setting("tail_days", "0"), 0.0)
 
     def test_parse_rejects_bad_values(self):
         for key, text in (
@@ -187,6 +189,7 @@ class SettingsTest(ScratchDb):
             ("bid_multiple", "21"),
             ("tie_band", "-0.01"),
             ("tie_band", "1.5"),
+            ("tail_days", "-1"),
             ("depth_haircut", "0.5"),
             ("stuck_share", "0.25"),
             ("no_such_key", "1"),

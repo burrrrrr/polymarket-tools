@@ -716,6 +716,7 @@ SETTINGS = {
     # 1 rests at most the capital left; capital already says anything under it.
     "bid_multiple": Bound(1, 20),
     "tie_band": Bound(0, 1),
+    "tail_days": Bound(0),
 }
 
 

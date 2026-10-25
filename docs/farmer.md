@@ -256,7 +256,7 @@ while it exists.
 - **Keys.** The keys are the option names with underscores, and the seconds
   options end in `_s`: `capital`, `max_lead`, `ask_offset`, `min_capture`,
   `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`, `hurdle_rate`,
-  `bid_multiple`, `tie_band`, `drop_threshold`, `drop_window_s`,
+  `bid_multiple`, `tail_days`, `tie_band`, `drop_threshold`, `drop_window_s`,
   `cooldown_s`, `naked_cooldown_s`, and `expiry_buffer_days`. Each value is
   a JSON number. The console shows every one but `tie_band`.
 - **Bad values.** `farm_db.put_setting` refuses an unknown key or an
@@ -303,6 +303,11 @@ if no farmer was running when it was sent.
   most, and rests nothing once the capital is used. One sweep can fill all of
   a resting bid, so a market can hold up to its multiple times its capital
   for a moment; the backtest reports how often.
+- `--tail-days` caps each quoting favorite bid by what one sweep filling all
+  of it would lose: at most that many days of its plan's reward, the filled
+  shares valued as the ask sells that inventory (see
+  [the tail cap](pricing.md#the-tail-cap)). 0 is no cap. A sole bid is not
+  capped.
 - The approved budget caps the naked longshot leg outside the free zone, and
   no longshot bid rests where a fill would give a favorite buyer over 20% a
   year. [The longshot bid](pricing.md#the-longshot-bid) has both rules.
@@ -318,7 +323,8 @@ if no farmer was running when it was sent.
   size. It stays while its price is still a candidate, its net trails the
   best bid's by no more than `1 - --keep-ratio` of it (or $0.02/day, if
   more), it beats the orders without it, the naked budget still balances at
-  least 80% of it, and it is no more than 25% over the bid room. One priced
+  least 80% of it, it is no more than 25% over the bid room, and its tail is
+  no more than 25% over the tail cap. One priced
   over the bid the tie band chose stays only while its net is inside the
   band. This
   keeps queue position and avoids churning orders on every small move of the
@@ -382,6 +388,7 @@ it does not manage.
 | `--capital` | 500 | Most USD of favorite inventory a market may hold, at cost |
 | `--bid-multiple` | 4 | Most a quoting favorite bid may rest, as a multiple of the capital left. A sole bid rests the capital left |
 | `--tie-band` | 0.05 | Favorite bids netting within this fraction of the best net are tied, and the lowest price rests |
+| `--tail-days` | 30 | Most days of its plan's reward one sweep filling the whole quoting favorite bid may lose, its shares sold as that inventory sells. 0 is no cap |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask and longshot ask minimum above the shares' average cost |
@@ -464,7 +471,10 @@ Each column has exactly one writer process. The module docstring of
 `farm/farm_db.py` lists every table with its writer and its purpose.
 
 `farm_events` holds changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`,
-`ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and `SETTINGS`. At
+`ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and `SETTINGS`. A
+`PLACE` row's `data` holds the `order_id` the CLOB gave the order, or is
+empty when the CLOB refused it, and a `CANCEL` row's the order it cancelled.
+At
 startup the farmer deletes the events older than 30 days and the `farm_mids`
 samples older than 7 days. A live farmer fetches `rewards_daily`, your reward
 earnings per market per day, every 10 minutes.
@@ -477,8 +487,10 @@ overwritten.
 A `FILL` event comes from a change in your positions, because the data API
 reports no fills. Its price is the price of the order the listing showed
 leaving the book, else of the order that rested in that slot at the previous
-cycle, and its `data` says which (`price_source`) and `filled_at`, when it
-left the book. A market that joins the managed set, at start or approved
+cycle, and its `data` says which (`price_source`), that order's
+`order_id`, and `filled_at`, when it left the book.
+`analysis/fill_calibration.py` joins the `order_id` to the `PLACE` row to
+find the bid a fill hit. A market that joins the managed set, at start or approved
 later, rebuilds its post-fill ceilings from these rows. An older row without
 `filled_at` counts from when positions showed it.
 

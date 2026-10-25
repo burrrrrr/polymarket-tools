@@ -1431,6 +1431,15 @@ class SettingsTest(Writes):
         self.save("Quoting", bid_multiple="2")
         self.assertEqual(farm_db.load_settings(self.db), ({"bid_multiple": 2.0}, {}))
 
+    def test_the_tail_cap_saves_with_quoting(self):
+        page = self.client.get("/settings").text
+        self.assertRegex(page, r'(?s)Tail cap \(days of reward\).*?name="tail_days" value="30"')
+        resp = self.save("Quoting", tail_days="-1")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("tail_days: -1 is out of range", resp.text)
+        self.save("Quoting", tail_days="0")
+        self.assertEqual(farm_db.load_settings(self.db), ({"tail_days": 0.0}, {}))
+
     def test_reset_deletes_the_override(self):
         farm_db.put_setting(self.db, "cooldown_s", 30, self.now)
         resp = self.post("/settings/reset/cooldown_s")

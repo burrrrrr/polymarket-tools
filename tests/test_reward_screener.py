@@ -2,6 +2,7 @@ import base64
 import contextlib
 import io
 import json
+import math
 import os
 import tempfile
 import threading
@@ -638,6 +639,50 @@ class ValueQuoteTest(unittest.TestCase):
                                             5.0, outlook(curve(1e6)))
         self.assertEqual(value.fills_per_day, 0.0)
         self.assertAlmostEqual(value.net_per_day, 50.0)
+        self.assertEqual(value.tail_usd, 0.0)
+
+
+class TailTest(unittest.TestCase):
+    """The tail is what one sweep filling the whole bid would lose, its
+    shares sold as the inventory it leaves sells."""
+
+    NEWSOM = ValueQuoteTest.NEWSOM
+
+    def test_the_tail_sells_the_whole_bid_where_a_fill_sells_one_sweep(self):
+        newsom = outlook(curve(0.5, sizes=(100.0,)), years=0.228)
+        value = reward_screener.value_quote(*self.NEWSOM, newsom)
+        whole = reward_screener.value_quote(*self.NEWSOM, outlook(curve(0.5), years=0.228))
+        self.assertAlmostEqual(whole.loss_per_share, 0.02342, places=5)
+        self.assertAlmostEqual(value.tail_usd, 2083.0 * whole.loss_per_share)
+        self.assertEqual(whole.tail_usd, value.tail_usd)
+        self.assertLess(value.loss_per_share, whole.loss_per_share)
+
+    def test_shares_already_held_sell_alongside_the_whole_bid(self):
+        newsom = outlook(curve(0.5), years=0.228)
+        more = reward_screener.value_quote(*self.NEWSOM, newsom, held=5000.0)
+        self.assertAlmostEqual(more.tail_usd, 2083.0 * more.loss_per_share)
+        self.assertGreater(more.tail_usd,
+                           reward_screener.value_quote(*self.NEWSOM, newsom).tail_usd)
+
+    def test_a_whole_fill_worth_more_than_its_price_has_no_tail(self):
+        soon = outlook(curve(0.5), years=30 / 365.25, hurdle_rate=0.0)
+        value = reward_screener.value_quote(ValueQuoteTest.BOOK, 0.96, 0.035, 20.0,
+                                            ValueQuoteTest.THEIR_Q, (0.94, 100.0), 94.0, soon)
+        self.assertEqual((value.tail_usd, value.tail_days), (0.0, 0.0))
+
+    def test_the_tail_cap_compares_the_tail_with_days_of_the_plans_reward(self):
+        value = reward_screener.QuoteValue(0.95, 100.0, 95.0, 0.5, 0.0, 0.0, 15.0)
+        self.assertEqual(value.tail_days, 30.0)
+        self.assertTrue(value.within_tail(30.0))
+        self.assertFalse(value.within_tail(29.0))
+        self.assertTrue(value.within_tail(29.0, slack=1.25))
+        self.assertTrue(value.within_tail(0.0))
+
+    def test_a_tail_on_no_reward_is_over_any_cap(self):
+        value = reward_screener.QuoteValue(0.95, 100.0, 95.0, 0.0, 0.0, 0.0, 1.0)
+        self.assertEqual(value.tail_days, math.inf)
+        self.assertFalse(value.within_tail(1e6))
+        self.assertTrue(value._replace(tail_usd=0.0).within_tail(1.0))
 
 
 class PlanQuotesTest(unittest.TestCase):

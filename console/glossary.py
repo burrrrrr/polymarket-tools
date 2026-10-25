@@ -132,6 +132,15 @@ GLOSSARY = {
                                        "multiple times the capital left, at the size under "
                                        "that which nets the most. Leave blank to use the "
                                        "farmer's default."),
+    "tail_days": Term("Tail cap", "The most days of a market's planned reward that one sell "
+                                  "sweep filling the whole favorite bid may lose. The filled "
+                                  "shares are valued as the farmer's ask sells that many, "
+                                  "discounted at the hurdle rate, and what is still unsold "
+                                  "pays out at the end date. A larger bid, a higher price or "
+                                  "a later end date loses more, so at 30 the bid shrinks "
+                                  "until such a fill costs at most 30 days of its reward. A "
+                                  "resting bid may sit up to a quarter over the cap. 0 is no "
+                                  "cap. A sole bid is not capped."),
     "bid_multiple": Term("Bid multiple", "How large the resting favorite bid may be, as a "
                                          "multiple of the capital left: at 4 it may rest four "
                                          "times the capital not yet held in shares. A sweep "

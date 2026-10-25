@@ -655,6 +655,7 @@ class FarmConfig(NamedTuple):
     hurdle_rate: float
     bid_multiple: float
     tie_band: float
+    tail_days: float
 
 
 # ---------------------------------------------------------------------------
@@ -1060,9 +1061,19 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
     size rests no bid rests no smaller one: the naked budget trims every
     size it cannot balance to the same bid.
 
+    The tail cap: a bid whose tail (QuoteValue.within_tail) is over
+    cfg.tail_days of its reward is no candidate, and sets no bar. The tail
+    grows faster with the size than the reward, so at each price the ladder
+    passes the sizes over the cap and the first within it is the price's
+    full size. The cap shrinks the bid under the bid room, whichever is
+    tighter, and bid_cap still bounds the price. When the cap stopped every
+    bid that would pay, the reason names the fewest days of reward the tail
+    of one of them costs.
+
     resting is the orders the market rests now. Each favorite bid among them
     at a candidate price is planned and valued the same way at its own price
-    and size (FavChoice.resting), which is what keep_failure judges it by.
+    and size (FavChoice.resting), over the cap or not, which is what
+    keep_failure judges it by.
     """
     base = quotes_at(fm, levels, position, cfg, naked_allowed, None, fill_mid=fill_mid)
     if base.mid is None:
@@ -1088,27 +1099,46 @@ def target_orders(fm, levels, position, cfg, naked_allowed, outlook, bid_without
 
     prices = fav_bid_candidates(levels, fm.v, fm.tick, fm.min_size, cfg.max_lead, cap)
     room = bid_room(fm, position)
-    full = [valued(price, round_size_down(room / price)) for price in prices]
+    over_cap = []
+
+    def ladder(price):
+        """The (plan, value) pairs at price within the tail cap, at the
+        bid_sizes sizes of the room largest first, until a plan rests no
+        favorite bid."""
+        for size in bid_sizes(room, price, fm.min_size):
+            choice = valued(price, size)
+            if choice is None:
+                return
+            if choice[1].within_tail(cfg.tail_days):
+                yield choice
+            else:
+                over_cap.append(choice[1])
+
+    ladders = [ladder(price) for price in prices]
+    full = [next(sizes, None) for sizes in ladders]
     bar = max((value.net_per_day for _, value in filter(None, full)), default=None)
     every = []
-    for price, choice in zip(prices, full):
-        smaller = iter(bid_sizes(room, price, fm.min_size)[1:])
+    for sizes, choice in zip(ladders, full):
         while choice:
             every.append(choice)
             bar = max(bar, choice[1].net_per_day)
-            size = next(smaller, 0.0)
-            if (size < fm.min_size
-                    or choice[1].reward_per_day < tie_floor(bar, cfg.tie_band) - 1e-12):
+            if choice[1].reward_per_day < tie_floor(bar, cfg.tie_band) - 1e-12:
                 break
-            choice = valued(price, size)
-    if not every:
+            choice = next(sizes, None)
+    if not every and not over_cap:
         held = fm.bid_ceiling
         under = (f" under the {cents(held.price, fm.tick)} ceiling: {held.why}"
                  if held is not None and cap <= held.price + 1e-9 else "")
         return no_bid("no scoring favorite bid" + under)
     best = pick_bid(every, baseline, cfg.tie_band)
     if best is None:
-        top = max(every, key=lambda c: c[1].net_per_day)[1]
+        paying = [value for value in over_cap if value.net_per_day > baseline]
+        if paying:
+            fewest = min(paying, key=lambda value: value.tail_days)
+            return no_bid(f"every favorite bid that pays loses over {cfg.tail_days:g} days of "
+                          f"its reward if one sweep fills it (fewest {fewest.tail_days:.0f} "
+                          f"at {cents(fewest.price, fm.tick)})")
+        top = max([value for _, value in every] + over_cap, key=lambda value: value.net_per_day)
         return no_bid(f"no favorite bid pays: best net {signed_usd(top.net_per_day)}/day at "
                       f"{cents(top.price, fm.tick)}")
     plan, value = best
@@ -1321,6 +1351,7 @@ def scan_sole_bid(market, levels, config, now):
         capital=config.capital, max_lead=config.max_lead, min_fav=config.min_fav,
         min_low_score=config.min_low_score, expiry_buffer_days=config.expiry_buffer_days,
         hurdle_rate=config.hurdle_rate, ev_margin=0.0, bid_multiple=1.0, tie_band=0.0,
+        tail_days=0.0,
         # A plan from no position prices no exit and keeps no order.
         ask_offset=0.0, min_capture=0.0, keep_ratio=0.0, drop_threshold=0.0,
         drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0)
@@ -1351,7 +1382,10 @@ def keep_failure(order, intent, target, fm, position, cfg):
     chosen bid, inside the tie band (band_floor), and above the baseline, the
     plan around it still rests at least 80% of it (a budget-trimmed bid's
     size moves a third between neighboring prices), and it is no more than
-    25% over the bid room.
+    25% over the bid room. Its tail may be up to 25% over the tail cap too
+    (QuoteValue.within_tail with that slack): a bid the cap sized moves over
+    it whenever its reward dips, and a replacement scores nothing for ~30
+    seconds.
     A longshot bid is judged by the score it covers rather than its size: near
     the band edge a half-tick of mid moves its per-share score, and so the
     covering size, by a third. Score is min(Q_one, Q_two), so a shortfall
@@ -1409,6 +1443,8 @@ def keep_failure(order, intent, target, fm, position, cfg):
             return "net below keep ratio"
         if value.net_per_day <= fav.baseline_per_day:
             return "net below keep ratio"
+        if not value.within_tail(cfg.tail_days, high):
+            return "over the tail cap"
     elif order.slot is Slot.LONG_BID:
         if over_max_return(order.price, fm.zones.years_left):
             return "over the return limit"
@@ -2810,12 +2846,21 @@ class Farmer:
         return Plan(managed, levels, book_mid, target, preview, orders, actions)
 
     def settle(self, plan, placed, failed, now):
-        """Back off rejected slots, note the orders that should rest now,
-        publish the market's view, and retire it if due. placed maps each
-        place to the LiveOrder posted, None when the CLOB refused it."""
+        """Log the places sent with the ids of the orders posted, back off
+        rejected slots, note the orders that should rest now, publish the
+        market's view, and retire it if due. placed maps each place sent to
+        the LiveOrder posted, None when the CLOB refused it."""
         managed = plan.managed
         fm = managed.fm
         posted = {slot: order for (cid, slot), order in placed.items() if cid == fm.condition_id}
+        for a in plan.actions:
+            if isinstance(a, Place) and a.intent.slot in posted:
+                i, order = a.intent, posted.get(a.intent.slot)
+                self.emit(EventKind.PLACE,
+                          f"  PLACE  {i.slot.name:8} {cents(i.price, fm.tick):>7} x "
+                          f"{i.size:>9.2f}  score {i.score:.3f}  {fm.label}",
+                          fm.condition_id, i.slot, i.price, i.size, i.score,
+                          data=order and {"order_id": order.id})
         managed.orders = expected_orders(plan.orders, plan.actions, failed, posted)
         managed.posted = frozenset(o.id for o in posted.values() if o is not None)
         for (condition_id, slot), accepted in placed.items():
@@ -2896,13 +2941,6 @@ class Farmer:
                       f"{o.size_remaining:>9.2f}  score {s:.3f}  {fm.label}",
                       fm.condition_id, o.slot, o.price, o.size_remaining, s,
                       data={"order_id": o.id})
-        for a in actions:
-            if isinstance(a, Place):
-                i = a.intent
-                self.emit(EventKind.PLACE,
-                          f"  PLACE  {i.slot.name:8} {cents(i.price, fm.tick):>7} x "
-                          f"{i.size:>9.2f}  score {i.score:.3f}  {fm.label}",
-                          fm.condition_id, i.slot, i.price, i.size, i.score)
 
     def execute(self, plans):
         """Carry out every plan's actions, all cancels before any place. A
@@ -3203,6 +3241,7 @@ def config_from(args):
         hurdle_rate=args.hurdle_rate,
         bid_multiple=args.bid_multiple,
         tie_band=args.tie_band,
+        tail_days=args.tail_days,
     )
 
 
@@ -3281,6 +3320,9 @@ Examples:
                                         "inventory a market holds"),
         ("--tie-band", float, 0.05, "Favorite bids netting within this fraction of the "
                                     "best net are tied, and the lowest price rests"),
+        ("--tail-days", float, 30.0, "Most days of its plan's reward one sweep filling the "
+                                     "whole quoting favorite bid may lose, its shares sold "
+                                     "as that inventory sells. 0 is no cap"),
     ):
         parser.add_argument(flag, type=kind, default=default,
                             help=f"{help_text} (default: {default:g})")

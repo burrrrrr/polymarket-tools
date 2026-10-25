@@ -24,7 +24,7 @@ CFG = FarmConfig(capital=500.0, max_lead=0.005, ask_offset=0.01, min_capture=0.0
                  ev_margin=0.01, min_fav=FLOOR, min_low_score=0.10, keep_ratio=0.8,
                  drop_threshold=0.03, drop_window_s=60.0, cooldown_s=600.0,
                  naked_cooldown_s=3600.0, expiry_buffer_days=7.0, hurdle_rate=1.0,
-                 bid_multiple=4.0, tie_band=0.05)
+                 bid_multiple=4.0, tie_band=0.05, tail_days=0.0)
 END = datetime.fromtimestamp(T0, timezone.utc) + timedelta(days=100)
 FM = FarmMarket(condition_id="c1", slug="m", question="?", end_date=END, neg_risk=False,
                 tick=0.001, fav_token_id="fav", fav_outcome="No", rate_per_day=100.0, v=0.035,
@@ -68,7 +68,7 @@ def samples(n, every=300.0, start=T0, lift_after=math.inf):
 def walked(m, rules, n=24, lift_after=math.inf):
     """(Run, [(t - T0, bid)]) of one arm over n samples five minutes apart."""
     trace = []
-    run = pb.walk_run(m, samples(n, lift_after=lift_after), CFG, rules, pb.Plans(m, CFG),
+    run = pb.walk_run(m, samples(n, lift_after=lift_after), CFG, rules, pb.Plans(m, CFG, DEFAULT_PRIOR),
                       trace=trace)
     return run, [(t - T0, bid) for t, bid in trace]
 
@@ -96,12 +96,21 @@ class RulesTest(unittest.TestCase):
     def test_the_today_arm_rests_what_target_orders_plans_from_flat(self):
         m = market()
         run, trace = walked(m, pb.TODAY, n=1)
-        fm, levels, outlook = pb.Plans(m, CFG).at(samples(1)[0])
+        fm, levels, outlook = pb.Plans(m, CFG, DEFAULT_PRIOR).at(samples(1)[0])
         arm_fm, arm_cfg, arm_outlook = pb.TODAY.terms(fm, CFG, outlook)
         planned = target_orders(arm_fm, levels, Position(), arm_cfg, True, arm_outlook,
                                 bid_without_history=True)
         bid = next(i for i in planned.intents if i.slot is Slot.FAV_BID)
         self.assertEqual(trace, [(0.0, pb.Resting(bid.price, bid.size))])
+
+
+    def test_plans_value_fills_with_the_prior_they_are_given(self):
+        m, sample = market(), samples(1)[0]
+        bumped = DEFAULT_PRIOR._replace(rates=tuple(3 * r for r in DEFAULT_PRIOR.rates),
+                                        floor=0.85)
+        stored = pb.Plans(m, CFG, bumped).at(sample)[2].fills
+        default = pb.Plans(m, CFG, DEFAULT_PRIOR).at(sample)[2].fills
+        self.assertGreater(stored.per_day(0.01), default.per_day(0.01))
 
 
 class WalkTest(unittest.TestCase):
@@ -199,20 +208,6 @@ class BookTest(unittest.TestCase):
         book = pb.others_book(sample, 0.001)
         self.assertEqual(book.bids, [(0.958, 200.0), (0.955, 1500.0)])
         self.assertEqual(book.asks, [(0.97, 2000.0)])
-
-
-class SizesTest(unittest.TestCase):
-    def test_a_burst_counts_the_shares_it_sold_over_a_cent_under_the_mid_before_it(self):
-        record = {"sells": [[T0, [[0.955, 100.0], [0.949, 30.0], [0.94, 20.0]]],
-                            [T0 + 7200, [[0.958, 40.0]]]],
-                  "mids": [[T0 - 600, 0.96]]}
-        self.assertEqual(pb.sweep_sizes(record, FLOOR), [50.0])
-        self.assertEqual(pb.sweep_sizes(record, 0.97), [])
-
-    def test_the_table_is_the_means_of_equal_probability_bins(self):
-        self.assertEqual(pb.quantile_table([1.0, 2.0, 3.0, 4.0, 100.0, 200.0], points=3),
-                         (1.5, 3.5, 150.0))
-        self.assertEqual(pb.quantile_table([5.0, 1.0], points=3), (1.0, 5.0))
 
 
 class FetchTest(unittest.TestCase):

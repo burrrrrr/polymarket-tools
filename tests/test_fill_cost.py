@@ -332,16 +332,22 @@ class CurveTest(unittest.TestCase):
         self.assertFalse(curve.from_history)
         self.assertEqual(fill_source(empty, PRIOR, 0.90), "prior")
 
-    def test_a_prior_fit_at_another_floor_gives_way_to_the_default(self):
-        curve = fill_curve(None, PRIOR._replace(floor=0.92), 0.90)
-        self.assertAlmostEqual(curve.per_day(0.01), DEFAULT_PRIOR.rates[DISTANCES.index(0.01)])
+    def test_a_prior_fit_at_a_nearby_floor_is_kept(self):
+        near = PRIOR._replace(floor=0.85)
+        self.assertEqual(fill_curve(None, near, 0.90), fill_curve(None, PRIOR, 0.90))
+        self.assertEqual(fill_curve(HISTORY, near, 0.90), fill_curve(HISTORY, PRIOR, 0.90))
+
+    def test_a_prior_fit_at_a_distant_floor_gives_way_to_the_default(self):
+        far = PRIOR._replace(floor=0.84)
+        self.assertEqual(fill_curve(None, far, 0.90), fill_curve(None, DEFAULT_PRIOR, 0.90))
+        self.assertEqual(fill_source(None, far, 0.90), "default")
 
     def test_the_source_names_where_the_rates_came_from(self):
         self.assertEqual(fill_source(HISTORY, PRIOR, 0.90), "history")
         self.assertEqual(fill_source(None, PRIOR, 0.90), "prior")
         self.assertEqual(fill_source(HISTORY._replace(floor=0.92), PRIOR, 0.90), "prior")
         self.assertEqual(fill_source(None, DEFAULT_PRIOR, 0.90), "default")
-        self.assertEqual(fill_source(None, PRIOR._replace(floor=0.92), 0.90), "default")
+        self.assertEqual(fill_source(None, PRIOR._replace(floor=0.85), 0.90), "prior")
 
 
 def histories(counts, days=60.0, floor=0.90, exits=None, held=None):

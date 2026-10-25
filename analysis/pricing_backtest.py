@@ -6,13 +6,13 @@ carried as the farmer carries them.
   fetch  read each market with book samples: its taker sells and buys of the
          favorite from LEAD_DAYS before its first sample, and its favorite's
          minute mids to now
-  sizes  print fill_cost.SWEEP_SIZES as measured on the cache
   run    walk each run of each market's book samples under each arm
 
 A run is a stretch of book samples no more than RUN_GAP_S apart: the farmer
 was quoting the market throughout, and every walk starts it flat. At each
 decision the walk plans with the production reward_farmer.target_orders on
-the walked position, ceiling and fill mid, and rests the plan's favorite bid
+the walked position, ceiling and fill mid, fills shrunk toward the last
+scan's prior as the farmer's are, and rests the plan's favorite bid
 and favorite ask. Between decisions, in time order:
 
   sells  each burst of taker sells fills the bid min(shares left, shares sold
@@ -58,7 +58,7 @@ from analysis import queue_fit
 from analysis.exit_backtest import Mids, _fmt_interval, _utc, changes
 from farm import farm_books, fill_cost, reward_screener
 from farm.exit_value import Piece, Sweep
-from farm.fill_cost import DAY_S, DEFAULT_PRIOR, PRE_SWEEP_S, SWEEP_SIZES, WHOLE_BID, YEAR_DAYS, Hit
+from farm.fill_cost import DAY_S, PRE_SWEEP_S, SWEEP_SIZES, WHOLE_BID, YEAR_DAYS, Hit
 from farm.fill_watch import (BUY, NO_FILLS, SELL, Gone, inventory_ceiling, watch_listing,
                              watch_positions)
 from farm.reward_farmer import (FarmConfig, FarmMarket, Position, QSide, Role, Slot,
@@ -283,10 +283,11 @@ def expected_hold_s(Q, years_left):
 class Plans:
     """What a decision at each of a run's samples plans from, worked out once
     for every arm: (FarmMarket with this cycle's tick, zones and book mid,
-    the book without our orders, the Outlook), or None on a one-sided book."""
+    the book without our orders, the Outlook with fills shrunk toward prior),
+    or None on a one-sided book."""
 
-    def __init__(self, market, cfg):
-        self.market, self.cfg, self._seen = market, cfg, {}
+    def __init__(self, market, cfg, prior):
+        self.market, self.cfg, self.prior, self._seen = market, cfg, prior, {}
 
     def at(self, sample):
         key = sample.at
@@ -304,7 +305,7 @@ class Plans:
         if fm.book_mid is None:
             return None
         history = history_as_of(market, t, cfg.min_fav)
-        return fm, levels, market_outlook(fm, None, history, DEFAULT_PRIOR, cfg, sample.at)
+        return fm, levels, market_outlook(fm, None, history, self.prior, cfg, sample.at)
 
 
 def _fill(position, shares, price):
@@ -434,7 +435,7 @@ def _check_current(checks, price, sample, tick, sole_bid):
     checks[f"live {key} within tick"] += abs(gap) <= tick + EPS
 
 
-def walk_market(market, samples, cfg, arms=ARMS):
+def walk_market(market, samples, cfg, prior, arms=ARMS):
     """({arm name: [Run]} over the market's runs, the harness checks)."""
     checks = Counter()
     out = {rules.name: [] for rules in arms}
@@ -442,7 +443,7 @@ def walk_market(market, samples, cfg, arms=ARMS):
         if run[0].at.timestamp() < market.start:
             checks["runs before trades"] += 1
             continue
-        plans = Plans(market, cfg)
+        plans = Plans(market, cfg, prior)
         checks["runs"] += 1
         for rules in arms:
             out[rules.name].append(walk_run(market, run, cfg, rules, plans,
@@ -465,6 +466,15 @@ def farm_terms(db_path, hurdle_rate=HURDLE_RATE):
     cfg = config_from(build_parser().parse_args([]))
     cfg = cfg._replace(**{k: v for k, v in stored.items() if k in FarmConfig._fields})
     return cfg._replace(hurdle_rate=hurdle_rate), rows
+
+
+def stored_prior(db_path):
+    """The fill prior the farmer values bids with: the last scan's."""
+    conn = queue_fit._read_only(db_path)
+    try:
+        return reward_screener.load_prior(conn)
+    finally:
+        conn.close()
 
 
 def farm_market_of(row, cfg):
@@ -519,14 +529,14 @@ def load_cache(cache_dir, limit=None, only=None):
 _shared = None
 
 
-def _share(books_path, cfg, arms):
+def _share(books_path, cfg, prior, arms):
     global _shared
-    _shared = books_path, cfg, arms
+    _shared = books_path, cfg, prior, arms
 
 
 def _job(args):
     record, row = args
-    books_path, cfg, arms = _shared
+    books_path, cfg, prior, arms = _shared
     started = time.perf_counter()
     market = market_of(record, row, cfg)
     conn = queue_fit._read_only(books_path)
@@ -534,21 +544,21 @@ def _job(args):
         samples = farm_books.read_books(conn, market.condition_id)
     finally:
         conn.close()
-    walked, checks = walk_market(market, samples, cfg, arms)
+    walked, checks = walk_market(market, samples, cfg, prior, arms)
     checks["seconds"] += time.perf_counter() - started
     return market.condition_id, (walked, checks)
 
 
-def run(records, rows, books_path, cfg, arms=ARMS, workers=1):
+def run(records, rows, books_path, cfg, prior, arms=ARMS, workers=1):
     """({condition_id: ({arm: [Run]}, checks)}, cached markets left out)."""
     kept = [(r, rows[r["condition_id"]]) for r in records
             if r["condition_id"] in rows and r["mids"]
             and farm_market_of(rows[r["condition_id"]], cfg) is not None]
     if workers > 1:
-        with Pool(workers, initializer=_share, initargs=(books_path, cfg, arms)) as pool:
+        with Pool(workers, initializer=_share, initargs=(books_path, cfg, prior, arms)) as pool:
             done = pool.map(_job, kept, chunksize=1)
     else:
-        _share(books_path, cfg, arms)
+        _share(books_path, cfg, prior, arms)
         done = [_job(job) for job in kept]
     return dict(done), len(records) - len(kept)
 
@@ -716,9 +726,12 @@ def sampled_span(books_path):
 def run_backtest(args):
     started = time.perf_counter()
     cfg, rows = farm_terms(args.db, args.hurdle_rate)
+    if args.tail_days is not None:
+        cfg = cfg._replace(tail_days=args.tail_days)
     arms = tuple(a for a in ARMS if not args.arms or a.name in args.arms)
     records = load_cache(args.cache, args.limit, set(args.markets) if args.markets else None)
-    by_market, skipped = run(records, rows, args.books, cfg, arms, args.workers)
+    by_market, skipped = run(records, rows, args.books, cfg, stored_prior(args.db), arms,
+                             args.workers)
     live = live_fills(args.db, *sampled_span(args.books), by_market)
     result = report(by_market, skipped, cfg, live, arms, args.reps)
     result["seconds"] = time.perf_counter() - started
@@ -788,74 +801,10 @@ def fetch(found, cache_dir, now, http):
     print(f"done: {len(todo) - failed} fetched, {failed} failed", flush=True)
 
 
-SIZE_POINTS = 40
-SIZE_CHECKS = (100.0, 300.0, 600.0, 1000.0, 2000.0, 4000.0)
-
-
-def sweep_sizes(record, floor):
-    """The shares each burst of a cached market sold strictly under a bid
-    EXIT_DISTANCE below the mid before it, for the bursts that reached there
-    from a mid at or above floor: the sweeps fill_cost counts at that
-    distance, sized as they would fill a bid there."""
-    sells = sorted((Sweep(at, tuple(Piece(p, s) for p, s in pieces))
-                    for at, pieces in record["sells"]), key=lambda s: s.at)
-    if not sells or not record["mids"]:
-        return []
-    found = []
-    for b in market_bursts(sells, Mids(record["mids"])):
-        if b.pre_mid is None or b.pre_mid < floor:
-            continue
-        under = b.pre_mid - fill_cost.EXIT_DISTANCE - EPS
-        below = sum(p.size for p in b.pieces if p.price < under)
-        if below > 0:
-            found.append(below)
-    return found
-
-
-def quantile_table(sizes, points=SIZE_POINTS):
-    """The means of `points` equal-probability bins of the sizes, smallest
-    first, or the sizes themselves when there are fewer. Bin means rather than
-    midpoints, so the table's mean is the sizes' mean: the tail of a
-    heavy-tailed sweep is what fills a large bid."""
-    xs = sorted(sizes)
-    if len(xs) < points:
-        return tuple(round(x, 1) for x in xs)
-    edges = [i * len(xs) // points for i in range(points + 1)]
-    return tuple(round(sum(xs[a:b]) / (b - a), 1) for a, b in zip(edges, edges[1:]))
-
-
-def sizes_text(records, floor, now):
-    """fill_cost.SWEEP_SIZES as source text with its provenance, and
-    E[min(Q, X)] at SIZE_CHECKS beside the FILL events' fractions."""
-    per = {r["condition_id"]: sweep_sizes(r, floor) for r in records}
-    sizes = [x for found in per.values() for x in found]
-    if not sizes:
-        return "no sweeps in the cache\n"
-    table = quantile_table(sizes)
-    rows = [", ".join(f"{x:g}" for x in table[i:i + 10]) for i in range(0, len(table), 10)]
-    xs = sorted(sizes)
-    lines = [f"# The means of {SIZE_POINTS} equal-probability bins of the shares the sell",
-             f"# bursts sold more than EXIT_DISTANCE under the mid before them, from a mid",
-             f"# of at least {floor:g}: {len(sizes):,} bursts on "
-             f"{sum(1 for found in per.values() if found)} of {len(records)} markets of",
-             f"# the cache, measured {now:%Y-%m-%d} by",
-             "#   python -m analysis.pricing_backtest sizes --cache work\\fill-pricing\\cache",
-             f"# median {xs[len(xs) // 2]:,.0f}, mean {sum(xs) / len(xs):,.0f}, "
-             f"p90 {xs[int(0.9 * (len(xs) - 1))]:,.0f}, p99 {xs[int(0.99 * (len(xs) - 1))]:,.0f} shares.",
-             "SWEEP_SIZES = (", *(f"    {row}," for row in rows), ")", "",
-             "E[min(Q, X)] over the table: " + ", ".join(
-                 f"Q {q:,.0f}: {fill_cost.sweep_fill(q, table):,.0f}" for q in SIZE_CHECKS)]
-    return "\n".join(lines) + "\n"
-
-
 def main():
     parser = argparse.ArgumentParser(prog="python -m analysis.pricing_backtest",
                                      description=__doc__.strip().splitlines()[0])
     sub = parser.add_subparsers(dest="command", required=True)
-    p = sub.add_parser("sizes", help="print fill_cost.SWEEP_SIZES measured on the cache")
-    p.add_argument("--cache", required=True)
-    p.add_argument("--floor", type=float, default=DEFAULT_PRIOR.floor,
-                   help="only sweeps from a mid at or above this")
     p = sub.add_parser("fetch", help="cache the sells and mids of the markets with book samples")
     p.add_argument("--db", required=True, help="farm.db, for each market's favorite and tick")
     p.add_argument("--books", required=True, help="farm_books.db")
@@ -871,14 +820,14 @@ def main():
     p.add_argument("--hurdle-rate", type=float, default=HURDLE_RATE,
                    help="yearly return capital must beat, in place of the farmer's "
                         f"(default: {HURDLE_RATE:g})")
+    p.add_argument("--tail-days", type=float,
+                   help="the tail cap in days of reward, in place of the farmer's; 0 is none")
     p.add_argument("--arms", nargs="*", choices=[a.name for a in ARMS],
                    help="only these arms (default: all)")
     p.add_argument("--json", help="also write the result to this file")
     p.add_argument("--report", help="also write the text report to this file")
     args = parser.parse_args()
-    if args.command == "sizes":
-        print(sizes_text(load_cache(args.cache), args.floor, datetime.now(timezone.utc)), end="")
-    elif args.command == "fetch":
+    if args.command == "fetch":
         found, missing = queue_fit.listings(args.db, args.books)
         if missing:
             print(f"{len(missing)} markets with samples have no favorite in {args.db}", flush=True)

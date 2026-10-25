@@ -47,6 +47,7 @@ SETTING_GROUPS = (QUOTING, SAFETY)
 SETTING_FIELDS = {
     "capital": Field("Capital per market ($)", QUOTING),
     "bid_multiple": Field("Bid multiple of capital", QUOTING),
+    "tail_days": Field("Tail cap (days of reward)", QUOTING),
     "max_lead": Field("Max lead", QUOTING),
     "ask_offset": Field("Ask offset", QUOTING),
     "min_capture": Field("Min capture", QUOTING),

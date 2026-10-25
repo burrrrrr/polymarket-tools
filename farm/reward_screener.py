@@ -376,7 +376,8 @@ class QuoteValue(NamedTuple):
     """One configuration of our quotes, valued per day. price is the favorite
     bid's, or None for a configuration without one: no fills, and the reward
     the other legs earn alone. loss_per_share is what a filled share loses,
-    negative when the share is worth more than its price."""
+    negative when the share is worth more than its price. tail_usd is what
+    one sweep filling the whole bid would lose, never less than nothing."""
 
     price: Optional[float]
     size: float
@@ -384,6 +385,19 @@ class QuoteValue(NamedTuple):
     reward_per_day: float
     fills_per_day: float
     loss_per_share: float
+    tail_usd: float
+
+    @property
+    def tail_days(self):
+        """tail_usd in days of this plan's reward: inf for a tail on no reward."""
+        if self.tail_usd <= 0:
+            return 0.0
+        return self.tail_usd / self.reward_per_day if self.reward_per_day > 0 else math.inf
+
+    def within_tail(self, cap_days, slack=1.0):
+        """Whether the tail costs at most cap_days of the reward, or slack
+        times that; a cap of 0 days is no cap."""
+        return cap_days <= 0 or self.tail_usd <= slack * cap_days * self.reward_per_day + 1e-12
 
     @property
     def fill_cost_per_day(self):
@@ -780,24 +794,31 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, outlook, held=
     sale_price, the ask the farmer would rest for it, credited never over
     outlook.worth, or at that worth without one, at the rate that ask sells
     the inventory the fill leaves, fill_cost.sales_per_day of held plus what
-    one sweep fills.
+    one sweep fills. The tail values the whole bid filled the same way, its
+    shares sold as held plus the whole bid sells, a deep bid's too: depth
+    ahead makes such a sweep rarer, not smaller.
     """
     comp_q = competing_score(levels, mid, v, min_size)
     reward = outlook.rate_per_day * my_q / (my_q + comp_q) if my_q > 0 else 0.0
     if bid is None:
-        return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0)
+        return QuoteValue(None, 0.0, capital_usd, reward, 0.0, 0.0, 0.0)
     price, size = bid
     deep = shares_ahead(levels, price) > DEPTH_FREE_SHARES
     filled, worth = outlook.fills.sweep_fill(size), outlook.worth
+    sale = worth if sale_price is None else min(sale_price, worth)
+
+    def loss(shares):
+        return price - fill_cost.share_value(worth, sale, fill_cost.sales_per_day(held + shares),
+                                             outlook.years_left, outlook.hurdle_rate)
+
     return QuoteValue(
         price=price,
         size=size,
         capital_usd=capital_usd,
         reward_per_day=reward,
         fills_per_day=0.0 if deep else filled * outlook.fills.per_day(mid - price),
-        loss_per_share=price - fill_cost.share_value(
-            worth, worth if sale_price is None else min(sale_price, worth),
-            fill_cost.sales_per_day(held + filled), outlook.years_left, outlook.hurdle_rate),
+        loss_per_share=loss(filled),
+        tail_usd=size * max(0.0, loss(size)),
     )
 
 
