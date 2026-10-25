@@ -29,8 +29,8 @@ from tools.db import JobState
 from .forms import P_TRUE_ERROR, parse_p_true
 
 SLOTS = ("FAV_BID", "LONG_BID", "FAV_ASK", "LONG_ASK")
-PHASES = ("QUOTING", "SOLE_BID", "COOLDOWN", "BELOW_RANGE", "PAUSED", "UNREWARDED",
-          "RETIRED")
+PHASES = ("QUOTING", "SOLE_BID", "FILLED", "COOLDOWN", "BELOW_RANGE", "PAUSED",
+          "UNREWARDED", "RETIRED")
 # The phases whose orders rest and earn: the console counts both as quoting.
 EARNING = ("QUOTING", "SOLE_BID")
 WAITING = "WAITING"
@@ -46,8 +46,9 @@ TOP_EARNERS = 8
 LOOK_SHOWN = 6
 LOG_PAGE = 50
 
-PHASE_TONE = {"QUOTING": "t-q", "SOLE_BID": "t-c", "COOLDOWN": "t-c", "BELOW_RANGE": "t-b",
-              "PAUSED": "t-n", "UNREWARDED": "t-n", "RETIRED": "t-r", WAITING: "t-n"}
+PHASE_TONE = {"QUOTING": "t-q", "SOLE_BID": "t-c", "FILLED": "t-c", "COOLDOWN": "t-c",
+              "BELOW_RANGE": "t-b", "PAUSED": "t-n", "UNREWARDED": "t-n", "RETIRED": "t-r",
+              WAITING: "t-n"}
 SLOT_TONE = {"FAV_BID": "t-f", "FAV_ASK": "t-f", "LONG_BID": "t-b", "LONG_ASK": "t-b"}
 JOB_TONE = {JobState.QUEUED: "t-n", JobState.RUNNING: "t-c", JobState.DONE: "t-q",
             JobState.FAILED: "t-r"}
@@ -148,9 +149,9 @@ def review_url(condition_id, mode=None, skipped=0):
     return f"/review/{condition_id}" + (f"?{query}" if query else "")
 
 
-def polymarket_url(slug):
-    """polymarket.com redirects /market/<slug> to the market inside its event."""
-    return f"https://polymarket.com/market/{quote(slug)}" if slug else None
+def betmoar_url(slug):
+    """A market's page on betmoar.fun, which keys markets by their Polymarket slug."""
+    return f"https://www.betmoar.fun/market/{quote(slug)}" if slug else None
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +384,8 @@ class SlotRow:
     reason: str
     backoff_until: Optional[str]
     backoff_attempts: Optional[int]
+    # FAV_BID's post-fill ceiling, {"price", "why"}, as the farmer wrote it.
+    ceiling: Optional[dict] = None
 
 
 def slot_rows(state):
@@ -396,7 +399,7 @@ def slot_rows(state):
             target=_order(target), target_score=target and target["score"],
             live_score=view.get("live_score"), decision=view.get("decision", "none"),
             reason=view.get("reason", ""), backoff_until=backoff.get("until"),
-            backoff_attempts=backoff.get("attempts"),
+            backoff_attempts=backoff.get("attempts"), ceiling=view.get("ceiling"),
         ))
     return rows
 
@@ -1141,6 +1144,7 @@ class MarketDetail:
     min_size: Optional[float]
     tick: Optional[float]
     phase_since: Optional[datetime]
+    bid_multiple: float
     fav_bid_cap_usd: Optional[float]
     book: list
     timeline: list
@@ -1150,9 +1154,13 @@ class MarketDetail:
     markers: list
 
 
-def market_detail(market, state, status, events, mids, now):
-    """events: this market's events and the farmer's START events, newest first."""
+def market_detail(market, state, status, events, mids, now, farmer_bid_multiple):
+    """events: this market's events and the farmer's START events, newest first.
+    The favorite bid's cap is the capital times the market's bid multiple, else
+    the farmer's, except a sole bid's, which rests only the capital."""
     c = card(market, state, status, now)
+    multiple = market.bid_multiple if market.bid_multiple is not None else farmer_bid_multiple
+    rests = 1 if c.phase == "SOLE_BID" else multiple
     m = market.metrics.get("market", {})
     own = [e for e in events if e.condition_id == market.condition_id]
     phase_since = next((e.at for e in own if e.kind is EventKind.PHASE), None)
@@ -1160,7 +1168,8 @@ def market_detail(market, state, status, events, mids, now):
     return MarketDetail(
         card=c, status=market.status, v=m.get("v"),
         min_size=m.get("min_size"), tick=m.get("tick"), phase_since=phase_since,
-        fav_bid_cap_usd=c.capital_usd,
+        bid_multiple=multiple,
+        fav_bid_cap_usd=None if c.capital_usd is None else c.capital_usd * rests,
         book=book_rows(state.book, c.mid if c.mid is not None else c.book_mid, m.get("v"))
         if state else [],
         timeline=timeline(market, events, c.cutoff, now),

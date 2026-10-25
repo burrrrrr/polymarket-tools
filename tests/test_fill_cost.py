@@ -11,6 +11,8 @@ from farm.fill_cost import (
     FLOOR_RATE,
     PRE_SWEEP_S,
     STRENGTHS,
+    SWEEP_SIZES,
+    WHOLE_BID,
     History,
     Hit,
     Prior,
@@ -24,6 +26,7 @@ from farm.fill_cost import (
     prior_to_json,
     sales_per_day,
     share_value,
+    sweep_fill,
     years_until,
 )
 
@@ -125,6 +128,39 @@ def history_of(*hits, mids=STEADY, start=0.0, floor=0.90):
 
 def at(values, distance):
     return values[DISTANCES.index(distance)]
+
+
+class SweepFillTest(unittest.TestCase):
+    """A sweep that reaches a bid fills min(bid, its size), on average over
+    the measured sweep sizes."""
+
+    def test_a_bid_fills_the_mean_of_min_bid_and_each_sweep(self):
+        self.assertAlmostEqual(sweep_fill(150.0, (100.0, 200.0, 300.0, 400.0)),
+                               (100 + 150 + 150 + 150) / 4)
+
+    def test_a_bid_under_every_sweep_fills_whole(self):
+        self.assertEqual(sweep_fill(20.0, (100.0, 200.0)), 20.0)
+
+    def test_a_bid_over_every_sweep_fills_the_mean_sweep(self):
+        self.assertEqual(sweep_fill(10_000.0, (100.0, 200.0)), 150.0)
+
+    def test_the_whole_bid_table_fills_any_bid_whole(self):
+        self.assertEqual(sweep_fill(1e6, WHOLE_BID), 1e6)
+
+    def test_the_measured_table_grows_slower_than_the_bid(self):
+        fills = [sweep_fill(q) for q in (10.0, 100.0, 1000.0, 10_000.0)]
+        self.assertEqual(fills, sorted(fills))
+        self.assertGreater(fills[0], 0.8 * 10.0)
+        self.assertLess(fills[3], 1000.0)
+        self.assertLess((fills[3] - fills[2]) / 9000, (fills[2] - fills[1]) / 900)
+        self.assertEqual(len(SWEEP_SIZES), 40)
+        self.assertEqual(list(SWEEP_SIZES), sorted(SWEEP_SIZES))
+
+    def test_a_curve_fills_with_its_own_table_the_measured_one_by_default(self):
+        curve = fill_curve(None, DEFAULT_PRIOR, DEFAULT_PRIOR.floor)
+        self.assertEqual(curve.sweep_fill(500.0), sweep_fill(500.0))
+        whole = curve._replace(sweep_sizes=WHOLE_BID)
+        self.assertEqual(whole.sweep_fill(500.0), 500.0)
 
 
 class MakeHistoryTest(unittest.TestCase):
@@ -296,16 +332,22 @@ class CurveTest(unittest.TestCase):
         self.assertFalse(curve.from_history)
         self.assertEqual(fill_source(empty, PRIOR, 0.90), "prior")
 
-    def test_a_prior_fit_at_another_floor_gives_way_to_the_default(self):
-        curve = fill_curve(None, PRIOR._replace(floor=0.92), 0.90)
-        self.assertAlmostEqual(curve.per_day(0.01), DEFAULT_PRIOR.rates[DISTANCES.index(0.01)])
+    def test_a_prior_fit_at_a_nearby_floor_is_kept(self):
+        near = PRIOR._replace(floor=0.85)
+        self.assertEqual(fill_curve(None, near, 0.90), fill_curve(None, PRIOR, 0.90))
+        self.assertEqual(fill_curve(HISTORY, near, 0.90), fill_curve(HISTORY, PRIOR, 0.90))
+
+    def test_a_prior_fit_at_a_distant_floor_gives_way_to_the_default(self):
+        far = PRIOR._replace(floor=0.84)
+        self.assertEqual(fill_curve(None, far, 0.90), fill_curve(None, DEFAULT_PRIOR, 0.90))
+        self.assertEqual(fill_source(None, far, 0.90), "default")
 
     def test_the_source_names_where_the_rates_came_from(self):
         self.assertEqual(fill_source(HISTORY, PRIOR, 0.90), "history")
         self.assertEqual(fill_source(None, PRIOR, 0.90), "prior")
         self.assertEqual(fill_source(HISTORY._replace(floor=0.92), PRIOR, 0.90), "prior")
         self.assertEqual(fill_source(None, DEFAULT_PRIOR, 0.90), "default")
-        self.assertEqual(fill_source(None, PRIOR._replace(floor=0.92), 0.90), "default")
+        self.assertEqual(fill_source(None, PRIOR._replace(floor=0.85), 0.90), "prior")
 
 
 def histories(counts, days=60.0, floor=0.90, exits=None, held=None):

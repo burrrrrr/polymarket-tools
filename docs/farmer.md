@@ -69,7 +69,7 @@ four slots per market:
 
 | Slot | Order | Side | Purpose |
 | --- | --- | --- | --- |
-| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](pricing.md#the-fill-cost-model)), never above your `p_true` minus `--ev-margin` (or the book midpoint on a market [that follows the book](#markets-without-a-p_true)), never over the market's capital, and only when that net beats what the orders earn without it. Uses cash. |
+| `FAV_BID` | Buy the favorite | Q_one | The main quote. It rests at the price and size with the best net of its fill cost (see [The fill-cost model](pricing.md#the-fill-cost-model)), never above your `p_true` minus `--ev-margin` (or the book midpoint on a market [that follows the book](#markets-without-a-p_true)) or the ceiling its own fills set (see [After a fill](pricing.md#after-a-fill)), never over the market's bid room (its bid multiple times the capital left), and only when that net beats what the orders earn without it. Uses cash. |
 | `LONG_ASK` | Sell the longshot | Q_one | Sells longshot shares from an unwanted fill. Priced at the mirror of the favorite bid, so it scores the same, and never under their average cost plus `--min-capture`. |
 | `FAV_ASK` | Sell the favorite | Q_two | Exits favorite shares above their average cost plus `--min-capture`, which frees the capital again. |
 | `LONG_BID` | Buy the longshot | Q_two | Exists only to make Q_one count. It rests at the cheapest price that balances Q_one, 0.1c on most markets, and never where a fill would give a favorite buyer over 20% a year. [The longshot bid](pricing.md#the-longshot-bid) has the rule. |
@@ -87,7 +87,7 @@ these orders.
 
 ## Market lifecycle
 
-Each market is in one of seven states:
+Each market is in one of eight states:
 
 - `QUOTING`: orders rest as planned.
 - `COOLDOWN`: the favorite's ask fell by `--drop-threshold` within
@@ -100,6 +100,23 @@ Each market is in one of seven states:
   because a bid that leaves looks the same whether it was cancelled or sold
   into. When a bid leaves, the farmer keeps quoting and re-plans against the
   bids that remain.
+- `FILLED`: a favorite bid of the farmer's left the book without its cancel,
+  so it filled. The open-order listing shows that at once, every cycle, while
+  the positions read lags by up to a minute. Planning in that gap would see
+  no bid and the old inventory, and bid all the capital again. The
+  farmer expects the orders it rested last cycle (the listing less what its
+  cancels removed, plus the places the CLOB accepted), so a bid placed and
+  filled before the next listing counts too, and so does one that shrank. A
+  cancel that fails because the order was already matched or cancelled keeps
+  that market from placing a favorite bid in the same cycle. The bids come
+  down and the exits rest until positions show all the shares, at most two
+  minutes; the farmer reads positions every cycle meanwhile. Each read
+  records the shares it shows as a fill, priced at the orders that left the
+  book, oldest first, and keeps waiting for the rest. Only a fill positions
+  show moves the post-fill ceilings. A bid that left and never shows in the
+  positions, such as one cancelled by hand, raises an `ALERT` after two
+  minutes, leaves the ceilings as they were, and the market quotes again. A cooldown in force wins
+  over it, and it wins over a sole bid.
 - `BELOW_RANGE`: the midpoint is below `--min-fav`. The bids come down.
   Quoting resumes once the midpoint is 0.5c above `--min-fav`.
 - `SOLE_BID`: you set `sole_bid = 1` on a market with a `p_true`, and no other bid
@@ -117,11 +134,15 @@ Each market is in one of seven states:
     best ask. The bid rests two ticks above the lowest price whose midpoint
     keeps the longshot bid inside the band. In a book with a 97c ask and a
     5.5c band, a 0.1c longshot bid scores above a 94.4c midpoint, so the
-    lowest price is 91.9c and the bid rests at 92.1c.
+    lowest price is 91.9c and the bid rests at 92.1c. The farmer's own
+    favorite ask is left out of that lowest price, so an exit that falls to
+    sell inventory never lifts the bid that bought it. It still sets the
+    midpoint the plan scores, where it can stand in for the longshot bid on
+    Q_two, and the bid stays under it.
   - With no other maker scoring, any score on both sides earns the whole
     pool, so the bid sits as low as still pays. It uses all of the market's
-    capital. The farmer does not value its fills: every sale into the book
-    fills this bid.
+    capital left, not its bid room. The farmer does not value its fills:
+    every sale into the book fills this bid.
   - A longshot bid already resting stays as it rests, whatever it costs or
     covers, if it is at the lowest tick or offers a favorite buyer under 7% a
     year. One resting anywhere else is replaced: normal quoting can leave it
@@ -143,8 +164,8 @@ Each market is in one of seven states:
     rests at its cap around the kept or cheapest longshot bid that works.
   - A favorite bid already resting stays from the lowest paying price up to
     1c above the target. The target rises a tick for each tick the ask falls.
-  - The bid never goes above `p_true` minus `--ev-margin` and never crosses
-    an ask. If no price fits, the market leaves `SOLE_BID` and the other
+  - The bid never goes above `p_true` minus `--ev-margin` or the ceiling its
+    own fills set, and never crosses an ask. If no price fits, the market leaves `SOLE_BID` and the other
     checks apply.
 
   It lasts as long as no other bid returns. An ask drop still starts a
@@ -179,7 +200,7 @@ Each market is in one of seven states:
   row `approved`, so that market stays retired until you retire it and
   approve it again.
 
-`COOLDOWN`, `BELOW_RANGE` and `UNREWARDED` take down the two bids only. The
+`COOLDOWN`, `FILLED`, `BELOW_RANGE` and `UNREWARDED` take down the two bids only. The
 exits of shares the farmer holds, `FAV_ASK` and `LONG_ASK`, stay resting,
 priced as in any plan: they only sell inventory, at or above its cost plus
 `--min-capture`, and a sale frees its capital whatever stopped the quoting.
@@ -220,6 +241,8 @@ the same as setting it once, and a farmer that restarts reads the same level.
   favorite bid shrinks to whatever the covered `FAV_ASK` still balances.
 - `capital_usd` replaces `--capital` for that market only. NULL uses
   `--capital`.
+- `bid_multiple` replaces `--bid-multiple` for that market only, from 1 to
+  20. NULL uses `--bid-multiple`.
 - `sole_bid = 1` lets the market enter `SOLE_BID` (see
   [Market lifecycle](#market-lifecycle)). Set it only on a market you are
   near certain of. A market with no `p_true` never enters `SOLE_BID`.
@@ -233,8 +256,9 @@ while it exists.
 - **Keys.** The keys are the option names with underscores, and the seconds
   options end in `_s`: `capital`, `max_lead`, `ask_offset`, `min_capture`,
   `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`, `hurdle_rate`,
-  `drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
-  `expiry_buffer_days`. Each value is a JSON number.
+  `bid_multiple`, `tail_days`, `tie_band`, `drop_threshold`, `drop_window_s`,
+  `cooldown_s`, `naked_cooldown_s`, and `expiry_buffer_days`. Each value is
+  a JSON number. The console shows every one but `tie_band`.
 - **Bad values.** `farm_db.put_setting` refuses an unknown key or an
   out-of-range value. A bad row written another way is ignored, with an
   `ALERT` event.
@@ -271,10 +295,19 @@ if no farmer was running when it was sent.
 - Every order is good-till-date. It expires at the market's end date minus
   `--expiry-buffer-days`, even if the farmer dies.
 - The favorite bid never prices above `p_true - --ev-margin`, or above the
-  book midpoint on a market with no `p_true`.
-- `--capital` caps each market's favorite exposure. Favorite shares already
-  held count against it at cost. The favorite bid rests at the size at or
-  under what is left that nets the most.
+  book midpoint on a market with no `p_true`, or above the ceiling the
+  market's own fills set.
+- `--capital` caps each market's favorite inventory. Favorite shares already
+  held count against it at cost. The favorite bid may rest up to
+  `--bid-multiple` times what is left, at the size under that which nets the
+  most, and rests nothing once the capital is used. One sweep can fill all of
+  a resting bid, so a market can hold up to its multiple times its capital
+  for a moment; the backtest reports how often.
+- `--tail-days` caps each quoting favorite bid by what one sweep filling all
+  of it would lose: at most that many days of its plan's reward, the filled
+  shares valued as the ask sells that inventory (see
+  [the tail cap](pricing.md#the-tail-cap)). 0 is no cap. A sole bid is not
+  capped.
 - The approved budget caps the naked longshot leg outside the free zone, and
   no longshot bid rests where a fill would give a favorite buyer over 20% a
   year. [The longshot bid](pricing.md#the-longshot-bid) has both rules.
@@ -290,7 +323,10 @@ if no farmer was running when it was sent.
   size. It stays while its price is still a candidate, its net trails the
   best bid's by no more than `1 - --keep-ratio` of it (or $0.02/day, if
   more), it beats the orders without it, the naked budget still balances at
-  least 80% of it, and it is no more than 25% over the capital left. This
+  least 80% of it, it is no more than 25% over the bid room, and its tail is
+  no more than 25% over the tail cap. One priced
+  over the bid the tie band chose stays only while its net is inside the
+  band. This
   keeps queue position and avoids churning orders on every small move of the
   midpoint. A longshot ask is judged by its price instead of its score. One
   priced over its target is replaced, because the bids ahead of it in the
@@ -349,7 +385,10 @@ it does not manage.
 | `--once` | off | Run one cycle and exit |
 | `--keep-orders` | off | Live only. Ctrl+C and SIGTERM leave the managed orders resting instead of cancelling them. A crash still cancels them. Not with `--heartbeat` |
 | `--interval` | 5 | Seconds between cycles |
-| `--capital` | 500 | Most USD a market's favorite bid may be, held favorite shares included at cost. The farmer rests the size at or under it that nets the most |
+| `--capital` | 500 | Most USD of favorite inventory a market may hold, at cost |
+| `--bid-multiple` | 4 | Most a quoting favorite bid may rest, as a multiple of the capital left. A sole bid rests the capital left |
+| `--tie-band` | 0.05 | Favorite bids netting within this fraction of the best net are tied, and the lowest price rests |
+| `--tail-days` | 30 | Most days of its plan's reward one sweep filling the whole quoting favorite bid may lose, its shares sold as that inventory sells. 0 is no cap |
 | `--max-lead` | 0.005 | Most the favorite bid may sit above the best bid already in the book. 0 joins it |
 | `--ask-offset` | 0.01 | Favorite ask distance above the midpoint |
 | `--min-capture` | 0.005 | Favorite ask and longshot ask minimum above the shares' average cost |
@@ -432,7 +471,10 @@ Each column has exactly one writer process. The module docstring of
 `farm/farm_db.py` lists every table with its writer and its purpose.
 
 `farm_events` holds changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`,
-`ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and `SETTINGS`. At
+`ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and `SETTINGS`. A
+`PLACE` row's `data` holds the `order_id` the CLOB gave the order, or is
+empty when the CLOB refused it, and a `CANCEL` row's the order it cancelled.
+At
 startup the farmer deletes the events older than 30 days and the `farm_mids`
 samples older than 7 days. A live farmer fetches `rewards_daily`, your reward
 earnings per market per day, every 10 minutes.
@@ -443,8 +485,14 @@ single conditional `UPDATE`. A status you already changed is never
 overwritten.
 
 A `FILL` event comes from a change in your positions, because the data API
-reports no fills. Its price is the price of the order that rested in that
-slot at the previous cycle, and its `data` says so.
+reports no fills. Its price is the price of the order the listing showed
+leaving the book, else of the order that rested in that slot at the previous
+cycle, and its `data` says which (`price_source`), that order's
+`order_id`, and `filled_at`, when it left the book.
+`analysis/fill_calibration.py` joins the `order_id` to the `PLACE` row to
+find the bid a fill hit. A market that joins the managed set, at start or approved
+later, rebuilds its post-fill ceilings from these rows. An older row without
+`filled_at` counts from when positions showed it.
 
 `scoring_pct` and `rewards_daily` come from authenticated reward endpoints
 whose response fields Polymarket does not document. The farmer reads them

@@ -12,7 +12,8 @@ a busy timeout, and every column has exactly one writer process:
   markets         scan columns (slug, question, end_date, rewards_active,
                   rank_score, metrics, first_seen, last_scanned): screener.
                   Decisions (status, p_true, naked_budget_usd, note, paused,
-                  naked_paused, capital_usd, sole_bid): console or CLI.
+                  naked_paused, capital_usd, bid_multiple, sole_bid): console
+                  or CLI.
                   baseline_fav, baseline_long: farmer, live only.
                   One exception: the live farmer retires a market by moving
                   status and note from 'approved' to 'retired' in a single
@@ -98,7 +99,8 @@ CREATE TABLE IF NOT EXISTS markets (
     paused INTEGER NOT NULL DEFAULT 0,
     naked_paused INTEGER NOT NULL DEFAULT 0,
     capital_usd REAL,
-    sole_bid INTEGER NOT NULL DEFAULT 0
+    sole_bid INTEGER NOT NULL DEFAULT 0,
+    bid_multiple REAL
 );
 
 CREATE TABLE IF NOT EXISTS farm_state (
@@ -235,6 +237,7 @@ ADDED_COLUMNS = {
         ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
         ("capital_usd", "REAL"),
         ("sole_bid", "INTEGER NOT NULL DEFAULT 0"),
+        ("bid_multiple", "REAL"),
     ),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
@@ -310,8 +313,8 @@ def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None, exit_prior=
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
-    naked_paused, capital_usd, sole_bid) are never touched, so rescanning is
-    always safe. Retiring is the farmer's call. A funnel is kept as the last
+    naked_paused, capital_usd, bid_multiple, sole_bid) are never touched, so
+    rescanning is always safe. Retiring is the farmer's call. A funnel is kept as the last
     scan's, a prior (the JSON-safe dict of a fill prior) as the fill prior
     every reader values fills with, and an exit_prior likewise for exits.
     """
@@ -533,33 +536,43 @@ def _log_decision(conn, condition_id, decision, now, statuses, reason=None, note
 _UNAPPROVED = tuple(s for s in STATUSES if s != "approved")
 
 
-def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, now):
+def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, bid_multiple=None,
+                   now):
     """Approve with the human's terms; p_true None follows the market, and
-    capital_usd None keeps the current one."""
+    capital_usd and bid_multiple None keep the current ones."""
+    bid_multiple = _bid_multiple(bid_multiple)
     with conn:
         _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
-            "capital_usd = COALESCE(?, capital_usd) WHERE condition_id = ?",
-            (p_true, budget, capital_usd, condition_id),
+            "capital_usd = COALESCE(?, capital_usd), "
+            "bid_multiple = COALESCE(?, bid_multiple) WHERE condition_id = ?",
+            (p_true, budget, capital_usd, bid_multiple, condition_id),
         )
 
 
-def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *, now):
+def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *,
+                 bid_multiple=None, now):
     """Approve with exactly these terms; p_true None follows the market, and
-    capital_usd None means the farmer's capital.
+    capital_usd and bid_multiple None mean the farmer's settings.
 
     paused sets the pause flag in the same write, so the farmer previews the
     orders instead of placing them; False leaves the flag as it was.
     Re-approving a retired market makes the farmer manage it afresh.
     """
+    bid_multiple = _bid_multiple(bid_multiple)
     with conn:
         _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
-            "capital_usd = ?, paused = paused OR ? WHERE condition_id = ?",
-            (p_true, budget, capital_usd, paused, condition_id),
+            "capital_usd = ?, bid_multiple = ?, paused = paused OR ? WHERE condition_id = ?",
+            (p_true, budget, capital_usd, bid_multiple, paused, condition_id),
         )
+
+
+def _bid_multiple(value):
+    """A market's bid multiple, checked as the farmer's setting is, or None."""
+    return None if value is None else parse_setting("bid_multiple", json.dumps(value))
 
 
 def reject_market(conn, condition_id, note, reason, now):
@@ -700,6 +713,10 @@ SETTINGS = {
     "naked_cooldown_s": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
+    # 1 rests at most the capital left; capital already says anything under it.
+    "bid_multiple": Bound(1, 20),
+    "tie_band": Bound(0, 1),
+    "tail_days": Bound(0),
 }
 
 
@@ -1088,6 +1105,7 @@ class MarketRecord(NamedTuple):
     naked_paused: bool
     capital_usd: Optional[float]
     sole_bid: bool
+    bid_multiple: Optional[float]
 
 
 class StoredEvent(NamedTuple):
@@ -1122,6 +1140,7 @@ def _market(row):
         baseline_fav=row["baseline_fav"], baseline_long=row["baseline_long"],
         paused=bool(row["paused"]), naked_paused=bool(row["naked_paused"]),
         capital_usd=row["capital_usd"], sole_bid=bool(row["sole_bid"]),
+        bid_multiple=row["bid_multiple"],
     )
 
 

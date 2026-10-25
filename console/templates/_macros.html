@@ -7,8 +7,8 @@
 {%- macro field_error(errors, name) -%}
 {%- if errors.get(name) %}<span class="field-error" role="alert">{{ errors[name] }}</span>{% endif -%}
 {%- endmacro -%}
-{%- macro polymarket_link(slug, cls="", label="Polymarket ↗") -%}
-{%- if slug %}<a{% if cls %} class="{{ cls }}"{% endif %} href="{{ polymarket_url(slug) }}" target="_blank" rel="noopener noreferrer" title="Open on Polymarket in a new tab" aria-label="Open on Polymarket in a new tab">{{ label }}</a>{% endif -%}
+{%- macro betmoar_link(slug, cls="", label="Betmoar ↗") -%}
+{%- if slug %}<a{% if cls %} class="{{ cls }}"{% endif %} href="{{ betmoar_url(slug) }}" target="_blank" rel="noopener noreferrer" title="Open on Betmoar in a new tab" aria-label="Open on Betmoar in a new tab">{{ label }}</a>{% endif -%}
 {%- endmacro -%}
 {#- Pause, naked leg, sole bid, edit and retire for an approved market, and End cooldown
     while it cools down, last so no other button moves when it goes; a link to Review

@@ -137,8 +137,8 @@ measured fraction in 30 days. The fraction runs in a straight line in the
 log of the inventory through the two measured sizes, stays at 67.4% under
 100 shares and never goes under 5%. The line gives 2,000 shares 34.2%,
 where the replay measured 30.9%. The inventory is the favorite shares the
-farmer already holds plus the bid's size, so a fill on top of earlier fills
-costs more than the first.
+farmer already holds plus what one sweep fills of the bid, so a fill on top
+of earlier fills costs more than the first.
 
 In the replay the shares that sold went at about the ask's price. So a share
 bought at b is credited a sale at
@@ -156,16 +156,32 @@ under the average cost of the inventory with the fill added plus
 today. For each favorite bid price b on the tick grid inside the reward band,
 with the size Q it rests at once the quotes are balanced,
 
-    net(b) = reward/day(b, Q) - Q * rate(m - b) * max(L(b), 0)
+    net(b) = reward/day(b, Q) - F(Q) * rate(m - b) * max(L(b), 0)
 
 where m is the midpoint once your quotes join the book, and rate(d) is how
 many times a day a sell sweep reaches more than d below the midpoint. A sweep
-that reaches your bid fills all of it. On a short-dated market, or far under
-the midpoint, L(b) is negative: the share is worth more than the bid pays.
-A bid rests for its reward, so that fill costs nothing and is never counted
-as income.
+that reaches your bid fills min(Q, X), X the shares the seller wanted beyond
+the bids ahead of yours. X is heavy-tailed, so F(Q) is the mean of min(Q, x)
+over a fitted table, `SWEEP_SIZES` in `farm/fill_cost.py`. The table is fit
+to the farmer's own favorite bid fills, because a seller hits many makers and
+the public tape does not say which shares reached you. Each `FILL` event is
+one positions read with a fill, set beside the bid it hit, rebuilt from the
+`PLACE` rows. A fill that took 95% or more of that bid, and no more, only says
+the seller wanted at least that much, so it counts as censored there. A fill
+larger than the bid it was joined to also hit another order, so it says
+nothing about that bid and counts as an exact size. The table is the mean of
+40 equal-probability bins of a lognormal fit by maximum likelihood with that
+censoring. F is about Q for a small bid and grows slowly for a large one.
+Regenerate the table with
+`python -m analysis.fill_calibration fit --db data\farm.db --until TIME` and
+paste it with the provenance it prints, which names the time. Your own fills
+set X only: they are already trades in the public tape, so they never add to
+a market's count. On a short-dated
+market, or far under the midpoint, L(b) is negative: the share is
+worth more than the bid pays. A bid rests for its reward, so that fill costs
+nothing and is never counted as income.
 
-A bid behind a deep book is charged no fills. The model fills the whole bid
+A bid behind a deep book is charged no fills. The model fills a bid
 whatever rests ahead of it, but a sweep has to take the shares bid above your
 price before it reaches your bid. So a bid with more than 20,000 shares bid
 above its price (`DEPTH_FREE_SHARES` in `farm/reward_screener.py`) is valued
@@ -177,27 +193,93 @@ the trade histories of the 273 quoting markets read on 2026-10-12, which
 cover 13,921 market-days, an hour of selling into bids came to over 20,000
 shares 37 times, once in 376 market-days.
 
-The farmer chooses Q as well as b. A market's capital is the most its
-favorite bid may be, favorite shares already held counted at cost. At each
-price the farmer values all of the capital left, then three quarters, a half,
-a quarter and an eighth of it, and leaves out a size under the reward
-minimum. The reward is a share of the pool, so each further share earns less.
-L grows with Q, because a larger inventory sells more slowly. So the size
-that nets the most can be under the capital, and the farmer rests that size
-at the price where it nets the most. Where the fills of all the capital cost
-nothing, no smaller size nets more. A bid behind a deep book therefore rests
-at all of the capital left. At a price with more than 20,000 shares ahead no
-size is charged a fill, and the largest size earns the most reward. The price
-is chosen by the same net, so the bid can also move to the price behind that
-depth where it earns the most. The naked budget is a separate limit where the
+The farmer chooses Q as well as b. A market's capital is the most favorite
+inventory it may hold, shares already held counted at cost. The resting bid
+may be larger: up to the bid multiple (`--bid-multiple`, default 4, or the
+market's own, set on its approval) times the capital left, the bid room. A
+sweep fills only part of a large bid, so a bid over the capital earns more
+reward for about the same fills. One sweep can still fill all of it, which
+is why the multiple is yours to set. Once the inventory at cost reaches the
+capital, the bid room is nothing and no favorite bid rests. At each price the
+farmer values all of the bid room, then three quarters, a half, a quarter
+and so on while a size buys the reward minimum. The reward is a share of the
+pool, so each further share earns less, while a larger bid fills more and L
+grows with the inventory a fill leaves. So the size that nets the most can be
+under the bid room. Where the fills cost nothing, no smaller size nets more,
+so a bid behind a deep book rests at all of the bid room. At a price with
+more than 20,000 shares ahead no size is charged a fill, and the largest size
+earns the most reward. The naked budget is a separate limit where the
 longshot bid sits outside the free zone: a bid it cannot balance shrinks to
-what it balances, whatever the capital. A scan sizes its bid at all of
+what it balances, whatever the bid room. So on most markets the longshot
+cover, not the multiple, sets how large the bid is, and a larger room lets
+the bid rest deeper with the same score. A sole bid rests at the capital
+left, not the bid room: it values no fills. A scan sizes its bid at all of
 `--capital`.
 
+### The tail cap
+
+One sweep can still fill all of a bid, and sellers that size are common: 19
+of the farmer's fills took 500 shares or more, and they were 47% of the
+shares bought. So a quoting favorite bid also has a tail: what one sweep
+filling all of it would lose, valued the way a fill is, with the inventory
+the whole bid leaves to sell,
+
+    tail(b, Q) = Q * max(L(b) at an inventory of the shares held plus Q, 0)
+
+The bid may rest only while its tail is at most `--tail-days` (default 30,
+the `tail_days` setting, 0 for no cap) days of the plan's reward. A larger
+bid, a higher price and a later end date each lose more. The tail grows
+faster with the size than the reward does, so at each price the farmer
+passes the sizes over the cap, largest first, and values each size on its
+own: its reward, and the slower sale of a larger inventory. The cap shrinks
+the bid under the bid room, whichever is tighter, and the price cap still
+applies. When the cap stops every bid that would pay, the reason says how
+many days of reward the cheapest tail costs. A resting bid stays while its
+tail is within a quarter over the cap, so a bid the cap sized is not
+replaced each time its reward dips. A sole bid is not capped.
+`python -m analysis.fill_calibration report` prints what the cap does to the
+markets quoting now, from no position, for the caps and hurdles you ask for.
+
+### Choosing among bids that earn about the same
+
+The farmer does not take the single best net. Several prices and sizes net
+within a few percent of each other, and of bids that earn about the same,
+the lowest costs least when it fills. Among the bids netting at least the
+best net less the tie band (`--tie-band`, 5% of it), the farmer rests the
+lowest price, at that price its best net, then its smaller size. A bid
+already resting above that price stays while its own net is inside the band,
+and is replaced once it falls out of it.
+
 A scan holds no shares and has no p_true, so it values a fill with an
-inventory of the bid alone and the book midpoint as p_true. The farmer's ask
-rests over the midpoint, so a scan's a(b) is the midpoint. The farmer values
-a market that follows the book the same way, with the shares it holds.
+inventory of what one sweep fills of the bid and the book midpoint as
+p_true. The farmer's ask rests over the midpoint, so a scan's a(b) is the
+midpoint. The farmer values a market that follows the book the same way,
+with the shares it holds.
+
+## After a fill
+
+What the market's own fills say puts a ceiling on its next favorite bid,
+the lower of these (`farm/fill_watch.py`):
+
+- While the farm holds favorite shares, the bid stays a tick under the last
+  fill and under their average cost. Shares held from before the farm
+  managed the market blend the wallet's average cost, so there the last fill
+  alone holds the bid.
+- For 6 hours after a favorite ask sold, the bid stays a tick under its
+  price. 37% of favorite fills were followed by another in the same market
+  within 6 hours, against about 3% at random.
+
+The ceiling lowers the bid's cap below p_true less the EV margin, for the
+quoting bid and the sole bid alike, and a resting bid over it is replaced.
+It does not change whether the other makers support a bid, so it never
+starts a sole bid. A restart, or a market approved later, rebuilds the
+ceilings from the stored fills.
+The market page shows the ceiling and why, on the `FAV_BID` row.
+
+Whether these rules, the fill model and the bid multiple pay is measured by
+`python -m analysis.pricing_backtest run`, which walks the farmer through the
+recorded books with its position carried, under today's rule, all the new
+rules, and each new rule switched off.
 
 The measurement is the table `SOLD` in `farm/fill_cost.py`, next to the command
 that produced it. No fill under 53 days from resolution was replayed for the
@@ -231,6 +313,14 @@ farther one. A scan needs at least 20 sampled histories to fit a prior; with
 fewer, the stored prior stays. Until a scan stores one, a built-in prior fit from
 256 markets in October 2026 stands in.
 
+The scan fits its prior at its own `--min-fav`, and the farmer reads
+histories at its own. A history read at another floor counted other sweeps
+and is dropped. A prior fit within 0.05 of the reader's floor is used, and
+one fit farther off gives way to the built-in prior. That is a known
+mismatch: the prior also counts sweeps from midpoints between the two
+floors. Scanning at the farmer's `--min-fav` would make the floors agree by
+construction.
+
 The history also carries an exit clock. Each event counted 1c below the
 midpoint starts a clock, which stops at the first minute midpoint, a minute
 or more after the sweep began, back at or above the midpoint the sweep found.
@@ -241,5 +331,32 @@ measured: the midpoint is back within days and the ask sells over weeks. The
 clock is still read and stored with each history, and nothing values a fill
 with it.
 
-The model leaves out fills of the longshot bid, and the farmer's own record of
-its fills.
+The model leaves out fills of the longshot bid.
+
+## Checking the fill model
+
+`python -m analysis.fill_calibration report --db ... --books ... --cache ...
+--split DATE --until TIME` is the gate for any change to the fill model: the
+size table, the prior rule or `FillCurve`. It scores predicted against
+realized fills over every stretch the farmer rested a favorite bid before
+`--until` (`farm_books.db`), with each market's history rebuilt as it was
+then from the backtest cache. A stretch behind more than 20,000 shares is
+predicted no fills, as the farmer values it. It prints events and shares
+realized over predicted per model, over all the data, before the split and
+from it, with 90% intervals from resampling markets. It breaks them down by
+predicted events per market, by where the rate came from and by fill unit,
+and prints the tail share, the top markets and the tail cap on current
+markets. A change passes when three things hold. The production model's
+interval over all the data includes 1, for events and for shares. A table
+fit before the split, scored from it, has a ratio inside [0.67, 1.5] and an
+interval that reaches it. And the rates are calibrated in the unit the table
+is fit in: one `FILL` event, not an hour of them.
+
+Only the size table is refit before the split. The rates shrink toward the
+stored prior, which the scan fit over the last 60 days of each market's
+trades, a window that overlaps the test window, so the events score from the
+split is not fully held out.
+
+The walk backtest (`python -m analysis.pricing_backtest run`) scores fills
+from the public sells, the same tape the burst table came from, so it cannot
+check a fill-model change.

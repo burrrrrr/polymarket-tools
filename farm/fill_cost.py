@@ -23,10 +23,13 @@ counts, at each distance in DISTANCES, the sweeps that reached that far below
 the mid they found, over its last HISTORY_DAYS days of trades, at most one an
 hour. Few markets see enough sweeps to be rated alone, so each count is
 shrunk toward a Prior that a scan pools across markets, by as many days of
-evidence as the markets' spread around the pooled rate is worth. A bid of Q
-shares then fills Q times the FillCurve's rate at its distance a day: a sweep
-that reaches it fills all of it. reward_screener.value_quote charges a bid
-behind more than DEPTH_FREE_SHARES no fills at all.
+evidence as the markets' spread around the pooled rate is worth. A sweep
+that reaches a bid of Q shares fills min(Q, X) of it, X what the seller
+wanted beyond the bids ahead, and X is heavy-tailed, so a bid of Q shares
+fills sweep_fill(Q), the mean of min(Q, X) over SWEEP_SIZES, times the
+FillCurve's rate at its distance a day: about Q for a small bid, and little
+more than the typical seller for a large one. reward_screener.value_quote
+charges a bid behind more than DEPTH_FREE_SHARES no fills at all.
 
 A History also times how long the mid took to be back where each sweep at
 EXIT_DISTANCE found it (exits, held_days), a Prior pools that
@@ -99,6 +102,24 @@ SOLD = ((100.0, 0.674), (1000.0, 0.419))
 # The line through SOLD passes this near 28,000 shares, far past the largest
 # fill replayed, and turns negative past 44,000.
 MIN_SOLD = 0.05
+
+# Shares one FILL event takes of a bid it reaches, 40 bin means of a censored
+# lognormal fit to 272 fills on 127 markets, from
+#   python -m analysis.fill_calibration fit --db data\farm.db --until 2026-10-25T09:45:00Z
+SWEEP_SIZES = (
+    1.9, 4.3, 6.6, 9, 11.5, 14.1, 17, 20.1, 23.5, 27.1,
+    31, 35.3, 39.9, 45, 50.6, 56.7, 63.3, 70.7, 78.8, 87.8,
+    97.8, 109, 121.6, 135.7, 151.7, 170, 190.9, 215.2, 243.6, 277.2,
+    317.5, 366.7, 427.8, 505.9, 609.1, 751.9, 963.7, 1314.8, 2039.5, 6638.2,
+)
+# A table under which every sweep fills the whole bid: sweep_fill(q) is q.
+WHOLE_BID = (math.inf,)
+
+
+def sweep_fill(shares, sizes=SWEEP_SIZES):
+    """The shares of a resting bid of `shares` that one sweep reaching it
+    fills, on average: the mean of min(shares, x) over the sweep sizes."""
+    return sum(min(shares, x) for x in sizes) / len(sizes)
 
 
 def share_value(p_true, sale_price, per_day, years, hurdle_rate):
@@ -182,16 +203,19 @@ class FillCurve(NamedTuple):
     """Events a day that sweep past a bid at each DISTANCES point,
     non-increasing in distance. from_history says the market's own history
     went into it; False is the prior alone. exit_per_day is how often a day
-    the mid was back where a sweep found it, which no valuation reads."""
+    the mid was back where a sweep found it, which no valuation reads.
+    sweep_sizes is the table sweep_fill draws a sweep's size from: the
+    fitted SWEEP_SIZES, or another for a backtest's arm."""
 
     rates: tuple
     from_history: bool
     exit_per_day: float
+    sweep_sizes: tuple = SWEEP_SIZES
 
     def per_day(self, distance):
         """Events a day reaching past a bid `distance` below the mid, linear
         between grid points and flat outside them. A bid of Q shares fills
-        Q * per_day(distance) a day: an event fills the whole bid."""
+        sweep_fill(Q) * per_day(distance) a day."""
         i = bisect.bisect_right(DISTANCES, distance)
         if i == 0:
             return self.rates[0]
@@ -200,6 +224,10 @@ class FillCurve(NamedTuple):
         lo, hi = DISTANCES[i - 1], DISTANCES[i]
         weight = (distance - lo) / (hi - lo)
         return self.rates[i - 1] + weight * (self.rates[i] - self.rates[i - 1])
+
+    def sweep_fill(self, shares):
+        """The shares of a bid of `shares` one sweep fills, by this curve's table."""
+        return sweep_fill(shares, self.sweep_sizes)
 
 
 # fit_prior over 256 markets of the 2026-10-05 backtest cache whose favorite
@@ -333,8 +361,9 @@ def fill_curve(history: Optional[History], prior: Prior, floor):
 
     With a history, each grid rate is the market's events shrunk toward the
     prior, (k + strength * rate) / (days + strength); without one, the
-    prior's rates. A history or prior read with another floor counted other
-    sweeps, so the history is dropped and the prior replaced by DEFAULT_PRIOR.
+    prior's rates. A history read with another floor counted other sweeps
+    and is dropped; a prior fit more than PRIOR_FLOOR_SLACK from floor gives
+    way to DEFAULT_PRIOR (_usable).
     A history of no days, as a read that found no mids leaves, saw nothing
     and is dropped too, so it never passes for a market that was read. Each
     rate is then raised to the largest at any farther distance, so a
@@ -365,10 +394,18 @@ def fill_source(history: Optional[History], prior: Prior, floor):
     return "default" if prior.markets == 0 else "prior"
 
 
+# A prior fit this near the reader's floor stands in for one at it: the scan
+# fits at its own min_fav, a few cents from the farmer's.
+PRIOR_FLOOR_SLACK = 0.05
+
+
 def _usable(history, prior, floor):
+    """The history, None when it was read at another floor or saw no days,
+    and the prior, DEFAULT_PRIOR when it was fit more than PRIOR_FLOOR_SLACK
+    from floor."""
     return (history if history is not None and history.floor == floor and history.days > 0
             else None,
-            prior if prior.floor == floor else DEFAULT_PRIOR)
+            prior if abs(prior.floor - floor) <= PRIOR_FLOOR_SLACK + 1e-9 else DEFAULT_PRIOR)
 
 
 def history_to_json(history):

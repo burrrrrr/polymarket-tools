@@ -111,8 +111,8 @@ class MigrationTest(ScratchDb):
         a = rows["0xa"]
         self.assertEqual((a["status"], a["p_true"], a["naked_budget_usd"], a["baseline_fav"]),
                          ("approved", 0.97, 25.0, 12.0))
-        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"], a["sole_bid"]),
-                         (0, 0, None, 0))
+        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"], a["sole_bid"],
+                          a["bid_multiple"]), (0, 0, None, 0, None))
         self.assertEqual((rows["0xb"]["status"], rows["0xb"]["note"]), ("rejected", "risky"))
 
     def test_first_release_db_without_baselines_migrates(self):
@@ -163,6 +163,11 @@ class SettingsTest(ScratchDb):
         self.assertEqual(farm_db.parse_setting("max_lead", "0.015"), 0.015)
         self.assertEqual(farm_db.parse_setting("cooldown_s", "0"), 0.0)
         self.assertEqual(farm_db.parse_setting("capital", "250"), 250.0)
+        self.assertEqual(farm_db.parse_setting("bid_multiple", "4"), 4.0)
+        self.assertEqual(farm_db.parse_setting("bid_multiple", "1"), 1.0)
+        self.assertEqual(farm_db.parse_setting("tie_band", "0.05"), 0.05)
+        self.assertEqual(farm_db.parse_setting("tail_days", "30"), 30.0)
+        self.assertEqual(farm_db.parse_setting("tail_days", "0"), 0.0)
 
     def test_parse_rejects_bad_values(self):
         for key, text in (
@@ -180,6 +185,11 @@ class SettingsTest(ScratchDb):
             ("drop_window_s", "0"),
             ("hurdle_rate", "-0.1"),
             ("hurdle_rate", "10.5"),
+            ("bid_multiple", "0.5"),
+            ("bid_multiple", "21"),
+            ("tie_band", "-0.01"),
+            ("tie_band", "1.5"),
+            ("tail_days", "-1"),
             ("depth_haircut", "0.5"),
             ("stuck_share", "0.25"),
             ("no_such_key", "1"),
@@ -365,6 +375,21 @@ class ControlsTest(ScratchDb):
         row = farm_db.find_market(conn, "0xa")
         self.assertEqual((row["status"], row["p_true"], row["naked_budget_usd"],
                           row["capital_usd"]), ("approved", 0.98, 10.0, None))
+
+    def test_an_approval_sets_or_keeps_the_markets_bid_multiple(self):
+        conn = self.open()
+        seed(conn, "0xa")
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, bid_multiple=2.0, now=NOW)
+        self.assertEqual(farm_db.find_market(conn, "0xa")["bid_multiple"], 2.0)
+        farm_db.approve_market(conn, "0xa", 0.97, 10.0, now=NOW)
+        self.assertEqual(farm_db.find_market(conn, "0xa")["bid_multiple"], 2.0)
+        farm_db.approve_market(conn, "0xa", 0.97, 10.0, bid_multiple=3.0, now=NOW)
+        self.assertEqual(farm_db.find_market(conn, "0xa")["bid_multiple"], 3.0)
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, now=NOW)
+        self.assertIsNone(farm_db.find_market(conn, "0xa")["bid_multiple"])
+        with self.assertRaises(ValueError):
+            farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, bid_multiple=0.5, now=NOW)
+        self.assertIsNone(farm_db.read_markets(conn, ["0xa"])[0].bid_multiple)
 
     def test_candidate_queue_filters_by_planned_mode(self):
         conn = self.open()
