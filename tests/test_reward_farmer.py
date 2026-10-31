@@ -2885,9 +2885,9 @@ class FarmerCycleTest(FarmerHarness):
         fav = self.first_bid_on_stored_history(self.stored(reward_farmer.HISTORY_S + 60))
         self.assertEqual((fav["decision"], fav["target"]["price"]), ("place", 0.975))
 
-    def test_a_restart_ignores_a_stored_history_older_than_the_seed_limit(self):
-        fav = self.first_bid_on_stored_history(self.stored(reward_farmer.HISTORY_SEED_S + 60))
-        self.assertEqual((fav["decision"], fav["reason"]), ("none", "no fill history yet"))
+    def test_a_restart_quotes_on_a_stored_history_days_old(self):
+        fav = self.first_bid_on_stored_history(self.stored(3 * 86400))
+        self.assertEqual((fav["decision"], fav["target"]["price"]), ("place", 0.975))
 
     def test_a_restart_ignores_a_missing_or_malformed_stored_history(self):
         fresh = self.stored(60)
@@ -3161,7 +3161,7 @@ class BuyTapeFarmerTest(FarmerHarness):
 
     def test_a_history_without_a_fresh_tape_still_seeds_and_bids(self):
         stale = tape_to_json(BuyTape(self.sweeps, datetime.now(timezone.utc) - timedelta(
-            seconds=reward_farmer.HISTORY_SEED_S + 60), NOW.timestamp() - 86400), TAPE_ROWS_FARMER)
+            seconds=reward_farmer.TAPE_SEED_S + 60), NOW.timestamp() - 86400), TAPE_ROWS_FARMER)
         for tape in (None, stale, {"v": 99}):
             with self.subTest(tape=tape and tape["v"]):
                 with mock.patch.object(farm_db, "read_buys",
@@ -3439,6 +3439,25 @@ class LiveFarmerTest(FarmerHarness):
         farmer.cycle()
         self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
         self.client.cancel_orders.assert_not_called()
+
+    def test_a_restart_keeps_the_orders_resting_on_day_old_stored_histories(self):
+        first = self.started_farmer(client=self.client)
+        first.cycle()
+        first.shutdown("test", cancel=False)
+        resting = dict(self.resting)
+        self.assertEqual(len(resting), 4)
+        day_ago = datetime.now(timezone.utc) - timedelta(days=1)
+        with self.ui:
+            for cid, slots in self.query("SELECT condition_id, slots FROM farm_state"):
+                slots = json.loads(slots)
+                history = fill_cost.history_from_json(slots["FAV_BID"]["history"])
+                slots["FAV_BID"]["history"] = fill_cost.history_to_json(
+                    history._replace(read_at=day_ago))
+                self.ui.execute("UPDATE farm_state SET slots = ? WHERE condition_id = ?",
+                                (json.dumps(slots), cid))
+        self.started_farmer(read_histories=False, client=self.client).cycle()
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual(self.resting, resting)
 
     def test_one_cycle_cancels_both_markets_orders_in_one_call(self):
         farmer = self.started_farmer(client=self.client)

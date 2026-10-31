@@ -54,8 +54,8 @@ reads one market at a time: the markets with no history yet first, and the
 markets that are quoting before the rest. The hour runs from each market's
 own read, not from the start of the pass. A failed read keeps the last
 history and is retried after two minutes. A restart keeps the histories the
-last run stored that are under 70 minutes old, so a market whose hourly read
-was a few minutes late keeps its favorite bid. Until a market's first history
+last run stored, however old, so the orders the last run left resting stay
+while the reader reads every market again. Until a market's first history
 lands, the farmer places no favorite bid there, and only the exits rest. A
 read that found no midpoints counts as no history. The farmer values fills on
 the fill prior the last scan stored, read again every cycle.

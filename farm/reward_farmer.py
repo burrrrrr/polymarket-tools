@@ -352,10 +352,10 @@ MARKET_INFO_TICK_S = 5
 HISTORY_S = 3600
 HISTORY_RETRY_S = 120
 HISTORY_TICK_S = 15
-# A restart takes a stored history up to this old: past HISTORY_S, because a
+# A restart takes a stored buy tape up to this old: past HISTORY_S, because a
 # market is due the moment its hour is up and the reader, one market at a
 # time, can be minutes behind.
-HISTORY_SEED_S = HISTORY_S + 600
+TAPE_SEED_S = HISTORY_S + 600
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
@@ -2171,13 +2171,16 @@ class Farmer:
             managed.mid_watch = seeded_watch([(s.at, s.book_mid) for s in samples], now)
 
     def seed_histories(self, now):
-        """Take each wanted market's history from its farm_state row, and its
-        buy tape from fav_buys, while each is fresh, so the first cycle keeps
-        the favorite bids the last run left resting instead of cancelling them
-        until the reader gets round to it. A history seeds without a tape."""
+        """Take each wanted market's history from its farm_state row, however
+        old, and its buy tape from fav_buys while fresh, so the first cycle
+        keeps the favorite bids the last run left resting instead of
+        cancelling them until the reader gets round to it. A history spans
+        weeks of fills, so one a restart's downtime old prices nearly the same
+        bids; the reader replaces it within minutes. A history seeds without a
+        tape."""
 
-        def fresh(read):
-            return read is not None and now - read.read_at < timedelta(seconds=HISTORY_SEED_S)
+        def fresh(tape):
+            return tape is not None and now - tape.read_at < timedelta(seconds=TAPE_SEED_S)
 
         stored, tapes = farm_db.read_farm_states(self.db), farm_db.read_buys(self.db)
         histories = {cid: fill_cost.history_from_json(
@@ -2185,7 +2188,7 @@ class Farmer:
                      for cid in self.histories.wanted if cid in stored}
         reads = {}
         for cid, history in histories.items():
-            if fresh(history):
+            if history is not None:
                 tape = tape_from_json(tapes.get(cid))
                 reads[cid] = Read(history, tape if fresh(tape) else None)
         self.histories.read = reads
