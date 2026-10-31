@@ -489,13 +489,26 @@ class PublishTest(ScratchDb):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM farm_state").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM farmer_status").fetchone()[0], 1)
 
-    def test_prune_drops_events_older_than_thirty_days(self):
+    @mock.patch.object(farm_db, "PRUNE_BATCH", 2)
+    def test_prune_drops_expired_events_and_mids_a_batch_at_a_time(self):
         conn = self.open()
-        old = farm_db.Event(NOW - timedelta(days=31), farm_db.EventKind.START, "old")
-        new = farm_db.Event(NOW - timedelta(days=29), farm_db.EventKind.START, "new")
-        farm_db.publish(conn, self.status(), None, [old, new])
-        self.assertEqual(farm_db.prune_events(conn, NOW), 1)
-        self.assertEqual([r[0] for r in conn.execute("SELECT message FROM farm_events")], ["new"])
+        event_days, mid_days = (31.0, 31.0, 31.0, 29.0), (8.0, 8.0, 8.0, 6.0)
+        farm_db.publish(
+            conn, self.status(), None,
+            [farm_db.Event(NOW - timedelta(days=d, minutes=-i), farm_db.EventKind.START, str(i))
+             for i, d in enumerate(event_days)],
+            [farm_db.MidSample("0xa", NOW - timedelta(days=d, minutes=-i), 0.9, 0.9, None, None)
+             for i, d in enumerate(mid_days)])
+        messages = lambda: [r[0] for r in conn.execute("SELECT message FROM farm_events")]
+        mids = lambda: [r[0] for r in conn.execute("SELECT at FROM farm_mids ORDER BY at")]
+
+        self.assertFalse(farm_db.prune(conn, NOW))
+        self.assertEqual((len(messages()), len(mids())), (2, 2))
+        self.assertTrue(farm_db.prune(conn, NOW))
+        self.assertEqual(messages(), ["3"])
+        self.assertEqual(mids(), [farm_db.stamp(NOW - timedelta(days=6, minutes=-3))])
+        self.assertTrue(farm_db.prune(conn, NOW))
+        self.assertEqual(messages(), ["3"])
 
 
 class BuysTest(ScratchDb):
@@ -560,6 +573,27 @@ class BookSamplesTest(ScratchDb):
         self.assertEqual(farm_books.prune(conn, NOW), 1)
         self.assertEqual([s.at for s in farm_books.read_books(conn, "0xa")],
                          [NOW - timedelta(days=kept - 1)])
+
+    def test_the_recorder_prunes_again_once_the_prune_interval_has_passed(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        expired = now - timedelta(days=farm_books.BOOK_KEPT_DAYS + 1)
+        conn = self.books()
+        recorder, warn = self.recorder()
+        clock = mock.Mock(return_value=1000.0)
+        with mock.patch.object(farm_books.time, "monotonic", clock):
+            recorder.put([self.sample(now)])
+            recorder.drain()
+            farm_books.record(conn, [self.sample(expired)])
+            clock.return_value += farm_books.BOOK_PRUNE_S - 1
+            recorder.put([self.sample(now + timedelta(minutes=5))])
+            recorder.drain()
+            self.assertIn(expired, [s.at for s in farm_books.read_books(conn, "0xa")])
+            clock.return_value += 1
+            recorder.put([self.sample(now + timedelta(minutes=10))])
+            recorder.drain()
+        self.assertEqual([s.at for s in farm_books.read_books(conn, "0xa")],
+                         [now + timedelta(minutes=m) for m in (0, 5, 10)])
+        warn.assert_not_called()
 
     def test_the_recorder_writes_what_was_put_and_prunes_once_it_opens(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)

@@ -196,6 +196,7 @@ import json
 import math
 import os
 import signal
+import sqlite3
 import sys
 import threading
 import time
@@ -358,6 +359,7 @@ HISTORY_SEED_S = HISTORY_S + 600
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
+PRUNE_S = 600
 MID_SAMPLE_S = 60
 # farm_mids read back this far for the mid before a fill.
 FILL_MID_LOOKBACK_S = 600
@@ -2076,7 +2078,7 @@ class Farmer:
         self.mids = []
         self.book_samples = []
         self.scoring = {}
-        self.positions_at = self.rewards_at = self.resolutions_at = 0.0
+        self.positions_at = self.rewards_at = self.resolutions_at = self.prune_at = 0.0
         self.resolutions = {}
         self.started_at = self.last_cycle_at = datetime.now(timezone.utc)
         self.sim_ids = 0
@@ -2138,14 +2140,11 @@ class Farmer:
 
     def start(self):
         now = datetime.now(timezone.utc)
-        pruned = farm_db.prune_events(self.db, now)
-        mids_pruned = farm_db.prune_mids(self.db, now)
         expired = farm_db.expire_commands(self.db, now)
         mode = "LIVE" if self.live else "DRY RUN (no orders are sent)"
         self.emit(EventKind.START,
                   f"Reward farmer: {mode}; db {self.args.db}, every {self.args.interval:g}s",
-                  data={"pid": os.getpid(), "events_pruned": pruned,
-                        "mids_pruned": mids_pruned, "commands_expired": expired})
+                  data={"pid": os.getpid(), "commands_expired": expired})
         self.read_controls(now)
         # The first records are read here, before the reader thread starts, so
         # the first cycle (all of a --once run) manages the markets.
@@ -2471,6 +2470,12 @@ class Farmer:
         if self.live and time.monotonic() >= self.rewards_at:
             self.refresh_rewards(now)
             self.rewards_at = time.monotonic() + REWARDS_S
+        if time.monotonic() >= self.prune_at:
+            try:
+                if farm_db.prune(self.db, now):
+                    self.prune_at = time.monotonic() + PRUNE_S
+            except sqlite3.OperationalError as e:
+                log(f"Warning: pruning farm.db failed ({e}); retrying next cycle")
 
         try:
             orders = self.open_orders()

@@ -1,6 +1,7 @@
 import functools
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -2926,16 +2927,53 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual((row["fav_bid"], row["long_bid"]), (None, None))
         self.assertIsNotNone(row["book_mid"])
 
-    def test_start_prunes_mid_history_older_than_a_week(self):
-        now = datetime.now(timezone.utc)
-        status = farm_db.FarmerStatus("dry", 1, now, now, 5.0, False, 0, {})
+    @mock.patch.object(farm_db, "PRUNE_BATCH", 2)
+    def test_cycles_prune_a_mid_backlog_a_batch_at_a_time_then_wait(self):
+        clock, monotonic = [NOW], [1000.0]
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return clock[0]
+
+        week = timedelta(days=farm_db.MIDS_KEPT_DAYS)
+        seeded = [NOW - week - timedelta(days=1, minutes=-i) for i in range(3)]
+        seeded.append(NOW - week + timedelta(hours=1))
+        status = farm_db.FarmerStatus("dry", 1, NOW, NOW, 5.0, False, 0, {})
         farm_db.publish(self.ui, status, mids=[
-            farm_db.MidSample(CID, now - timedelta(days=8), 0.9, 0.9, None, None),
-            farm_db.MidSample(CID, now - timedelta(days=6), 0.9, 0.9, None, None),
-        ])
-        self.started_farmer()
-        self.assertEqual([r["at"] for r in self.query("SELECT at FROM farm_mids")],
-                         [farm_db.stamp(now - timedelta(days=6))])
+            farm_db.MidSample(CID, at, 0.9, 0.9, None, None) for at in seeded])
+
+        def seeded_left():
+            return [r["at"] for r in self.query("SELECT at FROM farm_mids WHERE at < ? ORDER BY at",
+                                                farm_db.stamp(NOW - timedelta(days=1)))]
+
+        def cycle_at(hours, seconds):
+            clock[0], monotonic[0] = NOW + timedelta(hours=hours), 1000.0 + seconds
+            farmer.cycle()
+            return seeded_left()
+
+        with mock.patch.object(reward_farmer, "datetime", Clock), \
+                mock.patch.object(reward_farmer.time, "monotonic", lambda: monotonic[0]):
+            farmer = self.started_farmer()
+            self.assertEqual(seeded_left(), [farm_db.stamp(at) for at in seeded])
+            self.assertEqual(cycle_at(0, 0), [farm_db.stamp(at) for at in seeded[2:]])
+            self.assertEqual(cycle_at(0, 5), [farm_db.stamp(seeded[3])])
+            # Two hours on the last seeded sample has expired too, but the
+            # farmer caught up and waits PRUNE_S before it prunes again.
+            self.assertEqual(cycle_at(2, reward_farmer.PRUNE_S + 4), [farm_db.stamp(seeded[3])])
+            self.assertEqual(cycle_at(2, reward_farmer.PRUNE_S + 5), [])
+
+    def test_a_locked_prune_warns_and_the_next_cycle_tries_again(self):
+        farmer = self.started_farmer()
+        prune = mock.Mock(side_effect=[sqlite3.OperationalError("database is locked"), True])
+        with mock.patch.object(farm_db, "prune", prune):
+            farmer.cycle()
+            self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+            warnings = [c.args[0] for c in reward_farmer.log.call_args_list
+                        if c.args[0].startswith("Warning: pruning")]
+            self.assertEqual(len(warnings), 1)
+            farmer.cycle()
+        self.assertEqual(prune.call_count, 2)
 
 
 class FollowMarketFarmerTest(FarmerHarness):

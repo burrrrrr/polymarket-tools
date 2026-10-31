@@ -13,7 +13,7 @@ simulated ones. The levels are zlib-compressed JSON, [bids, asks] of
 [price, size] best first: at a 5c depth a row holds about 28 levels in about
 250 bytes, some 17 MB a day at 237 markets, where plain JSON would take
 about 46 MB. Rows older than
-BOOK_KEPT_DAYS are pruned when the recorder opens the file.
+BOOK_KEPT_DAYS are pruned on the recorder's first write and hourly after.
 
 The farmer never writes here itself. Each cycle hands its samples to a
 BookRecorder, whose own thread writes them, so a slow or failing disk never
@@ -26,6 +26,7 @@ import os
 import queue
 import sqlite3
 import threading
+import time
 import zlib
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
@@ -36,6 +37,7 @@ FILE_NAME = "farm_books.db"
 BOOK_SAMPLE_S = 300
 BOOK_RECORD_DEPTH = 0.05
 BOOK_KEPT_DAYS = 45
+BOOK_PRUNE_S = 3600
 # About eight hours of samples, should the writer stall.
 QUEUE_BATCHES = 100
 WRITE_TICK_S = 1.0
@@ -137,7 +139,7 @@ class BookRecorder:
     """Writes the batches of BookSamples put to it into the file at path, on
     a thread of its own once started (drain writes on the caller's). The
     connection belongs to the thread that first drains, which prunes the
-    file as it opens it."""
+    file then and every BOOK_PRUNE_S after."""
 
     def __init__(self, path, stop, warn):
         self.path = path
@@ -146,6 +148,7 @@ class BookRecorder:
         self._queue = queue.Queue(QUEUE_BATCHES)
         self._conn = None
         self._thread = None
+        self._prune_at = 0.0
 
     def put(self, samples):
         """Hand over a batch without waiting."""
@@ -166,7 +169,9 @@ class BookRecorder:
             try:
                 if self._conn is None:
                     self._conn = open_books(self.path)
+                if time.monotonic() >= self._prune_at:
                     prune(self._conn, datetime.now(timezone.utc))
+                    self._prune_at = time.monotonic() + BOOK_PRUNE_S
                 record(self._conn, samples)
             except Exception as e:
                 self._warn(f"Warning: recording books to {self.path} failed ({e}); "

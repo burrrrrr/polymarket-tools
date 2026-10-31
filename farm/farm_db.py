@@ -76,6 +76,7 @@ STATUSES = ("candidate", "approved", "rejected", "retired")
 BUSY_TIMEOUT_S = 5
 EVENTS_KEPT_DAYS = 30
 MIDS_KEPT_DAYS = 7
+PRUNE_BATCH = 5_000
 
 SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS markets (
@@ -1029,20 +1030,21 @@ def publish(conn, status, states=None, events=(), mids=()):
         )
 
 
-def prune_events(conn, now):
+def prune(conn, now):
+    """Delete up to PRUNE_BATCH expired rows from farm_events and from
+    farm_mids in one transaction; True once neither has a full batch left."""
+    caught_up = True
     with conn:
-        return conn.execute(
-            "DELETE FROM farm_events WHERE at < ?",
-            (stamp(now - timedelta(days=EVENTS_KEPT_DAYS)),),
-        ).rowcount
-
-
-def prune_mids(conn, now):
-    with conn:
-        return conn.execute(
-            "DELETE FROM farm_mids WHERE at < ?",
-            (stamp(now - timedelta(days=MIDS_KEPT_DAYS)),),
-        ).rowcount
+        for table, days in (("farm_events", EVENTS_KEPT_DAYS), ("farm_mids", MIDS_KEPT_DAYS)):
+            # Rows go in oldest first, so the expired ones sit at the front of
+            # rowid order: taking the batch there never scans the table.
+            deleted = conn.execute(
+                f"DELETE FROM {table} WHERE rowid IN "
+                f"(SELECT rowid FROM {table} ORDER BY rowid LIMIT ?) AND at < ?",
+                (PRUNE_BATCH, stamp(now - timedelta(days=days))),
+            ).rowcount
+            caught_up = caught_up and deleted < PRUNE_BATCH
+    return caught_up
 
 
 def save_buys(conn, condition_id, read_at, tape_json):
