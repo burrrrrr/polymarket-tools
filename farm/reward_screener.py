@@ -1804,7 +1804,9 @@ def cmd_approve(args):
             f"Warning: planned favorite bid {plan['fav_bid_price'] * 100:.1f}c is "
             f"at or above p_true {args.p_true * 100:.1f}c; a fill would be -EV"
         )
-    end_date = parse_time(row["end_date"]) or parse_time(metrics["market"]["end_date"])
+    end_date = farm_db.farm_end_date(
+        parse_time(row["end_date"]) or parse_time(metrics["market"]["end_date"]),
+        parse_time(row["end_date_override"]))
     low_capital = planned_budget_cost(
         metrics, fill_cost.years_until(end_date, datetime.now(timezone.utc)))
     if args.budget < low_capital - 1e-9:

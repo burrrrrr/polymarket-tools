@@ -131,6 +131,14 @@ GLOSSARY = {
                                        "at cost. The farmer rests the bid size at or under it "
                                        "that nets the most. Leave blank to use the farmer's "
                                        "default."),
+    "end_date_override": Term("End date override",
+                              "Your own end date for this market, used instead of "
+                              "Polymarket's listed one when it is earlier. Set it on a market "
+                              "that resolves as soon as an event happens, before its listed "
+                              "deadline. The farmer prices the longshot bid, values fills and "
+                              "sets each order's expiry by it, and retires the market at this "
+                              "date minus the expiry buffer. Leave blank to use the listed "
+                              "date."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
                                  "the EV margin. The farmer never bids above that cap, and "
                                  "below it picks the price with the best net of fill costs. "
@@ -176,7 +184,8 @@ GLOSSARY = {
     "book_in_band": Term("Book inside the band", "Resting orders close enough to the midpoint "
                                                  "to earn rewards. Our longshot orders appear "
                                                  "at their mirror price, 1 minus the price."),
-    "expiry_cutoff": Term("Expiry cutoff", "End date minus the expiry buffer. Every order is "
+    "expiry_cutoff": Term("Expiry cutoff", "End date, or your end date override when it is "
+                                           "earlier, minus the expiry buffer. Every order is "
                                            "GTD and expires then, and the market retires."),
     "naked_leg": Term("Naked leg", "The longshot bid. Pausing it removes the longshot bid, "
                                    "and the favorite bid with it, because one-sided quotes "

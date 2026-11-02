@@ -220,6 +220,11 @@ the same as setting it once, and a farmer that restarts reads the same level.
   favorite bid shrinks to whatever the covered `FAV_ASK` still balances.
 - `capital_usd` replaces `--capital` for that market only. NULL uses
   `--capital`.
+- `end_date_override` (an ISO time) replaces the market's listed end date
+  while it is earlier, for a market that resolves on an event before its
+  deadline. The farmer prices the longshot bid, values fills, sets order
+  expiry and retires the market by it, from the next cycle. NULL uses the
+  listed end date, and a scan never changes it.
 - `sole_bid = 1` lets the market enter `SOLE_BID` (see
   [Market lifecycle](#market-lifecycle)). Set it only on a market you are
   near certain of. A market with no `p_true` never enters `SOLE_BID`.
@@ -268,8 +273,9 @@ if no farmer was running when it was sent.
 ## Safety mechanisms
 
 - Every order is post-only, so a fill is always a maker fill.
-- Every order is good-till-date. It expires at the market's end date minus
-  `--expiry-buffer-days`, even if the farmer dies.
+- Every order is good-till-date. It expires at the market's end date (or
+  its earlier `end_date_override`) minus `--expiry-buffer-days`, even if
+  the farmer dies.
 - The favorite bid never prices above `p_true - --ev-margin`, or above the
   book midpoint on a market with no `p_true`.
 - `--capital` caps each market's favorite exposure. Favorite shares already

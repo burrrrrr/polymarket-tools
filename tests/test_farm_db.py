@@ -111,8 +111,8 @@ class MigrationTest(ScratchDb):
         a = rows["0xa"]
         self.assertEqual((a["status"], a["p_true"], a["naked_budget_usd"], a["baseline_fav"]),
                          ("approved", 0.97, 25.0, 12.0))
-        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"], a["sole_bid"]),
-                         (0, 0, None, 0))
+        self.assertEqual((a["paused"], a["naked_paused"], a["capital_usd"], a["sole_bid"],
+                          a["end_date_override"]), (0, 0, None, 0, None))
         self.assertEqual((rows["0xb"]["status"], rows["0xb"]["note"]), ("rejected", "risky"))
 
     def test_first_release_db_without_baselines_migrates(self):
@@ -464,6 +464,62 @@ class ControlsTest(ScratchDb):
         sent = farm_db.send_command(conn, CommandKind.END_COOLDOWN, NOW, {"condition_id": "0xa"})
         self.assertEqual(farm_db.pending_commands(conn),
                          [farm_db.Command(sent, "end_cooldown", {"condition_id": "0xa"})])
+
+
+class EndDateOverrideTest(ScratchDb):
+    """The operator's end date for a market that resolves on an event before
+    its listed deadline."""
+
+    def scan(self, conn, cid, end_date):
+        farm_db.store_scan(conn, [farm_db.ScanRow(cid, cid, "?", end_date.isoformat(), 1.0,
+                                                  '{"plan": {"mode": "floor"}}')], [cid], NOW)
+
+    def market(self, conn, cid):
+        return farm_db.read_markets(conn, [cid])[0]
+
+    def test_the_farm_end_date_is_the_earlier_of_the_listed_date_and_the_override(self):
+        early, late = NOW + timedelta(days=10), NOW + timedelta(days=400)
+        self.assertEqual(farm_db.farm_end_date(late, early), early)
+        self.assertEqual(farm_db.farm_end_date(early, late), early)
+        self.assertEqual(farm_db.farm_end_date(late, None), late)
+        self.assertEqual(farm_db.farm_end_date(None, early), early)
+        self.assertIsNone(farm_db.farm_end_date(None, None))
+
+    def test_approval_stores_the_override_a_rescan_keeps_it_and_new_terms_clear_it(self):
+        conn = self.open()
+        listed, override = NOW + timedelta(days=400), NOW + timedelta(days=30)
+        self.scan(conn, "0xa", listed)
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, end_date_override=override,
+                             now=NOW)
+        m = self.market(conn, "0xa")
+        self.assertEqual((m.end_date, m.end_date_override, m.farm_end_date),
+                         (listed, override, override))
+        self.scan(conn, "0xa", listed)
+        self.assertEqual(self.market(conn, "0xa").farm_end_date, override)
+        # Polymarket moving its date earlier than the override wins.
+        sooner = NOW + timedelta(days=20)
+        self.scan(conn, "0xa", sooner)
+        m = self.market(conn, "0xa")
+        self.assertEqual((m.end_date_override, m.farm_end_date), (override, sooner))
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None, now=NOW)
+        m = self.market(conn, "0xa")
+        self.assertEqual((m.end_date_override, m.farm_end_date), (None, sooner))
+
+    def test_the_days_filter_counts_to_the_override(self):
+        conn = self.open()
+        self.scan(conn, "0xa", NOW + timedelta(days=400))
+        self.scan(conn, "0xb", NOW + timedelta(days=400))
+        farm_db.set_approval(conn, "0xa", 0.98, 10.0, None,
+                             end_date_override=NOW + timedelta(days=30), now=NOW)
+
+        def lasting(days):
+            rows, _ = farm_db.search_markets(
+                conn, statuses=(), mode=None, text="", min_days=days, buffer_days=7, now=NOW,
+                limit=50, offset=0)
+            return sorted(r.condition_id for r in rows)
+
+        self.assertEqual(lasting(20), ["0xa", "0xb"])
+        self.assertEqual(lasting(30), ["0xb"])
 
 
 class PublishTest(ScratchDb):

@@ -12,7 +12,8 @@ a busy timeout, and every column has exactly one writer process:
   markets         scan columns (slug, question, end_date, rewards_active,
                   rank_score, metrics, first_seen, last_scanned): screener.
                   Decisions (status, p_true, naked_budget_usd, note, paused,
-                  naked_paused, capital_usd, sole_bid): console or CLI.
+                  naked_paused, capital_usd, sole_bid, end_date_override):
+                  console or CLI.
                   baseline_fav, baseline_long: farmer, live only.
                   One exception: the live farmer retires a market by moving
                   status and note from 'approved' to 'retired' in a single
@@ -99,7 +100,8 @@ CREATE TABLE IF NOT EXISTS markets (
     paused INTEGER NOT NULL DEFAULT 0,
     naked_paused INTEGER NOT NULL DEFAULT 0,
     capital_usd REAL,
-    sole_bid INTEGER NOT NULL DEFAULT 0
+    sole_bid INTEGER NOT NULL DEFAULT 0,
+    end_date_override TEXT
 );
 
 CREATE TABLE IF NOT EXISTS farm_state (
@@ -236,6 +238,7 @@ ADDED_COLUMNS = {
         ("naked_paused", "INTEGER NOT NULL DEFAULT 0"),
         ("capital_usd", "REAL"),
         ("sole_bid", "INTEGER NOT NULL DEFAULT 0"),
+        ("end_date_override", "TEXT"),
     ),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
@@ -249,6 +252,14 @@ RETIRED_TRIAGE_COLUMN = "prompt_version"
 
 def stamp(dt):
     return dt.isoformat(timespec="seconds") if dt is not None else None
+
+
+def farm_end_date(listed, override):
+    """The end date the farmer runs a market by: the operator's override where
+    it is earlier than Polymarket's listed date, for a market that resolves on
+    an event before its deadline. A rescan that lists an earlier date wins."""
+    dates = [d for d in (listed, override) if d is not None]
+    return min(dates) if dates else None
 
 
 def open_db(path):
@@ -311,9 +322,9 @@ def store_scan(conn, rows, reward_ids, now, funnel=None, prior=None, exit_prior=
     """Upsert this scan's rows and flag markets that left the reward set.
 
     Human decisions (status, p_true, naked_budget_usd, note, paused,
-    naked_paused, capital_usd, sole_bid) are never touched, so rescanning is
-    always safe. Retiring is the farmer's call. A funnel is kept as the last
-    scan's, a prior (the JSON-safe dict of a fill prior) as the fill prior
+    naked_paused, capital_usd, sole_bid, end_date_override) are never
+    touched, so rescanning is always safe. Retiring is the farmer's call. A
+    funnel is kept as the last scan's, a prior (the JSON-safe dict of a fill prior) as the fill prior
     every reader values fills with, and an exit_prior likewise for exits.
     """
     at = stamp(now)
@@ -424,8 +435,8 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
 
     mode is the planned mode ('floor', 'budget' or 'sole'); without one, sole
     candidates are left out (see SOLE_CANDIDATE). min_days counts from now to
-    the end date less buffer_days, the farmer's cutoff. Stale and muted
-    candidates are always left out (see CURRENT and MUTED).
+    the farm end date (farm_end_date) less buffer_days, the farmer's cutoff.
+    Stale and muted candidates are always left out (see CURRENT and MUTED).
     """
     where, params = [CURRENT, f"NOT {MUTED}"], []
     if statuses:
@@ -441,7 +452,8 @@ def search_markets(conn, *, statuses, mode, text, min_days, buffer_days, now, li
         where.append("(question LIKE ? ESCAPE '!' OR slug LIKE ? ESCAPE '!')")
         params.extend([pattern, pattern])
     if min_days is not None:
-        where.append("julianday(end_date) - julianday(?) - ? >= ?")
+        where.append("MIN(julianday(end_date), COALESCE(julianday(end_date_override), "
+                     "julianday(end_date))) - julianday(?) - ? >= ?")
         params.extend([stamp(now), buffer_days, min_days])
     sql = " FROM markets" + (" WHERE " + " AND ".join(where) if where else "")
     total = conn.execute("SELECT COUNT(*)" + sql, params).fetchone()[0]
@@ -546,9 +558,11 @@ def approve_market(conn, condition_id, p_true, budget, capital_usd=None, *, now)
         )
 
 
-def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *, now):
-    """Approve with exactly these terms; p_true None follows the market, and
-    capital_usd None means the farmer's capital.
+def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, *,
+                 end_date_override=None, now):
+    """Approve with exactly these terms; p_true None follows the market,
+    capital_usd None means the farmer's capital, and end_date_override None
+    the listed end date (see farm_end_date).
 
     paused sets the pause flag in the same write, so the farmer previews the
     orders instead of placing them; False leaves the flag as it was.
@@ -558,8 +572,9 @@ def set_approval(conn, condition_id, p_true, budget, capital_usd, paused=False, 
         _log_decision(conn, condition_id, "approved", now, _UNAPPROVED, p_true=p_true)
         conn.execute(
             "UPDATE markets SET status = 'approved', p_true = ?, naked_budget_usd = ?, "
-            "capital_usd = ?, paused = paused OR ? WHERE condition_id = ?",
-            (p_true, budget, capital_usd, paused, condition_id),
+            "capital_usd = ?, end_date_override = ?, paused = paused OR ? "
+            "WHERE condition_id = ?",
+            (p_true, budget, capital_usd, stamp(end_date_override), paused, condition_id),
         )
 
 
@@ -1090,6 +1105,12 @@ class MarketRecord(NamedTuple):
     naked_paused: bool
     capital_usd: Optional[float]
     sole_bid: bool
+    # The operator's end date; end_date stays Polymarket's listed one.
+    end_date_override: Optional[datetime] = None
+
+    @property
+    def farm_end_date(self):
+        return farm_end_date(self.end_date, self.end_date_override)
 
 
 class StoredEvent(NamedTuple):
@@ -1124,6 +1145,7 @@ def _market(row):
         baseline_fav=row["baseline_fav"], baseline_long=row["baseline_long"],
         paused=bool(row["paused"]), naked_paused=bool(row["naked_paused"]),
         capital_usd=row["capital_usd"], sole_bid=bool(row["sole_bid"]),
+        end_date_override=_time(row["end_date_override"]),
     )
 
 

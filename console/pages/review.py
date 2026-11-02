@@ -43,6 +43,17 @@ def next_review(conn, ids, condition_id, mode):
     return views.review_url(following, mode) if following else queue_url(mode)
 
 
+def typed_end_date(market, text, now):
+    """The end date the review panels plan by: the listed one, or the earlier
+    end date override typed on the form; a blank or refused override plans
+    by the listed date, as the live preview does (forms.preview_terms)."""
+    try:
+        override = forms.parse_end_date_override(text, now, market.end_date)
+    except ValueError:
+        override = None
+    return farm_db.farm_end_date(market.end_date, override)
+
+
 def mute_target(market, form):
     """(MuteKind, value, label) of the event or tag a mute button sent, which
     must be the market's own."""
@@ -72,6 +83,8 @@ def routes(ctx):
             if market.capital_usd is not None else "",
             "sole_bid": market.sole_bid or (market.status == "candidate"
                                             and views.sole_plan(market.metrics)),
+            "end_date_override": f"{market.end_date_override:%Y-%m-%d}"
+            if market.end_date_override else "",
             "note": "",
         }
         cutoff = views.expiry_cutoff(market, status)
@@ -82,8 +95,11 @@ def routes(ctx):
             "queue_mode": mode, "skipped": skipped,
             "sole_count": len(farm_db.candidate_queue(conn, farm_db.SOLE)),
             "cutoff_days": (cutoff - now).total_seconds() / 86400 if cutoff else None,
-            "ev": views.ev_check(market.metrics, values["p_true"], values["follow_market"],
-                                 values["naked_budget"], ev_margin, views.years_left(market, now)),
+            "ev": views.ev_check(
+                market.metrics, values["p_true"], values["follow_market"],
+                values["naked_budget"], ev_margin,
+                views.years_left(typed_end_date(market, values.get("end_date_override"), now),
+                                 now)),
             "p_true_start": views.p_true_start(market.metrics),
             "ev_margin": ev_margin, "farmer_capital": ctx.effective(conn, "capital"),
             "values": values, "errors": errors or {},
@@ -117,12 +133,12 @@ def routes(ctx):
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
     def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
-                 capital=None, sole_bid=False):
+                 capital=None, sole_bid=False, end_date_override=None):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None follows the market."""
         terms = {"p_true": p_true, "naked_budget_usd": budget,
                  "capital_usd": capital, "paused": 0, "naked_paused": 0,
-                 "sole_bid": int(sole_bid)}
+                 "sole_bid": int(sole_bid), "end_date_override": farm_db.stamp(end_date_override)}
         cid = row["condition_id"]
         info, rates = ctx.infos.get(cid), ctx.total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
@@ -181,31 +197,34 @@ def routes(ctx):
 
     @router.get("/partials/review/{condition_id}/ev", response_class=HTMLResponse)
     def review_ev(request: Request, condition_id: str, p_true: str = "",
-                  follow_market: str = "", naked_budget: str = ""):
+                  follow_market: str = "", naked_budget: str = "", end_date_override: str = ""):
+        now = ctx.clock()
         with closing(ctx.connect()) as conn:
             market = ctx.find(conn, condition_id)
             ev = views.ev_check(market.metrics, p_true, follow_market == "1", naked_budget,
                                 ctx.effective(conn, "ev_margin"),
-                                views.years_left(market, ctx.clock()))
+                                views.years_left(typed_end_date(market, end_date_override, now),
+                                                 now))
         return ctx.templates.TemplateResponse(request, "partials/review_ev.html", {"ev": ev})
 
     @router.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
     def review_live(request: Request, condition_id: str, p_true: str = "",
                     follow_market: str = "", naked_budget: str = "", capital: str = "",
-                    sole_bid: str = "", mode: Optional[str] = None):
+                    sole_bid: str = "", end_date_override: str = "",
+                    mode: Optional[str] = None):
         mode = parse_mode(mode)
-        p, budget, cap = forms.preview_terms(
-            {"p_true": p_true, "follow_market": follow_market, "naked_budget": naked_budget,
-             "capital": capital})
         with closing(ctx.connect()) as conn:
+            market = ctx.find(conn, condition_id)
             row = farm_db.find_market(conn, condition_id)
-            if row is None:
-                raise HTTPException(404, f"no market {condition_id!r}")
             cfg, prior = farmer_config(conn), reward_screener.load_prior(conn)
+        p, budget, cap, override = forms.preview_terms(
+            {"p_true": p_true, "follow_market": follow_market, "naked_budget": naked_budget,
+             "capital": capital, "end_date_override": end_date_override},
+            ctx.clock(), market.end_date)
         try:
             (live, active), error = plan_now(row, cfg, prior, p,
                                              0.0 if budget is None else budget, cap,
-                                             sole_bid == "1"), None
+                                             sole_bid == "1", override), None
         except Exception as e:
             live, active, error = None, None, f"{type(e).__name__}: {e}"
         record_rewards([(row, active)])
@@ -272,10 +291,10 @@ def routes(ctx):
     @router.post("/review/{condition_id}/approve")
     async def approve(request: Request, condition_id: str):
         form = await form_of(request)
-        decision, errors = forms.parse_decision(form)
         mode = parse_mode(form.get("queue_mode"))
         with closing(ctx.connect()) as conn:
             market = ctx.find(conn, condition_id)
+            decision, errors = forms.parse_decision(form, ctx.clock(), market.end_date)
             if errors:
                 return review_page(request, conn, condition_id, 422,
                                    values={**form, "p_true": form.get("p_true", ""),
@@ -284,7 +303,8 @@ def routes(ctx):
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
-                                 decision.capital, decision.start_paused, now=ctx.clock())
+                                 decision.capital, decision.start_paused,
+                                 end_date_override=decision.end_date_override, now=ctx.clock())
             farm_db.set_sole_bid(conn, condition_id, decision.sole_bid)
             if market.status == "candidate" and not decision.start_paused:
                 return see_other(next_review(conn, ids, condition_id, mode))

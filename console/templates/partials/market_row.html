@@ -62,7 +62,7 @@
     <dd class="mono">{{ c.farm_fav | shares }} / {{ c.farm_long | shares }} · {{ c.position.baseline.fav | shares }} / {{ c.position.baseline.long | shares }} <span class="muted">(fav / long)</span></dd>
     {%- endif %}
     <dt>Cutoff{{ tip('expiry_cutoff') }}</dt>
-    <dd class="mono">{% if c.cutoff %}{{ c.cutoff.strftime('%Y-%m-%d') }}, {% if c.cutoff_in_s > 0 %}in {{ c.cutoff_in_s | span }}{% else %}passed{% endif %}{% else %}no end date{% endif %}</dd>
+    <dd class="mono">{% if c.cutoff %}{{ c.cutoff.strftime('%Y-%m-%d') }}, {% if c.cutoff_in_s > 0 %}in {{ c.cutoff_in_s | span }}{% else %}passed{% endif %}{% else %}no end date{% endif %}{% if c.end_overridden %} <span class="muted">from your override; listed {{ c.listed_end.strftime('%Y-%m-%d') if c.listed_end else 'none' }}</span>{% endif %}</dd>
     {%- if c.free_bid_usd %}
     <dt>Free bid{{ tip('naked_budget') }}</dt>
     <dd>{{ c.free_bid_usd | usd }} outside the budget{% if c.long_return is not none %}: a fill gives a buyer {{ '%.1f' % (c.long_return * 100) }}% a year{% endif %}</dd>

@@ -5,6 +5,7 @@ with any error writes nothing.
 """
 
 import math
+from datetime import date, datetime, time, timezone
 from typing import NamedTuple, Optional
 
 from farm import farm_db
@@ -90,6 +91,28 @@ def parse_p_true(text, follow_market):
     return percent / 100
 
 
+END_DATE_ERROR = "Enter a date, or leave blank for the listed end date."
+END_DATE_PAST_ERROR = "Must be after today (UTC)."
+
+
+def parse_end_date_override(text, now, listed):
+    """The end date override chosen on the form: a YYYY-MM-DD date as 00:00
+    UTC that day, after now and before the listed end date when there is
+    one, or None when blank. ValueError with the message to show otherwise."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        override = datetime.combine(date.fromisoformat(text), time(0), timezone.utc)
+    except ValueError:
+        raise ValueError(END_DATE_ERROR) from None
+    if override <= now:
+        raise ValueError(END_DATE_PAST_ERROR)
+    if listed is not None and override >= listed:
+        raise ValueError(f"Must be before the listed end date, {listed:%Y-%m-%d}.")
+    return override
+
+
 class Decision(NamedTuple):
     # None follows the market.
     p_true: Optional[float]
@@ -97,13 +120,16 @@ class Decision(NamedTuple):
     capital: Optional[float]
     start_paused: bool
     sole_bid: bool
+    # None runs the market by its listed end date.
+    end_date_override: Optional[datetime]
 
 
-def parse_decision(form):
+def parse_decision(form, now, listed_end):
     """Approval terms: p_true as a whole percent, or Follow the market ticked
     instead, a budget of 0 or more, and an optional positive capital (blank
-    means the farmer's capital), whether to start paused, and whether a sole
-    bid is allowed, which needs a p_true."""
+    means the farmer's capital), whether to start paused, whether a sole bid
+    is allowed, which needs a p_true, and an optional end date override
+    (parse_end_date_override) against now and the listed end date."""
     errors = {}
     follow_market = form.get("follow_market") == "1"
     sole_bid = form.get("sole_bid") == "1"
@@ -122,22 +148,34 @@ def parse_decision(form):
         if capital is None or not capital > 0:
             errors["capital"] = "Enter a positive amount, or leave blank for the farmer's."
     start_paused = form.get("start_paused") == "1"
-    return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid)), errors
+    try:
+        override = parse_end_date_override(form.get("end_date_override"), now, listed_end)
+    except ValueError as e:
+        override, errors["end_date_override"] = None, str(e)
+    return (None if errors else Decision(p_true, budget, capital, start_paused, sole_bid,
+                                         override)), errors
 
 
-def preview_terms(form):
-    """(p_true, naked budget, capital) from a decision form still being typed:
-    each is None when blank or invalid, so a preview can plan around it."""
-    decision, errors = parse_decision(form)
+def preview_terms(form, now, listed_end):
+    """(p_true, naked budget, capital, end date override) from a decision form
+    still being typed: each is None when blank or invalid, so a preview can
+    plan around it."""
+    decision, errors = parse_decision(form, now, listed_end)
     if decision:
-        return decision.p_true, decision.naked_budget, decision.capital
+        return (decision.p_true, decision.naked_budget, decision.capital,
+                decision.end_date_override)
     try:
         p_true = parse_p_true(form.get("p_true"), form.get("follow_market") == "1")
     except ValueError:
         p_true = None
+    try:
+        override = parse_end_date_override(form.get("end_date_override"), now, listed_end)
+    except ValueError:
+        override = None
     return (p_true,
             None if "naked_budget" in errors else _number(form.get("naked_budget")),
-            None if "capital" in errors else _number(form.get("capital")))
+            None if "capital" in errors else _number(form.get("capital")),
+            override)
 
 
 class Rejection(NamedTuple):

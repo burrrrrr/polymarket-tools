@@ -286,10 +286,10 @@ def budget_used(state):
     return held + budget_counted(state)
 
 
-def years_left(market, now):
-    """Years to a market's end date, which set the return a longshot bid
-    offers; none without an end date."""
-    return fill_cost.years_until(market.end_date, now) if market.end_date else 0.0
+def years_left(end_date, now):
+    """Years to a market's end date (farm_db.farm_end_date), which set the
+    return a longshot bid offers; none without an end date."""
+    return fill_cost.years_until(end_date, now) if end_date else 0.0
 
 
 @dataclass(frozen=True)
@@ -314,12 +314,19 @@ def event_view(e):
 
 
 def expiry_cutoff(market, status):
-    """When the farmer retires the market: its end date minus the expiry buffer."""
-    if market.end_date is None:
+    """When the farmer retires the market: its end date (farm_db.farm_end_date)
+    minus the expiry buffer."""
+    end = market.farm_end_date
+    if end is None:
         return None
     buffer = status.config.get("expiry_buffer_days") if status else None
     days = DEFAULT_EXPIRY_BUFFER_DAYS if buffer is None else buffer
-    return market.end_date - timedelta(days=days)
+    return end - timedelta(days=days)
+
+
+def end_overridden(market):
+    """Whether the operator's end date override sets the market's cutoff."""
+    return market.farm_end_date != market.end_date
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +455,10 @@ class Card:
     history: Optional[fill_cost.History] = None
     long_return: Optional[float] = None
     daily_usd: Optional[float] = None
+    # end_overridden: the cutoff comes from your end date override instead
+    # of listed_end, the market's listed end date.
+    end_overridden: bool = False
+    listed_end: Optional[datetime] = None
 
     @property
     def farm_fav(self):
@@ -491,6 +502,7 @@ def card(market, state, status, now):
             free_bid_usd=0.0, naked_pct=0.0, position=None,
             paused=market.paused, naked_paused=market.naked_paused,
             sole_bid=market.sole_bid, status=market.status,
+            end_overridden=end_overridden(market), listed_end=market.end_date,
         )
     fav_bid, long_bid = resting(state, "FAV_BID"), resting(state, "LONG_BID")
     fav_view = state.slots.get("FAV_BID") or {}
@@ -519,6 +531,7 @@ def card(market, state, status, now):
         history=fill_cost.history_from_json(fav_view.get("history")),
         long_return=(state.slots.get("LONG_BID") or {}).get("fill_return"),
         daily_usd=live_daily(state, market),
+        end_overridden=end_overridden(market), listed_end=market.end_date,
     )
 
 
@@ -764,7 +777,7 @@ ALERT_RULES = (
     AlertRule("Below range", "t-b", "mid under the favorite range",
               _in_phase("BELOW_RANGE", "the mid is under min_fav"),
               "/markets?phase=BELOW_RANGE",
-              control=Control("Edit p_true / budget", "/review/{cid}", post=False)),
+              control=Control("Edit terms", "/review/{cid}", post=False)),
     AlertRule("Paused", "t-n", "paused, every order down",
               _in_phase("PAUSED", "paused", "All its orders are down."),
               "/markets?phase=PAUSED",

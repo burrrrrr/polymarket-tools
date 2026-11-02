@@ -1964,7 +1964,7 @@ class ReturnLimitTest(unittest.TestCase):
         row = {"condition_id": CID, "slug": "", "question": "", "p_true": 0.98,
                "naked_budget_usd": 25.0, "capital_usd": None, "paused": 0, "naked_paused": 0,
                "sole_bid": 0, "end_date": (NOW + timedelta(days=30)).isoformat(),
-               "metrics": json.dumps(METRICS)}
+               "end_date_override": None, "metrics": json.dumps(METRICS)}
         fm = reward_farmer.farm_market(row, INFO, CFG, NOW)
         self.assertAlmostEqual(fm.zones.years_left, 30 / 365.25)
         self.assertEqual(reward_farmer.farm_market(row, INFO, CFG, NOW + timedelta(days=31))
@@ -3110,6 +3110,37 @@ class ReturnLimitFarmerTest(FarmerHarness):
         self.assertEqual(low["target"]["price"], 0.009)
         self.assertEqual((low["decision"], low["reason"]), ("replace", "over the return limit"))
 
+    def set_override(self, days):
+        self.ui.execute("UPDATE markets SET end_date_override = ? WHERE condition_id = ?",
+                        (farm_db.stamp(self.end_date(days)), CID))
+        self.ui.commit()
+
+    def test_an_end_date_override_reprices_the_running_farmer(self):
+        # The listed date is 100 days out. An override 20 days out is the
+        # market's end date from the next cycle, as if Polymarket listed it.
+        self.book = BUDGET_BOOK
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[1]["LONG_BID"]["target"]["price"], 0.014)
+        self.set_override(20)
+        farmer.cycle()
+        low = self.farm_state()[1]["LONG_BID"]
+        self.assertEqual(low["target"]["price"], 0.009)
+        self.assertEqual((low["decision"], low["reason"]), ("replace", "over the return limit"))
+        # An override after the listed date changes nothing.
+        self.set_override(200)
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[1]["LONG_BID"]["target"]["price"], 0.014)
+
+    def test_a_running_farmer_retires_at_the_override_less_the_expiry_buffer(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+        self.set_override(3)
+        farmer.cycle()
+        row, _ = self.farm_state()
+        self.assertEqual((row["phase"], row["phase_reason"]), ("RETIRED", "expiry buffer reached"))
+
 
 class BuyTapeFarmerTest(FarmerHarness):
     def setUp(self):
@@ -3433,6 +3464,22 @@ class LiveFarmerTest(FarmerHarness):
     def posted_tokens(self):
         return [sorted(item.order.token_id for item in c.args[0])
                 for c in self.client.post_orders.call_args_list]
+
+    def test_orders_expire_at_the_end_date_override_less_the_expiry_buffer(self):
+        override = farm_db.stamp(self.end_date(30))
+        self.ui.execute("UPDATE markets SET end_date_override = ? WHERE condition_id = ?",
+                        (override, CID))
+        self.ui.commit()
+        self.started_farmer(client=self.client).cycle()
+        expirations = {c.args[0].token_id: c.args[0].expiration
+                       for c in self.client.create_order.call_args_list}
+        cutoff = datetime.fromisoformat(override) - timedelta(days=7)
+        listed_cutoff = datetime.fromisoformat(
+            farm_db.find_market(self.ui, CID2)["end_date"]) - timedelta(days=7)
+        self.assertEqual(expirations, {FAV: int(cutoff.timestamp()),
+                                       LONG: int(cutoff.timestamp()),
+                                       FAV2: int(listed_cutoff.timestamp()),
+                                       LONG2: int(listed_cutoff.timestamp())})
 
     def test_one_cycle_posts_both_markets_places_in_one_batch(self):
         farmer = self.started_farmer(client=self.client)

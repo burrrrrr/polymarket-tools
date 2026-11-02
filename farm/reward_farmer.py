@@ -1738,13 +1738,14 @@ def rewards_active(info, condition_id, total_rates):
 
 def farm_market(row, info, cfg, now):
     """An approved DB row plus its market record as a FarmMarket, or Skip,
-    with the time its end date leaves at now."""
+    with the time its end date (farm_db.farm_end_date) leaves at now."""
     market = json.loads(row["metrics"])["market"]
     fav = market["fav_token_id"]
     others = [t for t in info.token_ids if t != fav]
     if fav not in info.token_ids or len(others) != 1:
         return Skip("favorite token not in the market's two tokens")
-    end_date = parse_time(row["end_date"]) or parse_time(market["end_date"])
+    listed = parse_time(row["end_date"]) or parse_time(market["end_date"])
+    end_date = farm_db.farm_end_date(listed, parse_time(row["end_date_override"]))
     return FarmMarket(
         condition_id=row["condition_id"],
         slug=row["slug"] or market["slug"],

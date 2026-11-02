@@ -4,7 +4,7 @@ import threading
 import time
 import unittest
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, time as clock_time, timedelta, timezone
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -20,6 +20,7 @@ from test_console import (
     A,
     B,
     C,
+    CONFIG,
     ORIGIN,
     Console,
     quoting_slots,
@@ -458,7 +459,7 @@ class ReviewTest(Writes):
                        "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
                        'hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, '
-                       '#d-sole_bid"'):
+                       '#d-sole_bid, #d-end_date_override"'):
             self.assertIn(needle, page)
         self.assertIn('hx-trigger="input changed delay:300ms"', page)
 
@@ -989,6 +990,89 @@ class ReviewTest(Writes):
         self.post(f"/review/{A}/approve", p_true="99", naked_budget="25", capital="150")
         row = self.row(A)
         self.assertEqual((row["status"], row["capital_usd"]), ("approved", 150.0))
+
+    def day(self, days):
+        """The date input's text for the UTC date this many days from now."""
+        return (self.now + timedelta(days=days)).date().isoformat()
+
+    @staticmethod
+    def midnight(text):
+        return datetime.combine(datetime.fromisoformat(text).date(), clock_time(0),
+                                timezone.utc)
+
+    def test_approve_stores_an_end_date_override_and_a_blank_clears_it(self):
+        # 0xddd is listed to end in 40 days.
+        listed = self.row("0xddd")["end_date"][:10]
+        self.assertIn(f"listed {listed}", self.client.get("/review/0xddd").text)
+        resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                         end_date_override=self.day(20))
+        self.assertEqual(resp.status_code, 303)
+        self.assertEqual(self.row("0xddd")["end_date_override"],
+                         farm_db.stamp(self.midnight(self.day(20))))
+        self.assertIn(f'name="end_date_override" value="{self.day(20)}"',
+                      self.client.get("/review/0xddd").text)
+        self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                  end_date_override="")
+        self.assertIsNone(self.row("0xddd")["end_date_override"])
+
+    def test_an_end_date_override_must_fall_between_now_and_the_listed_date(self):
+        before = self.snapshot_markets()
+        listed = self.row("0xddd")["end_date"][:10]
+        for text, message in (
+            ("soon", "Enter a date"),
+            (self.day(-1), "Must be after today"),
+            (self.day(0), "Must be after today"),
+            (self.day(41), f"Must be before the listed end date, {listed}."),
+        ):
+            with self.subTest(text=text):
+                resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="25",
+                                 end_date_override=text)
+                self.assertEqual(resp.status_code, 422)
+                self.assertIn(f'<span class="field-error" role="alert">{message}', resp.text)
+                self.assertIn(f'name="end_date_override" value="{text}"', resp.text)
+        self.assertEqual(self.snapshot_markets(), before)
+        self.assertIsNone(self.row("0xddd")["end_date_override"])
+
+    def test_the_live_preview_prices_the_longshot_bid_by_the_typed_override(self):
+        # 40 days out the longshot bid rests at 1.7c; an override 20 days out
+        # plans it as if Polymarket listed that date.
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
+        row = {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
+               "end_date": self.midnight(self.day(20)).isoformat()}
+        live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
+                                 utc_now(), False, fill_cost.DEFAULT_PRIOR)
+        nearer = next(o.price for o in live.orders if o.slot == "LONG_BID")
+        self.assertLess(nearer, 0.017)
+        self.assertIn("Buy Yes 1.7c", self.live())
+        self.assertIn(f"Buy Yes {views.cents(nearer)}",
+                      self.live(end_date_override=self.day(20)))
+        # A date the form would refuse previews the listed date.
+        self.assertIn("Buy Yes 1.7c", self.live(end_date_override=self.day(45)))
+
+    def test_the_ev_check_holds_the_budget_against_the_typed_override(self):
+        # 0xeee's 0.1c longshot bid is free 100 days out, its listed end, and
+        # offers a favorite buyer over 5% a year three days out.
+        self.assertNotIn("budget", self.ev("0xeee", "99", budget="0"))
+        self.assertIn("over your $0.00 budget",
+                      self.ev("0xeee", "99", budget="0", end_date_override=self.day(3)))
+        page = self.client.get("/review/0xeee").text
+        self.assertRegex(page, r'<input[^>]*id="d-end_date_override"[^>]*'
+                               r'hx-get="/partials/review/0xeee/ev"')
+
+    def test_the_market_shows_its_cutoff_from_the_override(self):
+        listed = self.row(A)["end_date"][:10]
+        override = self.midnight(self.day(30))
+        farm_db.set_approval(self.db, A, 0.99, 25.0, None, end_date_override=override,
+                             now=self.now)
+        cutoff = (override - timedelta(days=CONFIG["expiry_buffer_days"])).strftime("%Y-%m-%d")
+        card = self.client.get(f"/partials/markets/{A}/card").text
+        self.assertIn(f"{cutoff}, in", card)
+        self.assertIn(f"your override; listed {listed}", card)
+        self.assertIn("Edit terms", card)
+        summary = self.client.get(f"/markets/{A}").text
+        self.assertIn(f"your override; listed {listed}", summary)
+        farm_db.set_approval(self.db, A, 0.99, 25.0, None, now=self.now)
+        self.assertNotIn("your override", self.client.get(f"/partials/markets/{A}/card").text)
 
     def test_reject_with_note_and_retire_from_review(self):
         self.post("/review/0xeee/reject", reason="resolution_risk", note="  resolution risk ")
