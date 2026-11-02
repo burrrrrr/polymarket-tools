@@ -88,7 +88,7 @@ cannot narrow the sample to the busy markets it spared.
 | `--expiry-buffer-days` | 7 | Stop farming this many days before the market ends |
 | `--min-window-days` | 30 | The fewest farmable days a market needs |
 | `--horizon-cap-days` | 90 | Caps the days counted toward rank |
-| `--capital` | 500 | The USD behind the favorite bid. A scan sizes its bid at all of it. The farmer treats a market's capital as the most it may bid and chooses the size |
+| `--capital` | 500 | The USD of favorite inventory a market may hold. A scan sizes its bid at all of it. The farmer rests a bid of up to `--bid-multiple` times the capital it has left and chooses the size |
 | `--hurdle-rate` | 0.40 | Sets what a filled share costs, the same setting the farmer has. The scan has no p_true, so it costs a fill against the book midpoint |
 | `--tape-markets` | 100 | How many of the top markets read their fill history. The fill prior is fit from the 60 randomly drawn markets' histories instead, and needs at least 20 of them |
 | `--max-lead` | 0.005 | The most the favorite bid may sit above the best bid already in the book. 0 joins the best bid. The bid also stays one tick under the lowest ask |
@@ -109,7 +109,7 @@ cannot narrow the sample to the busy markets it spared.
 | `v` | Max spread from the midpoint that still scores, in cents |
 | `min` | Minimum order size that scores, in shares |
 | `est$/d` | Your estimated daily reward: pool times your share of the score |
-| `fill/d` | Favorite shares a day expected to fill your bid; `h` from the market's history, `p` from a scan's fill prior alone, `d` from the built-in default prior alone. 0 for a bid with more than 20,000 shares bid above it |
+| `fill/d` | Favorite shares a day expected to fill your bid; `h` from the market's history, `p` from a scan's fill prior alone, `d` from the built-in default prior alone. Fewer the more shares are bid above it |
 | `net$/d` | `est$/d` less `fill/d` times the loss per filled share |
 | `cap$` | Capital both bids tie up |
 | `APR%` | `est$/d` divided by `cap$`, times 365, before fill costs |

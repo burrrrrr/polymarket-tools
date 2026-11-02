@@ -41,7 +41,7 @@ def market(cid, slug, status="approved", budget=25.0, p_true=0.99, est=10.0, v=0
         naked_budget_usd=budget, note=None, end_date=NOW + timedelta(days=100),
         rewards_active=True, rank_score=1.0, metrics=metrics(slug, est, v), first_seen=NOW,
         last_scanned=NOW, baseline_fav=None, baseline_long=None, paused=paused,
-        naked_paused=False, capital_usd=None, sole_bid=sole_bid,
+        naked_paused=False, capital_usd=None, sole_bid=sole_bid, bid_multiple=None,
     )
 
 
@@ -830,6 +830,43 @@ class RoutesTest(Console):
         self.assertNotIn("bravo?", resp.text)
         self.assertIn("No other bid supports the midpoint. Its favorite bid is the only "
                       "bid in the reward band", self.client.get("/partials/markets/look").text)
+
+    def test_a_filled_market_lists_under_its_own_phase_like_a_cooldown(self):
+        self.publish(states=[state(A, "FILLED", "FAV_BID left the book; waiting for positions")
+                             ._replace(updated_at=self.now)])
+        resp = self.client.get("/markets?phase=FILLED")
+        self.assertEqual(resp.status_code, 200)
+        for needle in ("alpha?", '<a class="chip on" href="/markets?phase=FILLED" '
+                                 'aria-current="page">Filled',
+                       '<span class="badge t-c">FILLED<button type="button" class="tip"',
+                       'data-tip="FILLED"'):
+            self.assertIn(needle, resp.text)
+        self.assertNotIn("bravo?", resp.text)
+
+    def test_the_favorite_bid_slot_shows_its_post_fill_ceiling(self):
+        self.assertNotIn("ceiling", self.client.get(f"/partials/markets/{A}/live").text)
+        slots = quoting_slots()
+        slots["FAV_BID"]["ceiling"] = {"price": 0.92, "why": "holding 478 @ 93c, last fill 93c"}
+        self.publish(states=[state(A, slots=slots)._replace(updated_at=self.now)])
+        text = self.client.get(f"/partials/markets/{A}/live").text
+        self.assertIn("ceiling 92.0c: holding 478 @ 93c, last fill 93c", text)
+        self.assertIn('data-tip="fav_ceiling"', text)
+
+    def test_the_bid_cap_is_the_capital_times_the_markets_bid_multiple(self):
+        """A sole bid rests only the capital."""
+        # alpha's farm_state capital is $500 and the farmer's default multiple 4.
+        for multiple, phase, badge, cap in ((None, "QUOTING", "bid ×4", 2000.0),
+                                            (2.0, "QUOTING", "bid ×2", 1000.0),
+                                            (2.0, "SOLE_BID", "bid ×2", 500.0)):
+            with self.subTest(multiple=multiple, phase=phase):
+                farm_db.set_approval(self.db, A, 0.99, 25.0, None, bid_multiple=multiple,
+                                     now=self.now)
+                self.publish(states=[state(A, phase)._replace(updated_at=self.now)])
+                text = self.client.get(f"/partials/markets/{A}/summary").text
+                self.assertIn(badge, text)
+                self.assertIn(f"cap {views.usd(cap)}", text)
+                self.assertEqual(self.client.get(f"/api/markets/{A}").json()["fav_bid_cap_usd"],
+                                 cap)
 
     def test_log_kind_filter_excludes_other_kinds(self):
         text = self.client.get("/activity?tab=log&kind=FILL").text

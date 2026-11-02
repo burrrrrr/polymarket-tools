@@ -70,6 +70,8 @@ def routes(ctx):
                                               else reward_screener.DEFAULT_NAKED_BUDGET),
             "capital": views.number_text(market.capital_usd)
             if market.capital_usd is not None else "",
+            "bid_multiple": views.number_text(market.bid_multiple)
+            if market.bid_multiple is not None else "",
             "sole_bid": market.sole_bid or (market.status == "candidate"
                                             and views.sole_plan(market.metrics)),
             "note": "",
@@ -86,6 +88,7 @@ def routes(ctx):
                                  values["naked_budget"], ev_margin, views.years_left(market, now)),
             "p_true_start": views.p_true_start(market.metrics),
             "ev_margin": ev_margin, "farmer_capital": ctx.effective(conn, "capital"),
+            "farmer_bid_multiple": ctx.effective(conn, "bid_multiple"),
             "values": values, "errors": errors or {},
         }
 
@@ -117,12 +120,12 @@ def routes(ctx):
             return review_page(request, conn, condition_id, mode=mode, skipped=skipped)
 
     def plan_now(row, cfg, prior, p_true=None, budget=reward_screener.DEFAULT_NAKED_BUDGET,
-                 capital=None, sole_bid=False):
+                 capital=None, sole_bid=False, bid_multiple=None):
         """(views.live_review of a market row with these terms against the live
         book, its views.rewards_state); p_true None follows the market."""
         terms = {"p_true": p_true, "naked_budget_usd": budget,
-                 "capital_usd": capital, "paused": 0, "naked_paused": 0,
-                 "sole_bid": int(sole_bid)}
+                 "capital_usd": capital, "bid_multiple": bid_multiple, "paused": 0,
+                 "naked_paused": 0, "sole_bid": int(sole_bid)}
         cid = row["condition_id"]
         info, rates = ctx.infos.get(cid), ctx.total_rates.get()
         fav_token = json.loads(row["metrics"])["market"]["fav_token_id"]
@@ -192,11 +195,11 @@ def routes(ctx):
     @router.get("/partials/review/{condition_id}/live", response_class=HTMLResponse)
     def review_live(request: Request, condition_id: str, p_true: str = "",
                     follow_market: str = "", naked_budget: str = "", capital: str = "",
-                    sole_bid: str = "", mode: Optional[str] = None):
+                    bid_multiple: str = "", sole_bid: str = "", mode: Optional[str] = None):
         mode = parse_mode(mode)
-        p, budget, cap = forms.preview_terms(
+        p, budget, cap, multiple = forms.preview_terms(
             {"p_true": p_true, "follow_market": follow_market, "naked_budget": naked_budget,
-             "capital": capital})
+             "capital": capital, "bid_multiple": bid_multiple})
         with closing(ctx.connect()) as conn:
             row = farm_db.find_market(conn, condition_id)
             if row is None:
@@ -205,7 +208,7 @@ def routes(ctx):
         try:
             (live, active), error = plan_now(row, cfg, prior, p,
                                              0.0 if budget is None else budget, cap,
-                                             sole_bid == "1"), None
+                                             sole_bid == "1", multiple), None
         except Exception as e:
             live, active, error = None, None, f"{type(e).__name__}: {e}"
         record_rewards([(row, active)])
@@ -284,7 +287,8 @@ def routes(ctx):
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
             farm_db.set_approval(conn, condition_id, decision.p_true, decision.naked_budget,
-                                 decision.capital, decision.start_paused, now=ctx.clock())
+                                 decision.capital, decision.start_paused,
+                                 bid_multiple=decision.bid_multiple, now=ctx.clock())
             farm_db.set_sole_bid(conn, condition_id, decision.sole_bid)
             if market.status == "candidate" and not decision.start_paused:
                 return see_other(next_review(conn, ids, condition_id, mode))
@@ -302,7 +306,8 @@ def routes(ctx):
                                    values={**form, "p_true": form.get("p_true", ""),
                                            "follow_market": form.get("follow_market") == "1",
                                            "naked_budget": form.get("naked_budget", ""),
-                                           "capital": form.get("capital", "")},
+                                           "capital": form.get("capital", ""),
+                                           "bid_multiple": form.get("bid_multiple", "")},
                                    errors=errors, mode=mode)
             ids = farm_db.candidate_queue(conn, mode)
             now = ctx.clock()

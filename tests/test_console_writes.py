@@ -105,7 +105,7 @@ class Writes(Console):
     def snapshot_markets(self):
         return [tuple(r) for r in self.db.execute(
             "SELECT condition_id, status, p_true, naked_budget_usd, capital_usd, note, paused, "
-            "naked_paused, sole_bid FROM markets ORDER BY condition_id")]
+            "naked_paused, sole_bid, bid_multiple FROM markets ORDER BY condition_id")]
 
 
 class SecurityTest(Writes):
@@ -458,7 +458,7 @@ class ReviewTest(Writes):
                        "Reject", 'hx-get="/partials/review/0xddd/live"',
                        "every 5s [document.visibilityState === 'visible']",
                        'hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, '
-                       '#d-sole_bid"'):
+                       '#d-bid_multiple, #d-sole_bid"'):
             self.assertIn(needle, page)
         self.assertIn('hx-trigger="input changed delay:300ms"', page)
 
@@ -494,7 +494,8 @@ class ReviewTest(Writes):
             r'([^<]*?)\s*<', fragment.group(1)))
 
     def planned(self, p_true, capital, prior=fill_cost.DEFAULT_PRIOR):
-        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
+        cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))._replace(
+            **farm_db.load_settings(self.db)[0])
         row = {**dict(self.row("0xddd")), "p_true": p_true, "naked_budget_usd": 25.0,
                "capital_usd": capital}
         return views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
@@ -547,7 +548,16 @@ class ReviewTest(Writes):
         self.assertNotEqual(figures["Net/day"],
                             views.usd(self.planned(0.97, None).value.net_per_day))
 
+    def at_the_cap(self):
+        """The farmer's bid multiple set to 1 and its tie band to 0, so the
+        bid rests where the typed terms cap it. At the defaults a bid whose
+        longshot cover the $25 budget limits rests 1,470 shares at 93.7c,
+        under any cap these tests type, and the band rests a tick or more
+        under the cap."""
+        farm_db.put_settings(self.db, {"bid_multiple": 1.0, "tie_band": 0.0}, self.now)
+
     def test_projection_follows_the_terms_being_typed(self):
+        self.at_the_cap()
         full = self.projection(self.live())[1]
         for terms, p_true, capital in (({"capital": "100"}, 0.97, 100.0),
                                        ({"p_true": "96"}, 0.96, None)):
@@ -581,9 +591,9 @@ class ReviewTest(Writes):
     def test_live_orders_are_the_farmers_plan_against_the_live_book(self):
         text = self.live()
         cfg = reward_farmer.config_from(reward_farmer.build_parser().parse_args([]))
-        fm = reward_farmer.farm_market(
+        fm = reward_farmer.with_book_mid(reward_farmer.farm_market(
             {**dict(self.row("0xddd")), "p_true": 0.97, "naked_budget_usd": 25.0,
-             "capital_usd": None}, self.remote.info("0xddd"), cfg, self.now)
+             "capital_usd": None}, self.remote.info("0xddd"), cfg, self.now), BUDGET_BOOK)
         target = reward_farmer.target_orders(
             fm, BUDGET_BOOK, reward_farmer.Position(), cfg, True,
             reward_farmer.market_outlook(fm, None, None, fill_cost.DEFAULT_PRIOR, cfg, self.now),
@@ -598,6 +608,7 @@ class ReviewTest(Writes):
             self.assertIn(needle, text)
 
     def test_live_plan_follows_the_terms_being_typed(self):
+        self.at_the_cap()
         full = self.live()
         capped = self.live(capital="100")
         self.assertNotEqual(re.findall(r"FAV_BID ([\d,.]+)</td>", full),
@@ -614,6 +625,23 @@ class ReviewTest(Writes):
         farm_db.put_settings(self.db, {"hurdle_rate": 10.0, "ev_margin": 0.024}, self.now)
         self.assertRegex(self.live(p_true="95"), r"The farmer would place nothing: no favorite "
                                                  r"bid pays: best net -\$\d+\.\d\d/day at 92\.6c\.")
+
+    def test_live_plan_rests_the_bid_at_the_typed_multiple_of_the_capital(self):
+        # On echo's floor book the longshot cover is free, so nothing but the
+        # farmer's $500 capital, times the multiple, limits the favorite bid.
+        self.remote.books["tok-0xeee"] = FLOOR_BOOK
+
+        def bid_cost(multiple):
+            text = self.live("0xeee", p_true="99", bid_multiple=multiple)
+            found = re.search(r'>FAV_BID</span>(?:(?!</tr>).)*?<td class="mono">\$([\d,.]+)</td>',
+                              text, re.S)
+            self.assertIsNotNone(found, f"no FAV_BID planned at bid_multiple={multiple!r}")
+            return float(found.group(1).replace(",", ""))
+        self.assertLessEqual(bid_cost("1"), 500.0)
+        self.assertGreater(bid_cost("4"), 3 * 500.0)
+        self.assertLessEqual(bid_cost("4"), 4 * 500.0)
+        self.assertEqual(bid_cost(""), bid_cost("4"))
+        self.assertEqual(bid_cost("x"), bid_cost("4"))
 
     def test_live_plan_follows_the_sole_bid_box_when_no_other_bid_supports_the_market(self):
         # The only bid left is 80c under a 97c ask: an 88.5c midpoint.
@@ -649,6 +677,7 @@ class ReviewTest(Writes):
         # The 96.0c book midpoint caps the bid with no margin, over the 95.5c
         # that max_lead allows above the 95.0c best bid of the reward minimum.
         # A view of 96% keeps the 2c margin and caps it at 94.0c.
+        self.at_the_cap()
         text = self.live(p_true="", follow_market="1")
         self.assertIn("Buy No 95.5c", text)
         self.assertIn("Following the market: the favorite bid is capped at the book midpoint, "
@@ -664,7 +693,8 @@ class ReviewTest(Writes):
                    metrics=json.dumps({**metrics, **stored}))
         live = views.live_review(row, self.remote.info("0xddd"), BUDGET_BOOK, None, cfg,
                                  self.now, False, fill_cost.DEFAULT_PRIOR)
-        fm = reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg, self.now)
+        fm = reward_farmer.with_book_mid(
+            reward_farmer.farm_market(row, self.remote.info("0xddd"), cfg, self.now), BUDGET_BOOK)
         history = fill_cost.history_from_json(stored.get("history"))
         outlook = reward_farmer.market_outlook(fm, None, history, fill_cost.DEFAULT_PRIOR, cfg,
                                                self.now)
@@ -757,6 +787,27 @@ class ReviewTest(Writes):
         # Saving the terms with the box cleared turns it off again.
         self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="")
         self.assertEqual(self.row("0xddd")["sole_bid"], 0)
+
+    def test_approve_stores_the_typed_bid_multiple_and_blank_is_the_farmers(self):
+        farm_db.put_setting(self.db, "bid_multiple", 3.0, self.now)
+        self.assertRegex(self.client.get("/review/0xddd").text,
+                         r'id="d-bid_multiple" name="bid_multiple" value=""[^>]*'
+                         r'placeholder="default 3"')
+        self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                  bid_multiple="2")
+        self.assertEqual(self.row("0xddd")["bid_multiple"], 2.0)
+        self.assertIn('name="bid_multiple" value="2"', self.client.get("/review/0xddd").text)
+        self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
+                  bid_multiple="")
+        self.assertIsNone(self.row("0xddd")["bid_multiple"])
+
+    def test_a_rejected_form_keeps_the_bid_multiple_as_it_was_typed(self):
+        for url, fields in (("/review/0xddd/approve", {"p_true": ""}),
+                            ("/review/0xddd/reject", {"note": "x" * 501})):
+            with self.subTest(url=url):
+                resp = self.post(url, naked_budget="30", bid_multiple="7", **fields)
+                self.assertEqual(resp.status_code, 422)
+                self.assertIn('name="bid_multiple" value="7"', resp.text)
 
     def test_a_rejected_form_keeps_the_sole_bid_box_as_it_was_sent(self):
         resp = self.post("/review/0xddd/approve", p_true="", naked_budget="30", capital="",
@@ -1013,6 +1064,9 @@ class ReviewTest(Writes):
             ({"p_true": "97", "naked_budget": "-1"}, "0 or more"),
             ({"p_true": "97", "naked_budget": ""}, "0 or more"),
             ({"p_true": "97", "naked_budget": "25", "capital": "0"}, "positive amount"),
+            *(({"p_true": "97", "naked_budget": "25", "bid_multiple": bad},
+               "Enter a multiple from 1 to 20, or leave blank for the farmer&#39;s.")
+              for bad in ("0.5", "21", "x", "nan")),
         ):
             with self.subTest(fields=fields):
                 resp = self.post("/review/0xddd/approve", **fields)
@@ -1366,6 +1420,25 @@ class SettingsTest(Writes):
         self.assertIn("keep_ratio: &#39;abc&#39; is not JSON", resp.text)
         self.assertIn('name="capital" value="300"', resp.text)
         self.assertEqual(farm_db.load_settings(self.db), ({}, {}))
+
+    def test_the_bid_multiple_saves_with_quoting_and_the_tie_band_is_not_shown(self):
+        page = self.client.get("/settings").text
+        self.assertRegex(page, r'(?s)Bid multiple of capital.*?name="bid_multiple" value="4"')
+        self.assertNotIn("tie_band", page)
+        resp = self.save("Quoting", bid_multiple="21")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("bid_multiple: 21 is out of range", resp.text)
+        self.save("Quoting", bid_multiple="2")
+        self.assertEqual(farm_db.load_settings(self.db), ({"bid_multiple": 2.0}, {}))
+
+    def test_the_tail_cap_saves_with_quoting(self):
+        page = self.client.get("/settings").text
+        self.assertRegex(page, r'(?s)Tail cap \(days of reward\).*?name="tail_days" value="30"')
+        resp = self.save("Quoting", tail_days="-1")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("tail_days: -1 is out of range", resp.text)
+        self.save("Quoting", tail_days="0")
+        self.assertEqual(farm_db.load_settings(self.db), ({"tail_days": 0.0}, {}))
 
     def test_reset_deletes_the_override(self):
         farm_db.put_setting(self.db, "cooldown_s", 30, self.now)

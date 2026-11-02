@@ -66,14 +66,15 @@ GLOSSARY = {
                                        "plus the longshot bid."),
     "apr": Term("APR", "Estimated $/day ÷ capital × 365, before fill costs. A ranking figure, "
                        "not a forecast."),
-    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: its "
-                                       "size × how often a sell sweep reached that far below "
-                                       "the midpoint in the market's last 60 days, at most "
-                                       "once an hour, shrunk toward the rate the last scan "
-                                       "pooled across markets. Without the market's history "
-                                       "it is that pooled rate alone, and the farmer does not "
-                                       "bid. A bid with more than 20,000 shares bid above it "
-                                       "is charged no fills."),
+    "fills_per_day": Term("Fills/day", "Favorite shares a day expected to fill our bid: how "
+                                       "often a sell sweep reached that far below the "
+                                       "midpoint in the market's last 60 days, at most once an "
+                                       "hour, shrunk toward the rate the last scan pooled "
+                                       "across markets, × what the sellers each sweep brings "
+                                       "fill of the bid. Most of the shares bid above it take "
+                                       "a seller first, so a bid behind a deep book fills "
+                                       "less. Without the market's history the rate is the "
+                                       "pooled one alone, and the farmer does not bid."),
     "fill_cost": Term("Fill cost/day", "Fills/day × what each filled share loses: its price "
                                        "minus what it is worth today at the hurdle rate. The "
                                        "farmer's ask sells it slowly, measured at 67% of a "
@@ -81,7 +82,8 @@ GLOSSARY = {
                                        "30 days, at the ask's price or p_true if that is "
                                        "lower. A share unsold at the end date is worth "
                                        "p_true. Without a p_true it uses the midpoint. A "
-                                       "sweep that reaches the bid fills all of it. Never "
+                                       "sweep that reaches the bid fills as much as it "
+                                       "sells past it. Never "
                                        "under zero: a fill worth more than its price is not "
                                        "counted as income."),
     "net_apr": Term("Net APR", "Est $/day less the fill cost, ÷ capital × 365. Markets rank by "
@@ -126,11 +128,30 @@ GLOSSARY = {
                                          "are sold. A scan prices every market's longshot bid "
                                          "with the scan's naked budget, so set it to what you'd "
                                          "approve with."),
-    "capital_cap": Term("Capital cap", "The most USD this market may tie up on the favorite "
-                                       "side: resting favorite bids plus favorite shares held, "
-                                       "at cost. The farmer rests the bid size at or under it "
-                                       "that nets the most. Leave blank to use the farmer's "
-                                       "default."),
+    "capital_cap": Term("Capital cap", "The most USD of favorite shares this market may "
+                                       "hold, at cost. The favorite bid rests up to the bid "
+                                       "multiple times the capital left, at the size under "
+                                       "that which nets the most. Leave blank to use the "
+                                       "farmer's default."),
+    "tail_days": Term("Tail cap", "The most days of a market's planned reward the favorite "
+                                  "bid may lose if a 99th-percentile seller hits it, past the "
+                                  "share of the bids ahead that holds. The filled "
+                                  "shares are valued as the farmer's ask sells that many, "
+                                  "discounted at the hurdle rate, and what is still unsold "
+                                  "pays out at the end date. A larger bid, a higher price or "
+                                  "a later end date loses more, so at 30 the bid shrinks "
+                                  "until such a fill costs at most 30 days of its reward. A "
+                                  "resting bid may sit up to a quarter over the cap. 0 is no "
+                                  "cap. A sole bid is not capped."),
+    "bid_multiple": Term("Bid multiple", "How large the resting favorite bid may be, as a "
+                                         "multiple of the capital left: at 4 it may rest four "
+                                         "times the capital not yet held in shares. A sweep "
+                                         "fills only part of a bid, so a larger bid earns "
+                                         "more for about the same fills, but one sweep can "
+                                         "still fill all of it. Capital stays the most "
+                                         "inventory a market holds. A sole bid rests only the "
+                                         "capital left. Blank on a market means the farmer's "
+                                         "setting."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
                                  "the EV margin. The farmer never bids above that cap, and "
                                  "below it picks the price with the best net of fill costs. "
@@ -191,15 +212,20 @@ GLOSSARY = {
 
     # order slots and their decisions
     "FAV_BID": Term("FAV_BID", "Buys the favorite below the midpoint, at the price and the "
-                               "size within the capital cap that earn the most rewards net "
-                               "of what its fills cost: a filled share "
-                               "ties up capital until FAV_ASK sells it, or until the market "
+                               "size within the bid multiple of the capital left that earn the "
+                               "most rewards net of what its fills cost: a filled share ties "
+                               "up capital until FAV_ASK sells it, or until the market "
                                "resolves if it never does."),
     "LONG_BID": Term("LONG_BID", "Buys the longshot far below its midpoint. It exists only to "
                                  "make the favorite bid earn rewards; this is the naked leg."),
     "FAV_ASK": Term("FAV_ASK", "Sells favorite shares the farmer bought, above the midpoint "
                                "and above their cost. It frees capital and earns the spread."),
     "LONG_ASK": Term("LONG_ASK", "Sells longshot shares picked up from a longshot fill."),
+    "fav_ceiling": Term("Ceiling", "The highest the favorite bid may rest after this "
+                                   "market's own fills, and why. While the farm holds "
+                                   "favorite shares, a tick under their average cost and "
+                                   "the last fill. For 6 hours after a favorite ask sold, a "
+                                   "tick under its price. The lower of these applies."),
     "hold": Term("Hold", "The resting order is still close enough to its target, so it stays "
                          "put and keeps its place in the queue."),
     "backoff": Term("Backoff", "The exchange rejected this order recently. The farmer waits "
@@ -223,6 +249,9 @@ GLOSSARY = {
                                  "a favorite buyer under 7% a year. Every sale into the book "
                                  "fills the favorite bid. Quoting resumes once other bids "
                                  "have supported the market for five minutes."),
+    "FILLED": Term("Filled", "A favorite bid left the book without the farmer cancelling "
+                             "it, so it filled. No favorite bid rests until the positions "
+                             "read shows the shares, at most two minutes. The exits rest."),
     "COOLDOWN": Term("Cooldown", "The favorite's ask fell sharply (by at least the drop "
                                  "threshold within the drop window). The ask is the price "
                                  "at which the favorite's asks add up to three reward "
@@ -244,11 +273,11 @@ GLOSSARY = {
                                "on its next cycle."),
 
     # settings and scan parameters
-    "capital": Term("Capital per market", "The most USD one market may tie up on the "
-                                          "favorite side: its resting bid plus farm inventory "
-                                          "at cost. The farmer rests the bid size at or under "
-                                          "it that nets the most. A scan sizes its planned "
-                                          "favorite bid at all of it."),
+    "capital": Term("Capital per market", "The most USD of farm inventory one market may "
+                                          "hold, at cost. A quoting favorite bid rests up to "
+                                          "the bid multiple times the capital left, at the "
+                                          "size under that which nets the most. A scan sizes "
+                                          "its planned favorite bid at all of the capital."),
     "max_lead": Term("Max lead", "The most the favorite bid may sit above the best bid "
                                  "already in the book, in price: 0.005 is 0.5c. 0 joins "
                                  "the best bid."),

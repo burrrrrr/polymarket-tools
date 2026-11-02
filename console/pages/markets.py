@@ -179,7 +179,7 @@ def routes(ctx):
         events.sort(key=lambda e: -e.id)
         mids = farm_db.read_mids(conn, condition_id, now - timedelta(hours=24))
         vm = views.market_detail(market, snap.states.get(condition_id), snap.status,
-                                 events, mids, now)
+                                 events, mids, now, ctx.effective(conn, "bid_multiple"))
         return snap, vm
 
     @router.get("/markets/{condition_id}", response_class=HTMLResponse)

@@ -309,7 +309,7 @@ main { flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32
 .ev p:last-child { margin-bottom: 0; }
 .rules { margin: 0; font-size: 14px; line-height: 1.6; color: var(--ink-2); white-space: pre-line; }
 .decision .btn { justify-content: center; }
-.decision .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.decision .pair { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px; }
 .triage { opacity: .75; }
 
 /* glossary tips */

@@ -14,7 +14,7 @@
               <td class="mono">{% if s.order %}{{ s.order.price | cents }} × {{ s.order.size | shares }}{% else %}--{% endif %}</td>
               <td class="mono">{{ s.live_score | score }}</td>
               <td class="mono">{% if s.target %}{{ s.target.price | cents }} × {{ s.target.size | shares }} @ {{ s.target_score | score }}{% else %}--{% endif %}</td>
-              <td class="wrap" style="color: var(--ink-2)">{{ s.decision }}{% if s.decision in ('hold', 'backoff', 'preview') %}{{ tip(s.decision) }}{% endif %}{% if s.reason %}: {{ s.reason }}{% endif %}</td>
+              <td class="wrap" style="color: var(--ink-2)">{{ s.decision }}{% if s.decision in ('hold', 'backoff', 'preview') %}{{ tip(s.decision) }}{% endif %}{% if s.reason %}: {{ s.reason }}{% endif %}{% if s.ceiling %}<div class="small">ceiling {{ s.ceiling.price | cents }}: {{ s.ceiling.why }}{{ tip('fav_ceiling') }}</div>{% endif %}</td>
               <td class="mono">{% if s.backoff_until %}{{ s.backoff_attempts }}× until {{ s.backoff_until[11:19] }} UTC{% else %}--{% endif %}</td>
             </tr>
             {%- endfor %}
