@@ -238,8 +238,8 @@ while it exists.
 - **Keys.** The keys are the option names with underscores, and the seconds
   options end in `_s`: `capital`, `max_lead`, `ask_offset`, `min_capture`,
   `ev_margin`, `min_fav`, `min_low_score`, `keep_ratio`, `hurdle_rate`,
-  `drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`, and
-  `expiry_buffer_days`. Each value is a JSON number.
+  `drop_threshold`, `drop_window_s`, `cooldown_s`, `naked_cooldown_s`,
+  `free_cap_usd`, and `expiry_buffer_days`. Each value is a JSON number.
 - **Bad values.** `farm_db.put_setting` refuses an unknown key or an
   out-of-range value. A bad row written another way is ignored, with an
   `ALERT` event.
@@ -281,17 +281,20 @@ if no farmer was running when it was sent.
 - `--capital` caps each market's favorite exposure. Favorite shares already
   held count against it at cost. The favorite bid rests at the size at or
   under what is left that nets the most.
-- The approved budget caps the naked longshot leg outside the free zone, and
-  no longshot bid rests where a fill would give a favorite buyer over 20% a
-  year. [The longshot bid](pricing.md#the-longshot-bid) has both rules.
+- The approved budget caps the naked longshot leg outside the free zone,
+  `--free-cap` caps a bid in it where the budget is less, and no longshot
+  bid rests where a fill would give a favorite buyer over 20% a year.
+  [The longshot bid](pricing.md#the-longshot-bid) has the rules.
 - A longshot fill (your longshot shares went up) prints an `ALERT` and pauses
   the longshot bid for `--naked-cooldown` seconds. Without it, the favorite
   bid shrinks to whatever the covered favorite ask still balances.
 - An order that is still close to its target stays in place. It must sit on
   the current tick, score at least `--keep-ratio` of the target, keep a size
   within -20% and +25% of the target, and stay within the price cap or
-  budget, which a longshot bid resting free of it is not held to. Otherwise
-  it is replaced. A favorite bid is judged by its net as
+  budget. A longshot bid resting free of the budget is held to `--free-cap`
+  instead, or the budget when that is more, and a lower cap replaces one
+  over it at the next cycle. Otherwise it is replaced. A favorite bid is
+  judged by its net as
   it rests, at its own price and size, instead of its score and the target's
   size. It stays while its price is still a candidate, its net trails the
   best bid's by no more than `1 - --keep-ratio` of it (or $0.02/day, if
@@ -368,6 +371,7 @@ it does not manage.
 | `--drop-window` | 60 | Seconds over which that fall is measured |
 | `--cooldown` | 600 | Seconds without orders after an ask drop |
 | `--naked-cooldown` | 3600 | Seconds without a longshot bid after a longshot fill |
+| `--free-cap` | 300 | Most USD a longshot bid in the free zone may cost where the market's naked budget is less. 0 leaves the budget alone to limit every price |
 | `--expiry-buffer-days` | 7 | Retire this many days before the end date |
 | `--heartbeat` | off | Live only. See the warning below |
 

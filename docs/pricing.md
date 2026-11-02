@@ -36,7 +36,7 @@ puts each longshot price in one of three zones:
 
 | Zone | Return a fill gives a favorite buyer | What limits the bid |
 | --- | --- | --- |
-| Free | Under 5% a year (`FREE_RETURN` in `farm/reward_screener.py`) | The cost test below, not the naked budget |
+| Free | Under 5% a year (`FREE_RETURN` in `farm/reward_screener.py`) | The cost test below, and the free cap ($300 by default) where the naked budget is less |
 | Budgeted | From 5% to 20% a year | The naked budget, which you cap per market when you approve it. The bid's capital is naked risk, and the favorite bid shrinks to what the budget balances |
 | None | Over 20% a year (`MAX_RETURN`, a test value) | No longshot bid rests there, and so no favorite bid it would balance |
 
@@ -52,11 +52,10 @@ each unit of its score (`FREE_MAX_COST` in `farm/reward_screener.py`). A 0.1c
 share must score 0.002. A free price that fails the test is limited by the
 budget like any other.
 
-A bid at a price that passes is sized to balance the favorite bid's score,
-whatever that costs, so the favorite bid is never trimmed for it. The test
-caps the cost of each unit of score, not the dollars the bid ties up. Without
-it, the size that covers, Q_one divided by the score, would run to infinity
-at the edge of the reward band, where the score runs to zero.
+A bid at a price that passes is sized to balance the favorite bid's score.
+The test caps the cost of each unit of score, not the dollars the bid ties
+up. Without it, the size that covers, Q_one divided by the score, would run
+to infinity at the edge of the reward band, where the score runs to zero.
 
 - At 0.1c with a good score, the bid costs cents.
 - At the bound, the bid costs $0.50 for each unit of score it covers. That is
@@ -64,11 +63,27 @@ at the edge of the reward band, where the score runs to zero.
   to about $100 beside a $1,000 favorite bid, and to several hundred where
   the favorite bid sits close to the midpoint.
 
+### The free cap
+
+A sweep fills a free bid like any other. Live, free bids of $300 to $600
+rested naked, and one of $263 was swept for a $235 loss. So a free bid may
+cost at most the free cap (the farmer's `--free-cap`, `free_cap_usd` in
+the console's settings, $300 by default), or the market's naked budget when
+that is more. A replay put the reward the $300 cap gives up at about 0.4%.
+
+Where covering at the cheapest free price costs more than the cap, the bid
+takes the next price that covers within it. Each tick up scores more a
+share, so a dearer price can cover for fewer dollars. Where no price covers,
+the bid rests the cap at the free price where it buys the most score, and
+the favorite bid shrinks to match. A cap of 0 leaves the budget alone to
+limit every price. A scan plans with a $300 cap as well.
+
 ### Which price the bid takes
 
 The bid takes the cheapest price that passes one of two tests:
 
-- The price is free and passes the cost test. On most markets that price is
+- The price is free, passes the cost test, and its covering size fits the
+  free cap or the budget, whichever is more. On most markets that price is
   0.1c.
 - The covering size fits the budget. The covering size is enough to balance
   the favorite bid's score and at least the reward minimum. Its cost, plus
@@ -88,8 +103,9 @@ Three limits hold at every price:
   would carry risk without scoring.
 
 When no price up to the `--min-low-score` cap balances the favorite bid
-within the budget, the bid sits at the price where the budget buys the most
-score, sized to the budget. The favorite bid shrinks to match, because score
+within those dollars, the bid sits at the price where its dollars buy the
+most score, sized to them: the free cap or the budget, whichever is more, at
+a free price, and the budget at any other. The favorite bid shrinks to match, because score
 on one side beyond the other earns nothing. A market with no such price gets
 no longshot bid. Its favorite bid then shrinks to what the covered `FAV_ASK`
 balances, or does not rest. The exits are unaffected.
@@ -116,6 +132,10 @@ held. The farmer applies four more rules.
   come to offer 5% a year goes back under the budget. A bid whose price has
   come to offer over 20% is replaced by a cheaper one or cancelled. Returns
   only rise, so each happens once.
+- **A resting free bid over the free cap is replaced.** A free bid that
+  covers more than it needs otherwise stays, but one costing over the cap
+  and the budget both is replaced at the next cycle, so a lower cap takes
+  effect at once.
 - **The bid is replaced more often near the edge of the reward band.** A
   small move of the midpoint there changes the bid's score, and so its size,
   a lot. At 0.1c a replacement only moves the bid further back in the queue.

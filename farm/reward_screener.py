@@ -24,7 +24,10 @@ on the annual return it offers a favorite buyer who holds to the end date,
   FREE      under FREE_RETURN a year. Almost no buyer takes that, so the
             naked budget does not limit the bid: where a share costs at most
             FREE_MAX_COST for each unit of its score, it is sized to balance
-            the favorite bid whatever that costs.
+            the favorite bid up to the free cap (DEFAULT_FREE_CAP), or the
+            budget when that is more. A sweep still fills such a bid, so
+            past the cap it moves to a dearer price that covers for less,
+            or the favorite bid shrinks to what the cap balances.
   BUDGETED  from FREE_RETURN to MAX_RETURN. The naked risk on the leg is
             budgeted per market at approval time, and the favorite bid
             shrinks to what the budget balances.
@@ -148,6 +151,11 @@ MAX_RETURN = 0.20
 # puts it 4.5% of the band inside its edge, and a bid costs at most half its
 # favorite bid's score times its size.
 FREE_MAX_COST = 0.50
+# The most a free bid may cost, in USD, where the naked budget is less: the
+# farmer's --free-cap and a scan's free_cap. Free bids of $300 to $600 rested
+# naked live, and a $263 one was swept for a $235 loss. A replay put the
+# reward a $300 cap gives up at about 0.4%.
+DEFAULT_FREE_CAP = 300.0
 # The naked budget a scan prices each longshot bid within, and the one a new
 # review and the console's quotable check start with.
 DEFAULT_NAKED_BUDGET = 10.0
@@ -411,6 +419,7 @@ class ScreenConfig(NamedTuple):
     max_lead: float = 0.005
     min_low_score: float = 0.10
     naked_budget: float = DEFAULT_NAKED_BUDGET
+    free_cap: float = DEFAULT_FREE_CAP
     min_rate: float = 1.0
     fragile_drop: float = 0.03
     hurdle_rate: float = 0.40
@@ -613,10 +622,10 @@ def planned_budget_cost(metrics, years_left):
                        market.get("v") or 0.0, zones)
 
 
-def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, zones):
+def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, zones, free_cap):
     """The naked longshot bid adding `need` to Q_two. Outside the free zone it
-    costs at most `room` USD. LongshotBid, or None when need is not positive
-    or nothing fits.
+    costs at most `room` USD, and in it at most max(room, free_cap).
+    LongshotBid, or None when need is not positive or nothing fits.
 
     The bid never prices above the ceiling, the cheapest price scoring at
     least min_score, nor at a price offering the favorite buyer more than
@@ -632,24 +641,29 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, zones):
     bid scoring 0.10.
 
     A price in the free zone, offering the favorite buyer under FREE_RETURN
-    a year, may rest any size where a share costs at most FREE_MAX_COST for
-    each unit of its score (sized_without_budget): room does not limit it.
-    The cheapest such price is the bid whatever the need, unless a cheaper
-    price covers within room. So the bid offers the least return that
-    balances, its price cannot jump as the need grows, and the caller never
-    trims the favorite bid for it. The test must also pass at
-    zones.steady_mid, so a midpoint that wobbles across it cannot move the
-    bid from cycle to cycle: a price stops being free at the first cycle that
-    fails it and becomes free again only once the farmer's dwell has passed.
-    On most markets the cheapest free price is the lowest tick, 0.1c.
+    a year, may rest a size costing up to max(room, free_cap) where a share
+    costs at most FREE_MAX_COST for each unit of its score
+    (sized_without_budget). Below the cap the cheapest such price is the bid
+    whatever the need, unless a cheaper price covers within room. So the bid
+    offers the least return that balances, and its price cannot jump as the
+    need grows until the cap binds. Past the cap a dearer price may cover
+    for fewer dollars, since each tick up scores more a share: a sweep
+    fills a free bid as readily as any other, and the cap is what one costs.
+    The test must also pass at zones.steady_mid, so a midpoint that wobbles
+    across it cannot move the bid from cycle to cycle: a price stops being
+    free at the first cycle that fails it and becomes free again only once
+    the farmer's dwell has passed. On most markets the cheapest free price
+    is the lowest tick, 0.1c.
 
     Every other size must cost at most room: a bid from FREE_RETURN up, a
     cheaper one costing more than FREE_MAX_COST a unit of score, and any bid
     while the free zone is closed (zones.steady_mid is None).
-    When no price up to the ceiling covers within room, the bid goes to the
-    price where the size room buys scores the most, ties to the cheaper, and
-    the caller trims the favorite bid to the Q_two that reaches; None when
-    room buys less than min_size there. Score per dollar is U-shaped in
+    When no price up to the ceiling covers within its dollars, max(room,
+    free_cap) at a free price and room at any other, the bid goes to the
+    price where the size its dollars buy scores the most, ties to the
+    cheaper, and the caller trims the favorite bid to the Q_two that
+    reaches; None when they buy less than min_size there. A free_cap of 0
+    leaves room alone to limit every price. Score per dollar is U-shaped in
     price: 0.1c buys ten times the shares of 1c, so near the band edge the
     lowest tick with the whole room often beats the ceiling (Pfizer, $10 at
     a 0.9395 midpoint with v 0.065: 71.6 at 0.1c, 64.4 at the 1.7c ceiling,
@@ -682,16 +696,16 @@ def longshot_bid(levels, mid, v, tick, min_size, need, room, min_score, zones):
         n += 1
     if not scored or scored[-1][1] < min_score:
         return None
-    scored = [(p, s) for p, s in scored
-              if s > 0 and not over_max_return(p, zones.years_left)]
-    for price, s in scored:
+    scored = [(p, s, max(room, free_cap) if sized_without_budget(p, s, v, zones) else room)
+              for p, s in scored if s > 0 and not over_max_return(p, zones.years_left)]
+    for price, s, dollars in scored:
         size = max(min_size, round_size_up(need / s))
-        if sized_without_budget(price, s, v, zones) or size * price <= room + 1e-9:
+        if size * price <= dollars + 1e-9:
             return LongshotBid(price, size, s)
     if not scored:
         return None
     price, size, s = max(
-        ((p, round_size_down(room / p), s) for p, s in scored),
+        ((p, round_size_down(dollars / p), s) for p, s, dollars in scored),
         key=lambda bid: (bid[2] * bid[1], -bid[0]),
     )
     return LongshotBid(price, size, s) if size >= min_size else None
@@ -798,13 +812,13 @@ def value_quote(levels, mid, v, min_size, my_q, bid, capital_usd, p_true, outloo
 def plan_at(market, levels, config, fav_price, years_left):
     """Size our favorite bid at fav_price and price our longshot bid. QuotePlan or Skip.
 
-    The longshot bid is longshot_bid with config.naked_budget, covering the
-    favorite bid's score, as the farmer prices it with no longshot shares
-    held, years_left to the end date, and the book's midpoint having held:
-    in the free zone whatever that costs, above it within the budget, and
-    nowhere over MAX_RETURN. When that leaves it short, the favorite bid
-    shrinks to match, as the farmer's does: score beyond the smaller side
-    earns nothing.
+    The longshot bid is longshot_bid with config.naked_budget and
+    config.free_cap, covering the favorite bid's score, as the farmer prices
+    it with no longshot shares held, years_left to the end date, and the
+    book's midpoint having held: in the free zone up to the free cap, above
+    it within the budget, and nowhere over MAX_RETURN. When that leaves it
+    short, the favorite bid shrinks to match, as the farmer's does: score
+    beyond the smaller side earns nothing.
 
     A favorite bid above the best bid drags the midpoint up toward itself, so
     both legs are scored against the midpoint that includes it (QuotePlan.mid),
@@ -819,7 +833,7 @@ def plan_at(market, levels, config, fav_price, years_left):
         return Skip("favorite bid outside band")
     zones = Zones(years_left, adjusted_mid(levels.bids, levels.asks, market.min_size))
     low = longshot_bid(levels, mid, v, tick, market.min_size, fav_score * fav_size,
-                       config.naked_budget, config.min_low_score, zones)
+                       config.naked_budget, config.min_low_score, zones, config.free_cap)
     if low is not None:
         fav_size = min(fav_size, round_size_down(low.score * low.size / fav_score))
     if low is None or fav_size < market.min_size:

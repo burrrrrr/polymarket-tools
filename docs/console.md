@@ -143,6 +143,10 @@ rows and its funnel in one transaction and never changes your decisions.
   and write only the fields you changed, all in one transaction. A value
   that fails shows its error next to the field and nothing is saved.
   **Reset** deletes the override, so the farmer's own value applies again.
+  The Safety group's **Free bid cap** (`free_cap_usd`, $300 by default) is
+  the most a longshot bid in the free zone may cost where the market's naked
+  budget is less ([The free cap](pricing.md#the-free-cap)). Lowering it
+  replaces a resting free bid over it at the farmer's next cycle.
 
 There is no live switch. Live mode needs the private key, which the farmer
 reads in its own terminal, so you start it there:

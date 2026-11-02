@@ -85,6 +85,7 @@ CFG = FarmConfig(
     drop_window_s=60.0,
     cooldown_s=600.0,
     naked_cooldown_s=3600.0,
+    free_cap_usd=300.0,
     expiry_buffer_days=7.0,
     hurdle_rate=0.40,
 )
@@ -302,6 +303,27 @@ class BalancingTest(unittest.TestCase):
         self.assertEqual(fav.size, 500.73)
         self.assertAlmostEqual(fav.score * fav.size, low.score * low.size,
                                delta=fav.score * 0.01)
+
+    def test_a_free_long_bid_costs_at_most_the_free_cap(self):
+        # On the book above the 0.2c bid covering 523.56 favorite shares
+        # costs $100.57. Under a $50 cap a dearer free price covers them
+        # for less. Under a $20 cap, less than the $25 budget, no price up
+        # to the 1.1c ceiling covers within $25, and the bid rests as the
+        # budget alone would have it, the favorite bid trimmed.
+        book = Levels(bids=[(0.961, 1000.0)], asks=[(0.97, 1000.0)], tick=0.001)
+        fm = market(p_true=0.98, naked_budget_usd=25.0, zones=steady(0.9655))
+        intents = by_slot(quotes_at(fm, book, Position(), CFG._replace(free_cap_usd=50.0),
+                                    True, 0.955))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertGreater(low.price, 0.002)
+        self.assertLessEqual(low.price * low.size, 50.0)
+        self.assertEqual(fav.size, 523.56)
+        self.assertGreaterEqual(low.score * low.size, fav.score * fav.size)
+        intents = by_slot(quotes_at(fm, book, Position(), CFG._replace(free_cap_usd=20.0),
+                                    True, 0.955))
+        fav, low = intents[Slot.FAV_BID], intents[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.011, 2272.72))
+        self.assertEqual(fav.size, 500.73)
 
     def test_a_filled_free_bid_does_not_grow_the_next_one(self):
         # At a 0.9495 midpoint with v 5.5c a 0.1c share scores 0.01, and
@@ -662,6 +684,27 @@ class ReconcileTest(unittest.TestCase):
         closed = fm._replace(zones=Zones(100 / 365.25))
         self.assertEqual(keep_failure(order, low, target, closed, Position(), CFG),
                          "over twice the cover needed")
+        # Over the free cap it goes, free or not.
+        cost = order.price * order.size_remaining
+        self.assertLess(cost, CFG.free_cap_usd)
+        self.assertEqual(keep_failure(order, low, target, fm, Position(),
+                                      CFG._replace(free_cap_usd=cost - 1.0)),
+                         "over the free cap")
+
+    def test_a_free_long_bid_over_the_free_cap_and_the_budget_is_replaced(self):
+        # 675.82 shares at 0.1c cost $0.68, free of a $0.50 budget. A $0.60
+        # cap is under that, and the bid goes. A cap or a budget at its cost
+        # keeps it.
+        order = live("b", Slot.LONG_BID, 0.001, 675.82)
+        low = self.intents[Slot.LONG_BID]
+        tight = market(naked_budget_usd=0.5, zones=steady(0.99))
+        capped = CFG._replace(free_cap_usd=0.6)
+        self.assertEqual(keep_failure(order, low, self.target, tight, Position(), capped),
+                         "over the free cap")
+        self.assertIsNone(keep_failure(order, low, self.target, tight, Position(),
+                                       CFG._replace(free_cap_usd=0.68)))
+        self.assertIsNone(keep_failure(order, low, self.target,
+                                       tight._replace(naked_budget_usd=0.68), Position(), capped))
 
     def test_a_free_long_bid_over_the_naked_budget_stays(self):
         # 675.82 shares at 0.1c cost $0.68: over a $0.50 budget, and over a
@@ -3093,6 +3136,28 @@ class FreeDwellFarmerTest(FarmerHarness):
             tuple((at - ago, mid) for at, mid in managed.mid_watch.mids))
         self.assertTrue(self.planned(farmer)[2])
 
+    def test_a_free_cap_setting_brings_a_resting_free_bid_down_on_the_next_cycle(self):
+        # With no budget the 0.1c bid covering all 512.82 favorite shares
+        # rests free, $0.30 of it. A $0.20 cap set in the console replaces
+        # it at the next cycle with the 200 shares $0.20 buys, and the
+        # favorite bid shrinks to what they balance.
+        farm_db.set_approval(self.ui, CID, 0.995, 0.0, None, now=NOW)
+        self.record_mids([0.99] * 13)
+        farmer = self.started_farmer()
+        low, fav_size, free = self.planned(farmer)
+        self.assertEqual(fav_size, round_size_down(500.0 / 0.975))
+        self.assertGreater(low[0] * low[1], 0.2)
+        self.assertTrue(free)
+        farm_db.put_setting(self.ui, "free_cap_usd", 0.2, NOW)
+        low, fav_size, free = self.planned(farmer)
+        self.assertEqual(low, (0.001, 200.0))
+        self.assertLess(fav_size, round_size_down(500.0 / 0.975))
+        slots = self.farm_state()[1]
+        self.assertEqual((slots["LONG_BID"]["decision"], slots["LONG_BID"]["reason"]),
+                         ("replace", "over the free cap"))
+        settings = [e for e in self.events() if e["kind"] == "SETTINGS"]
+        self.assertEqual(json.loads(settings[-1]["data"]), {"free_cap_usd": [300.0, 0.2]})
+
 
 class ReturnLimitFarmerTest(FarmerHarness):
     def test_the_farmer_reads_the_time_left_from_the_end_date_each_cycle(self):
@@ -3829,6 +3894,11 @@ class ParserTest(unittest.TestCase):
             build_parser().parse_args(["--keep-orders", "--heartbeat"])
         for flag in ("--keep-orders", "--heartbeat"):
             build_parser().parse_args([flag])
+
+    def test_a_free_longshot_bid_costs_at_most_300_dollars_unless_told_otherwise(self):
+        self.assertEqual(config_from(build_parser().parse_args([])).free_cap_usd, 300.0)
+        self.assertEqual(config_from(build_parser().parse_args(["--free-cap", "50"]))
+                         .free_cap_usd, 50.0)
 
 
 if __name__ == "__main__":

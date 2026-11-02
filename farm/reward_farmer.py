@@ -45,14 +45,17 @@ farmer rests on both sides, in four slots per market:
             zones go by the annual return that gives a favorite buyer who
             holds to the end date (reward_screener.fill_return). Under
             FREE_RETURN almost no buyer takes it, and the bid is sized to
-            cover the rest of Q_one whatever that costs: the market's
-            naked_budget_usd does not limit it, so long as a share costs at
+            cover the rest of Q_one up to --free-cap USD, or the market's
+            naked_budget_usd when that is more, so long as a share costs at
             most FREE_MAX_COST for each unit of its score. It takes the
             cheapest such price, 0.1c on most markets, unless a cheaper
-            price covers within the budget. From FREE_RETURN up it takes
-            the cheapest price whose covering size fits the budget, less
-            longshot shares held, and never one above the cheapest price
-            scoring --min-low-score. Over MAX_RETURN it does
+            price covers within the budget. A sweep fills it all the same,
+            so where covering there costs over the cap a dearer free price
+            that covers for less takes its place, and with none the bid
+            rests the cap and the favorite bid shrinks. From FREE_RETURN up
+            it takes the cheapest price whose covering size fits the
+            budget, less longshot shares held, and never one above the
+            cheapest price scoring --min-low-score. Over MAX_RETURN it does
             not rest at all: such a bid is one convergence fills. Once a
             longshot bid has filled, the budget less the shares held limits
             every price until LONG_ASK has sold them. And a price is free
@@ -160,7 +163,8 @@ that stays rather than the target. A longshot bid is kept while it covers
 keep_ratio of the score it balances, up to twice it where the naked budget
 limits it above the lowest tick,
 at a price no higher than target or within two ticks of the min-score price,
-and not once its price has come to offer more than MAX_RETURN a year. A
+not once its price has come to offer more than MAX_RETURN a year, and not
+while it costs over --free-cap and the naked budget both, free or not. A
 favorite ask more than two ticks under its target is replaced although it
 scores more, so it follows a target that rises. A longshot ask priced over
 its target is replaced at once, and one priced under it always stays: its
@@ -225,6 +229,7 @@ from py_clob_client_v2.clob_types import (
 )
 
 from farm.reward_screener import (
+    DEFAULT_FREE_CAP,
     TWO_SIDED_ABOVE,
     Outlook,
     QuoteValue,
@@ -300,11 +305,13 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 # the whole naked budget where a fill costs real money. At the lowest tick it
 # stays: at 0.1c the extra cover costs cents, and on a 1c tick one tick of
 # mid moves the cover by more than this multiple. A bid free of the budget
-# stays too: it cost at most FREE_MAX_COST a unit of the score it was sized
-# for, and a smaller one in its place would save part of that for 30 seconds
-# unscored. Near the band edge, where the dearer free prices sit, a tick of
-# mid moves the cover by a third to a half, so such a bid would be replaced
-# often.
+# stays too while it costs at most the free cap, or the budget if more: it
+# cost at most FREE_MAX_COST a unit of the score it was sized for, and a
+# smaller one in its place would save part of that for 30 seconds unscored.
+# Near the band edge, where the dearer free prices sit, a tick of mid moves
+# the cover by a third to a half, so such a bid would be replaced often.
+# Over the cap it goes whatever it covers: a sweep fills a free bid too, and
+# the cap is the most the operator will lose to one.
 LONG_COVER_MAX = 2.0
 
 # How long a price must have passed its test for the free zone, on every
@@ -633,6 +640,7 @@ class FarmConfig(NamedTuple):
     drop_window_s: float
     cooldown_s: float
     naked_cooldown_s: float
+    free_cap_usd: float
     expiry_buffer_days: float
     hurdle_rate: float
 
@@ -695,8 +703,8 @@ def capital_room(fm, position):
 
 def naked_room(fm, position):
     """USD of longshot bid the budget still allows after longshot shares held,
-    at cost. It does not limit a bid sized without the budget
-    (free_of_budget)."""
+    at cost. A bid sized without the budget (free_of_budget) may cost up to
+    the farmer's free_cap_usd instead, when that is more."""
     return max(0.0, fm.naked_budget_usd - position.long_shares * position.long_avg)
 
 
@@ -822,9 +830,10 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
     `levels` is the favorite book without our own resting orders. The bid
     starts at fav_size, or at all of capital_room without one. Sizes are
     balanced so Q_two covers Q_one: covered FAV_ASK first, then the naked
-    LONG_BID, at the cheapest free price whatever the rest costs, or else at
-    the cheapest price that covers the rest within the budget, no higher
-    than the min_low_score price (longshot_bid), then the favorite bid
+    LONG_BID, at the cheapest free price that covers the rest within
+    cfg.free_cap_usd, or else at the cheapest price that covers the rest
+    within the budget, no higher than the min_low_score price
+    (longshot_bid), then the favorite bid
     shrinks to whatever Q_two reached. While longshot shares rest an exit the
     budget limits every price (long_zones), so a filled bid cannot grow the
     next one. No LONG_BID rests at a price offering over MAX_RETURN a year
@@ -887,7 +896,7 @@ def quotes_at(fm, levels, position, cfg, naked_allowed, fav_price, fav_size=None
             return None
         return longshot_bid(levels, mid, v, tick, fm.min_size, q_one - q_two_covered,
                             naked_room(fm, position), cfg.min_low_score,
-                            long_zones(fm, position))
+                            long_zones(fm, position), cfg.free_cap_usd)
 
     low = long_bid(q_one_exits + fav_score * fav_size)
     q_two = q_two_covered + (low.score * low.size if low else 0.0)
@@ -1226,7 +1235,7 @@ def scan_sole_bid(market, levels, config, now):
         hurdle_rate=config.hurdle_rate, ev_margin=0.0,
         # A plan from no position prices no exit and keeps no order.
         ask_offset=0.0, min_capture=0.0, keep_ratio=0.0, drop_threshold=0.0,
-        drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0)
+        drop_window_s=0.0, cooldown_s=0.0, naked_cooldown_s=0.0, free_cap_usd=config.free_cap)
     fm = FarmMarket(
         condition_id=market.condition_id, slug=market.slug, question=market.question,
         end_date=market.end_date, neg_risk=market.neg_risk, tick=market.tick,
@@ -1265,11 +1274,13 @@ def keep_failure(order, intent, target, fm, position, cfg):
     priced over target stays within LONG_PRICE_SLACK_TICKS of the cheapest
     price scoring min_low_score, the fill-risk bound the plan prices under.
     The naked budget does not hold a bid while its price is free of it
-    (free_of_budget). That bid stays whatever it costs or covers. Once the
-    price is no longer free, because the midpoint dipped under its test,
-    longshot shares rest an exit, or the nearing end date took the price out
-    of the free zone, a bid over the budget is replaced by the plan's, once,
-    and FREE_DWELL_S keeps the plan there.
+    (free_of_budget). That bid stays whatever it covers, while it costs at
+    most cfg.free_cap_usd or the budget, whichever is more. Over both it is
+    replaced, free or not, so a bid sized before a lower cap comes down at
+    the next cycle. Once the price is no longer free, because the midpoint
+    dipped under its test, longshot shares rest an exit, or the nearing end
+    date took the price out of the free zone, a bid over the budget is
+    replaced by the plan's, once, and FREE_DWELL_S keeps the plan there.
     A longshot bid whose price has come to offer the favorite buyer more
     than MAX_RETURN a year is replaced whatever it covers. Returns only rise
     as the end date nears, so a resting bid leaves each zone once, and the
@@ -1346,10 +1357,12 @@ def keep_failure(order, intent, target, fm, position, cfg):
     if order.slot is Slot.LONG_ASK and order.price < (
             long_exit_floor(position, fm, cfg) - 1e-9):
         return "below the exit floor"
-    if (order.slot is Slot.LONG_BID
-            and order.price * order.size_remaining > naked_room(fm, position) + 1e-9
-            and not free_of_budget(order.price, target.mid, fm, position)):
-        return "over the naked budget"
+    if order.slot is Slot.LONG_BID:
+        cost, room = order.price * order.size_remaining, naked_room(fm, position)
+        if cost > room + 1e-9 and not free_of_budget(order.price, target.mid, fm, position):
+            return "over the naked budget"
+        if cost > max(room, cfg.free_cap_usd) + 1e-9:
+            return "over the free cap"
     return None
 
 
@@ -2957,6 +2970,7 @@ def config_from(args):
         drop_window_s=args.drop_window,
         cooldown_s=args.cooldown,
         naked_cooldown_s=args.naked_cooldown,
+        free_cap_usd=args.free_cap,
         expiry_buffer_days=args.expiry_buffer_days,
         hurdle_rate=args.hurdle_rate,
     )
@@ -3027,6 +3041,9 @@ Examples:
         ("--cooldown", float, 600.0, "Seconds without quotes after an ask drop"),
         ("--naked-cooldown", float, 3600.0, "Seconds without a longshot bid after "
                                             "a longshot fill"),
+        ("--free-cap", float, DEFAULT_FREE_CAP, "Most USD a longshot bid in the free zone "
+                                                "may cost where the market's naked budget "
+                                                "is less"),
         ("--expiry-buffer-days", float, 7.0, "Retire this many days before the end date"),
         ("--hurdle-rate", float, 0.40, "Yearly return capital must beat; a filled share "
                                        "costs its price minus what it sells for, "

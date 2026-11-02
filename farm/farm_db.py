@@ -714,6 +714,7 @@ SETTINGS = {
     "drop_window_s": Bound(0, low_open=True),
     "cooldown_s": Bound(0),
     "naked_cooldown_s": Bound(0),
+    "free_cap_usd": Bound(0),
     "expiry_buffer_days": Bound(0),
     "hurdle_rate": Bound(0, 10),
 }

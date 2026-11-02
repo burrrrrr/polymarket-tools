@@ -58,6 +58,7 @@ SETTING_FIELDS = {
     "drop_window_s": Field("Drop window (s)", SAFETY),
     "cooldown_s": Field("Cooldown (s)", SAFETY),
     "naked_cooldown_s": Field("Naked cooldown (s)", SAFETY),
+    "free_cap_usd": Field("Free bid cap ($)", SAFETY),
     "min_fav": Field("Min favorite mid", SAFETY),
     "expiry_buffer_days": Field("Expiry buffer (days)", SAFETY),
 }

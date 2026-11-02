@@ -28,8 +28,10 @@ GLOSSARY = {
                            "a fill would give a favorite buyer under 5% a year to the end date, "
                            "0.1c on most markets. Almost no buyer takes that, so where a share "
                            "there costs at most $0.50 for each unit of its score, the bid is "
-                           "sized to balance the favorite bid whatever that costs: the naked "
-                           "budget does not limit it. The price must have passed that test for "
+                           "sized to balance the favorite bid up to the free bid cap ($300 "
+                           "unless set), or the naked budget when that is more. Past the cap "
+                           "it moves to a dearer price that covers for less, or the favorite "
+                           "bid shrinks to match. The price must have passed that test for "
                            "ten minutes: after one dip the bid moves to a dearer price that "
                            "passed throughout, or back under the budget where there is none."),
     "budget": Term("Budget", "The scan planned the longshot bid where a fill would give a "
@@ -121,7 +123,9 @@ GLOSSARY = {
                                          "shares held, at cost. A bid offering under 5% a year "
                                          "is outside the budget where a share costs at most "
                                          "$0.50 for each unit of its score: it is sized to "
-                                         "balance the favorite bid. Once a longshot bid has "
+                                         "balance the favorite bid, at a cost of up to the "
+                                         "free bid cap or this budget, whichever is more. "
+                                         "Once a longshot bid has "
                                          "filled, the budget limits every price until the shares "
                                          "are sold. A scan prices every market's longshot bid "
                                          "with the scan's naked budget, so set it to what you'd "
@@ -277,7 +281,7 @@ GLOSSARY = {
                                                 "the cheapest price in the free zone, where a "
                                                 "fill gives a favorite buyer under 5% a year, "
                                                 "whose share costs at most $0.50 for each unit "
-                                                "of its score, whatever its size costs. "
+                                                "of its score, up to the free bid cap. "
                                                 "Otherwise it takes the cheapest price whose "
                                                 "size covering the favorite bid fits the naked "
                                                 "budget, or else the price where the budget buys "
@@ -298,6 +302,14 @@ GLOSSARY = {
     "cooldown_s": Term("Cooldown", "Seconds all orders stay pulled after an ask drop."),
     "naked_cooldown_s": Term("Naked cooldown", "Pause the naked leg this long, in seconds, "
                                                "after a longshot fill."),
+    "free_cap_usd": Term("Free bid cap", "The most a longshot bid in the free zone, where a "
+                                         "fill gives a favorite buyer under 5% a year, may "
+                                         "cost, in USD, where the market's naked budget is "
+                                         "less. A free bid that would cost more moves to a "
+                                         "dearer price that covers for less, or rests this "
+                                         "much and the favorite bid shrinks to match. A "
+                                         "resting one over it is replaced. 0 leaves the "
+                                         "budget alone to limit every price."),
     "expiry_buffer_days": Term("Expiry buffer", "Days before the end date when every order "
                                                 "expires (GTD) and the market retires."),
     "min_window_days": Term("Min window", "Skip markets with fewer farmable days left than "

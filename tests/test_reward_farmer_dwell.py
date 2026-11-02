@@ -27,8 +27,9 @@ from test_reward_farmer import CFG, FLOOR_BOOK, NOW, by_slot, live, market, plan
 EDGE = market(v=0.055, min_size=100.0, p_true=0.98, naked_budget_usd=13.0, capital=1000.0)
 EDGE_UP = Levels(bids=[(0.937, 107.0), (0.936, 2000.0)], asks=[(0.956, 2000.0)], tick=0.001)
 EDGE_DOWN = Levels(bids=[(0.936, 2000.0)], asks=[(0.956, 2000.0)], tick=0.001)
-# No lead over the best bid, so no bid of ours moves the midpoint.
-EDGE_CFG = CFG._replace(max_lead=0.0)
+# No lead over the best bid, so no bid of ours moves the midpoint. The free
+# cap is over the $353.51 free bid, so the dwell alone decides where it rests.
+EDGE_CFG = CFG._replace(max_lead=0.0, free_cap_usd=1000.0)
 # 30 days out only 0.1c to 0.3c offer under 5% a year, and without the
 # 107-share bid none of them costs under $0.50 a unit. Under the budget the
 # bids are 1.4c x 928.57 and 90.7c x 928.57.

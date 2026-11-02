@@ -1451,6 +1451,17 @@ class SettingsTest(Writes):
         self.assertIn('name="capital" value="300"', resp.text)
         self.assertEqual(farm_db.load_settings(self.db), ({}, {}))
 
+    def test_the_free_cap_takes_any_dollar_amount_from_zero_up(self):
+        self.assertIn('name="free_cap_usd" value="300"', self.client.get("/settings").text)
+        resp = self.save("Safety", free_cap_usd="-1")
+        self.assertEqual(resp.status_code, 422)
+        self.assertIn("free_cap_usd: -1 is out of range", resp.text)
+        self.assertEqual(farm_db.load_settings(self.db), ({}, {}))
+        for text, value in (("0", 0.0), ("150", 150.0)):
+            with self.subTest(free_cap_usd=text):
+                self.assertEqual(self.save("Safety", free_cap_usd=text).status_code, 303)
+                self.assertEqual(farm_db.load_settings(self.db), ({"free_cap_usd": value}, {}))
+
     def test_reset_deletes_the_override(self):
         farm_db.put_setting(self.db, "cooldown_s", 30, self.now)
         resp = self.post("/settings/reset/cooldown_s")
