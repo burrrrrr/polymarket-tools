@@ -161,7 +161,8 @@ of the best bid's net instead of the score, valued as it rests at its own
 price and size, and the orders that balance it are planned around the bid
 that stays rather than the target. A longshot bid is kept while it covers
 keep_ratio of the score it balances, up to twice it where the naked budget
-limits it above the lowest tick,
+limits it above the lowest tick, and up to five times it anywhere while the
+shares beyond the need cost $25 or less,
 at a price no higher than target or within two ticks of the min-score price,
 not once its price has come to offer more than MAX_RETURN a year, and not
 while it costs over --free-cap and the naked budget both, free or not. A
@@ -313,6 +314,17 @@ KEEP_SIZE_RANGE = (0.8, 1.25)
 # Over the cap it goes whatever it covers: a sweep fills a free bid too, and
 # the cap is the most the operator will lose to one.
 LONG_COVER_MAX = 2.0
+# Those two exemptions hold while the midpoint swings a tick or so. A bid sized
+# near the band edge, where a share scores almost nothing, covers 10 to 75
+# times the need once the favorite midpoint rises: live, 93 bids rested $2,837
+# over their plans, and a 0.1c bid of $219 balanced what $8 would. Score is
+# min(Q_one, Q_two), so the excess earns nothing and all of it fills in a
+# sweep. Any longshot bid covering more than LONG_COVER_FAR times the need is
+# replaced, at any tick and free or not, once the shares beyond the need cost
+# more than FAR_COVER_MIN_USD: under that, the 30 seconds a replacement scores
+# nothing are worth more than the shares.
+LONG_COVER_FAR = 5.0
+FAR_COVER_MIN_USD = 25.0
 
 # How long a price must have passed its test for the free zone, on every
 # cycle, before the naked budget leaves a bid there alone (steady_mid). One
@@ -1281,6 +1293,10 @@ def keep_failure(order, intent, target, fm, position, cfg):
     dipped under its test, longshot shares rest an exit, or the nearing end
     date took the price out of the free zone, a bid over the budget is
     replaced by the plan's, once, and FREE_DWELL_S keeps the plan there.
+    Neither exemption keeps a bid covering over LONG_COVER_FAR times the
+    need whose shares beyond it cost over FAR_COVER_MIN_USD: a tick of mid
+    moves the cover by a third to a half, but a rising favorite midpoint
+    multiplies what a share sized near the band edge scores tenfold or more.
     A longshot bid whose price has come to offer the favorite buyer more
     than MAX_RETURN a year is replaced whatever it covers. Returns only rise
     as the end date nears, so a resting bid leaves each zone once, and the
@@ -1333,6 +1349,9 @@ def keep_failure(order, intent, target, fm, position, cfg):
         if (order.price > fm.tick + 1e-9 and covers > LONG_COVER_MAX * need + 1e-9
                 and not free_of_budget(order.price, target.mid, fm, position)):
             return "over twice the cover needed"
+        if covers > LONG_COVER_FAR * need + 1e-9 and order.price * (
+                order.size_remaining - need / per_share) > FAR_COVER_MIN_USD + 1e-9:
+            return "far over the cover needed"
     elif order.slot is Slot.FAV_ASK and order.price < (
             intent.price - ASK_PRICE_SLACK_TICKS * fm.tick - 1e-9):
         return "below the target price"

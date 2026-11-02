@@ -136,6 +136,11 @@ held. The farmer applies four more rules.
   covers more than it needs otherwise stays, but one costing over the cap
   and the budget both is replaced at the next cycle, so a lower cap takes
   effect at once.
+- **A resting bid far over its need is replaced.** A bid covering more than
+  five times the score it balances is replaced when the shares beyond the
+  need cost over $25, at any price and free or not. A bid sized near the
+  edge of the reward band covers 10 to 75 times its need once the favorite
+  midpoint rises. The extra shares earn nothing and fill in a sweep.
 - **The bid is replaced more often near the edge of the reward band.** A
   small move of the midpoint there changes the bid's score, and so its size,
   a lot. At 0.1c a replacement only moves the bid further back in the queue.

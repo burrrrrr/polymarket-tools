@@ -658,6 +658,26 @@ class ReconcileTest(unittest.TestCase):
         # At 0.1c the extra cover costs a few cents of naked budget.
         self.assertIsNone(self.long_keep(0.001, 1400.0))
 
+    def far_keep(self, capital, cover):
+        """keep_failure for a free 0.1c bid covering `cover` times the need of
+        the plan for this much capital."""
+        fm = market(capital=capital, zones=steady(0.99))
+        low = by_slot(plan(fm, FLOOR_BOOK))[Slot.LONG_BID]
+        self.assertEqual(low.price, 0.001)
+        order = live("b", Slot.LONG_BID, low.price, round(low.size * cover, 2))
+        return keep_failure(order, low, plan(fm, FLOOR_BOOK), fm, Position(), CFG)
+
+    def test_a_long_bid_at_the_lowest_tick_far_over_the_need_is_replaced(self):
+        # $1000 of favorite bid needs 1351.63 shares at 0.1c. Sized when the
+        # midpoint sat near the band edge, the bid now covers 29 times that:
+        # $37.85 more than the plan rests, all of it filled in a sweep.
+        self.assertEqual(self.far_keep(1000.0, 29), "far over the cover needed")
+
+    def test_a_long_bid_far_over_the_need_by_under_25_dollars_stays(self):
+        # 29 times the 675.82 shares $500 needs is $18.92 over the plan, less
+        # than the 30 seconds a replacement scores nothing are worth.
+        self.assertIsNone(self.far_keep(500.0, 29))
+
     def test_a_budgeted_long_bid_covering_over_twice_the_need_is_replaced(self):
         fm = market(naked_budget_usd=100.0)
         target = plan(fm, BUDGET_BOOK)
@@ -672,15 +692,18 @@ class ReconcileTest(unittest.TestCase):
         # longshot bid at 1c, the cheapest price costing at most $0.50 a
         # unit of score there, free of the budget. A tick of mid moves what
         # a share that near the band edge scores by half, so a bid sized a
-        # tick lower covers over twice the need now. It stays: it is already
-        # bounded by what it cost when it was sized. With the free zone
-        # closed the same bid is one the budget limits, and it goes.
+        # tick lower covers over twice the need now. It stays, at three times
+        # too: it is already bounded by what it cost when it was sized. With
+        # the free zone closed the same bid is one the budget limits, and it
+        # goes.
         fm = market(p_true=0.98, naked_budget_usd=25.0, zones=steady(0.96))
         target = plan(fm, BUDGET_BOOK)
         low = by_slot(target)[Slot.LONG_BID]
         self.assertEqual(low.price, 0.01)
         order = live("b", Slot.LONG_BID, low.price, round(low.size * 2.1, 2))
         self.assertIsNone(keep_failure(order, low, target, fm, Position(), CFG))
+        thrice = live("b", Slot.LONG_BID, low.price, round(low.size * 3, 2))
+        self.assertIsNone(keep_failure(thrice, low, target, fm, Position(), CFG))
         closed = fm._replace(zones=Zones(100 / 365.25))
         self.assertEqual(keep_failure(order, low, target, closed, Position(), CFG),
                          "over twice the cover needed")
@@ -690,6 +713,18 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(keep_failure(order, low, target, fm, Position(),
                                       CFG._replace(free_cap_usd=cost - 1.0)),
                          "over the free cap")
+
+    def test_a_free_long_bid_above_the_lowest_tick_far_over_the_need_is_replaced(self):
+        # Six times the 7038.98 shares the plan rests at 1c is $351.95 over
+        # it. A $500 cap keeps the free cap out of it.
+        fm = market(p_true=0.98, naked_budget_usd=25.0, zones=steady(0.96))
+        target = plan(fm, BUDGET_BOOK)
+        low = by_slot(target)[Slot.LONG_BID]
+        self.assertEqual((low.price, low.size), (0.01, 7038.98))
+        order = live("b", Slot.LONG_BID, low.price, round(low.size * 6, 2))
+        self.assertEqual(keep_failure(order, low, target, fm, Position(),
+                                      CFG._replace(free_cap_usd=500.0)),
+                         "far over the cover needed")
 
     def test_a_free_long_bid_over_the_free_cap_and_the_budget_is_replaced(self):
         # 675.82 shares at 0.1c cost $0.68, free of a $0.50 budget. A $0.60
@@ -3157,6 +3192,26 @@ class FreeDwellFarmerTest(FarmerHarness):
                          ("replace", "over the free cap"))
         settings = [e for e in self.events() if e["kind"] == "SETTINGS"]
         self.assertEqual(json.loads(settings[-1]["data"]), {"free_cap_usd": [300.0, 0.2]})
+
+    def test_a_free_bid_far_over_the_need_after_the_midpoint_rises_comes_down(self):
+        # At a steady 0.966 midpoint a 0.1c share scores under 0.01, and the free
+        # bid balancing the favorite bid takes 28,655 of them. With the
+        # midpoint up at 0.99 each scores 0.55 and the plan wants 303.45. The
+        # resting bid covers 94 times that, $28 more than the plan rests, and
+        # the next cycle puts the plan's bid in its place.
+        self.book = Levels(bids=[(0.962, 1000.0)], asks=[(0.970, 1000.0)], tick=0.001)
+        self.record_mids([0.966] * 13)
+        farmer = self.started_farmer()
+        self.assertEqual(self.planned(farmer)[0], (0.001, 28655.34))
+        self.book = FLOOR_BOOK
+        before = self.last_event_id()
+        self.assertEqual(self.planned(farmer)[0], (0.001, 303.45))
+        slots = self.farm_state()[1]
+        self.assertEqual((slots["LONG_BID"]["decision"], slots["LONG_BID"]["reason"]),
+                         ("replace", "far over the cover needed"))
+        self.assertEqual([(e["kind"], e["size"]) for e in self.events(before)
+                          if e["slot"] == "LONG_BID"],
+                         [("CANCEL", 28655.34), ("PLACE", 303.45)])
 
 
 class ReturnLimitFarmerTest(FarmerHarness):
