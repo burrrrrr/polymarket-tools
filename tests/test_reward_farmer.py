@@ -2142,8 +2142,9 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(fill_events(before, after), [(Slot.FAV_ASK, 40.0), (Slot.LONG_BID, 300.0)])
 
 
-def positions_api(*statuses):
-    """An httpx client whose /positions answers with statuses in turn, then 200."""
+def positions_api(*statuses, pages=([{"token_id": FAV, "current_size": 120, "avg_price": 0.97}],)):
+    """An httpx client whose /v2/positions answers with statuses in turn, then
+    serves pages by cursor."""
     calls = []
 
     def handle(request):
@@ -2152,7 +2153,10 @@ def positions_api(*statuses):
         if status == 429:
             return httpx.Response(429, headers={"retry-after": "1"},
                                   json={"error": "Too Many Requests"})
-        return httpx.Response(status, json=[{"asset": FAV, "size": "120", "avgPrice": "0.97"}])
+        index = int(request.url.params.get("cursor", 0))
+        more = index + 1 < len(pages)
+        return httpx.Response(status, json={"data": pages[index], "pagination": {
+            "has_more": more, "next_cursor": str(index + 1) if more else None}})
 
     return httpx.Client(transport=httpx.MockTransport(handle)), calls
 
@@ -2165,6 +2169,21 @@ class FetchHoldingsTest(unittest.TestCase):
         self.assertEqual(holdings, {FAV: (120.0, 0.97)})
         self.assertEqual(len(calls), 3)
         self.assertEqual([c.args for c in sleep.call_args_list], [(1.0,), (1.0,)])
+
+    def test_every_page_of_a_paged_listing_is_read(self):
+        long = {"token_id": LONG, "current_size": 300, "avg_price": 0.001}
+        http, calls = positions_api(pages=([{"token_id": FAV, "current_size": 120,
+                                             "avg_price": 0.97}], [long]))
+        holdings = reward_farmer.fetch_holdings(http, "0xme")
+        self.assertEqual(holdings, {FAV: (120.0, 0.97), LONG: (300.0, 0.001)})
+        self.assertEqual([c.url.params.get("cursor") for c in calls], [None, "1"])
+        self.assertEqual({c.url.path for c in calls}, {"/v2/positions"})
+
+    def test_a_read_that_is_not_a_listing_raises(self):
+        http = httpx.Client(transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json=[{"asset": FAV, "size": 120}])))
+        with self.assertRaises(ValueError):
+            reward_farmer.fetch_holdings(http, "0xme")
 
     def test_a_read_still_rate_limited_after_the_retries_raises(self):
         http, calls = positions_api(*[429] * 10)

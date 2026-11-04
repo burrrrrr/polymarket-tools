@@ -119,15 +119,15 @@ class FitTest(unittest.TestCase):
 class FetchTest(unittest.TestCase):
     def setUp(self):
         first = T0 + 7200
-        taker = [{"transactionHash": "early", "proxyWallet": "t", "side": "SELL", "asset": "fav",
+        taker = [{"transaction_hash": "early", "proxy_wallet": "t", "side": "SELL", "token_id": "fav",
                   "size": 5, "price": 0.95, "timestamp": first - 1000},
-                 {"transactionHash": "hit", "proxyWallet": "t", "side": "SELL", "asset": "fav",
+                 {"transaction_hash": "hit", "proxy_wallet": "t", "side": "SELL", "token_id": "fav",
                   "size": 30, "price": 0.946, "timestamp": first + 60},
-                 {"transactionHash": "lift", "proxyWallet": "t", "side": "BUY", "asset": "fav",
+                 {"transaction_hash": "lift", "proxy_wallet": "t", "side": "BUY", "token_id": "fav",
                   "size": 9, "price": 0.97, "timestamp": first + 70}]
-        makers = [{"transactionHash": "hit", "proxyWallet": "m", "side": "BUY", "asset": "fav",
+        makers = [{"transaction_hash": "hit", "proxy_wallet": "m", "side": "BUY", "token_id": "fav",
                    "size": 18, "price": 0.95, "timestamp": first + 60},
-                  {"transactionHash": "hit", "proxyWallet": "m2", "side": "SELL", "asset": "long",
+                  {"transaction_hash": "hit", "proxy_wallet": "m2", "side": "SELL", "token_id": "long",
                    "size": 12, "price": 0.06, "timestamp": first + 60}]
         self.listing = Listing("c1", "fav", 0.01, first)
         self.read, self.failing = [], set()

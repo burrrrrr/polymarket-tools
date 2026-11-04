@@ -267,7 +267,7 @@ from polymarket import region
 from polymarket.books import Levels
 from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
 from polymarket.hosts import DATA_API_HOST
-from polymarket.http import RATE_LIMIT_RETRIES, chunks, get_with_retry
+from polymarket.http import RATE_LIMIT_RETRIES, chunks, get_pages
 from polymarket.parse import as_float, parse_time
 
 BUY, SELL = "BUY", "SELL"
@@ -1858,20 +1858,14 @@ def fetch_market_infos(http, condition_ids, timeout=20):
 
 def fetch_holdings(http, user, timeout=30):
     """{token_id: (shares, avg_price)} for every position the user holds."""
-    holdings, offset = {}, 0
-    while True:
-        page = get_with_retry(
-            http, f"{DATA_API_HOST}/positions",
-            {"user": user, "limit": POSITIONS_PAGE, "offset": offset, "sizeThreshold": 0},
-            timeout,
-        ).json() or []
+    holdings = {}
+    params = {"user": user, "limit": POSITIONS_PAGE, "sizeThreshold": 0}
+    for page in get_pages(http, f"{DATA_API_HOST}/v2/positions", params, timeout):
         for p in page:
-            size, avg = as_float(p.get("size")), as_float(p.get("avgPrice"))
-            if p.get("asset") and size is not None:
-                holdings[str(p["asset"])] = (size, avg or 0.0)
-        if len(page) < POSITIONS_PAGE:
-            return holdings
-        offset += POSITIONS_PAGE
+            size, avg = as_float(p.get("current_size")), as_float(p.get("avg_price"))
+            if p.get("token_id") and size is not None:
+                holdings[str(p["token_id"])] = (size, avg or 0.0)
+    return holdings
 
 
 def parse_reward_percentages(resp):

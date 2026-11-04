@@ -458,7 +458,7 @@ RAW_MIDS = [(FIRST_TRADE - DAY, 0.95), (FIRST_TRADE - 1800, 0.95),
 
 
 def trade(when, price, side="SELL", tx=None):
-    return {"transactionHash": tx or f"tx{when}", "proxyWallet": "w", "asset": FAV,
+    return {"transaction_hash": tx or f"tx{when}", "proxy_wallet": "w", "token_id": FAV,
             "side": side, "size": 10.0, "price": price, "timestamp": when}
 
 

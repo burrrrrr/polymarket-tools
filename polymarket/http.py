@@ -23,6 +23,22 @@ def get_with_retry(http, url, params, timeout, retries=RATE_LIMIT_RETRIES):
     return resp
 
 
+def get_pages(http, url, params, timeout):
+    """Each page's rows of a data API v2 listing, following next_cursor until
+    the listing ends; raises on a failed or malformed read."""
+    cursor = None
+    while True:
+        body = get_with_retry(http, url, {**params, **({"cursor": cursor} if cursor else {})},
+                              timeout).json()
+        rows = body.get("data") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            raise ValueError(f"expected a v2 listing from {url}, got {str(body)[:200]}")
+        yield rows
+        cursor = (body.get("pagination") or {}).get("next_cursor")
+        if not cursor:
+            return
+
+
 def chunks(items, size):
     return [items[i:i + size] for i in range(0, len(items), size)]
 

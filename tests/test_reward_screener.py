@@ -1047,7 +1047,7 @@ FAV_TOKEN, LONG_TOKEN = "fav-token", "long-token"
 
 
 def priced(side, asset, price, tx="0xt", wallet="0xw", size=10.0, seconds_ago=60):
-    return {"transactionHash": tx, "proxyWallet": wallet, "side": side, "asset": asset,
+    return {"transaction_hash": tx, "proxy_wallet": wallet, "side": side, "token_id": asset,
             "size": size, "price": price, "timestamp": int(HISTORY_NOW.timestamp()) - seconds_ago}
 
 
@@ -1083,8 +1083,8 @@ class ParseHitsTest(unittest.TestCase):
     def test_malformed_rows_are_dropped(self):
         good = priced("SELL", FAV_TOKEN, 0.95)
         bad = [
-            {**good, "transactionHash": None}, {**good, "asset": ""},
-            {**good, "side": "HOLD", "asset": LONG_TOKEN},
+            {**good, "transaction_hash": None}, {**good, "token_id": ""},
+            {**good, "side": "HOLD", "token_id": LONG_TOKEN},
             {**good, "size": 0}, {**good, "size": "lots"}, {**good, "price": 1.0},
             {**good, "price": None}, {**good, "timestamp": None}, "row", None,
         ]
@@ -1147,7 +1147,7 @@ class ParseBuysTest(unittest.TestCase):
 
     def test_malformed_rows_are_dropped(self):
         good = priced("BUY", FAV_TOKEN, 0.95)
-        bad = [{**good, "transactionHash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
+        bad = [{**good, "transaction_hash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
                {**good, "price": 1.0}, {**good, "timestamp": None}, "row", None]
         self.assertEqual(parse_buys(bad, bad, FAV_TOKEN), [])
         broken_maker = {**priced("SELL", FAV_TOKEN, 0.99, wallet="0xm"), "size": -5}
@@ -1183,7 +1183,7 @@ class ParseSellsTest(unittest.TestCase):
 
     def test_malformed_rows_are_dropped(self):
         good = priced("SELL", FAV_TOKEN, 0.95)
-        bad = [{**good, "transactionHash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
+        bad = [{**good, "transaction_hash": None}, {**good, "side": "HOLD"}, {**good, "size": 0},
                {**good, "price": 1.0}, {**good, "timestamp": None}, "row", None]
         self.assertEqual(parse_sells(bad, bad, FAV_TOKEN), [])
         broken_maker = {**priced("BUY", FAV_TOKEN, 0.90, wallet="0xm"), "size": -5}
@@ -1198,8 +1198,8 @@ def hourly_mids(price, days=70):
 
 
 def history_api(all_pages, taker_pages=(), mids=(), statuses=()):
-    """An httpx client serving /trades pages by takerOnly and offset, and the
-    mids inside each /prices-history interval, after statuses."""
+    """An httpx client serving /v2/trades pages by takerOnly and cursor, and
+    the mids inside each /prices-history interval, after statuses."""
     calls = []
 
     def handle(request):
@@ -1213,8 +1213,11 @@ def history_api(all_pages, taker_pages=(), mids=(), statuses=()):
                 {"t": t, "p": p} for t, p in mids
                 if not isinstance(t, (int, float)) or lo <= t <= hi]})
         pages = taker_pages if params["takerOnly"] == "true" else all_pages
-        index = int(params["offset"]) // 1000
-        return httpx.Response(200, json=pages[index] if index < len(pages) else [])
+        index = int(params.get("cursor", 0))
+        more = index + 1 < len(pages)
+        return httpx.Response(200, json={
+            "data": pages[index] if index < len(pages) else [],
+            "pagination": {"has_more": more, "next_cursor": str(index + 1) if more else None}})
 
     return httpx.Client(transport=httpx.MockTransport(handle)), calls
 
@@ -1230,7 +1233,7 @@ class FetchReadTest(unittest.TestCase):
         http, calls = history_api([taker + maker], [taker], hourly_mids(0.96))
         history = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW,
                                              0.90).history
-        self.assertEqual([p["takerOnly"] for p in listed(calls, "/trades")], ["false", "true"])
+        self.assertEqual([p["takerOnly"] for p in listed(calls, "/v2/trades")], ["false", "true"])
         self.assertEqual(calls[-1].url.path, "/prices-history")
         reach = [history.events[fill_cost.DISTANCES.index(d)] for d in (0.02, 0.03)]
         self.assertEqual(reach, [1, 0])
@@ -1244,7 +1247,7 @@ class FetchReadTest(unittest.TestCase):
         old = [priced("BUY", FAV_TOKEN, 0.96, tx="0xc", wallet="0xt", seconds_ago=61 * DAY_S)]
         http, calls = history_api([hit + buy + ask + old], [hit + buy + old], hourly_mids(0.96))
         read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
-        self.assertEqual([c.url.path for c in calls], ["/trades"] * 2 + ["/prices-history"] * 5)
+        self.assertEqual([c.url.path for c in calls], ["/v2/trades"] * 2 + ["/prices-history"] * 5)
         start = HISTORY_NOW.timestamp() - 60 * DAY_S
         self.assertEqual((read.tape.read_at, read.tape.first_at), (HISTORY_NOW, start))
         self.assertEqual(read.tape.sweeps,
@@ -1278,9 +1281,9 @@ class FetchReadTest(unittest.TestCase):
                  for n in range(1000)]
         http, calls = history_api([first, second], [taker, taker], hourly_mids(0.96))
         read = reward_screener.fetch_read(http, "0xc0nd", FAV_TOKEN, HISTORY_NOW, 0.90)
-        trades = listed(calls, "/trades")
-        self.assertEqual([(p["takerOnly"], p["offset"]) for p in trades],
-                         [("false", "0"), ("false", "1000"), ("true", "0")])
+        trades = listed(calls, "/v2/trades")
+        self.assertEqual([(p["takerOnly"], p.get("cursor")) for p in trades],
+                         [("false", None), ("false", "1"), ("true", None)])
         self.assertAlmostEqual(read.history.days, 10.0)
         oldest = HISTORY_NOW.timestamp() - 10 * DAY_S
         self.assertEqual((read.tape.first_at, len(read.tape.sweeps)), (oldest, 241))

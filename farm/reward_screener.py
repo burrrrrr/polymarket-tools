@@ -99,7 +99,7 @@ from farm import exit_value, farm_db, fill_cost
 from polymarket.books import BOOKS_REQUEST_LIMIT, parse_books, request_books
 from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
 from polymarket.hosts import CLOB_HOST, DATA_API_HOST
-from polymarket.http import chunks, get_with_retry
+from polymarket.http import chunks, get_pages, get_with_retry
 from polymarket.parse import as_float, parse_time
 
 # Cursor values the CLOB uses to start and end a paginated listing.
@@ -116,7 +116,7 @@ REWARDS_STRIDE = 400
 REWARDS_THREADS = 8
 REWARDS_ATTEMPTS = 3
 
-# /trades pages; past 2,000 rows of a market it returns nothing.
+# /trades pages read per listing: the newest 2,000 rows of a market.
 TRADES_PAGE = 1000
 TRADES_PAGES = 2
 # /prices-history rejects an interval over about 15 days.
@@ -1151,13 +1151,13 @@ def parse_trade(row):
     if not isinstance(row, dict):
         return None
     side = str(row.get("side") or "").upper()
-    tx, asset = str(row.get("transactionHash") or ""), str(row.get("asset") or "")
+    tx, asset = str(row.get("transaction_hash") or ""), str(row.get("token_id") or "")
     size, price = as_float(row.get("size")), as_float(row.get("price"))
     at = as_float(row.get("timestamp"))
     if (not tx or not asset or side not in ("BUY", "SELL") or size is None or not size > 0
             or price is None or not 0 < price < 1 or at is None or not at > 0):
         return None
-    return TradeRow(tx, str(row.get("proxyWallet") or ""), asset, side, size, price, at)
+    return TradeRow(tx, str(row.get("proxy_wallet") or ""), asset, side, size, price, at)
 
 
 def parse_hits(taker_rows, all_rows, fav_token_id):
@@ -1393,25 +1393,22 @@ def fetch_trades(http, condition_id, taker_only, cutoff, timeout=20):
     """(rows, complete_from) of the market's /trades listing, newest first;
     raises on a failed read.
 
-    Pages stop at a short page, at one reaching past cutoff, or at
-    TRADES_PAGES, the most the API serves. complete_from is cutoff unless the
-    row cap ended the listing first, then the oldest row's unix time.
+    Pages stop at the listing's end, at one reaching past cutoff, or at
+    TRADES_PAGES. complete_from is cutoff unless the row cap ended the listing
+    first, then the oldest row's unix time.
     """
     rows, times = [], []
-    for page in range(TRADES_PAGES):
-        got = get_with_retry(
-            http, f"{DATA_API_HOST}/trades",
-            {"market": condition_id, "takerOnly": "true" if taker_only else "false",
-             "limit": TRADES_PAGE, "offset": page * TRADES_PAGE},
-            timeout,
-        ).json()
-        got = got if isinstance(got, list) else []
+    params = {"condition_id": condition_id, "takerOnly": "true" if taker_only else "false",
+              "limit": TRADES_PAGE}
+    for page, got in enumerate(get_pages(http, f"{DATA_API_HOST}/v2/trades", params, timeout), 1):
         rows.extend(got)
         times.extend(t for t in (as_float(r.get("timestamp")) for r in got if isinstance(r, dict))
                      if t is not None)
-        if len(got) < TRADES_PAGE or min(times, default=cutoff) < cutoff:
+        if min(times, default=cutoff) < cutoff:
             return rows, cutoff
-    return rows, max(cutoff, min(times, default=cutoff))
+        if page == TRADES_PAGES:
+            return rows, max(cutoff, min(times, default=cutoff))
+    return rows, cutoff
 
 
 def fetch_mids(http, token_id, start, end, timeout=20):
