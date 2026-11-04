@@ -5,7 +5,7 @@ with any error writes nothing.
 """
 
 import math
-from datetime import date, datetime, time, timezone
+from datetime import datetime, timezone
 from typing import NamedTuple, Optional
 
 from farm import farm_db
@@ -92,21 +92,23 @@ def parse_p_true(text, follow_market):
     return percent / 100
 
 
-END_DATE_ERROR = "Enter a date, or leave blank for the listed end date."
-END_DATE_PAST_ERROR = "Must be after today (UTC)."
+END_DATE_ERROR = "Pick a number of days, or Listed for the listed end date."
+END_DATE_PAST_ERROR = "Must be after now."
 
 
 def parse_end_date_override(text, now, listed):
-    """The end date override chosen on the form: a YYYY-MM-DD date as 00:00
-    UTC that day, after now and before the listed end date when there is
+    """The end date override chosen on the form: an ISO time, UTC when it
+    names no zone, after now and before the listed end date when there is
     one, or None when blank. ValueError with the message to show otherwise."""
     text = (text or "").strip()
     if not text:
         return None
     try:
-        override = datetime.combine(date.fromisoformat(text), time(0), timezone.utc)
+        override = datetime.fromisoformat(text)
     except ValueError:
         raise ValueError(END_DATE_ERROR) from None
+    if override.tzinfo is None:
+        override = override.replace(tzinfo=timezone.utc)
     if override <= now:
         raise ValueError(END_DATE_PAST_ERROR)
     if listed is not None and override >= listed:

@@ -1000,29 +1000,49 @@ class ReviewTest(Writes):
         return datetime.combine(datetime.fromisoformat(text).date(), clock_time(0),
                                 timezone.utc)
 
-    def test_approve_stores_an_end_date_override_and_a_blank_clears_it(self):
-        # 0xddd is listed to end in 40 days.
+    def test_a_day_button_sets_the_end_date_override_and_listed_clears_it(self):
+        # 0xddd is listed to end in 40 days, past every button.
+        self.clock[0] = self.now
         listed = self.row("0xddd")["end_date"][:10]
-        self.assertIn(f"listed {listed}", self.client.get("/review/0xddd").text)
+        page = self.client.get("/review/0xddd").text
+        self.assertIn(f"listed {listed}", page)
+        self.assertIn('data-end="">Listed</button>', page)
+        for days in (1, 3, 7, 14, 30):
+            at = farm_db.stamp(self.now + timedelta(days=days))
+            self.assertIn(f'data-end="{at}">{days}d</button>', page)
+        at = self.now + timedelta(days=14)
         resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
-                         end_date_override=self.day(20))
+                         end_date_override=farm_db.stamp(at))
         self.assertEqual(resp.status_code, 303)
-        self.assertEqual(self.row("0xddd")["end_date_override"],
-                         farm_db.stamp(self.midnight(self.day(20))))
-        self.assertIn(f'name="end_date_override" value="{self.day(20)}"',
-                      self.client.get("/review/0xddd").text)
+        self.assertEqual(self.row("0xddd")["end_date_override"], farm_db.stamp(at))
+        # Saving the terms again keeps the exact end time.
+        page = self.client.get("/review/0xddd").text
+        self.assertIn(f'name="end_date_override" value="{farm_db.stamp(at)}"', page)
+        self.assertIn(f"ends {at:%Y-%m-%d %H:%M} UTC", page)
         self.post("/review/0xddd/approve", p_true="97", naked_budget="30", capital="",
                   end_date_override="")
         self.assertIsNone(self.row("0xddd")["end_date_override"])
+
+    def test_a_day_button_past_the_listed_end_date_is_disabled(self):
+        self.clock[0] = self.now
+        self.db.execute("UPDATE markets SET end_date = ? WHERE condition_id = '0xddd'",
+                        (farm_db.stamp(self.now + timedelta(days=10)),))
+        self.db.commit()
+        page = self.client.get("/review/0xddd").text
+        for days, disabled in ((7, False), (14, True), (30, True)):
+            at = farm_db.stamp(self.now + timedelta(days=days))
+            self.assertIn(f'data-end="{at}"{" disabled" if disabled else ""}>{days}d</button>',
+                          page)
 
     def test_an_end_date_override_must_fall_between_now_and_the_listed_date(self):
         before = self.snapshot_markets()
         listed = self.row("0xddd")["end_date"][:10]
         for text, message in (
-            ("soon", "Enter a date"),
-            (self.day(-1), "Must be after today"),
-            (self.day(0), "Must be after today"),
-            (self.day(41), f"Must be before the listed end date, {listed}."),
+            ("soon", "Pick a number of days"),
+            (farm_db.stamp(utc_now() - timedelta(minutes=1)), "Must be after now"),
+            (self.day(0), "Must be after now"),
+            (farm_db.stamp(utc_now() + timedelta(days=41)),
+             f"Must be before the listed end date, {listed}."),
         ):
             with self.subTest(text=text):
                 resp = self.post("/review/0xddd/approve", p_true="97", naked_budget="25",

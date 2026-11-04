@@ -1,6 +1,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from datetime import timedelta
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -54,6 +55,19 @@ def typed_end_date(market, text, now):
     return farm_db.farm_end_date(market.end_date, override)
 
 
+END_PRESET_DAYS = (1, 3, 7, 14, 30)
+
+
+def end_presets(market, now):
+    """(days, end time stamp, whether it falls before the listed end date) for
+    each end date override button: now plus that many days."""
+    presets = []
+    for days in END_PRESET_DAYS:
+        at = now + timedelta(days=days)
+        presets.append((days, farm_db.stamp(at), market.end_date is None or at < market.end_date))
+    return presets
+
+
 def mute_target(market, form):
     """(MuteKind, value, label) of the event or tag a mute button sent, which
     must be the market's own."""
@@ -83,12 +97,18 @@ def routes(ctx):
             if market.capital_usd is not None else "",
             "sole_bid": market.sole_bid or (market.status == "candidate"
                                             and views.sole_plan(market.metrics)),
-            "end_date_override": f"{market.end_date_override:%Y-%m-%d}"
-            if market.end_date_override else "",
+            "end_date_override": farm_db.stamp(market.end_date_override) or "",
             "note": "",
         }
         cutoff = views.expiry_cutoff(market, status)
+        try:
+            end_override = forms.parse_end_date_override(values.get("end_date_override"), now,
+                                                          None)
+        except ValueError:
+            end_override = None
         return {
+            "end_presets": end_presets(market, now), "now_stamp": farm_db.stamp(now),
+            "end_override": end_override,
             "market": market, "m": market.metrics.get("market", {}),
             "plan": market.metrics.get("plan"),
             "queue": views.queue(farm_db.candidate_queue(conn, mode), market.condition_id),

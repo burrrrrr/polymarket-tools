@@ -124,9 +124,17 @@
         </div>
       </div>
       <div class="field">
-        <div class="label-row"><label class="lbl" for="d-end_date_override">End date override</label>{{ tip('end_date_override') }}</div>
-        <input class="inp mono" id="d-end_date_override" type="date" name="end_date_override" value="{{ values.end_date_override or '' }}" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.end_date_override }}>
-        <span class="hint">{% if market.end_date %}listed {{ market.end_date.strftime('%Y-%m-%d') }}{% else %}no listed end date{% endif %}; blank uses the listed date</span>
+        <div class="label-row"><span class="lbl" id="d-end-label">End date override</span>{{ tip('end_date_override') }}</div>
+        {%- set chosen = values.end_date_override or '' %}
+        <div class="chip-row end-picker" role="group" aria-labelledby="d-end-label" data-end-picker="d-end_date_override" data-now="{{ now_stamp }}">
+          <button class="chip{{ ' on' if not chosen }}" type="button" data-end="">Listed</button>
+          {%- for days, at, before_listed in end_presets %}
+          <button class="chip{{ ' on' if chosen == at }}" type="button" data-end="{{ at }}"{{ ' disabled' if not before_listed }}>{{ days }}d</button>
+          {%- endfor %}
+          <input class="inp mono" type="number" min="1" step="1" placeholder="days" aria-label="Custom number of days" data-end-days {{ 'aria-invalid="true"' | safe if errors.end_date_override }}>
+        </div>
+        <input id="d-end_date_override" type="hidden" name="end_date_override" value="{{ chosen }}" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}">
+        <span class="hint"><span id="d-end_date_override-summary">{% if end_override %}ends {{ end_override.strftime('%Y-%m-%d %H:%M') }} UTC{% elif chosen %}{{ chosen }}{% else %}the listed end date{% endif %}</span>; {% if market.end_date %}listed {{ market.end_date.strftime('%Y-%m-%d') }}{% else %}no listed end date{% endif %}</span>
         {{ field_error(errors, 'end_date_override') }}
       </div>
       <div class="field">

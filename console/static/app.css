@@ -145,6 +145,9 @@ main { flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32
 .chip-row > .lbl { width: 56px; }
 .chip { gap: 6px; }
 .chip.flag:not(.on) { border-style: dashed; }
+.chip[disabled] { opacity: .4; cursor: not-allowed; }
+.end-picker { gap: 6px; }
+.end-picker .inp { width: 80px; }
 .inp.search { width: 300px; }
 .look-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .look-card { padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }

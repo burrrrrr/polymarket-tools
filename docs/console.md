@@ -69,14 +69,16 @@ rows and its funnel in one transaction and never changes your decisions.
   ticked. The naked budget starts at $10 for a new market. A blank capital means the farmer's `capital` setting.
   **End date override** (`end_date_override`) is your own end date for a
   market that resolves as soon as an event happens, before the deadline
-  Polymarket lists. Enter a date after today and before the listed end date,
-  which the field shows. It counts from 00:00 UTC that day. The farmer then
+  Polymarket lists. Pick 1d, 3d, 7d, 14d or 30d, or type a custom number of
+  days; the override is that long from when the page loaded, to the second.
+  A button past the listed end date, which the field shows, is disabled.
+  Saving the terms again keeps the saved end time. The farmer then
   runs the market by it everywhere it used the listed date: where the
   longshot bid may rest, what a fill costs, each order's good-till-date
-  expiry, and retirement at the override minus `expiry_buffer_days`. A
-  blank field uses the listed date. A rescan that lists an earlier date than
+  expiry, and retirement at the override minus `expiry_buffer_days`.
+  **Listed** uses the listed date. A rescan that lists an earlier date than
   your override wins. The live preview and the EV check follow the date as
-  you type it.
+  you pick it.
   On a market that is already approved, the same form edits those terms.
   After a decision on a candidate, the console opens the next undecided
   candidate. After an edit, it opens the market's page.

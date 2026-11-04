@@ -141,7 +141,7 @@ GLOSSARY = {
                               "that resolves as soon as an event happens, before its listed "
                               "deadline. The farmer prices the longshot bid, values fills and "
                               "sets each order's expiry by it, and retires the market at this "
-                              "date minus the expiry buffer. Leave blank to use the listed "
+                              "date minus the expiry buffer. Pick Listed to use the listed "
                               "date."),
     "ev_check": Term("EV check", "Compares the planned favorite bid with your p_true minus "
                                  "the EV margin. The farmer never bids above that cap, and "
