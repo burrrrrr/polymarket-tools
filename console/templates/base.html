@@ -37,7 +37,7 @@
       {% call region("/partials/chrome/status", "sse:cycle, sse:status, every 15s") %}{% include "partials/status.html" %}{% endcall %}
     </div>
   </nav>
-  <main>
+  <main{% block main_attrs %}{% endblock %}>
     {%- if process == 'worker' %}
     {% call region("/partials/chrome/worker-banner", "sse:status, every 15s") %}{% include "partials/worker_banner.html" %}{% endcall %}
     {%- else %}

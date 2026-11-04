@@ -55,8 +55,6 @@ main { flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32
   justify-content: space-between; }
 .row { display: flex; flex-wrap: wrap; gap: 16px; }
 .row > .grow { flex: 999 1 520px; min-width: 0; }
-.row > .side { flex: 1 1 400px; min-width: 0; align-self: flex-start; position: sticky; top: 16px;
-  max-height: calc(100vh - 32px); overflow-y: auto; }
 .row > .feed-panel { flex: 1 1 300px; min-width: 0; max-width: 360px; }
 .stack { display: flex; flex-direction: column; gap: 10px; }
 .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
@@ -311,8 +309,26 @@ main { flex: 999 1 560px; min-width: 0; box-sizing: border-box; padding: 28px 32
 .ev p { margin: 0 0 6px; font-size: 13px; line-height: 1.5; }
 .ev p:last-child { margin-bottom: 0; }
 .rules { margin: 0; font-size: 14px; line-height: 1.6; color: var(--ink-2); white-space: pre-line; }
+main.wide { max-width: 1640px; }
+/* The decision panel is wide and two-column so all of it fits on screen with the book beside it. */
+.review-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 660px); gap: 16px;
+  align-items: start; }
+.decision-cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px;
+  align-items: start; }
+.decision .end-picker .chip { min-height: 32px; padding: 0 10px; }
+.decision .end-picker .inp { min-height: 32px; width: 72px; }
 .decision .btn { justify-content: center; }
-.decision .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.decision .pair { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.decision .pair > .inp { width: 100%; box-sizing: border-box; }
+/* Pinned to the bottom of the window, so Approve and Reject never need a scroll. */
+.decision-bar { position: sticky; bottom: 0; z-index: 5; margin: 0 -32px -28px; padding: 12px 32px;
+  display: flex; align-items: center; gap: 16px; background: var(--bg);
+  border-top: 1px solid var(--line); box-shadow: 0 -8px 24px rgba(0, 0, 0, .35); }
+.decision-bar .approve { order: 2; margin-left: auto; display: flex; align-items: center; gap: 14px; }
+.decision-bar .reject { order: 1; flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
+.decision-bar .reject select { width: 190px; }
+.decision-bar .reject .note { flex: 1; min-width: 120px; max-width: 320px; }
+.decision-bar .check { white-space: nowrap; }
 .triage { opacity: .75; }
 
 /* glossary tips */

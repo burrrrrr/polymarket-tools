@@ -1,6 +1,7 @@
 {% extends "base.html" %}
 {% from "_macros.html" import region, token_field, field_error, betmoar_link %}
 {% block title %}Review · {{ (market.question or market.slug or '') | truncate(40, True) }}{% endblock %}
+{% block main_attrs %} class="wide"{% endblock %}
 {% block content %}
 {%- set cid = market.condition_id -%}
 {%- set ev_inputs = "[name='p_true'],[name='follow_market'],[name='naked_budget'],[name='end_date_override']" -%}
@@ -46,31 +47,17 @@
     {%- if market.sole_bid %}<span class="badge t-c">sole bid allowed{{ tip('sole_bid') }}</span>{% endif %}
     {{ betmoar_link(market.slug) }}
   </div>
-  {%- if m.event_slug or m.tags %}
-  <form class="actions" method="post" action="/review/{{ cid }}/mute" style="gap: 8px">
-    {{ token_field() }}
-    <input type="hidden" name="queue_mode" value="{{ queue_mode or '' }}">
-    {%- if m.event_slug %}
-    <span class="small muted">Event</span><span class="small">{{ m.event_title or m.event_slug }}</span>
-    <button class="btn small-btn" type="submit" name="event" value="{{ m.event_slug }}" title="Hide this event's candidates from the queue">Mute event</button>
-    {%- endif %}
-    {%- if m.tags %}<span class="small muted">Tags</span>{% endif %}
-    {%- for t in m.tags %}
-    <span class="badge t-n">{{ t }}</span><button class="btn small-btn" type="submit" name="tag" value="{{ t }}" title="Hide candidates tagged {{ t }} from the queue">Mute</button>
-    {%- endfor %}
-  </form>
-  {%- endif %}
   {%- if market.note %}<span class="small muted">Note: {{ market.note }}</span>{% endif %}
 </header>
 
-<div class="row">
+<div class="review-grid">
   <div class="grow stack" style="gap: 16px">
     <section class="panel pad stack" style="gap: 14px">
       <div class="page-head" style="align-items: baseline">
         <h2>Live orders and book{{ tip('band_strip') }}</h2>
         <span class="streaming"><span class="dot" style="width: 6px; height: 6px; background: #63D3A6"></span>live, every {{ LIVE_POLL_S }}s</span>
       </div>
-      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision" hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, #d-sole_bid, #d-end_date_override" hx-swap="innerHTML">
+      <div class="stack" style="gap: 14px" hx-get="/partials/review/{{ cid }}/live{{ '?mode=' ~ queue_mode if queue_mode }}" hx-trigger="load, every {{ LIVE_POLL_S }}s [document.visibilityState === 'visible'], input delay:400ms from:form.decision, change from:#d-sole_bid" hx-include="#d-p_true, #d-follow_market, #d-naked_budget, #d-capital, #d-sole_bid, #d-end_date_override" hx-swap="innerHTML">
         <span class="small muted">Reading the live book...</span>
       </div>
     </section>
@@ -81,105 +68,110 @@
         <span class="small muted">Loading the market description from Gamma...</span>
       </div>
     </section>
+  </div>
 
+  <aside class="stack" style="gap: 16px">
+    <form class="panel pad stack decision" id="decision" method="post" action="/review/{{ cid }}/approve" style="gap: 10px">
+      {{ token_field() }}
+      <input type="hidden" name="queue_mode" value="{{ queue_mode or '' }}">
+      <h2>Decision</h2>
+      <div class="decision-cols">
+        <div class="stack">
+          <div class="field">
+            <div class="label-row"><label class="lbl" for="d-p_true">Your p_true for the favorite (%)</label>{{ tip('p_true') }}</div>
+            <div class="stepper">
+              {%- set off = ' disabled' if values.follow_market else '' %}
+              <button class="btn" type="button" data-step="down" aria-controls="d-p_true" aria-label="Lower p_true by 1%"{{ off }}>&minus;</button>
+              <input class="inp mono" id="d-p_true" name="p_true" value="{{ values.p_true }}"{{ off }} type="number" min="1" max="99" step="1"{% if p_true_start %} data-start="{{ p_true_start }}"{% endif %} autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
+              <button class="btn" type="button" data-step="up" aria-controls="d-p_true" aria-label="Raise p_true by 1%"{{ off }}>+</button>
+            </div>
+            {{ field_error(errors, 'p_true') }}
+            <label class="check"><input type="checkbox" id="d-follow_market" name="follow_market" value="1" data-disables="d-p_true"{{ ' checked' if values.follow_market }} hx-get="/partials/review/{{ cid }}/ev" hx-trigger="change delay:100ms" hx-target="#ev" hx-include="{{ ev_inputs }}"> Follow the market{{ tip('follow_market') }}</label>
+            {{ field_error(errors, 'follow_market') }}
+          </div>
+          <div class="field">
+            <div class="label-row"><span class="lbl">EV check</span>{{ tip('ev_check') }}</div>
+            <div id="ev" aria-live="polite">{% include "partials/review_ev.html" %}</div>
+          </div>
+          <div class="pair">
+            <div class="field">
+              <div class="label-row"><label class="lbl" for="d-naked_budget">Naked budget ($)</label>{{ tip('naked_budget') }}</div>
+              <input class="inp mono" id="d-naked_budget" name="naked_budget" value="{{ values.naked_budget }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.naked_budget }}>
+              {{ field_error(errors, 'naked_budget') }}
+            </div>
+            <div class="field">
+              <div class="label-row"><label class="lbl" for="d-capital">Capital cap ($)</label>{{ tip('capital_cap') }}</div>
+              <input class="inp mono" id="d-capital" name="capital" value="{{ values.capital }}" inputmode="decimal" autocomplete="off" placeholder="default {{ farmer_capital | usd }}" {{ 'aria-invalid="true"' | safe if errors.capital }}>
+              {{ field_error(errors, 'capital') }}
+            </div>
+          </div>
+          <div hx-get="/partials/review/{{ cid }}/holdings" hx-trigger="load" hx-swap="innerHTML">
+            <div class="note-box small muted">Reading the wallet's holdings in this market...</div>
+          </div>
+        </div>
+        <div class="stack">
+          <div class="field">
+            <div class="label-row"><span class="lbl" id="d-end-label">End date override</span>{{ tip('end_date_override') }}</div>
+            {%- set chosen = values.end_date_override or '' %}
+            <div class="chip-row end-picker" role="group" aria-labelledby="d-end-label" data-end-picker="d-end_date_override" data-now="{{ now_stamp }}">
+              <button class="chip{{ ' on' if not chosen }}" type="button" data-end="">Listed</button>
+              {%- for days, at, before_listed in end_presets %}
+              <button class="chip{{ ' on' if chosen == at }}" type="button" data-end="{{ at }}"{{ ' disabled' if not before_listed }}>{{ days }}d</button>
+              {%- endfor %}
+              <input class="inp mono" type="number" min="1" step="1" placeholder="days" aria-label="Custom number of days" data-end-days {{ 'aria-invalid="true"' | safe if errors.end_date_override }}>
+            </div>
+            <input id="d-end_date_override" type="hidden" name="end_date_override" value="{{ chosen }}" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}">
+            <span class="hint"><span id="d-end_date_override-summary">{% if end_override %}ends {{ end_override.strftime('%Y-%m-%d %H:%M') }} UTC{% elif chosen %}{{ chosen }}{% else %}the listed end date{% endif %}</span>; {% if market.end_date %}listed {{ market.end_date.strftime('%Y-%m-%d') }}{% else %}no listed end date{% endif %}</span>
+            {{ field_error(errors, 'end_date_override') }}
+          </div>
+          <div class="field">
+            <div class="label-row"><span class="lbl">At these terms</span></div>
+            <div id="projection" class="projection note-box small"><span class="muted">Planning against the live book...</span></div>
+          </div>
+        </div>
+      </div>
+    </form>
     <section class="panel pad stack">
       <h2>Claude triage</h2>
       <div hx-get="/partials/review/{{ cid }}/triage" hx-trigger="load" hx-swap="outerHTML">
         <span class="small muted">Loading Claude's triage...</span>
       </div>
     </section>
-  </div>
-
-  <aside class="side">
-    <form class="panel pad stack decision" method="post" action="/review/{{ cid }}/approve" style="gap: 10px">
-      {{ token_field() }}
-      <input type="hidden" name="queue_mode" value="{{ queue_mode or '' }}">
-      <h2>Decision</h2>
-      <div class="field">
-        <div class="label-row"><label class="lbl" for="d-p_true">Your p_true for the favorite (%)</label>{{ tip('p_true') }}</div>
-        <div class="stepper">
-          {%- set off = ' disabled' if values.follow_market else '' %}
-          <button class="btn" type="button" data-step="down" aria-controls="d-p_true" aria-label="Lower p_true by 1%"{{ off }}>&minus;</button>
-          <input class="inp mono" id="d-p_true" name="p_true" value="{{ values.p_true }}"{{ off }} type="number" min="1" max="99" step="1"{% if p_true_start %} data-start="{{ p_true_start }}"{% endif %} autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.p_true }}>
-          <button class="btn" type="button" data-step="up" aria-controls="d-p_true" aria-label="Raise p_true by 1%"{{ off }}>+</button>
-        </div>
-        {{ field_error(errors, 'p_true') }}
-        <label class="check"><input type="checkbox" id="d-follow_market" name="follow_market" value="1" data-disables="d-p_true"{{ ' checked' if values.follow_market }} hx-get="/partials/review/{{ cid }}/ev" hx-trigger="change delay:100ms" hx-target="#ev" hx-include="{{ ev_inputs }}"> Follow the market{{ tip('follow_market') }}</label>
-        {{ field_error(errors, 'follow_market') }}
-      </div>
-      <div class="field">
-        <div class="label-row"><span class="lbl">EV check</span>{{ tip('ev_check') }}</div>
-        <div id="ev" aria-live="polite">{% include "partials/review_ev.html" %}</div>
-      </div>
-      <div class="pair">
-        <div class="field">
-          <div class="label-row"><label class="lbl" for="d-naked_budget">Naked budget ($)</label>{{ tip('naked_budget') }}</div>
-          <input class="inp mono" id="d-naked_budget" name="naked_budget" value="{{ values.naked_budget }}" inputmode="decimal" autocomplete="off" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}" {{ 'aria-invalid="true"' | safe if errors.naked_budget }}>
-          {{ field_error(errors, 'naked_budget') }}
-        </div>
-        <div class="field">
-          <div class="label-row"><label class="lbl" for="d-capital">Capital cap ($)</label>{{ tip('capital_cap') }}</div>
-          <input class="inp mono" id="d-capital" name="capital" value="{{ values.capital }}" inputmode="decimal" autocomplete="off" placeholder="default {{ farmer_capital | usd }}" {{ 'aria-invalid="true"' | safe if errors.capital }}>
-          {{ field_error(errors, 'capital') }}
-        </div>
-      </div>
-      <div class="field">
-        <div class="label-row"><span class="lbl" id="d-end-label">End date override</span>{{ tip('end_date_override') }}</div>
-        {%- set chosen = values.end_date_override or '' %}
-        <div class="chip-row end-picker" role="group" aria-labelledby="d-end-label" data-end-picker="d-end_date_override" data-now="{{ now_stamp }}">
-          <button class="chip{{ ' on' if not chosen }}" type="button" data-end="">Listed</button>
-          {%- for days, at, before_listed in end_presets %}
-          <button class="chip{{ ' on' if chosen == at }}" type="button" data-end="{{ at }}"{{ ' disabled' if not before_listed }}>{{ days }}d</button>
-          {%- endfor %}
-          <input class="inp mono" type="number" min="1" step="1" placeholder="days" aria-label="Custom number of days" data-end-days {{ 'aria-invalid="true"' | safe if errors.end_date_override }}>
-        </div>
-        <input id="d-end_date_override" type="hidden" name="end_date_override" value="{{ chosen }}" hx-get="/partials/review/{{ cid }}/ev" hx-trigger="input changed delay:300ms" hx-target="#ev" hx-include="{{ ev_inputs }}">
-        <span class="hint"><span id="d-end_date_override-summary">{% if end_override %}ends {{ end_override.strftime('%Y-%m-%d %H:%M') }} UTC{% elif chosen %}{{ chosen }}{% else %}the listed end date{% endif %}</span>; {% if market.end_date %}listed {{ market.end_date.strftime('%Y-%m-%d') }}{% else %}no listed end date{% endif %}</span>
-        {{ field_error(errors, 'end_date_override') }}
-      </div>
-      <div class="field">
-        <div class="label-row"><span class="lbl">At these terms</span></div>
-        <div id="projection" class="projection note-box small"><span class="muted">Planning against the live book...</span></div>
-      </div>
-      <div hx-get="/partials/review/{{ cid }}/holdings" hx-trigger="load" hx-swap="innerHTML">
-        <div class="note-box small muted">Reading the wallet's holdings in this market...</div>
-      </div>
-      {%- if market.status != 'approved' %}
-      <label class="check"><input type="checkbox" name="start_paused" value="1"{{ ' checked' if values.start_paused }}> Start paused{{ tip('start_paused') }}</label>
-      {%- endif %}
-      <label class="check"><input type="checkbox" id="d-sole_bid" name="sole_bid" value="1"{{ ' checked' if values.sole_bid }}> Allow sole bid{{ tip('sole_bid') }}</label>
-      {%- if market.status == 'rejected' %}
-      <button class="btn btn-strong" type="submit" formaction="/review/{{ cid }}/unreject" formnovalidate>Un-reject (back to the queue)</button>
-      <button class="btn" type="submit">Approve and start quoting</button>
-      {%- else %}
-      <button class="btn btn-strong" type="submit">{{ {'approved': 'Save terms', 'retired': 'Re-approve and start quoting'}.get(market.status, 'Approve and start quoting') }}</button>
-      {%- endif %}
-      {%- if market.status == 'approved' %}
-      <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/retire" formnovalidate onclick="return confirm('Retire this market? The farmer cancels its orders and stops managing it.')">Retire</button>
-      {%- else %}
-      <div class="field">
-        <label class="lbl" for="d-reason">Reject reason (optional)</label>
-        <select class="inp" id="d-reason" name="reason" {{ 'aria-invalid="true"' | safe if errors.reason }}>
-          <option value="">No reason</option>
-          {%- for r in REJECT_REASONS %}
-          <option value="{{ r.value }}"{{ ' selected' if values.reason == r.value }}>{{ r.label }}</option>
-          {%- endfor %}
-        </select>
-        {{ field_error(errors, 'reason') }}
-      </div>
-      <div class="field">
-        <label class="lbl" for="d-note">Reject note (optional)</label>
-        <div class="input-row">
-          <input class="inp" id="d-note" name="note" value="{{ values.note }}" placeholder="e.g. resolution risk" maxlength="500" {{ 'aria-invalid="true"' | safe if errors.note }}>
-          <button class="btn btn-danger" type="submit" formaction="/review/{{ cid }}/reject" formnovalidate>Reject</button>
-        </div>
-        {{ field_error(errors, 'note') }}
-      </div>
-      {%- if m.event_slug %}
-      <label class="check"><input type="checkbox" name="mute_event" value="1"{{ ' checked' if values.mute_event }}> Also mute this event{{ ': ' ~ m.event_title if m.event_title }}</label>
-      {%- endif %}
-      {%- endif %}
-    </form>
   </aside>
+</div>
+
+<div class="decision-bar" role="group" aria-label="Decide this market">
+  {#- Approve comes first so Enter in a field approves, as before; CSS shows it on the right. #}
+  <div class="approve">
+    {%- if market.status != 'approved' %}
+    <label class="check"><input type="checkbox" name="start_paused" value="1" form="decision"{{ ' checked' if values.start_paused }}> Start paused{{ tip('start_paused') }}</label>
+    {%- endif %}
+    <label class="check"><input type="checkbox" id="d-sole_bid" name="sole_bid" value="1" form="decision"{{ ' checked' if values.sole_bid }}> Allow sole bid{{ tip('sole_bid') }}</label>
+    {%- if market.status == 'rejected' %}
+    <button class="btn" type="submit" form="decision">Approve and start quoting</button>
+    <button class="btn btn-strong" type="submit" form="decision" formaction="/review/{{ cid }}/unreject" formnovalidate>Un-reject (back to the queue)</button>
+    {%- else %}
+    <button class="btn btn-strong" type="submit" form="decision">{{ {'approved': 'Save terms', 'retired': 'Re-approve and start quoting'}.get(market.status, 'Approve and start quoting') }}</button>
+    {%- endif %}
+  </div>
+  <div class="reject">
+    {%- if market.status == 'approved' %}
+    <button class="btn btn-danger" type="submit" form="decision" formaction="/review/{{ cid }}/retire" formnovalidate onclick="return confirm('Retire this market? The farmer cancels its orders and stops managing it.')">Retire</button>
+    {%- elif market.status != 'rejected' %}
+    <select class="inp" id="d-reason" name="reason" form="decision" aria-label="Reject reason (optional)" {{ 'aria-invalid="true"' | safe if errors.reason }}>
+      <option value="">No reason</option>
+      {%- for r in REJECT_REASONS %}
+      <option value="{{ r.value }}"{{ ' selected' if values.reason == r.value }}>{{ r.label }}</option>
+      {%- endfor %}
+    </select>
+    <input class="inp note" id="d-note" name="note" form="decision" value="{{ values.note }}" placeholder="Reject note (optional)" aria-label="Reject note (optional)" maxlength="500" {{ 'aria-invalid="true"' | safe if errors.note }}>
+    {%- if m.event_slug %}
+    <label class="check" title="{{ m.event_title or m.event_slug }}"><input type="checkbox" name="mute_event" value="1" form="decision"{{ ' checked' if values.mute_event }}> Also mute this event</label>
+    {%- endif %}
+    <button class="btn btn-danger" type="submit" form="decision" formaction="/review/{{ cid }}/reject" formnovalidate>Reject</button>
+    {{ field_error(errors, 'reason') }}
+    {{ field_error(errors, 'note') }}
+    {%- endif %}
+  </div>
 </div>
 {% endblock %}

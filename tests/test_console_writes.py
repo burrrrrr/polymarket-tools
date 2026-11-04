@@ -206,22 +206,13 @@ class TopicTest(Writes):
         return [(d.condition_id, d.decision, d.reason) for d in farm_db.read_decisions(self.db)
                 if d.id not in self.seeded]
 
-    def discover_ids(self):
-        return re.findall(r'<a href="/review/(0x\w+)">', self.client.get("/discover").text)
-
-    def test_review_shows_the_event_and_tags_each_with_a_mute_button(self):
+    def test_review_offers_to_mute_the_event_on_reject_and_shows_no_tags(self):
         page = self.client.get("/review/0xeee").text
-        self.assertIn('<span class="small">2027 French presidential election</span>', page)
-        self.assertIn(f'name="event" value="{FR}"', page)
-        for tag in ("Politics", "French Election"):
-            self.assertIn(f'<span class="badge t-n">{tag}</span><button class="btn small-btn" '
-                          f'type="submit" name="tag" value="{tag}"', page)
-        self.assertIn("Also mute this event: 2027 French presidential election", page)
-        page = self.client.get("/review/0xfff").text
-        self.assertIn('name="tag" value="French Election"', page)
-        self.assertNotIn('name="event"', page)
-        self.assertNotIn("Also mute this event", page)
-        self.assertNotIn(f'action="/review/{C}/mute"', self.client.get(f"/review/{C}").text)
+        self.assertIn('title="2027 French presidential election"><input type="checkbox" '
+                      'name="mute_event"', page)
+        self.assertNotIn("French Election", page)
+        self.assertNotIn("/mute", page)
+        self.assertNotIn("Also mute this event", self.client.get("/review/0xfff").text)
 
     def test_reject_refuses_an_unknown_reason_and_logs_the_metrics_it_saw(self):
         resp = self.post("/review/0xddd/reject", note="meh", reason="bored")
@@ -254,29 +245,12 @@ class TopicTest(Writes):
         self.assertEqual([(m.kind, m.value, m.label) for m in farm_db.read_mutes(self.db)],
                          [(farm_db.MuteKind.EVENT, FR, "2027 French presidential election")])
 
-    def test_mute_buttons_hide_the_topic_from_the_queue_and_discover(self):
-        self.assertEqual(self.discover_ids(), ["0xddd", "0xeee", "0xfff"])
-        resp = self.post("/review/0xddd/mute", tag="Politics")
-        self.assertEqual(resp.headers["location"], "/review/0xfff")
-        self.assertEqual((farm_db.candidate_queue(self.db), self.discover_ids()),
-                         (["0xfff"], ["0xfff"]))
-        self.assertEqual(self.row("0xddd")["status"], "candidate")
-        resp = self.post("/review/0xfff/mute", tag="French Election", queue_mode="floor")
-        self.assertEqual(resp.headers["location"], "/review?mode=floor")
-        self.assertEqual(self.discover_ids(), [])
-        self.assertEqual(self.decisions(), [])
-
-    def test_mute_takes_only_the_markets_own_event_or_tags(self):
-        for fields in ({"tag": "Sports"}, {"event": "other-event"}, {"tag": ""}, {}):
-            with self.subTest(fields=fields):
-                self.assertEqual(self.post("/review/0xfff/mute", **fields).status_code, 400)
-        self.assertEqual(farm_db.read_mutes(self.db), [])
-
     def test_unreject_puts_a_rejected_market_back_in_the_queue(self):
         page = self.client.get(f"/review/{C}").text
-        self.assertIn(f'formaction="/review/{C}/unreject" formnovalidate>'
+        self.assertIn(f'form="decision" formaction="/review/{C}/unreject" formnovalidate>'
                       f'Un-reject (back to the queue)</button>', page)
-        self.assertIn('<button class="btn" type="submit">Approve and start quoting</button>', page)
+        self.assertIn('<button class="btn" type="submit" form="decision">Approve and start quoting'
+                      '</button>', page)
         self.assertNotIn("Un-reject", self.client.get("/review/0xddd").text)
         resp = self.post(f"/review/{C}/unreject", queue_mode="floor")
         self.assertEqual(resp.headers["location"], f"/review/{C}?mode=floor")

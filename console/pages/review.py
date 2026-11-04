@@ -36,7 +36,7 @@ def queue_url(mode):
 
 
 def next_review(conn, ids, condition_id, mode):
-    """Where to go once this market is decided or muted: next to it in the
+    """Where to go once this market is decided: next to it in the
     queue as it stood (ids), passing over markets that have left it since."""
     kept = set(farm_db.candidate_queue(conn, mode))
     following = views.after_decision([i for i in ids if i in kept or i == condition_id],
@@ -66,17 +66,6 @@ def end_presets(market, now):
         at = now + timedelta(days=days)
         presets.append((days, farm_db.stamp(at), market.end_date is None or at < market.end_date))
     return presets
-
-
-def mute_target(market, form):
-    """(MuteKind, value, label) of the event or tag a mute button sent, which
-    must be the market's own."""
-    m = market.metrics.get("market", {})
-    if form.get("event") and form["event"] == m.get("event_slug"):
-        return farm_db.MuteKind.EVENT, form["event"], m.get("event_title")
-    if form.get("tag") and form["tag"] in m.get("tags", ()):
-        return farm_db.MuteKind.TAG, form["tag"], form["tag"]
-    raise HTTPException(400, "mute an event or tag of this market")
 
 
 def routes(ctx):
@@ -360,16 +349,6 @@ def routes(ctx):
             ctx.find(conn, condition_id)
             farm_db.unreject_market(conn, condition_id, ctx.clock())
         return see_other(views.review_url(condition_id, mode))
-
-    @router.post("/review/{condition_id}/mute")
-    async def mute(request: Request, condition_id: str):
-        form = await form_of(request)
-        mode = parse_mode(form.get("queue_mode"))
-        with closing(ctx.connect()) as conn:
-            target = mute_target(ctx.find(conn, condition_id), form)
-            ids = farm_db.candidate_queue(conn, mode)
-            farm_db.mute(conn, *target, ctx.clock())
-            return see_other(next_review(conn, ids, condition_id, mode))
 
     @router.post("/review/{condition_id}/retire")
     async def retire_reviewed(request: Request, condition_id: str):
