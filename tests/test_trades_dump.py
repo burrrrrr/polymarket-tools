@@ -164,15 +164,35 @@ class StartTests(unittest.TestCase):
                 return RuntimeError(f"500 for {params.maker_address}")
             return [MADE]
 
+        conn = farm_db.open_db(self.farm_path)
+        farm_db.publish(conn, farm_db.FarmerStatus("live", 1, NOW, NOW, 1.0, False, 1, {}, None),
+                        events=[farm_db.Event(NOW, farm_db.EventKind.FILL, "FILL", "0x" + "c1" * 32,
+                                              "FAV_BID", 0.97, 5.0)])
+        conn.close()
         code, out = self.main(["--probe"], Clob(listing))
         self.assertEqual(code, 0)
         self.assertIn("open orders: ok, 0 orders", out)
+        self.assertIn("trades, maker_address = funder, last 1h: failed (500 for ME)", out)
+        market = "0x" + "c1" * 32
+        self.assertIn(f"trades, recently filled market 1 ({market}): ok, 1 trades", out)
+        self.assertIn(f"trades, recently filled market 1 ({market}), maker_address = funder: "
+                      f"failed (500 for ME)", out)
         self.assertIn("trades, no parameters: ok, 1 trades", out)
         self.assertIn("trades, maker_address = funder: failed (500 for ME)", out)
         self.assertIn("trades, maker_address = funder in lowercase: failed (500 for ME)", out)
         self.assertIn("trades, maker_address = signer: failed (500 for SIGNER)", out)
         self.assertNotIn(ME, out)
         self.assertNotIn(SIGNER, out)
+
+    def test_market_limits_both_listings_to_that_market(self):
+        markets = []
+
+        def listing(params):
+            markets.append(params.market)
+            return [MADE]
+
+        code, _ = self.main(["--market", "0xcid"], Clob(listing))
+        self.assertEqual((code, markets), (0, ["0xcid", "0xcid"]))
 
     def test_a_refused_time_bound_is_told_apart_by_a_listing_without_it(self):
         def listing(params):

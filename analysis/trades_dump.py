@@ -112,18 +112,21 @@ def farmer_ids(explicit):
         return None
 
 
-def a_farmed_market(explicit):
-    """One condition id farm.db approves, or None. Opens the file read-only."""
+def recently_filled(explicit, n=5):
+    """The condition ids of the n markets with the newest FILL events in
+    farm.db, newest first, or []. Opens the file read-only."""
     try:
         path = Path(data_dir.farm_db_path(explicit)).absolute()
         with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
-            conn.row_factory = sqlite3.Row
-            return min(farm_db.condition_ids(conn, "approved"), default=None)
+            return [row[0] for row in conn.execute(
+                "SELECT condition_id FROM farm_events WHERE kind = 'FILL' "
+                "AND condition_id IS NOT NULL GROUP BY condition_id "
+                "ORDER BY MAX(at) DESC LIMIT ?", (n,))]
     except (data_dir.NoDataDir, sqlite3.Error):
-        return None
+        return []
 
 
-def probe(client, account, market):
+def probe(client, account, markets, now):
     """One line for each way of asking the trades listing, first page only,
     with the open-orders listing as a control that the key works."""
     signer = client.get_address()
@@ -138,8 +141,14 @@ def probe(client, account, market):
             ("trades, maker_address = funder in lowercase",
              TradeParams(maker_address=account.lower())),
             ("trades, maker_address = signer", TradeParams(maker_address=signer))]
-    if market:
-        asks.append(("trades, market = a farmed market", TradeParams(market=market)))
+    for hours in (1, 6, 24, 72):
+        asks.append((f"trades, maker_address = funder, last {hours}h",
+                     TradeParams(maker_address=account, after=int(now - hours * 3600))))
+    for n, market in enumerate(markets, 1):
+        asks += [(f"trades, recently filled market {n} ({market})",
+                  TradeParams(market=market)),
+                 (f"trades, recently filled market {n} ({market}), maker_address = funder",
+                  TradeParams(market=market, maker_address=account))]
     lines = []
     try:
         lines.append(f"open orders: ok, {len(client.get_open_orders())} orders")
@@ -210,6 +219,7 @@ def main(argv=None):
                         help="how many MAKER and how many TAKER trades to print")
     parser.add_argument("--probe", action="store_true",
                         help="only try each way of asking the trades listing and say which work")
+    parser.add_argument("--market", help="list only this condition id's trades")
     parser.add_argument("--db", help="the farmer's SQLite file, opened read-only (default: "
                                      f"farm.db {data_dir.LOCATION_HELP})")
     args = parser.parse_args(argv)
@@ -221,7 +231,7 @@ def main(argv=None):
         return 1
     account = os.environ["POLYMARKET_FUNDER_ADDRESS"]
     if args.probe:
-        print("\n".join(probe(client, account, a_farmed_market(args.db))))
+        print("\n".join(probe(client, account, recently_filled(args.db), time.time())))
         return 0
     after = int(time.time() - args.hours * 3600)
 
@@ -231,16 +241,18 @@ def main(argv=None):
         except Exception as e:
             return None, re.sub(re.escape(account), "ME", str(e), flags=re.IGNORECASE)
 
-    with_address, why = listed(TradeParams(maker_address=account, after=after))
+    with_address, why = listed(
+        TradeParams(maker_address=account, after=after, market=args.market))
     if with_address is None:
         print(f"With maker_address and after: not listed ({why})")
-        with_address, unbounded = listed(TradeParams(maker_address=account), only_first_page=True)
+        with_address, unbounded = listed(TradeParams(maker_address=account, market=args.market),
+                                         only_first_page=True)
         if with_address is None:
             print(f"Error: the trades could not be listed ({unbounded})")
             return 1
         print("With maker_address and no after: listed, so the CLOB refused the time bound. "
               "Showing the first page, any age.")
-    without, why = listed(TradeParams(after=after))
+    without, why = listed(TradeParams(after=after, market=args.market))
     if without is None:
         print(f"With no address: not listed ({why})")
         without = []
