@@ -21,8 +21,8 @@ is opened in WAL mode with a busy timeout, and every column has one writer:
                    job's state.
   settings         console. A single row of the operator's choices.
 
-The worker reads farm.db, read-only, once an hour for the markets the farmer
-manages, and never writes it. The farmer never opens this file, so neither
+The worker reads farm.db, read-only, once an hour for the ids of the farmer's
+open orders, and never writes it. The farmer never opens this file, so neither
 waits on the other's write lock.
 
 Times are ISO 8601 UTC strings to the second, as in farm_db.
@@ -517,8 +517,8 @@ class Snapshot(NamedTuple):
 
 
 class SnapshotOrder(NamedTuple):
-    """farmer is whether the farmer managed the order's market when the snapshot
-    was taken, and None when the snapshot has no record of it."""
+    """farmer is whether the order was the farmer's when the snapshot was
+    taken, and None when the snapshot has no record of it."""
 
     id: int
     snapshot_id: int
@@ -539,12 +539,12 @@ def _snapshot(row):
 
 
 def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=None,
-                    farmer_markets=None):
+                    farmer_ids=None):
     """Store these OpenOrders as one snapshot and return its id.
 
-    names maps a condition id to its market's name. farmer_markets holds the
-    condition ids the farmer managed at taken_at, and None stores no record of
-    it. A source that is already stored raises sqlite3.IntegrityError and
+    names maps a condition id to its market's name. farmer_ids holds the ids
+    of the farmer's open orders at taken_at, and None stores no record of
+    them. A source that is already stored raises sqlite3.IntegrityError and
     stores nothing.
     """
     with conn:
@@ -557,7 +557,7 @@ def insert_snapshot(conn, taken_at, note, orders, names, source=None, job_id=Non
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [(snapshot_id, o.order_id, o.token_id, o.market, names.get(o.market), o.outcome,
               o.side.value, o.price, o.size, o.size_matched, stamp(o.expiration),
-              None if farmer_markets is None else o.market in farmer_markets)
+              None if farmer_ids is None else o.order_id in farmer_ids)
              for o in orders])
     return snapshot_id
 

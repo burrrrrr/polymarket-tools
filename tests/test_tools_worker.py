@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -90,8 +91,8 @@ class Scratch(unittest.TestCase):
                    pid=41, **{"sniper": FakeSniper, **kwargs})
 
     def queue(self, kind=JobKind.SNAPSHOT, **params):
-        if kind is JobKind.SNAPSHOT and set(params) <= {"note", "managed_markets"}:
-            params = {"note": "before the upgrade", "managed_markets": [], **params}
+        if kind is JobKind.SNAPSHOT and set(params) <= {"note", "farmer_order_ids"}:
+            params = {"note": "before the upgrade", "farmer_order_ids": [], **params}
         return db.enqueue_job(self.db, kind, params, self.clock())
 
     def messages(self, job_id):
@@ -124,9 +125,9 @@ class LoopTests(Scratch):
         self.assertEqual(self.messages(job), [
             "started", f"stored snapshot {taken.id} with 2 open orders", "done"])
 
-    def test_a_snapshot_job_records_the_orders_on_the_markets_the_console_named(self):
-        self.queue(managed_markets=[cid(2)])
-        self.run_worker(Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]))
+    def test_a_snapshot_job_records_the_orders_the_console_named_as_the_farmers(self):
+        self.queue(farmer_order_ids=["0xb"])
+        self.run_worker(Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(1))]))
         (taken,) = db.read_snapshots(self.db)
         self.assertEqual([o.farmer for o in db.read_snapshot_orders(self.db, taken.id)],
                          [False, True])
@@ -235,9 +236,9 @@ class RestoreJobTests(Scratch):
     def snapshot(self, *orders):
         return db.insert_snapshot(self.db, at(-3600), "", list(orders), {})
 
-    def queue_restore(self, kind, snapshot_id, managed=(), retired=()):
-        return self.queue(kind, snapshot_id=snapshot_id, managed_markets=list(managed),
-                          retired_markets=list(retired))
+    def queue_restore(self, kind, snapshot_id, farmer_ids=(), farmer_markets=()):
+        return self.queue(kind, snapshot_id=snapshot_id, farmer_order_ids=list(farmer_ids),
+                          farmer_markets=list(farmer_markets))
 
     def lines(self, job):
         return [(line.action, line.size, line.order_id)
@@ -246,7 +247,7 @@ class RestoreJobTests(Scratch):
     def test_a_preview_job_stores_the_plan_and_never_posts(self):
         venue = Venue(listing=[order("0xlive")])
         job = self.queue_restore(JobKind.PREVIEW, self.snapshot(
-            order("0xa"), order("0xb"), order("0xc", MARKET_B)), managed=[MARKET_B])
+            order("0xa"), order("0xb"), order("0xc", MARKET_B)), farmer_ids=["0xc"])
         self.run_worker(venue)
         self.assertEqual((db.read_job(self.db, job).state, db.read_job(self.db, job).error),
                          (JobState.DONE, None))
@@ -309,9 +310,10 @@ class RestoreJobTests(Scratch):
                                            (RestoreAction.PLACED, 100.0, "0xnew2")])
         self.assertEqual(len(venue.posts), 2)
 
-    def test_a_preview_skips_an_unrecorded_order_on_a_market_the_console_says_is_retired(self):
+    def test_a_preview_skips_an_unrecorded_order_on_a_market_the_console_says_is_the_farmers(
+            self):
         snapshot = self.snapshot(order("0xa", cid(1)), order("0xb", cid(2)))
-        job = self.queue_restore(JobKind.PREVIEW, snapshot, retired=[cid(1)])
+        job = self.queue_restore(JobKind.PREVIEW, snapshot, farmer_markets=[cid(1)])
         self.run_worker(Clob([]))
         self.assertEqual([line.action for line in db.read_restore_lines(self.db, job)],
                          [RestoreAction.SKIP_FARMER, RestoreAction.WOULD_PLACE])
@@ -332,6 +334,7 @@ class HourlyTests(Scratch):
                 for market, slug in ((cid(1), "alpha"), (cid(2), "bravo"))], [cid(1), cid(2)],
                 START)
             farm_db.approve_market(farm, cid(2), 0.99, 25.0, now=START)
+            farm_db.record_farmer_orders(farm, placed=[("0xb", cid(2))])
         db.set_hourly_snapshots(self.db, True, START)
 
     def run_hourly(self, clob, beats=1, **kwargs):
@@ -342,7 +345,8 @@ class HourlyTests(Scratch):
             "SELECT id FROM jobs WHERE kind = 'hourly_snapshot' ORDER BY id")]
 
     def listing(self):
-        return Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))])
+        return Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2)),
+                     entry(id="0xc", market=cid(2))])
 
     def test_hourly_snapshots_that_are_off_queue_nothing(self):
         db.set_hourly_snapshots(self.db, False, START)
@@ -358,15 +362,17 @@ class HourlyTests(Scratch):
         self.run_hourly(self.listing())
         self.assertEqual([j.created_at for j in self.hourly_jobs()], [at(0), at(3600)])
 
-    def test_the_job_stores_the_orders_off_the_farmers_markets_as_not_the_farmers(self):
+    def test_the_job_stores_every_order_but_the_farmers_saved_ones_as_not_the_farmers(self):
         self.run_hourly(self.listing())
         (job,) = self.hourly_jobs()
         (taken,) = db.read_snapshots(self.db)
         self.assertEqual((taken.note, taken.job_id), ("hourly", job.id))
         self.assertEqual([(o.order.order_id, o.farmer)
-                          for o in db.read_snapshot_orders(self.db, taken.id)], [("0xa", False)])
+                          for o in db.read_snapshot_orders(self.db, taken.id)],
+                         [("0xa", False), ("0xc", False)],
+                         "the hourly snapshot judged the orders by their market")
         self.assertEqual(self.messages(job.id), [
-            "started", f"stored snapshot {taken.id} with 1 open orders off the farmer's markets",
+            "started", f"stored snapshot {taken.id} with 2 open orders that are not the farmer's",
             "done"])
         self.assertIsNone(db.latest_job(self.db, JobKind.SNAPSHOT))
 
@@ -392,7 +398,10 @@ class HourlyTests(Scratch):
                       self.messages(self.hourly_jobs()[-1].id))
 
     def test_a_missing_farm_db_or_key_fails_the_job_saying_why(self):
+        unsaved = os.path.join(os.path.dirname(self.path), "unsaved.db")
+        sqlite3.connect(unsaved).close()
         for kwargs, says in (({"farm_path": self.farm_path + ".missing"}, "no farm.db at"),
+                             ({"farm_path": unsaved}, "no such table: farmer_orders"),
                              ({"farm_path": None}, "no farm.db in a data directory"),
                              ({"clob": None}, "holds no key")):
             with self.subTest(kwargs=kwargs):

@@ -82,10 +82,11 @@ The worker is a process of its own for three reasons:
 - The sniper does not share Python's interpreter lock with scans and the
   console's event stream.
 
-The worker never opens `farm.db`, and the farmer never opens `tools.db`, so
-neither waits on the other's write lock. When a restore needs to know which
-markets the farmer manages, the console reads them from `farm.db` at your
-click and puts them in the job.
+The worker opens `farm.db` only to read it, and the farmer never opens
+`tools.db`, so neither waits on the other's write lock. When a snapshot or a
+restore needs to know which orders are the farmer's, the console reads their
+ids from `farm.db` at your click and puts them in the job. An hourly snapshot
+reads them from `farm.db` itself.
 
 Both databases run in WAL mode with a 5-second busy timeout, and every column
 has one writer process. `farm/farm_db.py` owns the schema of `farm.db` and

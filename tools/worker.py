@@ -57,27 +57,28 @@ def stored_line(taken, orders="open orders"):
 def take_snapshot(run):
     run.log(stored_line(snapshot.take(
         run.client, run.http, run.conn, run.clock(), run.job.params["note"], job_id=run.job.id,
-        farmer_markets=set(run.job.params["managed_markets"]))))
+        farmer_ids=set(run.job.params["farmer_order_ids"]))))
 
 
-def managed_markets(path):
-    """The condition ids of the markets the farmer manages now, read from its
-    farm.db without writing it."""
+def farmer_order_ids(path):
+    """The ids of the farmer's open orders, read from its farm.db without
+    writing it."""
     if path is None or not os.path.exists(path):
         where = f"at {path}" if path else "in a data directory: the directory is missing"
-        raise JobRefused(f"no farm.db {where}, and an hourly snapshot reads the markets the "
-                         f"farmer manages from it")
+        raise JobRefused(f"no farm.db {where}, and an hourly snapshot reads the farmer's "
+                         f"orders from it")
     with closing(sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)) as farm:
-        return farm_db.condition_ids(farm, "approved")
+        farm.row_factory = sqlite3.Row
+        return frozenset(farm_db.farmer_orders(farm))
 
 
 def take_hourly_snapshot(run):
     taken = snapshot.take_hourly(run.client, run.http, run.conn, run.clock(),
-                                 managed_markets(run.farm_path), run.job.id)
+                                 farmer_order_ids(run.farm_path), run.job.id)
     if isinstance(taken, snapshot.Unchanged):
         run.log(f"unchanged since snapshot {taken.snapshot_id}")
     else:
-        run.log(stored_line(taken, "open orders off the farmer's markets"))
+        run.log(stored_line(taken, "open orders that are not the farmer's"))
     pruned = db.prune_hourly_snapshots(run.conn, run.clock() - db.HOURLY_KEEP)
     if pruned:
         run.log(f"pruned {pruned} hourly snapshot{'' if pruned == 1 else 's'} older than "

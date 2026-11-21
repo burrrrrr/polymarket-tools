@@ -35,49 +35,48 @@ class Imported(NamedTuple):
     skipped: int
 
 
-def take(client, http, conn, now, note, job_id=None, farmer_markets=None):
+def take(client, http, conn, now, note, job_id=None, farmer_ids=None):
     """Store the account's open orders as one snapshot taken at `now`.
 
-    farmer_markets holds the condition ids the farmer manages now, so that a
-    restore can leave the farmer's orders to the farmer whatever it manages by
-    then. None stores no record of it.
+    farmer_ids holds the ids of the farmer's open orders now, so that a
+    restore can leave the farmer's orders to the farmer once they are no
+    longer open. None stores no record of them.
 
     Raises when the listing fails or cannot be read, and then stores nothing.
     The market names come from Gamma. They are for display only, so when Gamma
     cannot be read the orders are stored without them.
     """
-    return _store(http, conn, now, note, open_orders(client), job_id, farmer_markets)
+    return _store(http, conn, now, note, open_orders(client), job_id, farmer_ids)
 
 
-def take_hourly(client, http, conn, now, managed_markets, job_id):
-    """Store the open orders on markets outside managed_markets as an hourly
-    snapshot, unless they are the newest hourly snapshot's orders with the
-    same sizes matched. Returns Unchanged then, having asked Gamma nothing,
-    and the Taken snapshot otherwise.
+def take_hourly(client, http, conn, now, farmer_ids, job_id):
+    """Store the open orders whose ids are not in farmer_ids, on any market,
+    as an hourly snapshot, unless they are the newest hourly snapshot's orders
+    with the same sizes matched. Returns Unchanged then, having asked Gamma
+    nothing, and the Taken snapshot otherwise.
 
-    Every order stored is recorded as not the farmer's, so a restore offers it
-    whatever the farmer manages by then. Raises as take does.
+    Every order stored is recorded as not the farmer's. Raises as take does.
     """
-    kept = [o for o in open_orders(client) if o.market not in managed_markets]
+    kept = [o for o in open_orders(client) if o.order_id not in farmer_ids]
     last = db.latest_hourly_snapshot(conn)
     if last is not None and _fills(kept) == _fills(
             stored.order for stored in db.read_snapshot_orders(conn, last.id)):
         return Unchanged(last.id)
-    return _store(http, conn, now, db.HOURLY_NOTE, kept, job_id, managed_markets)
+    return _store(http, conn, now, db.HOURLY_NOTE, kept, job_id, farmer_ids)
 
 
 def _fills(orders):
     return Counter((o.order_id, o.size_matched) for o in orders)
 
 
-def _store(http, conn, now, note, orders, job_id, farmer_markets):
+def _store(http, conn, now, note, orders, job_id, farmer_ids):
     names, names_error = {}, None
     try:
         names = gamma.market_names(http, [o.market for o in orders])
     except (httpx.HTTPError, ValueError) as e:
         names_error = f"{type(e).__name__}: {e}"
     snapshot_id = db.insert_snapshot(conn, now, note, orders, names, job_id=job_id,
-                                     farmer_markets=farmer_markets)
+                                     farmer_ids=farmer_ids)
     return Taken(snapshot_id, len(orders), names_error)
 
 

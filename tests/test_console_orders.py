@@ -73,7 +73,7 @@ class Orders(Console):
     def start_worker(self, keyed=True):
         return db.start_worker(self.tools, self.now, pid=41, keyed=keyed)
 
-    def take(self, note="before the upgrade", farmer_markets=None):
+    def take(self, note="before the upgrade", farmer_ids=None):
         job = db.enqueue_job(self.tools, JobKind.SNAPSHOT, {"note": note}, self.now)
         db.claim_job(self.tools, self.now)
         orders = [
@@ -83,7 +83,7 @@ class Orders(Console):
                       None)]
         snapshot = db.insert_snapshot(self.tools, self.now, note, orders,
                                       {MARKET: "Will alpha happen?"}, job_id=job,
-                                      farmer_markets=farmer_markets)
+                                      farmer_ids=farmer_ids)
         db.append_log(self.tools, self.now, f"stored snapshot {snapshot} with 2 open orders",
                       job_id=job)
         db.finish_job(self.tools, job, self.now)
@@ -144,7 +144,7 @@ class TakeSnapshotTest(Orders):
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/orders"))
         job = db.latest_job(self.tools, JobKind.SNAPSHOT)
         self.assertEqual((job.state, job.params), (JobState.QUEUED, {
-            "note": "before the upgrade", "managed_markets": sorted([A, B])}))
+            "note": "before the upgrade", "farmer_order_ids": []}))
         text = self.client.get("/orders").text
         for needle in ("Snapshot job 1", '<span class="badge t-n">queued</span>',
                        "before the upgrade", "waits for the worker, which is not running",
@@ -160,10 +160,11 @@ class TakeSnapshotTest(Orders):
         self.assertEqual(self.post("/orders/snapshot").status_code, 303)
         self.assertEqual(db.latest_job(self.tools, JobKind.SNAPSHOT).params["note"], "")
 
-    def test_the_job_names_the_markets_the_farmer_manages_at_the_click(self):
-        farm_db.mark_retired(self.db, A, "closed")
+    def test_the_job_names_the_farmers_open_orders_at_the_click(self):
+        farm_db.record_farmer_orders(self.db, placed=[("0xf2", B), ("0xf1", A)])
         self.post("/orders/snapshot")
-        self.assertEqual(db.latest_job(self.tools, JobKind.SNAPSHOT).params["managed_markets"], [B])
+        self.assertEqual(db.latest_job(self.tools, JobKind.SNAPSHOT).params["farmer_order_ids"],
+                         ["0xf1", "0xf2"])
 
     def test_a_post_without_the_console_token_is_refused_and_queues_nothing(self):
         for data, headers in (({"note": "x"}, {}), ({"note": "x", "console_token": "guess"}, {}),
@@ -303,13 +304,13 @@ class SnapshotsTest(Orders):
             self.assertIn(needle, text)
 
     def test_a_snapshots_page_marks_the_orders_recorded_as_the_farmers(self):
-        for farmer_markets, marked in (
-                ({MARKET}, ['<td class="wrap">Will alpha happen? ' + FARMERS + "</td>"]),
-                ({"0x" + "bb" * 32},
+        for farmer_ids, marked in (
+                ({"0xo1"}, ['<td class="wrap">Will alpha happen? ' + FARMERS + "</td>"]),
+                ({"0xo2"},
                  [f'<td class="wrap mono muted">{"0x" + "bb" * 32} {FARMERS}</td>']),
                 (set(), [])):
-            with self.subTest(farmer_markets=farmer_markets):
-                _, snapshot, _ = self.take(farmer_markets=farmer_markets)
+            with self.subTest(farmer_ids=farmer_ids):
+                _, snapshot, _ = self.take(farmer_ids=farmer_ids)
                 text = self.client.get(f"/orders/snapshots/{snapshot}").text
                 self.assertEqual(re.findall(r'<td class="wrap[^>]*>[^<]*<span.*?</td>', text),
                                  marked)
@@ -341,7 +342,8 @@ class RestoreTest(Orders):
 
     def ran(self, kind, lines, state=JobState.DONE, error=None):
         job = db.enqueue_job(self.tools, kind, {"snapshot_id": self.snapshot,
-                                                "managed_markets": []}, self.now)
+                                                "farmer_order_ids": [], "farmer_markets": []},
+                             self.now)
         if state is not JobState.QUEUED:
             db.claim_job(self.tools, self.now)
             db.add_restore_lines(self.tools, [
@@ -369,21 +371,23 @@ class RestoreTest(Orders):
         self.assertIn(f'hx-get="/partials/orders/restore/{self.snapshot}" '
                       'hx-trigger="sse:job, sse:status"', text)
 
-    def test_preview_queues_a_job_with_the_markets_the_farmer_manages_at_the_click(self):
+    def test_preview_queues_a_job_with_the_farmers_orders_and_markets_at_the_click(self):
         resp = self.post(f"{self.url}/preview")
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, self.url))
         job = db.latest_restore_job(self.tools, self.snapshot)
         self.assertEqual((job.kind, job.state, job.params), (JobKind.PREVIEW, JobState.QUEUED, {
-            "snapshot_id": self.snapshot, "managed_markets": sorted([A, B]),
-            "retired_markets": []}))
+            "snapshot_id": self.snapshot, "farmer_order_ids": [],
+            "farmer_markets": sorted([A, B])}))
         db.claim_job(self.tools, self.now)
         db.finish_job(self.tools, job.id, self.now)
+        farm_db.record_farmer_orders(self.db, placed=[("0xf1", B)])
         farm_db.approve_market(self.db, C, 0.99, 25.0, now=self.now)
         farm_db.mark_retired(self.db, A, "closed")
         self.post(f"{self.url}/preview")
         params = db.latest_restore_job(self.tools, self.snapshot).params
-        self.assertEqual((params["managed_markets"], params["retired_markets"]),
-                         (sorted([B, C]), [A]))
+        self.assertEqual((params["farmer_order_ids"], params["farmer_markets"]),
+                         (["0xf1"], sorted([A, B, C])),
+                         "a retired market fell out of the markets the farmer managed")
 
     def test_a_queued_preview_says_it_waits_for_a_worker_that_is_not_running(self):
         self.post(f"{self.url}/preview")
@@ -438,14 +442,15 @@ class RestoreTest(Orders):
                 self.assertIn("Place 1 order</button>", resp.text)
         self.assertEqual(self.restore_jobs(), [], "a restore was queued without the typed word")
 
-    def test_the_typed_word_queues_a_restore_with_the_markets_the_farmer_manages(self):
+    def test_the_typed_word_queues_a_restore_with_the_farmers_orders_and_markets(self):
         self.previewed()
+        farm_db.record_farmer_orders(self.db, placed=[("0xf2", A), ("0xf1", B)])
         resp = self.post(f"{self.url}/restore", confirm=" PLACE ")
         self.assertEqual((resp.status_code, resp.headers["location"]), (303, self.url))
         job = db.latest_restore_job(self.tools, self.snapshot)
         self.assertEqual((job.kind, job.state, job.params), (JobKind.RESTORE, JobState.QUEUED, {
-            "snapshot_id": self.snapshot, "managed_markets": sorted([A, B]),
-            "retired_markets": []}))
+            "snapshot_id": self.snapshot, "farmer_order_ids": ["0xf1", "0xf2"],
+            "farmer_markets": sorted([A, B])}))
 
     def test_a_queued_restore_says_how_long_it_may_wait_for_a_worker(self):
         self.previewed()
@@ -499,10 +504,10 @@ class RestoreTest(Orders):
         detail = "no answer (TimeoutError: timed out): the order may rest: check your open orders"
         self.ran(JobKind.RESTORE, [(0, RestoreAction.ERROR, None, detail),
                                    (1, RestoreAction.SKIP_FARMER, None,
-                                    "the farmer manages this market")])
+                                    "the farmer's order when the snapshot was taken")])
         text = self.client.get(self.url).text
-        for needle in ("<h2>Error</h2>", detail, "<h2>Skipped: the farmer&#39;s market</h2>",
-                       "the farmer manages this market"):
+        for needle in ("<h2>Error</h2>", detail, "<h2>Skipped: the farmer&#39;s order</h2>",
+                       "the farmer&#39;s order when the snapshot was taken"):
             self.assertIn(needle, text)
         self.assertNotIn("<h2>Placed</h2>", text)
 

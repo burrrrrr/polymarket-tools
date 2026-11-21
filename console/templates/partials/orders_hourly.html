@@ -10,7 +10,7 @@
       <button class="btn" type="submit">Turn {{ 'off' if hourly_on else 'on' }}</button>
     </div>
   </div>
-  <span class="hint">Every hour the worker takes your open orders outside the farmer's markets, stores a new snapshot only when they changed, and keeps {{ hourly_keep_days }} days of them. Check now runs one at once, and the next comes an hour after it.</span>
+  <span class="hint">Every hour the worker takes your open orders that are not the farmer's, on any market, stores a new snapshot only when they changed, and keeps {{ hourly_keep_days }} days of them. Check now runs one at once, and the next comes an hour after it.</span>
   {%- if hourly_job %}
   <span class="mono small c-mut">Hourly job {{ hourly_job.id }} queued {{ hourly_job.created_at | stamp_local }} · <span class="badge {{ JOB_TONE[hourly_job.state] }}">{{ hourly_job.state.value }}</span></span>
   {%- if hourly_job.state.value == 'queued' and not chrome.worker.running %}

@@ -224,9 +224,9 @@ class SnapshotTests(Scratch):
                           (snapshot_id, None, orders[1])])
         self.assertEqual(len({s.id for s in stored}), 2)
 
-    def test_a_snapshot_records_which_orders_sat_on_a_market_the_farmer_managed(self):
-        orders = [order("0xo1", MARKET_A), order("0xo2", MARKET_B)]
-        recorded = db.insert_snapshot(self.db, NOW, "", orders, {}, farmer_markets={MARKET_B})
+    def test_a_snapshot_records_which_orders_were_the_farmers(self):
+        orders = [order("0xo1", MARKET_A), order("0xo2", MARKET_A)]
+        recorded = db.insert_snapshot(self.db, NOW, "", orders, {}, farmer_ids={"0xo2"})
         unrecorded = db.insert_snapshot(self.db, NOW, "", orders, {})
         self.assertEqual([s.farmer for s in db.read_snapshot_orders(self.db, recorded)],
                          [False, True])
@@ -242,7 +242,7 @@ class SnapshotTests(Scratch):
         self.addCleanup(self.db.close)
         self.assertEqual([(s.order, s.farmer) for s in db.read_snapshot_orders(self.db, kept)],
                          [(order(), None)])
-        later = db.insert_snapshot(self.db, NOW, "", [order()], {}, farmer_markets={MARKET_A})
+        later = db.insert_snapshot(self.db, NOW, "", [order()], {}, farmer_ids={"0xo1"})
         self.assertEqual([s.farmer for s in db.read_snapshot_orders(self.db, later)], [True])
 
     def test_snapshots_list_newest_first_with_their_order_counts(self):
@@ -384,10 +384,10 @@ class RestoreJobTests(Scratch):
             db.finish_job(self.db, job, NOW)
             return job
 
-        preview = run(JobKind.PREVIEW, snapshot_id=1, managed_markets=[])
+        preview = run(JobKind.PREVIEW, snapshot_id=1, farmer_order_ids=[])
         self.assertEqual(db.latest_restore_job(self.db, 1).id, preview)
-        restore = run(JobKind.RESTORE, snapshot_id=1, managed_markets=[])
-        run(JobKind.PREVIEW, snapshot_id=2, managed_markets=[])
+        restore = run(JobKind.RESTORE, snapshot_id=1, farmer_order_ids=[])
+        run(JobKind.PREVIEW, snapshot_id=2, farmer_order_ids=[])
         run(JobKind.SNAPSHOT, note="")
         latest = db.latest_restore_job(self.db, 1)
         self.assertEqual((latest.id, latest.kind), (restore, JobKind.RESTORE))

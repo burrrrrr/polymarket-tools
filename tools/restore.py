@@ -40,7 +40,7 @@ class Unsent(NamedTuple):
     detail: str
 
 
-def plan(snapshot_orders, live_orders, managed_markets, now, retired_markets=frozenset()):
+def plan(snapshot_orders, live_orders, farmer_ids, now, farmer_markets=frozenset()):
     """One PlanLine for each snapshot order, in their order.
 
     An order is skipped when nothing of it was left to fill, when it is the
@@ -50,10 +50,12 @@ def plan(snapshot_orders, live_orders, managed_markets, now, retired_markets=fro
     covers one snapshot order, so two identical orders with one copy are a
     skip and a place.
 
-    An order is the farmer's when the farmer manages its market now, or managed
-    it when the snapshot was taken. A snapshot with no record of that leaves an
-    order to the farmer when its market is in retired_markets, the markets the
-    farmer managed once and has retired.
+    An order is the farmer's when the snapshot records it as the farmer's, or
+    its id is in farmer_ids, the farmer's open orders now. A snapshot with no
+    record of whose orders were the farmer's leaves an order to the farmer when
+    its market is in farmer_markets, the markets the farmer manages or managed.
+    Any other order is the operator's, whatever its market, and the farmer
+    leaves it alone.
     """
     snapshot_ids = {stored.order.order_id for stored in snapshot_orders}
     resting = {live.order_id for live in live_orders}
@@ -63,15 +65,15 @@ def plan(snapshot_orders, live_orders, managed_markets, now, retired_markets=fro
         order = stored.order
         if order.remaining <= 0:
             action, reason = RestoreAction.SKIP_FILLED, "nothing of it was left to fill"
-        elif order.market in managed_markets:
-            action, reason = RestoreAction.SKIP_FARMER, "the farmer manages this market"
         elif stored.farmer:
             action, reason = (RestoreAction.SKIP_FARMER,
-                              "the farmer managed this market when the snapshot was taken")
-        elif stored.farmer is None and order.market in retired_markets:
+                              "the farmer's order when the snapshot was taken")
+        elif order.order_id in farmer_ids:
+            action, reason = RestoreAction.SKIP_FARMER, "the farmer's order"
+        elif stored.farmer is None and order.market in farmer_markets:
             action, reason = (RestoreAction.SKIP_FARMER,
-                              "the farmer has retired this market, and the snapshot does not "
-                              "record whose order this was")
+                              "the snapshot does not record whose order this was, and the "
+                              "farmer manages or managed this market")
         elif order.expiration is not None and order.expiration <= now:
             action, reason = RestoreAction.SKIP_EXPIRED, "expired"
         elif order.expiration is not None and order.expiration <= now + EXPIRY_MARGIN:
@@ -156,7 +158,7 @@ def _planned(client, conn, job, now):
     if db.read_snapshot(conn, snapshot_id) is None:
         raise ValueError(f"no snapshot {snapshot_id}")
     return plan(db.read_snapshot_orders(conn, snapshot_id), orders.open_orders(client),
-                set(job.params["managed_markets"]), now, set(job.params["retired_markets"]))
+                set(job.params["farmer_order_ids"]), now, set(job.params["farmer_markets"]))
 
 
 def _key(order):
