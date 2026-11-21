@@ -241,23 +241,19 @@ def main(argv=None):
         except Exception as e:
             return None, re.sub(re.escape(account), "ME", str(e), flags=re.IGNORECASE)
 
-    with_address, why = listed(
+    with_address, why_with = listed(
         TradeParams(maker_address=account, after=after, market=args.market))
+    without, why_without = listed(TradeParams(after=after, market=args.market))
+    if with_address is None and without is None:
+        print(f"Error: the trades could not be listed ({why_without})")
+        return 1
     if with_address is None:
-        print(f"With maker_address and after: not listed ({why})")
-        with_address, unbounded = listed(TradeParams(maker_address=account, market=args.market),
-                                         only_first_page=True)
-        if with_address is None:
-            print(f"Error: the trades could not be listed ({unbounded})")
-            return 1
-        print("With maker_address and no after: listed, so the CLOB refused the time bound. "
-              "Showing the first page, any age.")
-    without, why = listed(TradeParams(after=after, market=args.market))
+        print(f"With maker_address: not listed ({why_with})")
     if without is None:
-        print(f"With no address: not listed ({why})")
-        without = []
+        print(f"With no address: not listed ({why_without})")
     print(f"Trades matched in the last {args.hours:g} hours")
-    print("\n".join(report(with_address, without, account, args.show, farmer_ids(args.db))))
+    print("\n".join(report(with_address or [], without or [], account, args.show,
+                           farmer_ids(args.db))))
     return 0
 
 

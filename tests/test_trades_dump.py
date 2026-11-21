@@ -194,16 +194,14 @@ class StartTests(unittest.TestCase):
         code, _ = self.main(["--market", "0xcid"], Clob(listing))
         self.assertEqual((code, markets), (0, ["0xcid", "0xcid"]))
 
-    def test_a_refused_time_bound_is_told_apart_by_a_listing_without_it(self):
+    def test_a_listing_with_the_address_that_fails_still_reports_the_one_without(self):
         def listing(params):
-            return RuntimeError("500 Internal server error") if params.after else [MADE]
+            return RuntimeError("500 Internal server error") if params.maker_address else [MADE]
 
-        clob = Clob(listing)
-        code, out = self.main(["--show", "1"], clob)
+        code, out = self.main(["--show", "1"], Clob(listing))
         self.assertEqual(code, 0)
-        self.assertIn("so the CLOB refused the time bound", out)
+        self.assertIn("With maker_address: not listed (500 Internal server error)", out)
         self.assertIn("MAKER trade 1 of 1 shown", out)
-        self.assertEqual(clob.asked[:2], [(ME, 1791160000 - 72 * 3600), (ME, None)])
 
     def test_an_account_the_environment_does_not_describe_ends_it(self):
         code, out = self.main([], Clob([]), ConfigError("POLYMARKET_FUNDER_ADDRESS is not set"))
