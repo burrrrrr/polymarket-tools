@@ -106,6 +106,32 @@ class UseForSdkTests(unittest.TestCase):
         self.assertEqual(sdk_http.request("https://clob.test/time", "GET"), {"through": "ours"})
         self.assertEqual(seen, ["https://clob.test/time"])
 
+    def sdk_with_one_disconnect(self):
+        import py_clob_client_v2.http_helpers.helpers as sdk_http
+        self.addCleanup(setattr, sdk_http, "_http_client", sdk_http._http_client)
+        sent = []
+
+        def handler(request):
+            sent.append(request.method)
+            if len(sent) == 1:
+                raise httpx.RemoteProtocolError("Server disconnected", request=request)
+            return httpx.Response(200, json={"ok": True})
+
+        use_for_sdk(client(handler))
+        return sdk_http, sent
+
+    def test_a_get_on_a_connection_the_server_closed_is_sent_again(self):
+        sdk_http, sent = self.sdk_with_one_disconnect()
+        self.assertEqual(sdk_http.get("https://clob.test/data/orders"), {"ok": True})
+        self.assertEqual(sent, ["GET", "GET"])
+
+    def test_a_post_on_a_connection_the_server_closed_is_not_sent_again(self):
+        from py_clob_client_v2.exceptions import PolyApiException
+        sdk_http, sent = self.sdk_with_one_disconnect()
+        with self.assertRaises(PolyApiException):
+            sdk_http.post("https://clob.test/order", data={"order": 1})
+        self.assertEqual(sent, ["POST"])
+
 
 if __name__ == "__main__":
     unittest.main()

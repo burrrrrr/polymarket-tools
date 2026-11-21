@@ -68,6 +68,25 @@ def persistent_client():
 
 def use_for_sdk(http):
     """Send every py_clob_client_v2 request through http, for the whole process:
-    the SDK keeps one module-level client."""
+    the SDK keeps one module-level client. The SDK retries no GET, so a GET is
+    sent once more when it finds its pooled connection closed by the server."""
     import py_clob_client_v2.http_helpers.helpers as sdk_http
-    sdk_http._http_client = http
+    sdk_http._http_client = ResendStaleGet(http)
+
+
+class ResendStaleGet:
+    """http's request, with a GET sent again on a fresh connection when the
+    server had closed the pooled one. The CLOB closes a connection idle for
+    between 30 s and 150 s, and persistent_client keeps it. A POST is never sent
+    again: the CLOB may have taken the order."""
+
+    def __init__(self, http):
+        self.http = http
+
+    def request(self, method, url, **kwargs):
+        try:
+            return self.http.request(method=method, url=url, **kwargs)
+        except httpx.RemoteProtocolError:
+            if method != "GET":
+                raise
+            return self.http.request(method=method, url=url, **kwargs)
