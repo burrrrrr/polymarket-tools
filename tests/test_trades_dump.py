@@ -75,11 +75,12 @@ class Clob:
     def __init__(self, listing):
         self.listing, self.asked = listing, []
 
-    def get_trades(self, params):
+    def get_trades(self, params, only_first_page=False):
         self.asked.append((params.maker_address, params.after))
-        if isinstance(self.listing, Exception):
-            raise self.listing
-        return self.listing
+        listing = self.listing(params) if callable(self.listing) else self.listing
+        if isinstance(listing, Exception):
+            raise listing
+        return listing
 
 
 class StartTests(unittest.TestCase):
@@ -140,6 +141,26 @@ class StartTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("the trades could not be listed (GET /trades?maker_address=ME)", out)
         self.assertNotIn(ME, out)
+
+    def test_a_listing_with_no_address_that_fails_still_reports_the_one_with_it(self):
+        def listing(params):
+            return [MADE] if params.maker_address else RuntimeError("500 Internal server error")
+
+        code, out = self.main(["--show", "1"], Clob(listing))
+        self.assertEqual(code, 0)
+        self.assertIn("With no address: not listed (500 Internal server error)", out)
+        self.assertIn("MAKER trade 1 of 1 shown", out)
+
+    def test_a_refused_time_bound_is_told_apart_by_a_listing_without_it(self):
+        def listing(params):
+            return RuntimeError("500 Internal server error") if params.after else [MADE]
+
+        clob = Clob(listing)
+        code, out = self.main(["--show", "1"], clob)
+        self.assertEqual(code, 0)
+        self.assertIn("so the CLOB refused the time bound", out)
+        self.assertIn("MAKER trade 1 of 1 shown", out)
+        self.assertEqual(clob.asked[:2], [(ME, 1791160000 - 72 * 3600), (ME, None)])
 
     def test_an_account_the_environment_does_not_describe_ends_it(self):
         code, out = self.main([], Clob([]), ConfigError("POLYMARKET_FUNDER_ADDRESS is not set"))

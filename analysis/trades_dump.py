@@ -177,13 +177,26 @@ def main(argv=None):
         return 1
     account = os.environ["POLYMARKET_FUNDER_ADDRESS"]
     after = int(time.time() - args.hours * 3600)
-    try:
-        with_address = client.get_trades(TradeParams(maker_address=account, after=after))
-        without = client.get_trades(TradeParams(after=after))
-    except Exception as e:
-        why = re.sub(re.escape(account), "ME", str(e), flags=re.IGNORECASE)
-        print(f"Error: the trades could not be listed ({why})")
-        return 1
+
+    def listed(params, only_first_page=False):
+        try:
+            return client.get_trades(params, only_first_page=only_first_page), None
+        except Exception as e:
+            return None, re.sub(re.escape(account), "ME", str(e), flags=re.IGNORECASE)
+
+    with_address, why = listed(TradeParams(maker_address=account, after=after))
+    if with_address is None:
+        print(f"With maker_address and after: not listed ({why})")
+        with_address, unbounded = listed(TradeParams(maker_address=account), only_first_page=True)
+        if with_address is None:
+            print(f"Error: the trades could not be listed ({unbounded})")
+            return 1
+        print("With maker_address and no after: listed, so the CLOB refused the time bound. "
+              "Showing the first page, any age.")
+    without, why = listed(TradeParams(after=after))
+    if without is None:
+        print(f"With no address: not listed ({why})")
+        without = []
     print(f"Trades matched in the last {args.hours:g} hours")
     print("\n".join(report(with_address, without, account, args.show, farmer_ids(args.db))))
     return 0
