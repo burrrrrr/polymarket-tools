@@ -39,10 +39,11 @@ a busy timeout, and every column has exactly one writer process:
                   restart starts from it.
   farmer_orders   farmer, live only. One row per order the farmer placed
                   that is open or left the listing lately: added when the
-                  CLOB accepts it or a listing first shows it, deleted once
-                  farm.db holds a trades read asked UNLISTED_GRACE_S after a
-                  listing stopped showing it that finds no unsettled fill of
-                  it. A stop deletes none; a later run does.
+                  CLOB accepts it or a listing first shows it, deleted
+                  UNLISTED_GRACE_S after a listing stopped showing it, once
+                  farm.db holds its market's cursor, if it has one, neither
+                  behind nor waiting on a fill of it. A stop deletes none; a
+                  later run does.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
                   config, read every cycle. Keys under the `scan.`,
@@ -51,8 +52,10 @@ a busy timeout, and every column has exactly one writer process:
                   last scan parameters, scan.last (screener) the last scan's
                   funnel, triage.auto_top_n (console) how many new
                   candidates a console scan sends to Claude, and
-                  farmer.fills (farmer, live only) how far the farm ledgers
-                  have counted the account's trades.
+                  farmer.fills (farmer, live only) a JSON object keyed by
+                  condition id: how far each market's farm ledger has
+                  counted the account's trades (FillCursor). A market's
+                  key goes when it retires.
   commands        the console inserts rows; the farmer only stamps
                   consumed_at and result.
   decisions       console or CLI, append-only. One row each time a human
@@ -931,28 +934,35 @@ FILLS_KEY = "farmer.fills"
 
 
 class FillCursor(NamedTuple):
-    """How far the farm ledgers have counted the account's trades."""
+    """How far one market's farm ledger has counted the account's trades."""
 
-    # Unix seconds. The ledgers account for every fill matched before it; one
+    # Unix seconds. The ledger accounts for every fill matched before it; one
     # still unsettled SETTLE_MAX_S after matching is taken as final.
     after: int
     # The (trade id, order id) of each counted fill matched at or after it.
     counted: frozenset
+    # The id of each order with a fill the chain may still undo; the cursor
+    # waits at the oldest such fill.
+    unsettled: frozenset = frozenset()
+    # A positions read needed the market's trades and did not read them, so
+    # the next one asks whatever the holdings show.
+    behind: bool = False
 
 
-def load_fill_cursor(conn):
-    """The saved FillCursor, or None before the first save."""
+def load_fill_cursors(conn):
+    """{condition_id: FillCursor} as saved, empty before the first save."""
     saved = _get_json(conn, FILLS_KEY)
-    if saved is None:
-        return None
-    return FillCursor(saved["after"], frozenset(tuple(key) for key in saved["counted"]))
+    return {cid: FillCursor(c["after"], frozenset(tuple(key) for key in c["counted"]),
+                            frozenset(c["unsettled"]), c["behind"])
+            for cid, c in (saved or {}).items()}
 
 
-def save_inventory(conn, rows, cursor, now):
-    """Write each (condition_id, ledger, baseline) and the cursor in one
+def save_inventory(conn, rows, cursors, now):
+    """Write each (condition_id, ledger, baseline) and the cursors in one
     transaction, so a crash never leaves a ledger and the cursor it was
     counted up to apart. ledger and baseline are (fav, long) pairs; either
-    None clears its columns. cursor None leaves the saved one."""
+    None clears its columns. cursors is {condition_id: FillCursor}, which
+    replaces every saved one, or None to leave them."""
     with conn:
         conn.executemany(
             "UPDATE markets SET farm_fav = ?, farm_long = ?, baseline_fav = ?, "
@@ -960,9 +970,11 @@ def save_inventory(conn, rows, cursor, now):
             [(*(ledger or (None, None)), *(baseline or (None, None)), condition_id)
              for condition_id, ledger, baseline in rows],
         )
-        if cursor is not None:
+        if cursors is not None:
             _put_json(conn, FILLS_KEY,
-                      {"after": cursor.after, "counted": sorted(cursor.counted)}, now)
+                      {cid: {"after": c.after, "counted": sorted(c.counted),
+                             "unsettled": sorted(c.unsettled), "behind": c.behind}
+                       for cid, c in cursors.items()}, now)
 
 
 def farmer_orders(conn):

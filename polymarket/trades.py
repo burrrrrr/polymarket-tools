@@ -77,12 +77,15 @@ def parse_trades(entries, account):
     return [fill for entry in entries for fill in _fills(entry, me)]
 
 
-def fetch_fills(client, account, after):
-    """Every Fill of the account the CLOB lists for `after`, unix seconds, a
-    bound that may include that second. Raises what the client raises, and
-    UnreadableTrade."""
-    return parse_trades(client.get_trades(TradeParams(maker_address=account, after=after)),
-                        account)
+def fetch_fills(client, account, market, after):
+    """Every Fill of the account the CLOB lists on one market, a condition
+    id, for `after`, unix seconds, a bound that may include that second.
+    Raises what the client raises, and UnreadableTrade.
+
+    The listing is asked without the account's address: asked with it, the
+    listing answered 500 for this account where the market's listing
+    without it answered."""
+    return parse_trades(client.get_trades(TradeParams(market=market, after=after)), account)
 
 
 def _fills(entry, me):

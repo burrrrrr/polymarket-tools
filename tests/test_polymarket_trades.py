@@ -108,22 +108,22 @@ class Clob:
         self.listing, self.asked = listing, []
 
     def get_trades(self, params):
-        self.asked.append((params.maker_address, params.after))
+        self.asked.append((params.market, params.maker_address, params.after))
         if isinstance(self.listing, Exception):
             raise self.listing
         return self.listing
 
 
 class FetchFillsTests(unittest.TestCase):
-    def test_it_asks_for_the_accounts_trades_after_a_time_and_parses_them(self):
+    def test_it_asks_for_one_markets_trades_after_a_time_without_the_address(self):
         clob = Clob([trade()])
-        fills = fetch_fills(clob, ME, 1791150000)
-        self.assertEqual(clob.asked, [(ME, 1791150000)])
+        fills = fetch_fills(clob, ME, "0xmarket", 1791150000)
+        self.assertEqual(clob.asked, [("0xmarket", None, 1791150000)])
         self.assertEqual([f.order_id for f in fills], ["0xtaking"])
 
     def test_a_failed_listing_raises_what_the_client_raised(self):
         with self.assertRaises(ConnectionError):
-            fetch_fills(Clob(ConnectionError("timed out")), ME, 0)
+            fetch_fills(Clob(ConnectionError("timed out")), ME, "0xmarket", 0)
 
 
 if __name__ == "__main__":

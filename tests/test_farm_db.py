@@ -577,7 +577,9 @@ class FarmerOrdersTest(ScratchDb):
 
 
 class InventoryTest(ScratchDb):
-    CURSOR = farm_db.FillCursor(1791157113, frozenset({("t1", "o1"), ("t1", "o2")}))
+    CURSORS = {"0xa": farm_db.FillCursor(1791157113, frozenset({("t1", "o1"), ("t1", "o2")}),
+                                         frozenset({"o2"}), True),
+               "0xb": farm_db.FillCursor(1791157000, frozenset())}
 
     def market(self, conn, condition_id="0xa"):
         with conn:
@@ -587,44 +589,46 @@ class InventoryTest(ScratchDb):
         row = farm_db.find_market(conn, condition_id)
         return ((row["farm_fav"], row["farm_long"]), (row["baseline_fav"], row["baseline_long"]))
 
-    def test_a_new_market_has_no_ledger_and_a_new_file_no_cursor(self):
+    def test_a_new_market_has_no_ledger_and_a_new_file_no_cursors(self):
         conn = self.open()
         self.market(conn)
         self.assertEqual(self.inventory(conn), ((None, None), (None, None)))
-        self.assertIsNone(farm_db.load_fill_cursor(conn))
+        self.assertEqual(farm_db.load_fill_cursors(conn), {})
 
-    def test_ledgers_baselines_and_the_cursor_are_read_back_as_saved(self):
+    def test_ledgers_baselines_and_the_cursors_are_read_back_as_saved(self):
         conn = self.open()
         self.market(conn, "0xa")
         self.market(conn, "0xb")
         farm_db.save_inventory(conn, [("0xa", (50.0, 2.5), (100.0, 0.0)),
-                                      ("0xb", None, (7.0, 0.0))], self.CURSOR, NOW)
+                                      ("0xb", None, (7.0, 0.0))], self.CURSORS, NOW)
         self.assertEqual(self.inventory(conn, "0xa"), ((50.0, 2.5), (100.0, 0.0)))
         self.assertEqual(self.inventory(conn, "0xb"), ((None, None), (7.0, 0.0)))
-        self.assertEqual(farm_db.load_fill_cursor(conn), self.CURSOR)
+        self.assertEqual(farm_db.load_fill_cursors(conn), self.CURSORS)
 
-    def test_saving_no_ledger_clears_it_and_no_cursor_leaves_the_saved_one(self):
+    def test_saving_no_ledger_clears_it_and_no_cursors_leaves_the_saved_ones(self):
         conn = self.open()
         self.market(conn)
-        farm_db.save_inventory(conn, [("0xa", (50.0, 0.0), (100.0, 0.0))], self.CURSOR, NOW)
+        farm_db.save_inventory(conn, [("0xa", (50.0, 0.0), (100.0, 0.0))], self.CURSORS, NOW)
         farm_db.save_inventory(conn, [("0xa", None, (100.0, 0.0))], None, NOW)
         self.assertEqual(self.inventory(conn), ((None, None), (100.0, 0.0)))
-        self.assertEqual(farm_db.load_fill_cursor(conn), self.CURSOR)
+        self.assertEqual(farm_db.load_fill_cursors(conn), self.CURSORS)
+        farm_db.save_inventory(conn, [], {"0xb": self.CURSORS["0xb"]}, NOW)
+        self.assertEqual(farm_db.load_fill_cursors(conn), {"0xb": self.CURSORS["0xb"]})
 
-    def test_inventory_and_cursor_save_in_one_transaction(self):
+    def test_inventory_and_cursors_save_in_one_transaction(self):
         conn = self.open()
         self.market(conn)
-        farm_db.save_inventory(conn, [("0xa", (50.0, 0.0), (100.0, 0.0))], self.CURSOR, NOW)
-        moved = farm_db.FillCursor(1791157200, frozenset())
+        farm_db.save_inventory(conn, [("0xa", (50.0, 0.0), (100.0, 0.0))], self.CURSORS, NOW)
+        moved = {"0xa": farm_db.FillCursor(1791157200, frozenset())}
         full = mock.patch.object(farm_db, "_put_json", side_effect=sqlite3.OperationalError("full"))
         with full, self.assertRaises(sqlite3.OperationalError):
             farm_db.save_inventory(conn, [("0xa", (80.0, 0.0), (70.0, 0.0))], moved, NOW)
         self.assertEqual(self.inventory(conn), ((50.0, 0.0), (100.0, 0.0)))
-        self.assertEqual(farm_db.load_fill_cursor(conn), self.CURSOR)
+        self.assertEqual(farm_db.load_fill_cursors(conn), self.CURSORS)
 
     def test_farmer_rows_in_settings_are_not_farmer_config(self):
         conn = self.open()
-        farm_db.save_inventory(conn, [], self.CURSOR, NOW)
+        farm_db.save_inventory(conn, [], self.CURSORS, NOW)
         self.assertEqual(farm_db.load_settings(conn), ({}, {}))
 
     def test_an_older_file_gains_the_ledger_columns_and_keeps_its_baselines(self):
