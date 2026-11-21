@@ -217,6 +217,20 @@ class HourlyTest(Orders):
         resp = self.client.post("/orders/hourly", data={"on": "1"})
         self.assertEqual(resp.status_code, 403)
         self.assertFalse(db.hourly_snapshots(self.tools))
+        resp = self.client.post("/orders/hourly/now")
+        self.assertEqual(resp.status_code, 403)
+        self.assertIsNone(db.latest_job(self.tools, JobKind.HOURLY_SNAPSHOT))
+
+    def test_check_now_queues_one_hourly_job_and_a_second_press_adds_none(self):
+        self.assertIn('formaction="/orders/hourly/now">Check now</button>',
+                      self.client.get("/orders").text)
+        resp = self.post("/orders/hourly/now")
+        self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/orders"))
+        job = db.latest_job(self.tools, JobKind.HOURLY_SNAPSHOT)
+        self.assertEqual((job.state, job.created_at), (JobState.QUEUED, self.now))
+        self.assertEqual(self.post("/orders/hourly/now").status_code, 303)
+        self.assertEqual(self.tools.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 1)
+        self.assertFalse(db.hourly_snapshots(self.tools), "checking does not turn them on")
 
     def test_the_panel_shows_the_latest_hourly_job_and_what_it_logged(self):
         job = db.enqueue_job(self.tools, JobKind.HOURLY_SNAPSHOT, {}, self.now)
@@ -529,7 +543,7 @@ class NotConfiguredTest(Console):
         self.assertNotIn("Not running", self.client.get("/").text)
 
     def test_nothing_can_be_queued_or_read(self):
-        for url in ("/orders/snapshot", "/orders/hourly"):
+        for url in ("/orders/snapshot", "/orders/hourly", "/orders/hourly/now"):
             with self.subTest(url=url):
                 resp = self.client.post(url, data={"console_token": self.app.state.token,
                                                    "on": "1"})

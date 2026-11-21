@@ -160,6 +160,16 @@ def routes(ctx):
             tools_db.set_hourly_snapshots(conn, on, ctx.clock())
         return see_other("/orders")
 
+    @router.post("/orders/hourly/now")
+    async def check_hourly_now(request: Request):
+        await form_of(request)
+        with closing(ctx.connect_tools()) as conn:
+            try:
+                tools_db.enqueue_job(conn, JobKind.HOURLY_SNAPSHOT, {}, ctx.clock())
+            except tools_db.JobOpen:
+                pass  # the check asked for is already queued or running
+        return see_other("/orders")
+
     @router.get("/orders/snapshots/{snapshot_id}", response_class=HTMLResponse)
     def snapshot_page(request: Request, snapshot_id: int):
         with closing(ctx.connect_tools()) as conn:
