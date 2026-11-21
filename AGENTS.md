@@ -11,8 +11,10 @@ A reward farmer, screener, console and order tools for one Polymarket account.
   master password, so give the user the command to run.
 - Open the databases in `data/` read-only. Tests and browser checks use a
   scratch database and a port other than 8787.
-- Orders outside the farmer's approved markets are the user's manual orders.
-  Leave them out of farmer findings.
+- An order is the farmer's when its id is in farm.db `farmer_orders` or it
+  expires at its market's `expires_at`. Every other order is the user's manual
+  order, including one on a market the farmer manages. Leave manual orders out
+  of farmer findings.
 - The farmer's bids may total more than the wallet's cash. When cash runs out,
   Polymarket cancels open orders, and that can include the user's manual
   orders. The shortfall itself is expected. The worker's hourly snapshots of
