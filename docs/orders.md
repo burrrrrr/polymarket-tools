@@ -23,7 +23,10 @@ The worker lists every open order on the account, the farmer's and your own
 alike, and stores them with their market names. With each order it stores
 whether the order's market had the status `approved` in `farm.db` at your
 click, so that a later restore leaves the farmer's orders to the farmer
-whatever the farmer manages by then. A listing that fails stores
+whatever the farmer manages by then. That record cannot tell the farmer's
+orders from yours on the same market: the farmer leaves your orders on its
+markets alone, but a restore treats every order on an approved market as the
+farmer's and skips it. A listing that fails stores
 nothing, and the job ends `failed` with the error. When Gamma cannot name the
 markets, the orders are stored without names and the page shows each market's
 condition id.
@@ -77,8 +80,8 @@ the first rule that fits decides.
 | Rule | Group on the page | Why |
 | --- | --- | --- |
 | Nothing of the order was left to fill when the snapshot was taken | **Skipped: nothing left to fill** | There is no size to place. |
-| The order's market has the status `approved` in `farm.db` at your click | **Skipped: the farmer's market** | The farmer cancels the orders on its markets that are not its own, and places its own. |
-| The order's market had the status `approved` when the snapshot was taken | **Skipped: the farmer's market** | The order was the farmer's, or the farmer would have cancelled it. A market the farmer has stopped managing since gets none of its old orders back. |
+| The order's market has the status `approved` in `farm.db` at your click | **Skipped: the farmer's market** | The farmer places its own orders there. An order you placed there by hand is skipped too: place it again by hand. |
+| The order's market had the status `approved` when the snapshot was taken | **Skipped: the farmer's market** | The order was probably the farmer's. A market the farmer has stopped managing since gets none of its old orders back. An order you placed there by hand is skipped too: place it again by hand. |
 | The snapshot has no record of that (an imported file, or a snapshot from before the record was kept), and the market has the status `retired` now | **Skipped: the farmer's market** | The farmer managed the market once, and nothing says whose order this was. An order you placed there by hand is skipped too: place it again by hand. |
 | The order expires within 2 minutes from now, or has expired | **Skipped: expired** | The CLOB refuses an order that expires within a minute. The second minute is for the job to reach the order. |
 | The same order, by its id, is still open | **Skipped: already open** | It never went missing. This holds however much more of it has filled since. |

@@ -31,6 +31,10 @@ a busy timeout, and every column has exactly one writer process:
   fav_buys        farmer. Each market's last buy tape read (exit_value),
                   in dry run too, replaced when a new read lands, so a
                   restart starts from it.
+  farmer_orders   farmer, live only. One row per open order the farmer
+                  placed: added when the CLOB accepts it or a listing first
+                  shows it, deleted when a listing no longer shows it or
+                  the farmer cancels it at a stop.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
                   config, read every cycle. Keys under the `scan.` and
@@ -167,6 +171,11 @@ CREATE TABLE IF NOT EXISTS fav_buys (
     condition_id TEXT PRIMARY KEY,
     read_at TEXT NOT NULL,
     tape TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS farmer_orders (
+    order_id TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -908,6 +917,21 @@ def save_baseline(conn, condition_id, fav, long):
             "UPDATE markets SET baseline_fav = ?, baseline_long = ? WHERE condition_id = ?",
             (fav, long, condition_id),
         )
+
+
+def farmer_orders(conn):
+    """{order_id: condition_id} of the open orders on record as the farmer's."""
+    return {row["order_id"]: row["condition_id"]
+            for row in conn.execute("SELECT order_id, condition_id FROM farmer_orders")}
+
+
+def record_farmer_orders(conn, placed=(), gone=()):
+    """Add placed, (order_id, condition_id) pairs, and delete the ids in gone,
+    in one transaction. Running it again changes nothing."""
+    with conn:
+        conn.executemany("INSERT OR IGNORE INTO farmer_orders VALUES (?, ?)", placed)
+        conn.executemany("DELETE FROM farmer_orders WHERE order_id = ?",
+                         [(order_id,) for order_id in gone])
 
 
 class EventKind(Enum):

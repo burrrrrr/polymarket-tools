@@ -157,7 +157,7 @@ Each market is in one of seven states:
   through the wait. If the returned bids leave the sole bid outside the
   band, there is nothing to hold and the market quotes as usual at once. A
   restart does not carry the wait over.
-- `PAUSED`: you set `paused = 1` on the market. All orders come down. When
+- `PAUSED`: you set `paused = 1` on the market. The farmer's orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
 - `UNREWARDED`: the total reward listing pays the market under $1 a day, or
@@ -170,7 +170,7 @@ Each market is in one of seven states:
 - `RETIRED`: the market closed or stopped accepting orders, you no longer
   approve it, it reached its end date minus `--expiry-buffer-days`, or Gamma
   shows it is already decided (its event closed or a resolution was
-  proposed; checked once a minute). All orders are cancelled. In live mode the
+  proposed; checked once a minute). The farmer's orders are cancelled. In live mode the
   database row becomes `retired` with a note. A row you rejected keeps its
   `rejected` status. Retirement wins over a pause. If you approve a retired
   market again after the farmer has seen it unapproved, the farmer manages it
@@ -308,8 +308,9 @@ if no farmer was running when it was sent.
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
   logged once per rejection.
-- In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels every
-  order on the managed markets before the farmer exits. A normal `--once`
+- In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels the
+  farmer's orders on the managed markets before the farmer exits. Your own
+  orders there keep resting. A normal `--once`
   exit leaves the orders resting. So do Ctrl+C and SIGTERM under
   `--keep-orders`, and a `stop` command that asks to keep the orders. Orders
   left that way rest unmanaged until the farmer starts again: no cooldowns,
@@ -343,10 +344,21 @@ farm inventory's cost, for the `FAV_ASK` exit floor and the capital and budget
 caps. When your earlier shares cost more or less than the farm's fills, the
 exit floor is off by that difference.
 
-In live mode the farmer adopts the open orders on the markets it manages. It
-keeps the ones that match a slot target and cancels the rest, including
-orders you placed there by hand. It never reads or touches orders on markets
-it does not manage.
+In live mode the farmer manages only the orders it placed. An open order on
+a managed market's tokens is the farmer's when its id is in the
+`farmer_orders` table of `farm.db`, or when it expires at the second the
+farmer signs that market's orders with: the end date (or its
+`end_date_override`) minus `--expiry-buffer-days`. The farmer saves the id of
+each order the CLOB accepts, and of each order it first recognises by that
+expiration, so an order stays its own after the market's end date or the
+buffer changes. It deletes the ids that are no longer listed as open.
+
+It keeps its orders that match a slot target and cancels the rest. Every
+other order on the market, such as one you placed there by hand, is yours.
+The farmer never cancels or plans around it, but it still takes your
+orders out of the favorite book before it prices, as it does its own. An
+open order the farmer cannot read (no price or no id) is not cancelled at a
+stop. It never reads or touches orders on markets it does not manage.
 
 ## Key options
 

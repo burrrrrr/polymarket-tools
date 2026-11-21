@@ -41,6 +41,7 @@ from farm.reward_farmer import (
     naked_allowed,
     next_backoff,
     order_score,
+    placed_by_farmer,
     quotes_at,
     ratchet_baseline,
     reconcile,
@@ -2119,6 +2120,18 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(stripped.bids, [(0.985, 1000.0)])
         self.assertEqual(stripped.asks, [(0.995, 1000.0)])
 
+    def test_a_farmers_order_has_an_id_on_record_or_the_markets_expiration(self):
+        fm = market()
+        second = int(fm.expires_at.timestamp())
+        saved = {"kept": "0xc0nd"}
+        self.assertTrue(placed_by_farmer({"id": "kept", "expiration": str(second + 86400)},
+                                         fm, saved))
+        self.assertTrue(placed_by_farmer({"id": "new", "expiration": str(second)}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "gtc", "expiration": "0"}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "bare"}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "near", "expiration": str(second - 1)},
+                                          fm, saved))
+
     def test_rewards_need_a_listed_rate_and_a_max_spread(self):
         info = MarketInfo((FAV, LONG), 0.085, 50.0, 0.001, False, True, False)
         self.assertTrue(rewards_active(info, "0xc0nd", {"0xc0nd": 2.1}))
@@ -2528,6 +2541,13 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(places, [("FAV_BID", 0.975), ("LONG_BID", 0.001)])
         market_row = farm_db.find_market(self.ui, CID)
         self.assertEqual((market_row["status"], market_row["baseline_fav"]), ("approved", None))
+
+    def test_a_dry_run_records_no_order_ids(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        farmer.cycle()
+        self.assertTrue(any(m.sim_orders for m in farmer.markets.values()))
+        self.assertEqual(farm_db.farmer_orders(self.ui), {})
 
     def test_a_cycle_with_no_changes_adds_no_events(self):
         farmer = self.started_farmer()
@@ -3588,9 +3608,21 @@ class LiveFarmerTest(FarmerHarness):
                 "id": order_id, "market": self.market_of[order.token_id],
                 "asset_id": order.token_id, "side": order.side, "price": str(order.price),
                 "original_size": str(order.size), "size_matched": "0",
+                "expiration": str(order.expiration),
             }
             responses.append({"success": True, "orderID": order_id, "errorMsg": ""})
         return responses
+
+    def rest_manual(self, order_id, token_id, side, price, size):
+        """The user's own good-till-cancelled order resting on the account."""
+        self.resting[order_id] = {
+            "id": order_id, "market": self.market_of.get(token_id, "0xunmanaged"),
+            "asset_id": token_id, "side": side, "price": str(price),
+            "original_size": str(size), "size_matched": "0", "expiration": "0",
+        }
+
+    def recorded(self):
+        return set(farm_db.farmer_orders(self.ui))
 
     def get_open_orders(self):
         return list(self.resting.values())
@@ -3755,6 +3787,105 @@ class LiveFarmerTest(FarmerHarness):
         farmer.cycle()
         self.assertEqual(self.posted_tokens(), [[FAV2]])
         self.client.cancel_orders.assert_not_called()
+        self.assertNotIn(gone, self.recorded())
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_a_manual_order_on_a_managed_token_survives_the_cycle_and_a_pause(self):
+        self.rest_manual("manual", FAV, "BUY", 0.985, 20.0)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+        self.client.cancel_orders.assert_not_called()
+        self.assertFalse(any(o.id == "manual" for m in farmer.markets.values() for o in m.orders))
+        farmer_ids = set(self.resting) - {"manual"}
+        for cid in (CID, CID2):
+            farm_db.set_paused(self.ui, cid, True)
+        farmer.cycle()
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["manual"])
+
+    def priced_book(self, book):
+        """farm_state's book_mid and FAV bid levels after one live cycle on book."""
+        self.book = book
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.shutdown("test", cancel=True)
+        row, _ = self.farm_state()
+        return row["book_mid"], json.loads(row["book"])["bids"]
+
+    def test_a_manual_order_is_still_taken_out_of_the_priced_book(self):
+        without_mid, _ = self.priced_book(FLOOR_BOOK)
+        self.rest_manual("manual", FAV, "BUY", 0.99, 200.0)
+        with_mid, bids = self.priced_book(FLOOR_BOOK._replace(bids=[(0.99, 200.0), (0.985, 1000.0)]))
+        self.assertEqual(with_mid, without_mid)
+        self.assertEqual(next(b["ours"] for b in bids if b["price"] == 0.99), 200.0)
+        self.assertIn("manual", self.resting)
+
+    def test_a_restart_holds_orders_whose_ids_were_never_saved(self):
+        first = self.started_farmer(client=self.client)
+        first.cycle()
+        kept = dict(self.resting)
+        first.shutdown("test", cancel=False)
+        with self.ui:
+            self.ui.execute("DELETE FROM farmer_orders")
+        self.client.reset_mock()
+
+        self.started_farmer(client=self.client).cycle()
+        self.client.cancel_orders.assert_not_called()
+        self.client.post_orders.assert_not_called()
+        self.assertEqual(self.resting, kept)
+        self.assertEqual(self.recorded(), set(kept))
+
+    def test_an_order_whose_post_raised_is_held_at_the_next_cycle(self):
+        def rests_then_raises(batch, post_only):
+            self.client.post_orders.side_effect = self.post_orders
+            self.post_orders(batch, post_only)
+            raise httpx.ReadTimeout("timed out")
+
+        self.client.post_orders.side_effect = rests_then_raises
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.assertEqual(self.recorded(), set())
+        farmer.cycle()
+        self.assertEqual(self.client.post_orders.call_count, 1)
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual(len(self.resting), 4)
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_orders_stay_the_farmers_when_the_markets_expiry_moves(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        with self.ui:
+            self.ui.execute("UPDATE markets SET end_date_override = ? WHERE condition_id = ?",
+                            (farm_db.stamp(self.end_date(30)), CID))
+        farmer.cycle()
+        on_cid = [(e["asset_id"], e["side"]) for e in self.resting.values()
+                  if e["market"] == CID]
+        self.assertEqual(sorted(on_cid), sorted(set(on_cid)))
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual(self.client.post_orders.call_count, 1)
+
+    def test_order_ids_are_on_record_before_the_flush(self):
+        farmer = self.started_farmer(client=self.client)
+        with mock.patch.object(farm_db, "publish", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertRaises(sqlite3.OperationalError):
+            farmer.cycle()
+        self.assertEqual(len(self.resting), 4)
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_rejected_and_unnamed_posts_are_not_recorded(self):
+        def answers(batch, post_only):
+            responses = self.post_orders(batch, post_only)
+            rejected = responses[0]["orderID"]
+            del self.resting[rejected]
+            return [{"success": False, "orderID": rejected, "errorMsg": "not enough balance"},
+                    {"success": True}, *responses[2:]]
+
+        self.client.post_orders.side_effect = answers
+        self.started_farmer(client=self.client).cycle()
+        self.assertEqual(self.recorded(), set(list(self.resting)[1:]))
 
     def stopped_after_a_cycle(self):
         farmer = self.started_farmer(client=self.client)
@@ -3762,15 +3893,17 @@ class LiveFarmerTest(FarmerHarness):
         self.client.reset_mock()
         return farmer
 
-    def test_stopping_lists_once_and_cancels_only_the_managed_markets_orders(self):
+    def test_stopping_lists_once_and_cancels_only_the_farmers_orders(self):
         farmer = self.stopped_after_a_cycle()
-        managed_ids = set(self.resting)
+        farmer_ids = set(self.resting)
         self.resting["foreign"] = {"id": "foreign", "market": "0xunmanaged", "asset_id": "x"}
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
         farmer.shutdown("test", cancel=True)
         self.client.get_open_orders.assert_called_once_with()
         self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
-                         [managed_ids])
-        self.assertEqual(list(self.resting), ["foreign"])
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["foreign", "manual"])
+        self.assertEqual(self.recorded(), set())
         self.client.cancel_market_orders.assert_not_called()
         cancels = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "CANCEL"]
         self.assertEqual(cancels, [(CID, "Cancelled 2 orders on test-market"),
@@ -3798,13 +3931,43 @@ class LiveFarmerTest(FarmerHarness):
             ("ALERT", CID2, f"Warning: cancelling {stuck} on other-market failed (matched)"),
         ])
 
-    def test_a_failed_listing_on_stop_falls_back_to_a_cancel_per_market(self):
+    def test_a_failed_listing_on_stop_cancels_the_order_ids_on_record(self):
         farmer = self.stopped_after_a_cycle()
+        farmer_ids = set(self.resting)
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
         self.client.get_open_orders.side_effect = httpx.ConnectError("down")
         farmer.shutdown("test", cancel=True)
-        self.client.cancel_orders.assert_not_called()
-        self.assertEqual([c.args[0].market for c in self.client.cancel_market_orders.call_args_list],
-                         [CID, CID2])
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["manual"])
+        self.client.cancel_market_orders.assert_not_called()
+        cancels = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "CANCEL"]
+        self.assertEqual(cancels, [(CID, "Cancelled 2 orders on test-market"),
+                                   (CID2, "Cancelled 2 orders on other-market")])
+
+    def test_a_failed_cancel_on_stop_is_retried_market_by_market_then_alerted(self):
+        farmer = self.stopped_after_a_cycle()
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
+        on_cid2 = {i for i, e in self.resting.items() if e["market"] == CID2}
+
+        def cancel_orders(order_ids):
+            if len(order_ids) > 2 or set(order_ids) == on_cid2:
+                raise httpx.ConnectError("down")
+            return self.cancel_orders(order_ids)
+
+        self.client.cancel_orders.side_effect = cancel_orders
+        farmer.shutdown("test", cancel=True)
+        self.assertEqual(len(self.client.cancel_orders.call_args_list), 3)
+        self.assertEqual(set(self.resting), on_cid2 | {"manual"})
+        self.assertEqual(self.recorded(), on_cid2)
+        self.client.cancel_market_orders.assert_not_called()
+        flagged = [(e["kind"], e["condition_id"], e["message"]) for e in self.events()
+                   if e["kind"] in ("CANCEL", "ALERT")]
+        self.assertEqual(flagged, [
+            ("ALERT", CID2, "Warning: cancelling 2 orders on other-market failed (down); "
+                            "they rest until they expire"),
+            ("CANCEL", CID, "Cancelled 2 orders on test-market"),
+        ])
 
     def market_info_fetches(self):
         return sorted(c.args[0] for c in self.client.get_clob_market_info.call_args_list)

@@ -567,6 +567,15 @@ class PublishTest(ScratchDb):
         self.assertEqual(messages(), ["3"])
 
 
+class FarmerOrdersTest(ScratchDb):
+    def test_recording_farmer_orders_adds_drops_and_repeats_safely(self):
+        conn = self.open()
+        farm_db.record_farmer_orders(conn, placed=[("o1", "0xa"), ("o2", "0xa"), ("o3", "0xb")])
+        farm_db.record_farmer_orders(conn, placed=[("o4", "0xb"), ("o1", "0xa")], gone=["o2"])
+        farm_db.record_farmer_orders(conn, placed=[("o4", "0xb")], gone=["o2", "o9"])
+        self.assertEqual(farm_db.farmer_orders(conn), {"o1": "0xa", "o3": "0xb", "o4": "0xb"})
+
+
 class BuysTest(ScratchDb):
     TAPE = {"v": 1, "read_at": NOW.isoformat(), "first_at": NOW.timestamp() - 86400,
             "sweeps": [[NOW.timestamp() - 60, [[0.97, 25.0], [0.965, 300.0]]]]}

@@ -132,10 +132,21 @@ markets (retirement, baselines). Each quoting market's favorite book goes to
 farm_books.db beside farm.db every five minutes, on a thread of its own (see
 farm/farm_books.py).
 
-Stopping cancels the live orders on the managed markets, whether by a stop
-command, Ctrl+C, SIGTERM, or a crash; only a finished --once run leaves them
-resting. A stop command asking to keep orders, or Ctrl+C and SIGTERM under
---keep-orders, leaves them resting too. Until the next start they are
+The farmer acts only on the orders it placed. A listed order on a managed
+market's tokens is the farmer's when its id is in farm.db's farmer_orders or
+it expires at the second the farmer signs that market's orders with
+(expires_at); every other order there is the user's own. The user's orders
+are still taken out of the favorite book before it is priced, as the
+farmer's are, and counted in the published book's `ours`, but the farmer
+never plans around or cancels them.
+Each accepted post saves its id, and each listing saves the id of an order
+it recognised by expiration alone and deletes the ids it no longer shows,
+so an order stays the farmer's after its market's expires_at moves.
+
+Stopping cancels the farmer's live orders on the managed markets, whether by
+a stop command, Ctrl+C, SIGTERM, or a crash; only a finished --once run
+leaves them resting. A stop command asking to keep orders, or Ctrl+C and
+SIGTERM under --keep-orders, leaves them resting too. Until the next start they are
 unmanaged: no cooldowns, retirement, or fill handling. The next start adopts
 the ones still close to target and replaces the rest; a market no longer
 approved by then is not managed, and its orders rest until they expire.
@@ -223,7 +234,6 @@ from py_clob_client_v2.clob_types import (
     AssetType,
     BalanceAllowanceParams,
     OrderArgsV2,
-    OrderMarketCancelParams,
     OrderType,
     PartialCreateOrderOptions,
     PostOrdersV2Args,
@@ -518,6 +528,16 @@ class LiveOrder(NamedTuple):
     side: str
     price: float
     size_remaining: float
+
+
+class Listed(NamedTuple):
+    """One market's open orders on the account: the farmer's and the user's."""
+    farmer: list
+    manual: list
+
+    @property
+    def account(self):
+        return self.farmer + self.manual
 
 
 NOTHING_RESTING = MappingProxyType({})
@@ -1598,7 +1618,8 @@ def in_fav_book(order, fm):
 
 
 def strip_own(levels, orders, fm):
-    """The favorite book without our resting orders."""
+    """The favorite book without the account's resting orders, the farmer's
+    and the user's own."""
     bids, asks = [], []
     for o in orders:
         is_bid, price = in_fav_book(o, fm)
@@ -1835,6 +1856,16 @@ def parse_open_order(entry, fm):
         price=price,
         size_remaining=round(remaining, 2),
     )
+
+
+def gtd_expiration(fm):
+    return int(fm.expires_at.timestamp())
+
+
+def placed_by_farmer(entry, fm, saved):
+    """Whether a listed order on fm's tokens is the farmer's: its id is on
+    record, or it expires at the second the farmer signs fm's orders with."""
+    return entry.get("id") in saved or as_float(entry.get("expiration")) == gtd_expiration(fm)
 
 
 # ---------------------------------------------------------------------------
@@ -2088,6 +2119,7 @@ class Plan(NamedTuple):
     preview: Optional[Target]
     orders: list
     actions: list
+    account: list
 
 
 class Farmer:
@@ -2473,17 +2505,47 @@ class Farmer:
                 for token_id in (m.fm.fav_token_id, m.fm.long_token_id)}
 
     def open_orders(self):
-        """{condition_id: [LiveOrder]} for every managed market; one listing live."""
+        """{condition_id: Listed} for every managed market. Live: one listing,
+        which also brings farmer_orders up to date with what it showed."""
         if not self.live:
-            return {cid: list(m.sim_orders) for cid, m in self.markets.items()}
-        orders = {cid: [] for cid in self.markets}
+            return {cid: Listed(list(m.sim_orders), []) for cid, m in self.markets.items()}
+        try:
+            saved = farm_db.farmer_orders(self.db)
+        except sqlite3.Error as e:
+            log(f"Warning: the farmer's order ids are unavailable ({e}); "
+                f"telling its orders by expiration alone")
+            saved = None
+        entries = self.client.get_open_orders()
+        listed = {cid: Listed([], []) for cid in self.markets}
         market_of = self.market_of_token()
-        for entry in self.client.get_open_orders():
+        adopted = []
+        for entry in entries:
             cid = market_of.get(str(entry.get("asset_id") or ""))
-            order = parse_open_order(entry, self.markets[cid].fm) if cid else None
-            if order is not None:
-                orders[cid].append(order)
-        return orders
+            if cid is None:
+                continue
+            fm = self.markets[cid].fm
+            order = parse_open_order(entry, fm)
+            if order is None:
+                continue
+            if placed_by_farmer(entry, fm, saved or {}):
+                listed[cid].farmer.append(order)
+                if saved is not None and order.id not in saved:
+                    adopted.append((order.id, cid))
+            else:
+                listed[cid].manual.append(order)
+        if saved is not None:
+            if adopted:
+                log(f"Recognised {len(adopted)} orders by expiration; ids saved")
+            self.record_orders(placed=adopted,
+                               gone=saved.keys() - {e.get("id") for e in entries})
+        return listed
+
+    def record_orders(self, placed=(), gone=()):
+        """Write to farmer_orders; a failed write warns and never fails the cycle."""
+        try:
+            farm_db.record_farmer_orders(self.db, placed, gone)
+        except sqlite3.Error as e:
+            log(f"Warning: recording the farmer's order ids failed ({e})")
 
     def cycle(self):
         now = self.last_cycle_at = datetime.now(timezone.utc)
@@ -2508,7 +2570,7 @@ class Farmer:
                 log(f"Warning: pruning farm.db failed ({e}); retrying next cycle")
 
         try:
-            orders = self.open_orders()
+            listed = self.open_orders()
         except Exception as e:
             # Planning on no orders would duplicate the ones actually resting.
             log(f"Warning: open orders unavailable ({e}); planning no market")
@@ -2520,7 +2582,7 @@ class Farmer:
         for managed in active:
             try:
                 plan = self.step_market(managed, books.get(managed.fm.fav_token_id),
-                                        orders[managed.fm.condition_id], now)
+                                        listed[managed.fm.condition_id], now)
             except Exception as e:
                 log(f"Error on {managed.fm.label}: {e}")
                 continue
@@ -2538,7 +2600,7 @@ class Farmer:
                 log(f"Error on {plan.managed.fm.label}: {e}")
         self.flush()
 
-    def step_market(self, managed, levels, orders, now):
+    def step_market(self, managed, levels, listed, now):
         """Advance the lifecycle and plan the orders; None when there is no plan."""
         fm = managed.fm
         if levels is None:
@@ -2550,8 +2612,8 @@ class Farmer:
         if levels.tick:
             fm = managed.fm = fm._replace(tick=levels.tick)
 
-        managed.orders = orders
-        book = strip_own(levels, orders, fm) if self.live else levels
+        orders = managed.orders = listed.farmer
+        book = strip_own(levels, listed.account, fm) if self.live else levels
         fm = with_book_mid(fm, book)
         book_mid = fm.book_mid
         book_ask = drop_ask(book.asks, fm.min_size)
@@ -2624,7 +2686,7 @@ class Farmer:
             now,
         )
         self.report(managed, target, orders, actions)
-        return Plan(managed, levels, book_mid, target, preview, orders, actions)
+        return Plan(managed, levels, book_mid, target, preview, orders, actions, listed.account)
 
     def settle(self, plan, placed, now):
         """Back off rejected slots, publish the market's view, and retire it if due."""
@@ -2652,12 +2714,12 @@ class Farmer:
             managed.book_sampled_at = now
             self.book_samples.append(farm_books.sample(
                 fm.condition_id, now, plan.book_mid, plan.levels.bids, plan.levels.asks,
-                [(o.slot.name, o.price, o.size_remaining) for o in plan.orders]))
+                [(o.slot.name, o.price, o.size_remaining) for o in plan.account]))
         if managed.state.phase is Phase.RETIRED:
             self.retire(managed)
 
     def market_state(self, plan, now):
-        managed, levels, book_mid, target, preview, orders, actions = plan
+        managed, levels, book_mid, target, preview, orders, actions, account = plan
         fm, state = managed.fm, managed.state
         q1, q2 = q_totals(target.intents)
         return farm_db.FarmState(
@@ -2675,7 +2737,7 @@ class Farmer:
             position=position_view(managed.held, managed.baseline, managed.position),
             slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
                              managed.position, self.cfg, self.history(fm)),
-            book=book_view(levels, orders, target.mid or book_mid, fm),
+            book=book_view(levels, account, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
             backoff={slot.name: {"until": stamp(b.until), "attempts": b.attempts}
                      for slot, b in managed.backoffs.items()},
@@ -2773,7 +2835,7 @@ class Farmer:
             fm = p.managed.fm
             self.refresh_tick(fm, {a.intent.token_id for a in p.actions if isinstance(a, Place)})
             options = PartialCreateOrderOptions(tick_size=f"{fm.tick:g}", neg_risk=fm.neg_risk)
-            expiration = int(fm.expires_at.timestamp())
+            expiration = gtd_expiration(fm)
             for a in p.actions:
                 if isinstance(a, Place):
                     i = a.intent if a.intent.side == BUY else self.sellable(fm, a.intent)
@@ -2804,6 +2866,7 @@ class Farmer:
                               f"  post of {len(fms)} orders failed on {fms[0].label}: {e}",
                               fms[0].condition_id)
                 continue
+            placed = []
             for (fm, i, _), resp in zip(chunk, responses if isinstance(responses, list) else []):
                 if not isinstance(resp, dict) or not resp.get("success") or resp.get("errorMsg"):
                     self.emit(EventKind.REJECT,
@@ -2813,6 +2876,9 @@ class Farmer:
                               data={"response": resp if isinstance(resp, dict) else str(resp)})
                 else:
                     accepted.append((fm, i))
+                    if resp.get("orderID"):
+                        placed.append((resp["orderID"], fm.condition_id))
+            self.record_orders(placed=placed)
         return accepted
 
     def sellable(self, fm, intent):
@@ -2872,42 +2938,57 @@ class Farmer:
                       data={"balance_usd": balance, "planned_usd": planned})
 
     def cancel_managed(self):
-        """Cancel every open order on a managed market: one listing, one cancel.
+        """Cancel the farmer's open orders on the managed markets: one listing,
+        one cancel.
 
         Orders left resting while the farmer is down are what stopping
-        guards against, so any failure falls back to a cancel per market.
+        guards against, so a failed listing cancels the ids on record
+        instead, and a failed cancel is tried again market by market.
         """
-        market_of = self.market_of_token()
         try:
-            entries = [e for e in self.client.get_open_orders()
-                       if str(e.get("asset_id") or "") in market_of]
-            resp = self.client.cancel_orders([e["id"] for e in entries]) if entries else None
-            failed = dict((resp or {}).get("not_canceled") or {})
+            ids = {cid: [o.id for o in listed.farmer]
+                   for cid, listed in self.open_orders().items() if listed.farmer}
+        except Exception as e:
+            log(f"Warning: open orders unavailable ({e}); cancelling the order ids on record")
+            ids = self.recorded_ids()
+        if not ids:
+            return
+        failed = {}
+        try:
+            resp = self.client.cancel_orders([i for order_ids in ids.values() for i in order_ids])
+            failed.update((resp or {}).get("not_canceled") or {})
         except Exception as e:
             log(f"Warning: bulk cancel failed ({e}); cancelling market by market")
-            self.cancel_by_market()
-            return
-        sent = {}
-        for e in entries:
-            sent.setdefault(market_of[str(e["asset_id"])], []).append(e["id"])
-        for cid, ids in sent.items():
+            for cid, order_ids in list(ids.items()):
+                try:
+                    resp = self.client.cancel_orders(order_ids)
+                    failed.update((resp or {}).get("not_canceled") or {})
+                except Exception as e:
+                    del ids[cid]
+                    self.emit(EventKind.ALERT,
+                              f"Warning: cancelling {len(order_ids)} orders on "
+                              f"{self.markets[cid].fm.label} failed ({e}); "
+                              f"they rest until they expire", cid)
+        self.record_orders(gone=[i for order_ids in ids.values() for i in order_ids
+                                 if i not in failed])
+        for cid, order_ids in ids.items():
             label = self.markets[cid].fm.label
-            n = sum(order_id not in failed for order_id in ids)
+            n = sum(order_id not in failed for order_id in order_ids)
             self.emit(EventKind.CANCEL, f"Cancelled {n} orders on {label}", cid)
-            for order_id in ids:
+            for order_id in order_ids:
                 if order_id in failed:
                     self.emit(EventKind.ALERT,
                               f"Warning: cancelling {order_id} on {label} failed "
                               f"({failed[order_id]})", cid, data={"order_id": order_id})
 
-    def cancel_by_market(self):
-        for cid, managed in self.markets.items():
-            try:
-                self.client.cancel_market_orders(OrderMarketCancelParams(market=cid))
-                self.emit(EventKind.CANCEL, f"Cancelled all orders on {managed.fm.label}", cid)
-            except Exception as e:
-                self.emit(EventKind.ALERT,
-                          f"Warning: cancelling orders on {managed.fm.label} failed ({e})", cid)
+    def recorded_ids(self):
+        try:
+            recorded = farm_db.farmer_orders(self.db)
+        except sqlite3.Error as e:
+            log(f"Warning: the farmer's order ids are unavailable ({e}); cancelling none")
+            return {}
+        return {cid: ids for cid in self.markets
+                if (ids := [i for i, on in recorded.items() if on == cid])}
 
 
 def heartbeat(client, stop):
