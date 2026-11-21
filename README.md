@@ -179,11 +179,12 @@ the `py_clob_client_v2.config` module.
 
 ### Where the wallet key comes from
 
-Three programs read the key: a farmer started with `--live`, the worker
-unless you start it with `--no-key`, and `analysis/scoring_probe.py`. A
-dry-run farmer, the screener, and the console read no key.
+Four programs read the key: a farmer started with `--live`, the worker
+unless you start it with `--no-key`, `analysis/scoring_probe.py`, and
+`analysis/trades_dump.py`. A dry-run farmer, the screener, and the console
+read no key.
 
-Each of the three reads `POLYMARKET_PRIVATE_KEY` when it is set. Otherwise it
+Each of the four reads `POLYMARKET_PRIVATE_KEY` when it is set. Otherwise it
 reads the note of a Bitwarden item. `POLYMARKET_KEY_SOURCE=env` or
 `POLYMARKET_KEY_SOURCE=bitwarden` reads that source alone.
 
@@ -338,6 +339,14 @@ dry-run watches. Use it to rehearse a watch with no key in the process.
 `python -m analysis.scoring_probe` measures how long an order rests before
 Polymarket counts it for rewards. It reads the live key, lists your open
 orders, and places and cancels nothing. Its module docstring has the details.
+
+### Trades dump
+
+`python -m analysis.trades_dump` prints how the CLOB lists your account's
+trades, beside the fills the farmer reads from them. It reads the live key
+and places and cancels nothing.
+[Check the trade layout](docs/farmer.md#check-the-trade-layout) says when to
+run it and what to look for.
 
 ## Safety
 

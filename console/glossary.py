@@ -162,11 +162,16 @@ GLOSSARY = {
                                            "lost, this is what you'd lose. A bid sized without "
                                            "the naked budget does not count against it."),
     "capital_in_bids": Term("Capital in bids", "USD locked in resting favorite bids."),
-    "farm_inventory": Term("Farm inventory", "Shares the farmer bought through fills, above "
-                                             "the baseline. Only these are offered back for "
-                                             "sale."),
-    "baseline": Term("Baseline", "Shares you already held when the farmer started managing "
-                                 "this market. The farmer never sells them."),
+    "farm_inventory": Term("Farm inventory", "In live mode, the shares the farmer's own "
+                                             "orders bought and have not sold. Only these "
+                                             "are offered back for sale. In a dry run a "
+                                             "share you buy by hand still counts as farm "
+                                             "inventory."),
+    "baseline": Term("Baseline", "In live mode, your own shares of this market: the ones you "
+                                 "held when the farmer started managing it, and the ones you "
+                                 "bought by hand since. The farmer never sells them. In a "
+                                 "dry run a share you buy by hand still counts as farm "
+                                 "inventory, not as baseline."),
     "rate_now": Term("Rate now", "Polymarket's live scoring share of each quoting market's "
                                  "pool. In dry run, or before the first share arrives, the "
                                  "farmer's modeled share stands in; it runs low. Only "
