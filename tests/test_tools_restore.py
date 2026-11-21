@@ -35,8 +35,8 @@ def actions(lines):
 
 
 class PlanTests(unittest.TestCase):
-    def plan(self, snapshot, live=(), managed=(), now=NOW):
-        return restore.plan(stored(*snapshot), list(live), set(managed), now)
+    def plan(self, snapshot, live=(), farmer_ids=(), now=NOW):
+        return restore.plan(stored(*snapshot), list(live), set(farmer_ids), now)
 
     def test_an_order_that_is_gone_is_placed_whole(self):
         (line,) = self.plan([order(size=100.0)])
@@ -46,7 +46,7 @@ class PlanTests(unittest.TestCase):
         snapshot = stored(
             order("0xa"), order("0xb", MARKET_B), order("0xc", expiration=NOW - timedelta(days=1)),
             order("0xd", size=50.0, matched=50.0), order("0xe"), order("0xf", MARKET_C))
-        lines = restore.plan(snapshot, [order("0xlive")], {MARKET_B}, NOW)
+        lines = restore.plan(snapshot, [order("0xlive")], {"0xb"}, NOW)
         self.assertEqual([line.order for line in lines], snapshot)
         self.assertEqual(actions(lines), [LIVE, FARMER, EXPIRED, FILLED, WOULD, WOULD])
         self.assertEqual(restore.plan([], [order()], set(), NOW), [])
@@ -84,27 +84,31 @@ class PlanTests(unittest.TestCase):
         (line,) = self.plan([order(expiration=None)], now=NOW + timedelta(days=4000))
         self.assertEqual(line.action, WOULD)
 
-    def test_an_order_on_a_market_the_farmer_manages_is_skipped(self):
-        lines = self.plan([order("0xa", MARKET_A), order("0xb", MARKET_B)], managed={MARKET_B})
-        self.assertEqual(actions(lines), [WOULD, FARMER])
+    def test_an_order_of_the_operators_on_a_market_the_farmer_manages_is_placed(self):
+        mine = db.SnapshotOrder(1, 1, None, order("0xmine", MARKET_A), False)
+        farmers_now = db.SnapshotOrder(2, 1, None, order("0xfarmer", MARKET_A), False)
+        lines = restore.plan([mine, farmers_now], [], {"0xfarmer"}, NOW,
+                             farmer_markets={MARKET_A})
+        self.assertEqual(actions(lines), [WOULD, FARMER],
+                         "an order of the operator's was skipped for its market")
+        self.assertEqual(lines[1].reason, "the farmer's order")
 
-    def test_an_order_the_snapshot_records_as_on_a_farmer_market_is_skipped_whatever_is_managed_now(
-            self):
+    def test_an_order_the_snapshot_records_as_the_farmers_is_skipped_whatever_is_open_now(self):
         farmers = db.SnapshotOrder(1, 1, None, order("0xa", MARKET_A), True)
-        mine = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_B), False)
+        mine = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_A), False)
         lines = restore.plan([farmers, mine], [], set(), NOW)
         self.assertEqual(actions(lines), [FARMER, WOULD])
         self.assertIn("when the snapshot was taken", lines[0].reason)
 
-    def test_an_unrecorded_order_on_a_market_the_farmer_has_retired_is_skipped(self):
+    def test_an_unrecorded_order_on_a_market_the_farmer_manages_or_managed_is_skipped(self):
         unrecorded = db.SnapshotOrder(1, 1, None, order("0xa", MARKET_A))
-        placed_since = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_A), False)
+        recorded_mine = db.SnapshotOrder(2, 1, None, order("0xb", MARKET_A), False)
         elsewhere = db.SnapshotOrder(3, 1, None, order("0xc", MARKET_B))
-        lines = restore.plan([unrecorded, placed_since, elsewhere], [], set(), NOW,
-                             retired_markets={MARKET_A})
+        lines = restore.plan([unrecorded, recorded_mine, elsewhere], [], set(), NOW,
+                             farmer_markets={MARKET_A})
         self.assertEqual(actions(lines), [FARMER, WOULD, WOULD],
-                         "only an order with no record is judged by the market's retirement")
-        self.assertIn("retired", lines[0].reason)
+                         "only an order with no record is judged by its market")
+        self.assertIn("does not record", lines[0].reason)
 
     def test_an_order_with_an_open_copy_is_skipped(self):
         (line,) = self.plan([order("0xold")], live=[order("0xnew")])
@@ -147,7 +151,7 @@ class PlanTests(unittest.TestCase):
             [order("0xa"), order("0xb", MARKET_B), order("0xc", expiration=NOW),
              order("0xd", MARKET_C, expiration=NOW + timedelta(seconds=30)),
              order("0xe", MARKET_C, size=5.0, matched=5.0)],
-            live=[order("0xlive")], managed={MARKET_B})
+            live=[order("0xlive")], farmer_ids={"0xb"})
         self.assertEqual(actions(lines), [LIVE, FARMER, EXPIRED, EXPIRED, FILLED])
         for line in lines:
             self.assertTrue(line.reason, line.action)
@@ -210,10 +214,12 @@ class Scratch(unittest.TestCase):
         self.now = NOW
         self.stop = threading.Event()
 
-    def job(self, kind, orders, managed=(), queued_at=NOW, retired=()):
-        snapshot = db.insert_snapshot(self.db, NOW - timedelta(days=1), "", orders, {})
-        db.enqueue_job(self.db, kind, {"snapshot_id": snapshot, "managed_markets": list(managed),
-                                       "retired_markets": list(retired)}, queued_at)
+    def job(self, kind, orders, farmer_ids=(), queued_at=NOW, farmer_markets=(), recorded=None):
+        snapshot = db.insert_snapshot(self.db, NOW - timedelta(days=1), "", orders, {},
+                                      farmer_ids=recorded)
+        db.enqueue_job(self.db, kind, {"snapshot_id": snapshot,
+                                       "farmer_order_ids": list(farmer_ids),
+                                       "farmer_markets": list(farmer_markets)}, queued_at)
         return db.claim_job(self.db, queued_at)
 
     def place(self, venue, orders, **job):
@@ -276,10 +282,19 @@ class PlaceTests(Scratch):
         venue = Venue(listing=[order("0xlive")])
         self.place(venue, [order("0xa"), order("0xb", expiration=NOW - timedelta(days=1)),
                            order("0xc", MARKET_B), order("0xd", size=9.0, matched=9.0)],
-                   managed=[MARKET_B])
+                   farmer_ids=["0xc"])
         self.assertEqual(self.results(), [(LIVE, 100.0, None), (EXPIRED, 100.0, None),
                                           (FARMER, 100.0, None), (FILLED, 0.0, None)])
         self.assertEqual((venue.signed, venue.posts), ([], []))
+
+    def test_a_missing_order_of_the_operators_on_a_farmer_market_is_placed(self):
+        venue = Venue()
+        self.place(venue, [order("0xmine", MARKET_A), order("0xfarmer", MARKET_A, price=0.97),
+                           order("0xthen", MARKET_A, price=0.96)],
+                   farmer_ids=["0xfarmer"], farmer_markets=[MARKET_A], recorded={"0xthen"})
+        self.assertEqual(self.results(), [(PLACED, 100.0, "0xnew1"), (FARMER, 100.0, None),
+                                          (FARMER, 100.0, None)])
+        self.assertEqual([post[2] for post in venue.posts], [0.98])
 
     def test_two_identical_orders_with_one_open_copy_place_one(self):
         venue = Venue(listing=[order("0xlive")])
@@ -384,8 +399,8 @@ class PlaceTests(Scratch):
         job = self.job(JobKind.RESTORE, [order()])
         with self.assertRaisesRegex(ValueError, "no snapshot 99"):
             restore.place(Venue(), self.db, job._replace(params={"snapshot_id": 99,
-                                                                 "managed_markets": [],
-                                                                 "retired_markets": []}),
+                                                                 "farmer_order_ids": [],
+                                                                 "farmer_markets": []}),
                           lambda: NOW, self.stop)
 
     def test_the_summary_counts_what_became_of_the_orders(self):
@@ -393,7 +408,7 @@ class PlaceTests(Scratch):
                       answer=lambda signed: NO_FUNDS if signed.price == 0.5 else ACCEPT)
         lines = self.place(venue, [order("0xa"), order("0xb"), order("0xc", MARKET_B, price=0.5),
                                    order("0xd", MARKET_C), order("0xe", MARKET_C)],
-                           managed=[MARKET_C])
+                           farmer_ids=["0xd", "0xe"])
         self.assertEqual(restore.summary(lines), "1 placed, 1 rejected, 3 skipped")
 
 
@@ -410,7 +425,7 @@ class PreviewTests(Scratch):
         venue = Venue(listing=[order("0xlive")])
         self.preview(venue, [order("0xa"), order("0xb"), order("0xc", MARKET_B),
                              order("0xd", size=100.0, matched=40.0, price=0.5)],
-                     managed=[MARKET_B])
+                     farmer_ids=["0xc"])
         self.assertEqual(self.results(), [(LIVE, 100.0, None), (WOULD, 100.0, None),
                                           (FARMER, 100.0, None), (WOULD, 60.0, None)])
         self.assertEqual((venue.signed, venue.posts, venue.markets_read), ([], [], []))

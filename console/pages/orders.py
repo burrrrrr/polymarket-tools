@@ -33,7 +33,7 @@ LINE_HEADINGS = (
     LineHeading(RestoreAction.WOULD_PLACE, "Would place", "t-q"),
     LineHeading(RestoreAction.SKIP_LIVE, "Skipped: already open", "t-n"),
     LineHeading(RestoreAction.SKIP_EXPIRED, "Skipped: expired", "t-n"),
-    LineHeading(RestoreAction.SKIP_FARMER, "Skipped: the farmer's market", "t-n"),
+    LineHeading(RestoreAction.SKIP_FARMER, "Skipped: the farmer's order", "t-n"),
     LineHeading(RestoreAction.SKIP_FILLED, "Skipped: nothing left to fill", "t-n"),
 )
 
@@ -72,9 +72,15 @@ def restore_view(job, log, lines):
     return RestoreView(job, preview, log, groups, len(lines), to_place)
 
 
-def managed_markets(farm):
-    """The condition ids of the markets the farmer manages now, for a job's params."""
-    return sorted(farm_db.condition_ids(farm, "approved"))
+def farmer_order_ids(farm):
+    """The ids of the farmer's open orders now, for a job's params."""
+    return sorted(farm_db.farmer_orders(farm))
+
+
+def farmer_markets(farm):
+    """The condition ids of the markets the farmer manages or managed, for a
+    restore of a snapshot with no record of whose orders were the farmer's."""
+    return sorted(farm_db.condition_ids(farm, "approved") | farm_db.condition_ids(farm, "retired"))
 
 
 def placing_refusal(last):
@@ -124,8 +130,8 @@ def routes(ctx):
 
     def queue_restore_job(request, conn, snapshot, kind):
         with closing(ctx.connect()) as farm:
-            params = {"snapshot_id": snapshot.id, "managed_markets": managed_markets(farm),
-                      "retired_markets": sorted(farm_db.condition_ids(farm, "retired"))}
+            params = {"snapshot_id": snapshot.id, "farmer_order_ids": farmer_order_ids(farm),
+                      "farmer_markets": farmer_markets(farm)}
         try:
             tools_db.enqueue_job(conn, kind, params, ctx.clock())
         except tools_db.JobOpen as e:
@@ -145,7 +151,7 @@ def routes(ctx):
         if errors:
             return orders_response(request, 422, errors=errors, note=form.get("note"))
         with closing(ctx.connect()) as farm:
-            params = {"note": note, "managed_markets": managed_markets(farm)}
+            params = {"note": note, "farmer_order_ids": farmer_order_ids(farm)}
         with closing(ctx.connect_tools()) as conn:
             try:
                 tools_db.enqueue_job(conn, JobKind.SNAPSHOT, params, ctx.clock())

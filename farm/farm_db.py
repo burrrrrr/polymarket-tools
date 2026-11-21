@@ -14,7 +14,13 @@ a busy timeout, and every column has exactly one writer process:
                   Decisions (status, p_true, naked_budget_usd, note, paused,
                   naked_paused, capital_usd, sole_bid, end_date_override):
                   console or CLI.
-                  baseline_fav, baseline_long: farmer, live only.
+                  baseline_fav, baseline_long, farm_fav, farm_long: farmer,
+                  live only. farm_* is the farm ledger, the shares the
+                  farmer's own orders bought and have not sold, NULL until a
+                  trades read seeds it and again once the market retires;
+                  baseline_* is the rest of the wallet's shares. They are
+                  written together with the settings row farmer.fills
+                  (save_inventory).
                   One exception: the live farmer retires a market by moving
                   status and note from 'approved' to 'retired' in a single
                   conditional UPDATE, so it never overwrites a human decision.
@@ -31,14 +37,25 @@ a busy timeout, and every column has exactly one writer process:
   fav_buys        farmer. Each market's last buy tape read (exit_value),
                   in dry run too, replaced when a new read lands, so a
                   restart starts from it.
+  farmer_orders   farmer, live only. One row per order the farmer placed
+                  that is open or left the listing lately: added when the
+                  CLOB accepts it or a listing first shows it, deleted
+                  UNLISTED_GRACE_S after a listing stopped showing it, once
+                  farm.db holds its market's cursor, if it has one, neither
+                  behind nor waiting on a fill of it. A stop deletes none; a
+                  later run does.
   rewards_daily   farmer, live only.
   settings        console or CLI. Overrides of the farmer's command-line
-                  config, read every cycle. Keys under the `scan.` and
-                  `triage.` prefixes are not farmer config and the farmer
-                  skips them: scan.params (console) holds the last scan
-                  parameters, scan.last (screener) the last scan's funnel,
-                  triage.auto_top_n (console) how many new candidates a
-                  console scan sends to Claude.
+                  config, read every cycle. Keys under the `scan.`,
+                  `triage.` and `farmer.` prefixes are not farmer config and
+                  the farmer skips them: scan.params (console) holds the
+                  last scan parameters, scan.last (screener) the last scan's
+                  funnel, triage.auto_top_n (console) how many new
+                  candidates a console scan sends to Claude, and
+                  farmer.fills (farmer, live only) a JSON object keyed by
+                  condition id: how far each market's farm ledger has
+                  counted the account's trades (FillCursor). A market's
+                  key goes when it retires.
   commands        the console inserts rows; the farmer only stamps
                   consumed_at and result.
   decisions       console or CLI, append-only. One row each time a human
@@ -101,7 +118,9 @@ CREATE TABLE IF NOT EXISTS markets (
     naked_paused INTEGER NOT NULL DEFAULT 0,
     capital_usd REAL,
     sole_bid INTEGER NOT NULL DEFAULT 0,
-    end_date_override TEXT
+    end_date_override TEXT,
+    farm_fav REAL,
+    farm_long REAL
 );
 
 CREATE TABLE IF NOT EXISTS farm_state (
@@ -167,6 +186,11 @@ CREATE TABLE IF NOT EXISTS fav_buys (
     condition_id TEXT PRIMARY KEY,
     read_at TEXT NOT NULL,
     tape TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS farmer_orders (
+    order_id TEXT PRIMARY KEY,
+    condition_id TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -239,6 +263,8 @@ ADDED_COLUMNS = {
         ("capital_usd", "REAL"),
         ("sole_bid", "INTEGER NOT NULL DEFAULT 0"),
         ("end_date_override", "TEXT"),
+        ("farm_fav", "REAL"),
+        ("farm_long", "REAL"),
     ),
 }
 # Settings the farmer no longer has. A row left behind would be reported as
@@ -757,12 +783,14 @@ def delete_setting(conn, key):
 def load_settings(conn):
     """({key: value} of the valid rows, {key: error} of the rest).
 
-    Rows under the scan. and triage. prefixes are the console's and the
-    screener's, not farmer config, so they are neither.
+    Rows under the scan., triage. and farmer. prefixes are the console's,
+    the screener's and the farmer's own, not farmer config, so they are
+    neither.
     """
     values, errors = {}, {}
     for row in conn.execute("SELECT key, value FROM settings "
-                            "WHERE key NOT LIKE 'scan.%' AND key NOT LIKE 'triage.%'"):
+                            "WHERE key NOT LIKE 'scan.%' AND key NOT LIKE 'triage.%' "
+                            "AND key NOT LIKE 'farmer.%'"):
         try:
             values[row["key"]] = parse_setting(row["key"], row["value"])
         except ValueError as e:
@@ -902,18 +930,86 @@ def mark_retired(conn, condition_id, reason):
         )
 
 
-def save_baseline(conn, condition_id, fav, long):
+FILLS_KEY = "farmer.fills"
+
+
+class FillCursor(NamedTuple):
+    """How far one market's farm ledger has counted the account's trades."""
+
+    # Unix seconds. The ledger accounts for every fill matched before it; one
+    # still unsettled SETTLE_MAX_S after matching is taken as final.
+    after: int
+    # The (trade id, order id) of each counted fill matched at or after it.
+    counted: frozenset
+    # The id of each order with a fill the chain may still undo; the cursor
+    # waits at the oldest such fill.
+    unsettled: frozenset = frozenset()
+    # A positions read needed the market's trades and did not read them, so
+    # the next one asks whatever the holdings show.
+    behind: bool = False
+
+
+def load_fill_cursors(conn):
+    """{condition_id: FillCursor} as saved, empty before the first save."""
+    saved = _get_json(conn, FILLS_KEY)
+    return {cid: FillCursor(c["after"], frozenset(tuple(key) for key in c["counted"]),
+                            frozenset(c["unsettled"]), c["behind"])
+            for cid, c in (saved or {}).items()}
+
+
+def save_inventory(conn, rows, cursors, now):
+    """Write each (condition_id, ledger, baseline) and the cursors in one
+    transaction, so a crash never leaves a ledger and the cursor it was
+    counted up to apart. ledger and baseline are (fav, long) pairs; either
+    None clears its columns. cursors is {condition_id: FillCursor}, which
+    replaces every saved one, or None to leave them."""
     with conn:
-        conn.execute(
-            "UPDATE markets SET baseline_fav = ?, baseline_long = ? WHERE condition_id = ?",
-            (fav, long, condition_id),
+        conn.executemany(
+            "UPDATE markets SET farm_fav = ?, farm_long = ?, baseline_fav = ?, "
+            "baseline_long = ? WHERE condition_id = ?",
+            [(*(ledger or (None, None)), *(baseline or (None, None)), condition_id)
+             for condition_id, ledger, baseline in rows],
         )
+        if cursors is not None:
+            _put_json(conn, FILLS_KEY,
+                      {cid: {"after": c.after, "counted": sorted(c.counted),
+                             "unsettled": sorted(c.unsettled), "behind": c.behind}
+                       for cid, c in cursors.items()}, now)
+
+
+def farmer_orders(conn):
+    """{order_id: condition_id} of the orders on record as the farmer's: its
+    open ones, and those that left the listing lately."""
+    return {row["order_id"]: row["condition_id"]
+            for row in conn.execute("SELECT order_id, condition_id FROM farmer_orders")}
+
+
+def farmer_ids_named(conn):
+    """Every order id the file names as the farmer's: the ids in
+    farmer_orders, and the ones its FILL and CANCEL events carry. It only
+    reads, and a file from before farmer_orders gives the events' ids."""
+    ids = {row[0] for row in conn.execute(
+        "SELECT json_extract(data, '$.order_id') FROM farm_events "
+        "WHERE kind IN ('FILL', 'CANCEL')") if row[0]}
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'farmer_orders'").fetchone():
+        ids.update(farmer_orders(conn))
+    return ids
+
+
+def record_farmer_orders(conn, placed=(), gone=()):
+    """Add placed, (order_id, condition_id) pairs, and delete the ids in gone,
+    in one transaction. Running it again changes nothing."""
+    with conn:
+        conn.executemany("INSERT OR IGNORE INTO farmer_orders VALUES (?, ?)", placed)
+        conn.executemany("DELETE FROM farmer_orders WHERE order_id = ?",
+                         [(order_id,) for order_id in gone])
 
 
 class EventKind(Enum):
     PLACE = "PLACE"
     CANCEL = "CANCEL"
     FILL = "FILL"
+    MANUAL_FILL = "MANUAL_FILL"
     PHASE = "PHASE"
     ALERT = "ALERT"
     REJECT = "REJECT"

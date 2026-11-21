@@ -45,13 +45,16 @@ class TakeTests(Scratch):
              ("0xb", f"Q {cid(2)[-4:]}", Side.SELL, False),
              ("0xc", f"Q {cid(1)[-4:]}", Side.BUY, True)])
 
-    def test_a_snapshot_records_the_orders_on_the_markets_the_farmer_managed_then(self):
-        gamma = Gamma(open_ids=[cid(1), cid(2)])
-        listing = [entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]
+    def test_a_snapshot_records_which_orders_were_the_farmers_by_their_ids(self):
+        gamma = Gamma(open_ids=[cid(1)])
+        listing = [entry(id="0xmine", market=cid(1)), entry(id="0xfarmer", market=cid(1))]
         taken = snapshot.take(Clob(listing), client(gamma), self.db, NOW, "",
-                              farmer_markets={cid(2)})
-        self.assertEqual([o.farmer for o in db.read_snapshot_orders(self.db, taken.snapshot_id)],
-                         [False, True])
+                              farmer_ids={"0xfarmer"})
+        self.assertEqual([(o.order.order_id, o.farmer)
+                          for o in db.read_snapshot_orders(self.db, taken.snapshot_id)],
+                         [("0xmine", False), ("0xfarmer", True)],
+                         "an order of the operator's on the farmer's market was recorded as "
+                         "the farmer's")
 
     def test_a_failed_listing_raises_and_stores_no_snapshot(self):
         gamma = Gamma()
@@ -83,10 +86,11 @@ class TakeHourlyTests(Scratch):
         super().setUp()
         self.gamma = Gamma(open_ids=[cid(1), cid(2), cid(3)])
 
-    def hourly(self, listing, managed=frozenset({cid(2)}), now=NOW):
+    def hourly(self, listing, farmer_ids=frozenset({"0xf1", "0xf2"}), now=NOW):
         job = db.enqueue_job(self.db, JobKind.HOURLY_SNAPSHOT, {}, now)
         db.claim_job(self.db, now)
-        taken = snapshot.take_hourly(Clob(listing), client(self.gamma), self.db, now, managed, job)
+        taken = snapshot.take_hourly(Clob(listing), client(self.gamma), self.db, now, farmer_ids,
+                                     job)
         db.finish_job(self.db, job, now)
         return taken
 
@@ -94,21 +98,22 @@ class TakeHourlyTests(Scratch):
         return [(o.order.order_id, o.market_name, o.farmer)
                 for o in db.read_snapshot_orders(self.db, snapshot_id)]
 
-    def test_it_stores_only_the_orders_off_the_farmers_markets_as_not_the_farmers(self):
-        taken = self.hourly([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2)),
-                             entry(id="0xc", market=cid(3))])
+    def test_it_stores_every_order_but_the_farmers_as_not_the_farmers_on_any_market(self):
+        taken = self.hourly([entry(id="0xa", market=cid(1)), entry(id="0xf1", market=cid(2)),
+                             entry(id="0xc", market=cid(2))])
         self.assertEqual((taken.orders, taken.names_error), (2, None))
         self.assertEqual(db.read_snapshot(self.db, taken.snapshot_id).note, "hourly")
         self.assertEqual(self.stored(taken.snapshot_id), [
-            ("0xa", f"Q {cid(1)[-4:]}", False), ("0xc", f"Q {cid(3)[-4:]}", False)])
+            ("0xa", f"Q {cid(1)[-4:]}", False), ("0xc", f"Q {cid(2)[-4:]}", False)],
+            "an order of the operator's on the farmer's market was left out")
         self.assertEqual([p.get_list("condition_ids") for p in self.gamma.requests],
-                         [[cid(1), cid(3)]])
+                         [[cid(1), cid(2)]])
 
     def test_the_same_orders_an_hour_later_store_nothing_and_ask_gamma_nothing(self):
-        listing = [entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]
+        listing = [entry(id="0xa", market=cid(1)), entry(id="0xf1", market=cid(2))]
         first = self.hourly(listing)
         asked, before = len(self.gamma.requests), self.rows()
-        again = self.hourly(list(reversed(listing)) + [entry(id="0xc", market=cid(2))],
+        again = self.hourly(list(reversed(listing)) + [entry(id="0xf2", market=cid(2))],
                             now=NOW + timedelta(hours=1))
         self.assertEqual(again, snapshot.Unchanged(first.snapshot_id))
         self.assertEqual((self.rows(), len(self.gamma.requests)), (before, asked))
@@ -132,7 +137,7 @@ class TakeHourlyTests(Scratch):
         self.assertEqual(self.hourly(listing), snapshot.Unchanged(hourly.snapshot_id))
 
     def test_the_first_hourly_snapshot_is_stored_even_with_no_orders(self):
-        taken = self.hourly([entry(market=cid(2))])
+        taken = self.hourly([entry(id="0xf1", market=cid(2))])
         self.assertEqual(db.read_snapshot(self.db, taken.snapshot_id).orders, 0)
 
 

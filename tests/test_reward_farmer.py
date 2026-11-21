@@ -12,12 +12,18 @@ from unittest import mock
 import httpx
 
 from farm import farm_books, farm_db, fill_cost, reward_farmer, reward_screener
-from farm.farm_db import CommandKind
+from farm.farm_db import CommandKind, FillCursor
 from farm.reward_farmer import (
+    QUIET_S,
+    SEED_STILL_S,
+    SETTLE_MAX_S,
+    UNLISTED_GRACE_S,
     Baseline,
     Cancel,
     FarmConfig,
+    FarmLedger,
     FarmMarket,
+    LastBuy,
     LiveOrder,
     MarketInfo,
     Observation,
@@ -36,15 +42,23 @@ from farm.reward_farmer import (
     ev_cap,
     farm_position,
     fill_events,
+    healed_ledger,
     keep_failure,
+    latest_buy,
     market_outlook,
+    moved_ledger,
     naked_allowed,
+    new_fills,
     next_backoff,
+    next_inventory,
     order_score,
+    placed_by_farmer,
     quotes_at,
     ratchet_baseline,
     reconcile,
     rewards_active,
+    seed_ledger,
+    settled_baseline,
     sole_bid_target,
     sole_long_allowed,
     step_state,
@@ -67,6 +81,8 @@ from farm.reward_screener import (
     under_free_return,
 )
 from polymarket.books import Levels
+from polymarket.orders import Side
+from polymarket.trades import Fill, FillState
 from test_reward_screener import MISTRAL_BOOK, MISTRAL_BOOK_BID_GONE
 
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
@@ -1438,6 +1454,300 @@ class BaselineTest(unittest.TestCase):
         ask = by_slot(plan(market(), FLOOR_BOOK, farm))[Slot.FAV_ASK]
         self.assertLessEqual(ask.size, held.fav_shares)
 
+    def test_the_first_trades_read_seeds_the_ledger_with_the_farm_as_it_stood(self):
+        held = Position(fav_shares=150.0, long_shares=40.0)
+        ledger, baseline = inventory_after(None, Baseline(100.0, 60.0), held, None, ((), ()))
+        self.assertEqual((ledger, baseline), (FarmLedger(50.0, 0.0), Baseline(100.0, 40.0)))
+        self.assertEqual(inventory_after(None, None, held, None, ((), ())),
+                         (FarmLedger(0.0, 0.0), Baseline(150.0, 40.0)))
+
+    def test_a_ledger_takes_no_fills_from_the_read_that_seeds_it(self):
+        held = Position(fav_shares=150.0)
+        bought = [filled("ours", "BUY", 30.0)]
+        ledger, _ = inventory_after(None, Baseline(100.0, 0.0), held, None, (bought, ()))
+        self.assertEqual(ledger, seed_ledger(held, Baseline(100.0, 0.0)))
+        self.assertEqual(ledger.fav, 50.0)
+
+    def test_only_farmer_fills_move_the_ledger(self):
+        ledger, kept = FarmLedger(50.0, 10.0), Baseline(100.0, 100.0)
+        mine = [filled("a", "BUY", 30.0), filled("b", "SELL", 5.0, trade_id="t2"),
+                filled("c", "SELL", 4.0, LONG, trade_id="t3")]
+        yours = [filled("x", "BUY", 70.0, trade_id="t4"),
+                 filled("y", "SELL", 20.0, LONG, trade_id="t5")]
+        self.assertEqual(moved_ledger(ledger, mine, (), kept, market()), FarmLedger(75.0, 6.0))
+        self.assertEqual(moved_ledger(ledger, (), yours, kept, market()), ledger)
+        self.assertEqual(moved_ledger(ledger, mine, yours, kept, market()), FarmLedger(75.0, 6.0))
+
+    def test_a_manual_buy_never_becomes_farm_inventory(self):
+        ledger, baseline = FarmLedger(50.0, 0.0), Baseline(100.0, 0.0)
+        bought = ((), [filled("yours", "BUY", 200.0)])
+        for held in (150.0, 350.0):
+            with self.subTest(held=held):
+                held = Position(fav_shares=held, fav_avg=0.97)
+                ledger, baseline = inventory_after(ledger, baseline, held, None, bought)
+                self.assertEqual(farm_position(held, baseline).fav_shares, 50.0)
+                bought = ((), ())
+        self.assertEqual(baseline, Baseline(300.0, 0.0))
+
+    def test_a_manual_sale_of_your_own_shares_leaves_the_farm_whole(self):
+        held = Position(fav_shares=90.0)
+        sold = ((), [filled("yours", "SELL", 60.0)])
+        ledger, baseline = inventory_after(FarmLedger(50.0, 0.0), Baseline(100.0, 0.0), held,
+                                          None, sold)
+        self.assertEqual((farm_position(held, baseline).fav_shares, baseline.fav), (50.0, 40.0))
+
+    def test_a_manual_sale_past_your_shares_takes_the_rest_from_the_farm(self):
+        ledger, kept = FarmLedger(50.0, 0.0), Baseline(100.0, 0.0)
+        sold = [filled("x", "SELL", 120.0)]
+        self.assertEqual(moved_ledger(ledger, (), sold, kept, market()), FarmLedger(30.0, 0.0))
+        after_a_buy = [filled("y", "BUY", 20.0, trade_id="t2", at=-5), *sold]
+        self.assertEqual(moved_ledger(ledger, (), after_a_buy, kept, market()), ledger)
+        bought_back = [*sold, filled("y", "BUY", 120.0, trade_id="t2", at=5)]
+        self.assertEqual(moved_ledger(ledger, (), bought_back, kept, market()),
+                         FarmLedger(30.0, 0.0))
+        self.assertEqual(moved_ledger(ledger, (), [filled("z", "SELL", 500.0)], kept, market()),
+                         FarmLedger(0.0, 0.0))
+
+    def test_an_unread_rise_in_holdings_is_yours(self):
+        ledger, baseline = FarmLedger(50.0, 0.0), Baseline(100.0, 0.0)
+        held = Position(fav_shares=180.0)
+        unread = inventory_after(ledger, baseline, held, None, None)
+        self.assertEqual(unread, (ledger, Baseline(130.0, 0.0)))
+        self.assertEqual(farm_position(held, unread[1]).fav_shares, 50.0)
+
+    def test_an_unread_fall_comes_off_the_farm(self):
+        ledger, baseline = FarmLedger(50.0, 0.0), Baseline(100.0, 0.0)
+        held = Position(fav_shares=120.0)
+        unread = inventory_after(ledger, baseline, held, None, None)
+        self.assertEqual(unread, (ledger, baseline))
+        self.assertEqual(farm_position(held, unread[1]).fav_shares, 20.0)
+
+    def test_before_its_first_trades_read_a_rise_in_holdings_is_yours_too(self):
+        first = Position(fav_shares=150.0)
+        ledger, baseline = inventory_after(None, Baseline(100.0, 0.0), first, None, None)
+        farm = farm_position(first, baseline)
+        self.assertEqual((ledger, farm.fav_shares), (None, 50.0))
+        risen = Position(fav_shares=230.0)
+        ledger, baseline = inventory_after(None, baseline, risen, farm, None)
+        self.assertEqual((ledger, farm_position(risen, baseline).fav_shares), (None, 50.0))
+        ledger, baseline = inventory_after(None, baseline, risen, farm, ((), ()))
+        self.assertEqual((ledger, baseline), (FarmLedger(50.0, 0.0), Baseline(180.0, 0.0)))
+
+    def test_the_baseline_carries_no_float_dust(self):
+        held = Position(fav_shares=150.3)
+        ledger = seed_ledger(held, Baseline(100.0, 0.0))
+        self.assertEqual(settled_baseline(None, held, ledger, synced=True), Baseline(100.0, 0.0))
+
+
+def inventory_after(ledger, baseline, held, farm, fills):
+    """(ledger, baseline) after a positions read at NOW, a buy having matched
+    on both tokens just then."""
+    return next_inventory(ledger, baseline, held, farm, fills, market(), LastBuy(NOW, NOW),
+                          NOW, held)[:2]
+
+
+def filled(order_id, side, shares, token_id=FAV, trade_id="t1", at=0, state=FillState.PENDING):
+    """A Fill matched `at` seconds after NOW."""
+    return Fill(trade_id, order_id, "0xc0nd", token_id, Side(side), shares, 0.97,
+                NOW + timedelta(seconds=at), False, state)
+
+
+T0 = int(NOW.timestamp())
+
+
+class FillCursorTest(unittest.TestCase):
+    def test_a_fill_read_twice_counts_once(self):
+        fill = filled("a", "BUY", 30.0, at=10)
+        count, cursor = new_fills([fill], FillCursor(T0, frozenset()), NOW)
+        self.assertEqual(count, [fill])
+        again, same = new_fills([fill._replace(state=FillState.CONFIRMED)], cursor, NOW)
+        self.assertEqual((again, same.counted), ([], cursor.counted))
+
+    def test_one_trade_filling_two_of_our_orders_counts_both(self):
+        fills = [filled("a", "BUY", 30.0), filled("b", "BUY", 20.0)]
+        count, cursor = new_fills(fills, FillCursor(T0, frozenset()), NOW)
+        self.assertEqual((count, cursor.counted), (fills, {("t1", "a"), ("t1", "b")}))
+
+    def test_a_fill_that_failed_before_it_was_counted_never_counts(self):
+        failed = filled("a", "BUY", 30.0, state=FillState.FAILED)
+        self.assertEqual(new_fills([failed], FillCursor(T0, frozenset()), NOW),
+                         ([], FillCursor(T0, frozenset())))
+
+    def test_a_counted_fill_that_fails_is_taken_back(self):
+        fill = filled("a", "BUY", 30.0, at=10)
+        count, cursor = new_fills([fill], FillCursor(T0, frozenset()), NOW)
+        ledger = moved_ledger(FarmLedger(50.0, 0.0), count, (), Baseline(0.0, 0.0), market())
+        self.assertEqual(ledger.fav, 80.0)
+        failed = fill._replace(state=FillState.FAILED)
+        count, cursor = new_fills([failed], cursor, NOW)
+        self.assertEqual(count, [failed])
+        ledger = moved_ledger(ledger, count, (), Baseline(0.0, 0.0), market())
+        self.assertEqual(ledger.fav, 50.0)
+        self.assertEqual(new_fills([failed], cursor, NOW)[0], [])
+
+    def test_the_cursor_waits_at_the_oldest_unsettled_fill(self):
+        settled = filled("a", "BUY", 30.0, at=10, state=FillState.CONFIRMED)
+        waiting = filled("b", "BUY", 20.0, trade_id="t2", at=20)
+        newest = filled("c", "SELL", 5.0, trade_id="t3", at=30, state=FillState.CONFIRMED)
+        _, cursor = new_fills([settled, waiting, newest], FillCursor(T0, frozenset()), NOW)
+        self.assertEqual(cursor, FillCursor(T0 + 19, frozenset({waiting.key, newest.key}),
+                                            frozenset({"b"})))
+        done = waiting._replace(state=FillState.CONFIRMED)
+        count, cursor = new_fills([done, newest], cursor, NOW)
+        self.assertEqual((count, cursor), ([], FillCursor(T0 + 29, frozenset({newest.key}))))
+
+    def test_a_read_with_no_fills_leaves_the_cursor_put_and_not_behind(self):
+        cursor = FillCursor(T0, frozenset({("t1", "a")}))
+        self.assertEqual(new_fills([], cursor._replace(behind=True), NOW), ([], cursor))
+
+    def test_a_fill_unsettled_for_too_long_no_longer_holds_the_cursor(self):
+        stuck = filled("a", "BUY", 30.0, at=10)
+        later = filled("b", "BUY", 20.0, trade_id="t2", at=500, state=FillState.CONFIRMED)
+        cursor = FillCursor(T0, frozenset())
+        _, held_back = new_fills([stuck, later], cursor, NOW + timedelta(seconds=SETTLE_MAX_S))
+        self.assertEqual((held_back.after, held_back.unsettled), (T0 + 9, {"a"}))
+        _, moved_on = new_fills([stuck, later], cursor,
+                                NOW + timedelta(seconds=SETTLE_MAX_S + 11))
+        self.assertEqual(moved_on, FillCursor(T0 + 499, frozenset({later.key})))
+
+
+class QuietHealTest(unittest.TestCase):
+    LONG_AGO = NOW - timedelta(seconds=QUIET_S)
+    LATELY = NOW - timedelta(seconds=QUIET_S - 1)
+
+    def test_a_ledger_over_the_holdings_of_a_quiet_token_is_lowered_to_them(self):
+        held = Position(fav_shares=30.0, long_shares=40.0)
+        quiet = LastBuy(self.LONG_AGO, self.LONG_AGO)
+        self.assertEqual(healed_ledger(FarmLedger(50.0, 10.0), held, held, quiet, NOW),
+                         FarmLedger(30.0, 10.0))
+
+    def test_a_token_bought_lately_keeps_a_ledger_over_its_holdings(self):
+        held = Position(fav_shares=30.0, long_shares=5.0)
+        ledger = FarmLedger(50.0, 10.0)
+        lately = LastBuy(self.LATELY, self.LATELY)
+        self.assertEqual(healed_ledger(ledger, held, held, lately, NOW), ledger)
+        self.assertEqual(healed_ledger(ledger, held, held, LastBuy(self.LATELY, self.LONG_AGO),
+                                       NOW), FarmLedger(50.0, 5.0))
+
+    def test_a_ledger_is_lowered_to_the_larger_of_the_last_two_holdings_read(self):
+        quiet = LastBuy(self.LONG_AGO, self.LONG_AGO)
+        ledger = FarmLedger(50.0, 10.0)
+        gone, shown = Position(), Position(fav_shares=40.0, long_shares=10.0)
+        self.assertEqual(healed_ledger(ledger, gone, shown, quiet, NOW), FarmLedger(40.0, 10.0))
+        self.assertEqual(healed_ledger(ledger, shown, gone, quiet, NOW), FarmLedger(40.0, 10.0))
+        self.assertEqual(healed_ledger(ledger, gone, gone, quiet, NOW), FarmLedger(0.0, 0.0))
+        self.assertEqual(healed_ledger(ledger, gone, None, quiet, NOW), ledger)
+
+    def test_any_buy_restarts_the_quiet_period_and_a_sale_does_not(self):
+        before = LastBuy(self.LONG_AGO, self.LONG_AGO)
+        sale = filled("yours", "SELL", 30.0, at=-10)
+        self.assertEqual(latest_buy(before, [sale], market()), before)
+        for buy in (filled("ours", "BUY", 30.0, at=-10),
+                    filled("yours", "BUY", 30.0, at=-10, state=FillState.FAILED)):
+            with self.subTest(buy=buy):
+                self.assertEqual(latest_buy(before, [sale, buy], market()),
+                                 LastBuy(NOW - timedelta(seconds=10), self.LONG_AGO))
+        self.assertEqual(latest_buy(LastBuy(NOW, NOW), [filled("ours", "BUY", 1.0, at=-10)],
+                                    market()), LastBuy(NOW, NOW))
+
+    def read(self, ledger, held, fills, last_buy):
+        held = Position(fav_shares=held)
+        return next_inventory(ledger, Baseline(0.0, 0.0), held, None, fills, market(), last_buy,
+                              NOW, held)
+
+    def test_a_good_read_of_a_quiet_token_heals_and_says_what_the_ledger_was(self):
+        quiet = LastBuy(self.LONG_AGO, self.LONG_AGO)
+        self.assertEqual(self.read(FarmLedger(50.0, 0.0), 20.0, ((), ()), quiet),
+                         (FarmLedger(20.0, 0.0), Baseline(0.0, 0.0), FarmLedger(50.0, 0.0)))
+
+    def test_a_read_without_the_trades_heals_nothing(self):
+        quiet = LastBuy(self.LONG_AGO, self.LONG_AGO)
+        ledger = FarmLedger(50.0, 0.0)
+        self.assertEqual(self.read(ledger, 20.0, None, quiet),
+                         (ledger, Baseline(0.0, 0.0), ledger))
+
+    def test_a_farmer_buy_the_positions_do_not_show_yet_is_not_healed_away(self):
+        bought = filled("ours", "BUY", 30.0, at=-5)
+        last_buy = latest_buy(LastBuy(self.LONG_AGO, self.LONG_AGO), [bought], market())
+        ledger, _, _ = self.read(FarmLedger(50.0, 0.0), 50.0, ([bought], ()), last_buy)
+        self.assertEqual(ledger, FarmLedger(80.0, 0.0))
+
+
+class FillTimingTest(unittest.TestCase):
+    """The farm holds 50 favorite shares beside 100 of the user's, and 30
+    shares trade. The trade listing and the positions show it in either
+    order: a good trades read counts the trade, a failed one leaves it
+    unread."""
+
+    def setUp(self):
+        self.ledger, self.baseline, self.farm = FarmLedger(50.0, 0.0), Baseline(100.0, 0.0), None
+
+    def farm_after(self, held, mine=(), yours=(), read=True):
+        held = Position(fav_shares=held, fav_avg=0.97)
+        self.ledger, self.baseline = inventory_after(
+            self.ledger, self.baseline, held, self.farm, (mine, yours) if read else None)
+        self.farm = farm_position(held, self.baseline)
+        return self.farm.fav_shares
+
+    def test_a_farmer_buy_the_trades_show_first_is_the_farms_from_the_match(self):
+        self.assertEqual(self.farm_after(150.0, mine=[filled("ours", "BUY", 30.0)]), 80.0)
+        self.assertEqual(self.farm_after(180.0), 80.0)
+        self.assertEqual(self.baseline.fav, 100.0)
+
+    def test_a_farmer_buy_shows_with_the_positions_when_you_hold_none(self):
+        self.ledger, self.baseline = FarmLedger(50.0, 0.0), Baseline(0.0, 0.0)
+        self.assertEqual(self.farm_after(50.0, mine=[filled("ours", "BUY", 30.0)]), 50.0)
+        self.assertEqual(self.farm_after(80.0), 80.0)
+
+    def test_a_farmer_buy_the_positions_show_first_waits_for_its_trade(self):
+        self.assertEqual(self.farm_after(180.0, read=False), 50.0)
+        self.assertEqual(self.farm_after(180.0, mine=[filled("ours", "BUY", 30.0)]), 80.0)
+        self.assertEqual(self.baseline.fav, 100.0)
+
+    def test_a_farmer_sale_the_trades_show_first_leaves_the_farm_at_once(self):
+        self.assertEqual(self.farm_after(150.0, mine=[filled("ours", "SELL", 30.0)]), 20.0)
+        self.assertEqual(self.farm_after(120.0), 20.0)
+        self.assertEqual(self.baseline.fav, 100.0)
+
+    def test_a_farmer_sale_the_positions_show_first_comes_off_the_farm(self):
+        self.assertEqual(self.farm_after(120.0, read=False), 20.0)
+        self.assertEqual(self.farm_after(120.0, mine=[filled("ours", "SELL", 30.0)]), 20.0)
+        self.assertEqual(self.baseline.fav, 100.0)
+
+    def test_a_manual_buy_the_trades_show_first_moves_nothing(self):
+        self.assertEqual(self.farm_after(150.0, yours=[filled("yours", "BUY", 30.0)]), 50.0)
+        self.assertEqual(self.farm_after(180.0), 50.0)
+        self.assertEqual(self.baseline.fav, 130.0)
+
+    def test_a_manual_buy_the_positions_show_first_is_yours(self):
+        self.assertEqual(self.farm_after(180.0, read=False), 50.0)
+        self.assertEqual(self.farm_after(180.0, yours=[filled("yours", "BUY", 30.0)]), 50.0)
+        self.assertEqual(self.baseline.fav, 130.0)
+
+    def test_a_manual_sale_the_trades_show_first_moves_nothing(self):
+        self.assertEqual(self.farm_after(150.0, yours=[filled("yours", "SELL", 30.0)]), 50.0)
+        self.assertEqual(self.farm_after(120.0), 50.0)
+        self.assertEqual(self.baseline.fav, 70.0)
+
+    def test_a_manual_sale_the_positions_show_first_shorts_the_farm_until_read(self):
+        self.assertEqual(self.farm_after(120.0, read=False), 20.0)
+        self.assertEqual(self.farm_after(120.0, yours=[filled("yours", "SELL", 30.0)]), 50.0)
+        self.assertEqual(self.baseline.fav, 70.0)
+
+    def test_an_unread_farmer_sale_a_manual_buy_hides_is_farm_until_the_trades_read(self):
+        self.assertEqual(self.farm_after(150.0, read=False), 50.0)
+        both = dict(mine=[filled("ours", "SELL", 30.0)],
+                    yours=[filled("yours", "BUY", 30.0, trade_id="t2")])
+        self.assertEqual(self.farm_after(150.0, **both), 20.0)
+        self.assertEqual(self.baseline.fav, 130.0)
+
+    def test_a_farmer_buy_that_fails_is_farm_until_its_failure_is_read(self):
+        bought = filled("ours", "BUY", 30.0)
+        self.assertEqual(self.farm_after(150.0, mine=[bought]), 80.0)
+        self.assertEqual(self.farm_after(150.0, mine=[bought._replace(state=FillState.FAILED)]),
+                         50.0)
+        self.assertEqual(self.baseline.fav, 100.0)
+
 
 # OpenSI on 2026-10-09 at 19:08 UTC without our orders, the day after a
 # 2,715-share fill of our 93.9c bid. The mid was 94.8c before the fill.
@@ -2119,6 +2429,18 @@ class BoundaryTest(unittest.TestCase):
         self.assertEqual(stripped.bids, [(0.985, 1000.0)])
         self.assertEqual(stripped.asks, [(0.995, 1000.0)])
 
+    def test_a_farmers_order_has_an_id_on_record_or_the_markets_expiration(self):
+        fm = market()
+        second = int(fm.expires_at.timestamp())
+        saved = {"kept": "0xc0nd"}
+        self.assertTrue(placed_by_farmer({"id": "kept", "expiration": str(second + 86400)},
+                                         fm, saved))
+        self.assertTrue(placed_by_farmer({"id": "new", "expiration": str(second)}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "gtc", "expiration": "0"}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "bare"}, fm, saved))
+        self.assertFalse(placed_by_farmer({"id": "near", "expiration": str(second - 1)},
+                                          fm, saved))
+
     def test_rewards_need_a_listed_rate_and_a_max_spread(self):
         info = MarketInfo((FAV, LONG), 0.085, 50.0, 0.001, False, True, False)
         self.assertTrue(rewards_active(info, "0xc0nd", {"0xc0nd": 2.1}))
@@ -2528,6 +2850,13 @@ class FarmerCycleTest(FarmerHarness):
         self.assertEqual(places, [("FAV_BID", 0.975), ("LONG_BID", 0.001)])
         market_row = farm_db.find_market(self.ui, CID)
         self.assertEqual((market_row["status"], market_row["baseline_fav"]), ("approved", None))
+
+    def test_a_dry_run_records_no_order_ids(self):
+        farmer = self.started_farmer()
+        farmer.cycle()
+        farmer.cycle()
+        self.assertTrue(any(m.sim_orders for m in farmer.markets.values()))
+        self.assertEqual(farm_db.farmer_orders(self.ui), {})
 
     def test_a_cycle_with_no_changes_adds_no_events(self):
         farmer = self.started_farmer()
@@ -3413,6 +3742,7 @@ class BookRecordingTest(FarmerHarness):
 
 
 CID2, FAV2, LONG2 = "0xc0nd2", "fav-token-2", "long-token-2"
+ME = "0xme"
 INFO2 = INFO._replace(token_ids=(FAV2, LONG2))
 
 
@@ -3511,7 +3841,7 @@ class ExitFarmerTest(FarmerHarness):
         farm_db.publish(self.ui, farm_db.FarmerStatus(
             "dry", 1, fill_at, fill_at, 1.0, False, 1, {}, fill_at), events=[farm_db.Event(
                 fill_at, farm_db.EventKind.FILL, "FILL", CID, "FAV_BID", 0.95, 100.0, None, None)])
-        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        farm_db.save_inventory(self.ui, [(CID, None, (0.0, 0.0))], None, NOW)
         self.holdings.return_value = {FAV: (100.0, 0.95)}
         self.assertEqual(self.ask_target(self.started_farmer()), 0.985)
 
@@ -3524,7 +3854,7 @@ class ExitFarmerTest(FarmerHarness):
             "dry", 1, fill_at, fill_at, 1.0, False, 1, {}, fill_at), events=[farm_db.Event(
                 fill_at, farm_db.EventKind.FILL, "FILL", CID, "FAV_BID", 0.95, 100.0, None,
                 {"fill_mid": 0.975})])
-        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        farm_db.save_inventory(self.ui, [(CID, None, (0.0, 0.0))], None, NOW)
         self.holdings.return_value = {FAV: (100.0, 0.95)}
         self.assertEqual(self.ask_target(self.started_farmer()), 0.985)
 
@@ -3557,6 +3887,123 @@ class LiveFarmerTest(FarmerHarness):
         self.client.post_orders.side_effect = self.post_orders
         self.client.get_open_orders.side_effect = self.get_open_orders
         self.client.cancel_orders.side_effect = self.cancel_orders
+        self.trades = []
+        self.asks, self.asks_read = [], 0
+        self.trades_down = set()
+        self.addCleanup(lambda: self.assertEqual(
+            [p for p in self.asks if p.maker_address or not p.market], [],
+            "trades asked by address or not by market"))
+        self.after_includes_its_second = True
+        self.client.get_trades.side_effect = self.get_trades
+        patcher = mock.patch.dict(os.environ, {"POLYMARKET_FUNDER_ADDRESS": ME})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def get_trades(self, params):
+        self.asks.append(params)
+        if params.maker_address or not params.market or params.market in self.trades_down:
+            raise RuntimeError("500 Internal server error")
+        first = params.after + (0 if self.after_includes_its_second else 1)
+        return [t for t in self.trades
+                if t["market"] == params.market and int(t["match_time"]) >= first]
+
+    def asked(self):
+        """The markets whose trades were asked since the last call, in order."""
+        asked = [params.market for params in self.asks[self.asks_read:]]
+        self.asks_read = len(self.asks)
+        return asked
+
+    def list_trade(self, later=0, **fields):
+        """A trade the CLOB lists, matched `later` seconds from now."""
+        trade = {"id": f"t{len(self.trades) + 1}", "status": "MATCHED",
+                 "match_time": str(int(time.time()) + later), "owner": "taker-api-key",
+                 "maker_address": "0xother", **fields}
+        self.trades.append(trade)
+        return trade
+
+    def fill(self, order_id, shares=None, settled=True):
+        """A taker fills `shares` of a resting order, all of it by default.
+        The CLOB lists the trade and takes a filled order off its listing;
+        once settled the wallet shows the shares. Returns the listed trade."""
+        order = self.resting[order_id]
+        left = float(order["original_size"]) - float(order["size_matched"])
+        shares = left if shares is None else shares
+        order["size_matched"] = str(float(order["size_matched"]) + shares)
+        if shares == left:
+            del self.resting[order_id]
+        if settled:
+            self.hold(order["asset_id"], shares if order["side"] == "BUY" else -shares)
+        return self.list_trade(
+            market=order["market"], trader_side="MAKER", taker_order_id="0xtaker",
+            asset_id=order["asset_id"], side="SELL" if order["side"] == "BUY" else "BUY",
+            size=str(shares), price=order["price"],
+            maker_orders=[{"order_id": order_id, "owner": "my-api-key",
+                           "maker_address": ME.upper(), "matched_amount": str(shares),
+                           "price": order["price"], "asset_id": order["asset_id"],
+                           "side": order["side"]}])
+
+    def manual_trade(self, token_id, side, shares, price=0.97, settled=True, later=0):
+        """The user takes `shares` off the book by hand, `later` seconds from now."""
+        if settled:
+            self.hold(token_id, shares if side == "BUY" else -shares)
+        return self.list_trade(
+            later, market=self.market_of[token_id], trader_side="TAKER",
+            taker_order_id=f"manual-{len(self.trades)}", asset_id=token_id, side=side,
+            size=str(shares), price=str(price),
+            maker_orders=[{"order_id": "0xtheirs", "owner": "their-api-key",
+                           "maker_address": "0xother", "matched_amount": str(shares),
+                           "price": str(price), "asset_id": token_id,
+                           "side": "SELL" if side == "BUY" else "BUY"}])
+
+    def hold(self, token_id, change):
+        """The wallet's shares of a token as the data API reports them."""
+        holdings = reward_farmer.fetch_holdings.return_value
+        holdings[token_id] = (round(holdings.get(token_id, (0.0, 0.95))[0] + change, 6), 0.95)
+
+    def order_id(self, token_id, side):
+        return next(i for i, o in self.resting.items()
+                    if (o["asset_id"], o["side"]) == (token_id, side))
+
+    def read(self, farmer, later=0):
+        """A positions read `later` seconds from now."""
+        farmer.refresh_positions(datetime.now(timezone.utc) + timedelta(seconds=later))
+
+    def inventory(self, farmer, cid=CID):
+        """(the farm's favorite shares, the baseline's) on cid after a cycle."""
+        farmer.cycle()
+        row = self.query("SELECT position FROM farm_state WHERE condition_id = ?", cid)[0]
+        position = json.loads(row["position"])
+        return position["farm"]["fav"], position["baseline"]["fav"]
+
+    def approve_another(self, n):
+        """Approve one more market beside CID and CID2 before the farmer
+        starts; returns its condition id and favorite token."""
+        cid, fav, long = f"0xc0nd{n}", f"fav-token-{n}", f"long-token-{n}"
+        metrics = {"market": {**METRICS["market"], "fav_token_id": fav, "slug": f"market-{n}"}}
+        farm_db.store_scan(self.ui, [farm_db.ScanRow(
+            cid, f"market-{n}", f"Market {n}?", self.end_date().isoformat(), 1.0,
+            json.dumps(metrics),
+        )], [*self.infos.return_value, cid], NOW)
+        farm_db.approve_market(self.ui, cid, 0.995, 25.0, now=NOW)
+        self.infos.return_value = {**self.infos.return_value,
+                                   cid: INFO._replace(token_ids=(fav, long))}
+        self.market_of.update({fav: cid, long: cid})
+        self.clob_ticks[cid] = "0.001"
+        return cid, fav
+
+    def farming(self, farm, yours=0.0):
+        """A live farmer, one cycle and a positions read in, whose ledger on
+        CID has seeded with `farm` favorite shares beside `yours` of the
+        user's."""
+        farm_db.save_inventory(self.ui, [(CID, None, (yours, 0.0))], None, NOW)
+        self.hold(FAV, farm + yours)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.read(farmer)
+        return farmer
+
+    def fills(self):
+        return [(e["slot"], e["size"], e["price"]) for e in self.events() if e["kind"] == "FILL"]
 
     def get_clob_market_info(self, condition_id):
         for token_id, cid in self.market_of.items():
@@ -3588,9 +4035,21 @@ class LiveFarmerTest(FarmerHarness):
                 "id": order_id, "market": self.market_of[order.token_id],
                 "asset_id": order.token_id, "side": order.side, "price": str(order.price),
                 "original_size": str(order.size), "size_matched": "0",
+                "expiration": str(order.expiration),
             }
             responses.append({"success": True, "orderID": order_id, "errorMsg": ""})
         return responses
+
+    def rest_manual(self, order_id, token_id, side, price, size):
+        """The user's own good-till-cancelled order resting on the account."""
+        self.resting[order_id] = {
+            "id": order_id, "market": self.market_of.get(token_id, "0xunmanaged"),
+            "asset_id": token_id, "side": side, "price": str(price),
+            "original_size": str(size), "size_matched": "0", "expiration": "0",
+        }
+
+    def recorded(self):
+        return set(farm_db.farmer_orders(self.ui))
 
     def get_open_orders(self):
         return list(self.resting.values())
@@ -3671,7 +4130,7 @@ class LiveFarmerTest(FarmerHarness):
     def favorite_asks_with_balance(self, balance):
         """The sizes of the favorite asks a cycle rests when the data API says
         51.76 shares are held and the CLOB's balance read does `balance`."""
-        farm_db.save_baseline(self.ui, CID, 0.0, 0.0)
+        farm_db.save_inventory(self.ui, [(CID, None, (0.0, 0.0))], None, NOW)
         reward_farmer.fetch_holdings.return_value = {FAV: (51.76, 0.95)}
 
         def balance_allowance(params):
@@ -3755,6 +4214,106 @@ class LiveFarmerTest(FarmerHarness):
         farmer.cycle()
         self.assertEqual(self.posted_tokens(), [[FAV2]])
         self.client.cancel_orders.assert_not_called()
+        self.read(farmer, later=UNLISTED_GRACE_S)
+        self.assertNotIn(gone, self.recorded())
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_a_manual_order_on_a_managed_token_survives_the_cycle_and_a_pause(self):
+        self.rest_manual("manual", FAV, "BUY", 0.985, 20.0)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual(self.posted_tokens(), [sorted([FAV, LONG, FAV2, LONG2])])
+        self.client.cancel_orders.assert_not_called()
+        self.assertFalse(any(o.id == "manual" for m in farmer.markets.values() for o in m.orders))
+        farmer_ids = set(self.resting) - {"manual"}
+        for cid in (CID, CID2):
+            farm_db.set_paused(self.ui, cid, True)
+        farmer.cycle()
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["manual"])
+
+    def priced_book(self, book):
+        """farm_state's book_mid and FAV bid levels after one live cycle on book."""
+        self.book = book
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.shutdown("test", cancel=True)
+        row, _ = self.farm_state()
+        return row["book_mid"], json.loads(row["book"])["bids"]
+
+    def test_a_manual_order_is_still_taken_out_of_the_priced_book(self):
+        without_mid, _ = self.priced_book(FLOOR_BOOK)
+        self.rest_manual("manual", FAV, "BUY", 0.99, 200.0)
+        with_mid, bids = self.priced_book(FLOOR_BOOK._replace(bids=[(0.99, 200.0), (0.985, 1000.0)]))
+        self.assertEqual(with_mid, without_mid)
+        self.assertEqual(next(b["ours"] for b in bids if b["price"] == 0.99), 200.0)
+        self.assertIn("manual", self.resting)
+
+    def test_a_restart_holds_orders_whose_ids_were_never_saved(self):
+        first = self.started_farmer(client=self.client)
+        first.cycle()
+        kept = dict(self.resting)
+        first.shutdown("test", cancel=False)
+        with self.ui:
+            self.ui.execute("DELETE FROM farmer_orders")
+        self.client.reset_mock()
+
+        self.started_farmer(client=self.client).cycle()
+        self.client.cancel_orders.assert_not_called()
+        self.client.post_orders.assert_not_called()
+        self.assertEqual(self.resting, kept)
+        self.assertEqual(self.recorded(), set(kept))
+
+    def test_an_order_whose_post_raised_is_held_at_the_next_cycle(self):
+        def rests_then_raises(batch, post_only):
+            self.client.post_orders.side_effect = self.post_orders
+            self.post_orders(batch, post_only)
+            raise httpx.ReadTimeout("timed out")
+
+        self.client.post_orders.side_effect = rests_then_raises
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.assertEqual(self.recorded(), set())
+        farmer.cycle()
+        self.assertEqual(self.client.post_orders.call_count, 1)
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual(len(self.resting), 4)
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_orders_stay_the_farmers_when_the_markets_expiry_moves(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        with self.ui:
+            self.ui.execute("UPDATE markets SET end_date_override = ? WHERE condition_id = ?",
+                            (farm_db.stamp(self.end_date(30)), CID))
+        farmer.cycle()
+        on_cid = [(e["asset_id"], e["side"]) for e in self.resting.values()
+                  if e["market"] == CID]
+        self.assertEqual(sorted(on_cid), sorted(set(on_cid)))
+        self.client.cancel_orders.assert_not_called()
+        self.assertEqual(self.client.post_orders.call_count, 1)
+
+    def test_order_ids_are_on_record_before_the_flush(self):
+        farmer = self.started_farmer(client=self.client)
+        with mock.patch.object(farm_db, "publish", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertRaises(sqlite3.OperationalError):
+            farmer.cycle()
+        self.assertEqual(len(self.resting), 4)
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_rejected_and_unnamed_posts_are_not_recorded(self):
+        def answers(batch, post_only):
+            responses = self.post_orders(batch, post_only)
+            rejected = responses[0]["orderID"]
+            del self.resting[rejected]
+            return [{"success": False, "orderID": rejected, "errorMsg": "not enough balance"},
+                    {"success": True}, *responses[2:]]
+
+        self.client.post_orders.side_effect = answers
+        self.started_farmer(client=self.client).cycle()
+        self.assertEqual(self.recorded(), set(list(self.resting)[1:]))
 
     def stopped_after_a_cycle(self):
         farmer = self.started_farmer(client=self.client)
@@ -3762,15 +4321,17 @@ class LiveFarmerTest(FarmerHarness):
         self.client.reset_mock()
         return farmer
 
-    def test_stopping_lists_once_and_cancels_only_the_managed_markets_orders(self):
+    def test_stopping_lists_once_and_cancels_only_the_farmers_orders(self):
         farmer = self.stopped_after_a_cycle()
-        managed_ids = set(self.resting)
+        farmer_ids = set(self.resting)
         self.resting["foreign"] = {"id": "foreign", "market": "0xunmanaged", "asset_id": "x"}
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
         farmer.shutdown("test", cancel=True)
         self.client.get_open_orders.assert_called_once_with()
         self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
-                         [managed_ids])
-        self.assertEqual(list(self.resting), ["foreign"])
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["foreign", "manual"])
+        self.assertEqual(self.recorded(), farmer_ids)
         self.client.cancel_market_orders.assert_not_called()
         cancels = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "CANCEL"]
         self.assertEqual(cancels, [(CID, "Cancelled 2 orders on test-market"),
@@ -3798,13 +4359,44 @@ class LiveFarmerTest(FarmerHarness):
             ("ALERT", CID2, f"Warning: cancelling {stuck} on other-market failed (matched)"),
         ])
 
-    def test_a_failed_listing_on_stop_falls_back_to_a_cancel_per_market(self):
+    def test_a_failed_listing_on_stop_cancels_the_order_ids_on_record(self):
         farmer = self.stopped_after_a_cycle()
+        farmer_ids = set(self.resting)
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
         self.client.get_open_orders.side_effect = httpx.ConnectError("down")
         farmer.shutdown("test", cancel=True)
-        self.client.cancel_orders.assert_not_called()
-        self.assertEqual([c.args[0].market for c in self.client.cancel_market_orders.call_args_list],
-                         [CID, CID2])
+        self.assertEqual([set(c.args[0]) for c in self.client.cancel_orders.call_args_list],
+                         [farmer_ids])
+        self.assertEqual(list(self.resting), ["manual"])
+        self.client.cancel_market_orders.assert_not_called()
+        cancels = [(e["condition_id"], e["message"]) for e in self.events() if e["kind"] == "CANCEL"]
+        self.assertEqual(cancels, [(CID, "Cancelled 2 orders on test-market"),
+                                   (CID2, "Cancelled 2 orders on other-market")])
+
+    def test_a_failed_cancel_on_stop_is_retried_market_by_market_then_alerted(self):
+        farmer = self.stopped_after_a_cycle()
+        farmer_ids = set(self.resting)
+        self.rest_manual("manual", FAV, "BUY", 0.97, 20.0)
+        on_cid2 = {i for i, e in self.resting.items() if e["market"] == CID2}
+
+        def cancel_orders(order_ids):
+            if len(order_ids) > 2 or set(order_ids) == on_cid2:
+                raise httpx.ConnectError("down")
+            return self.cancel_orders(order_ids)
+
+        self.client.cancel_orders.side_effect = cancel_orders
+        farmer.shutdown("test", cancel=True)
+        self.assertEqual(len(self.client.cancel_orders.call_args_list), 3)
+        self.assertEqual(set(self.resting), on_cid2 | {"manual"})
+        self.assertEqual(self.recorded(), farmer_ids)
+        self.client.cancel_market_orders.assert_not_called()
+        flagged = [(e["kind"], e["condition_id"], e["message"]) for e in self.events()
+                   if e["kind"] in ("CANCEL", "ALERT")]
+        self.assertEqual(flagged, [
+            ("ALERT", CID2, "Warning: cancelling 2 orders on other-market failed (down); "
+                            "they rest until they expire"),
+            ("CANCEL", CID, "Cancelled 2 orders on test-market"),
+        ])
 
     def market_info_fetches(self):
         return sorted(c.args[0] for c in self.client.get_clob_market_info.call_args_list)
@@ -3960,6 +4552,496 @@ class LiveFarmerTest(FarmerHarness):
         self.client.cancel_orders.assert_not_called()
         self.client.post_orders.assert_not_called()
         self.assertEqual(self.resting, kept)
+
+    def test_a_farmer_sale_matched_before_the_holdings_held_still_is_out_of_the_ledger(self):
+        farm_db.record_farmer_orders(self.ui, placed=[("0xearlier", CID)])
+        farm_db.save_inventory(self.ui, [(CID, None, (200.0, 0.0))], None, NOW)
+        self.hold(FAV, 300.0)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        sale = self.fill(self.order_id(FAV, "SELL"), 40.0, settled=False)
+        sale["match_time"] = str(int(time.time()) - 30)
+        self.read(farmer, later=60)
+        self.hold(FAV, -40.0)
+        for later in (90, 150, 300):
+            self.read(farmer, later=later)
+        self.assertIsNone(farm_db.find_market(self.ui, CID)["farm_fav"])
+        self.read(farmer, later=90 + SEED_STILL_S)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 60.0)
+        self.assertEqual(self.inventory(farmer), (60.0, 200.0))
+        self.assertEqual(self.asked(), [])
+
+    def test_a_farmer_fill_matched_while_the_holdings_held_still_counts_after_seeding(self):
+        farm_db.record_farmer_orders(self.ui, placed=[("0xearlier", CID)])
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid, settled=False)["match_time"] = str(int(time.time()) + 250)
+        self.read(farmer, later=SEED_STILL_S)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 0.0)
+        self.hold(FAV, size)
+        self.read(farmer, later=SEED_STILL_S + 60)
+        self.assertEqual(self.inventory(farmer), (size, 0.0))
+
+    def test_holdings_that_move_before_they_have_held_still_long_enough_start_again(self):
+        farm_db.record_farmer_orders(self.ui, placed=[("0xearlier", CID)])
+        self.hold(FAV, 100.0)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.read(farmer, later=200)
+        self.hold(FAV, 10.0)
+        self.read(farmer, later=250)
+        self.read(farmer, later=SEED_STILL_S + 200)
+        self.assertIsNone(farm_db.find_market(self.ui, CID)["farm_fav"])
+        self.read(farmer, later=SEED_STILL_S + 250)
+        row = farm_db.find_market(self.ui, CID)
+        self.assertEqual((row["farm_fav"], row["baseline_fav"]), (0.0, 110.0))
+
+    def test_a_ledger_saved_without_its_cursor_seeds_again(self):
+        farm_db.save_inventory(self.ui, [(CID, (80.0, 0.0), (100.0, 0.0))], None, NOW)
+        self.hold(FAV, 150.0)
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (50.0, 100.0))
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 50.0)
+
+    def test_a_market_with_no_farmer_order_yet_seeds_at_its_first_read(self):
+        farmer = self.started_farmer(client=self.client)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 0.0)
+        farmer.cycle()
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        self.read(farmer, later=60)
+        self.assertEqual(self.inventory(farmer), (size, 0.0))
+        self.assertEqual(self.asked(), [CID])
+
+    def test_on_farmer_trades_alone_a_buy_is_a_fill_when_the_positions_show_it(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid, settled=False)
+        farmer.cycle()
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (0.0, 0.0))
+        self.assertEqual(self.fills(), [])
+        self.hold(FAV, size)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 0.0))
+        self.read(farmer)
+        farmer.cycle()
+        self.assertEqual(self.fills(), [("FAV_BID", size, 0.975)])
+        self.assertEqual(self.resting[self.order_id(FAV, "SELL")]["original_size"], str(size))
+        self.assertEqual([e for e in self.events() if e["kind"] == "MANUAL_FILL"], [])
+
+    def test_a_farmer_sale_is_a_fill_at_the_positions_read_that_shows_it(self):
+        farmer = self.farming(100.0)
+        self.fill(self.order_id(FAV, "SELL"), 40.0, settled=False)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer)[0], 100.0)
+        self.assertEqual(self.fills(), [])
+        self.hold(FAV, -40.0)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (60.0, 0.0))
+        self.assertEqual([(slot, size) for slot, size, _ in self.fills()], [("FAV_ASK", 40.0)])
+        self.read(farmer)
+        self.assertEqual(len(self.fills()), 1)
+
+    def test_a_farmer_longshot_fill_still_pauses_the_naked_bid(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        farmer.cycle()
+        self.read(farmer)
+        bid = self.order_id(LONG, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        self.read(farmer)
+        farmer.cycle()
+        self.assertEqual(self.fills(), [("LONG_BID", size, 0.001)])
+        self.assertIsNotNone(self.farm_state()[0]["naked_paused_until"])
+        alerts = [e["message"] for e in self.events() if e["kind"] == "ALERT"]
+        self.assertEqual(len(alerts), 1)
+        self.assertRegex(alerts[0], "^ALERT test-market: naked longshot fill; LONG_BID paused")
+
+    def test_a_manual_buy_rests_no_exit_and_books_no_fill(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.manual_trade(FAV, "BUY", 200.0)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (0.0, 200.0))
+        farmer.cycle()
+        self.assertNotIn((FAV, "SELL"), {(o["asset_id"], o["side"]) for o in self.resting.values()})
+        self.assertEqual(self.fills(), [])
+        self.assertEqual(farm_db.find_market(self.ui, CID)["baseline_fav"], 200.0)
+
+    def test_a_manual_fill_is_logged_as_a_manual_fill(self):
+        farmer = self.farming(0.0)
+        self.manual_trade(FAV, "BUY", 200.0)
+        self.read(farmer)
+        self.read(farmer)
+        farmer.cycle()
+        logged = [(e["condition_id"], e["slot"], e["size"], e["price"], e["message"])
+                  for e in self.events() if e["kind"] == "MANUAL_FILL"]
+        self.assertEqual(logged, [(CID, "FAV_BID", 200.0, 0.97,
+                                   "MANUAL_FILL test-market: you bought 200 favorite shares "
+                                   "@ 97.0c; not farm inventory")])
+
+    def test_a_fill_of_your_own_resting_order_is_yours(self):
+        self.rest_manual("manual", FAV, "BUY", 0.97, 80.0)
+        farmer = self.farming(0.0)
+        self.fill("manual")
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (0.0, 80.0))
+        self.assertEqual(self.fills(), [])
+        logged = [json.loads(e["data"]) for e in self.events() if e["kind"] == "MANUAL_FILL"]
+        self.assertEqual([(d["order_id"], d["taker"]) for d in logged], [("manual", False)])
+
+    def test_a_manual_longshot_buy_does_not_pause_the_naked_bid(self):
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        bid = self.order_id(LONG, "BUY")
+        self.manual_trade(LONG, "BUY", 300.0, price=0.02)
+        self.read(farmer)
+        farmer.cycle()
+        self.assertIsNone(self.farm_state()[0]["naked_paused_until"])
+        self.assertIn(bid, self.resting)
+        self.assertEqual([e["message"] for e in self.events() if e["kind"] in ("ALERT", "FILL")],
+                         [])
+
+    def test_a_manual_sale_of_your_own_shares_leaves_the_farm_whole(self):
+        farmer = self.farming(50.0, yours=100.0)
+        self.manual_trade(FAV, "SELL", 60.0)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (50.0, 40.0))
+        self.assertEqual(self.fills(), [])
+
+    def test_a_farmer_buy_counts_at_the_positions_read_that_shows_it_and_once(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid, settled=False)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (0.0, 1000.0))
+        self.assertEqual((self.fills(), self.asked()), ([], []))
+        self.hold(FAV, size)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        self.assertEqual([(slot, shares) for slot, shares, _ in self.fills()],
+                         [("FAV_BID", size)])
+
+    def test_a_read_whose_holdings_the_ledgers_explain_asks_no_trades(self):
+        farmer = self.farming(50.0, yours=100.0)
+        self.manual_trade(FAV, "BUY", 30.0, settled=False)
+        self.manual_trade(FAV2, "BUY", 30.0, settled=False)
+        for minute in range(1, 4):
+            self.read(farmer, later=60 * minute)
+        self.assertEqual(self.asked(), [])
+        self.assertEqual(self.inventory(farmer), (50.0, 100.0))
+
+    def test_a_fill_counts_once_when_after_leaves_out_its_own_second(self):
+        self.after_includes_its_second = False
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        self.read(farmer)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+
+    def test_a_restart_counts_each_fill_once(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        farmer.shutdown("test", cancel=False)
+        again = self.started_farmer(client=self.client)
+        self.assertEqual(self.inventory(again), (size, 1000.0))
+
+    def test_a_fill_that_landed_as_the_farmer_stopped_is_counted_at_the_next_start(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        farmer.shutdown("test", cancel=True)
+        again = self.started_farmer(client=self.client)
+        self.assertEqual(self.inventory(again), (size, 1000.0))
+
+    def test_a_failed_trades_read_keeps_quoting_and_catches_up_once(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.client.get_trades.side_effect = httpx.ConnectError("down")
+        self.fill(bid)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (0.0, round(1000.0 + size, 6)))
+        self.assertEqual(self.farm_state()[0]["phase"], "QUOTING")
+        self.assertEqual(float(self.resting[self.order_id(FAV, "BUY")]["original_size"]), size)
+        self.assertIn(mock.call("Warning: test-market: trades unavailable (down); a rise in its "
+                                "holdings is yours until its trades read"),
+                      reward_farmer.log.call_args_list)
+        self.client.get_trades.side_effect = self.get_trades
+        self.read(farmer)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        self.assertEqual([(slot, shares) for slot, shares, _ in self.fills()],
+                         [("FAV_BID", size)])
+
+    def test_a_market_whose_trades_answer_500_is_the_only_one_left_unsynced(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bids = [self.order_id(FAV, "BUY"), self.order_id(FAV2, "BUY")]
+        size, size2 = (float(self.resting[bid]["original_size"]) for bid in bids)
+        self.trades_down.add(CID)
+        for bid in bids:
+            self.fill(bid)["status"] = "CONFIRMED"
+        self.read(farmer, later=60)
+        self.assertEqual(self.asked(), [CID, CID2])
+        self.assertEqual(self.inventory(farmer), (0.0, round(1000.0 + size, 6)))
+        self.assertEqual(self.inventory(farmer, CID2), (size2, 0.0))
+        self.trades_down.clear()
+        self.read(farmer, later=120)
+        self.assertEqual(self.asked(), [CID])
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        self.assertEqual(self.inventory(farmer, CID2), (size2, 0.0))
+        self.assertEqual([(e["condition_id"], e["size"]) for e in self.events()
+                          if e["kind"] == "FILL"], [(CID2, size2), (CID, size)])
+
+    def test_a_restart_asks_a_market_whose_holdings_moved_while_down_from_its_cursor(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        farmer.shutdown("test", cancel=False)
+        saved = farm_db.load_fill_cursors(self.ui)[CID]
+        self.fill(bid)
+        again = self.started_farmer(client=self.client)
+        self.assertEqual(self.asked(), [CID])
+        self.assertEqual(self.asks[-1].after, saved.after)
+        self.assertEqual(self.inventory(again), (size, 1000.0))
+
+    def test_trades_past_the_cap_wait_a_read_unsynced_and_are_asked_at_the_next(self):
+        third, (fourth, fav4) = (self.approve_another(n) for n in (3, 4))
+        farmer = self.farming(0.0)
+        bid = self.order_id(fav4, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        for fav in (FAV, FAV2, third[1]):
+            self.manual_trade(fav, "BUY", 10.0)["status"] = "CONFIRMED"
+        self.fill(bid)["status"] = "CONFIRMED"
+        self.read(farmer, later=60)
+        self.assertEqual(self.asked(), [CID, CID2, third[0]])
+        self.assertEqual(self.inventory(farmer, fourth), (0.0, size))
+        self.read(farmer, later=120)
+        self.assertEqual(self.asked(), [fourth])
+        self.assertEqual(self.inventory(farmer, fourth), (size, 0.0))
+        self.assertEqual(self.inventory(farmer), (0.0, 10.0))
+
+    def alerts(self, farmer):
+        farmer.cycle()
+        return [e["message"] for e in self.events() if e["kind"] == "ALERT"]
+
+    def test_an_unreadable_trade_moves_no_inventory_and_alerts_at_the_third_read(self):
+        farmer = self.farming(100.0)
+        self.list_trade(market=CID, trader_side="MAKER", maker_orders=[])
+        self.hold(FAV, 50.0)
+        self.read(farmer, later=60)
+        self.read(farmer, later=120)
+        self.assertEqual(self.inventory(farmer), (100.0, 50.0))
+        self.assertEqual(self.alerts(farmer), [])
+        self.read(farmer, later=180)
+        self.assertEqual(self.alerts(farmer), [
+            "ALERT test-market: no trades read in 3 asks (a trade cannot be read (trade t1: a "
+            "MAKER trade with none of the account's maker orders)); until they read, no fill "
+            "moves its farm inventory and a rise in its holdings is yours"])
+        self.assertEqual(self.inventory(farmer), (100.0, 50.0))
+
+    def test_trades_unread_for_long_alert_once_an_hour_and_their_return_is_logged(self):
+        farmer = self.farming(100.0)
+        self.client.get_trades.side_effect = httpx.ConnectError("down")
+        self.hold(FAV, 10.0)
+        for minute in range(1, 63):
+            self.read(farmer, later=60 * minute)
+        self.assertEqual(self.alerts(farmer), [
+            "ALERT test-market: no trades read in 3 asks (trades unavailable (down)); until "
+            "they read, no fill moves its farm inventory and a rise in its holdings is yours"])
+        self.read(farmer, later=60 * 63)
+        self.assertEqual(self.alerts(farmer)[1:], [
+            "ALERT test-market: no trades read in 63 asks (trades unavailable (down)); until "
+            "they read, no fill moves its farm inventory and a rise in its holdings is yours"])
+        self.client.get_trades.side_effect = self.get_trades
+        self.read(farmer, later=60 * 64)
+        self.assertIn(mock.call("test-market: trades read again after 63 asks without them"),
+                      reward_farmer.log.call_args_list)
+        self.client.get_trades.side_effect = httpx.ConnectError("down")
+        self.hold(FAV, 10.0)
+        self.read(farmer, later=60 * 65)
+        self.read(farmer, later=60 * 66)
+        self.assertEqual(len(self.alerts(farmer)), 2)
+        self.read(farmer, later=60 * 67)
+        self.assertEqual(len(self.alerts(farmer)), 3)
+
+    def test_farm_shares_you_sold_by_hand_leave_the_ledger_and_a_later_buy_stays_yours(self):
+        farmer = self.farming(50.0, yours=100.0)
+        self.manual_trade(FAV, "SELL", 100.0, settled=False, later=QUIET_S - 30)
+        self.manual_trade(LONG, "BUY", 5.0, price=0.02, later=QUIET_S - 20)
+        self.read(farmer, later=QUIET_S)
+        self.assertEqual(self.inventory(farmer), (50.0, 100.0))
+        self.hold(FAV, -100.0)
+        self.manual_trade(FAV, "SELL", 30.0, later=QUIET_S + 30)
+        self.read(farmer, later=QUIET_S + 60)
+        self.read(farmer, later=QUIET_S + 75)
+        self.assertEqual(self.inventory(farmer), (20.0, 0.0))
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 20.0)
+        self.assertIn(mock.call("test-market: the farm ledger was over the holdings with no buy "
+                                "for 15 minutes; lowered fav 50 -> 20, long 0 -> 0"),
+                      reward_farmer.log.call_args_list)
+        self.manual_trade(FAV, "BUY", 60.0, later=QUIET_S + 90)
+        self.read(farmer, later=QUIET_S + 120)
+        self.assertEqual(self.inventory(farmer), (20.0, 60.0))
+        self.read(farmer, later=2 * QUIET_S + 120)
+        self.assertEqual(self.inventory(farmer), (20.0, 60.0))
+        farmer.cycle()
+        self.assertEqual([o["original_size"] for o in self.resting.values()
+                          if (o["asset_id"], o["side"]) == (FAV, "SELL")], ["20.0"])
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 20.0)
+
+    def test_one_positions_read_without_the_token_lowers_no_ledger_and_two_low_reads_do(self):
+        farmer = self.farming(50.0)
+        holdings = reward_farmer.fetch_holdings.return_value
+        self.read(farmer, later=QUIET_S)
+        shown = holdings.pop(FAV)
+        self.read(farmer, later=QUIET_S + 60)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 50.0)
+        holdings[FAV] = shown
+        self.read(farmer, later=QUIET_S + 120)
+        self.assertEqual(self.inventory(farmer), (50.0, 0.0))
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 50.0)
+        holdings[FAV] = (20.0, 0.95)
+        self.read(farmer, later=QUIET_S + 180)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 50.0)
+        self.read(farmer, later=QUIET_S + 240)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 20.0)
+        self.assertEqual(self.inventory(farmer), (20.0, 0.0))
+
+    def test_after_a_start_no_ledger_is_lowered_until_a_quiet_period_has_passed(self):
+        farmer = self.farming(50.0)
+        farmer.shutdown("test", cancel=False)
+        self.hold(FAV, -30.0)
+        again = self.started_farmer(client=self.client)
+        self.read(again, later=QUIET_S - 60)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 50.0)
+        self.read(again, later=QUIET_S)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 20.0)
+
+    def test_a_filled_orders_id_stays_on_record_until_its_fill_is_counted_and_settled(self):
+        farmer = self.farming(0.0)
+        bid = self.order_id(FAV, "BUY")
+        trade = self.fill(bid)
+        farmer.cycle()
+        self.assertIn(bid, self.recorded())
+        self.client.get_trades.side_effect = httpx.ConnectError("down")
+        self.read(farmer, later=UNLISTED_GRACE_S)
+        self.assertIn(bid, self.recorded())
+        self.client.get_trades.side_effect = self.get_trades
+        self.read(farmer, later=UNLISTED_GRACE_S - 30)
+        self.assertIn(bid, self.recorded())
+        self.read(farmer, later=UNLISTED_GRACE_S)
+        self.assertIn(bid, self.recorded())
+        trade["status"] = "CONFIRMED"
+        self.read(farmer, later=UNLISTED_GRACE_S)
+        self.assertEqual(self.recorded(), set(self.resting))
+
+    def test_a_counted_farmer_buy_that_fails_is_taken_back(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        trade = self.fill(bid)
+        farmer.cycle()
+        self.read(farmer, later=60)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+        trade["status"] = "FAILED"
+        self.hold(FAV, -size)
+        self.read(farmer, later=120)
+        self.assertEqual(self.inventory(farmer), (0.0, 1000.0))
+        self.read(farmer, later=180)
+        self.assertEqual(self.inventory(farmer), (0.0, 1000.0))
+        self.assertIn(bid, self.recorded())
+        self.read(farmer, later=UNLISTED_GRACE_S + 60)
+        self.assertNotIn(bid, self.recorded())
+
+    def test_the_next_start_forgets_the_ids_a_stop_left_on_record(self):
+        farmer = self.stopped_after_a_cycle()
+        stopped = set(self.resting)
+        farmer.shutdown("test", cancel=True)
+        self.assertEqual(self.recorded(), stopped)
+        again = self.started_farmer(client=self.client)
+        again.cycle()
+        self.read(again, later=UNLISTED_GRACE_S)
+        self.assertEqual(self.recorded(), set(self.resting))
+        self.assertFalse(stopped & self.recorded())
+
+    def test_a_read_that_fails_on_one_market_moves_no_ledger_and_the_next_counts_once(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        ledgers = {cid: m.ledger for cid, m in farmer.markets.items()}
+        cursors = farmer.cursors
+        computed = []
+
+        def fails_on_the_second_market(ledger, baseline, held, farm, fills, fm, *rest):
+            computed.append(fm.condition_id)
+            if fm.condition_id == CID2:
+                raise RuntimeError("boom")
+            return next_inventory(ledger, baseline, held, farm, fills, fm, *rest)
+
+        with mock.patch.object(reward_farmer, "next_inventory", fails_on_the_second_market), \
+                self.assertRaises(RuntimeError):
+            self.read(farmer)
+        self.assertEqual(computed, [CID, CID2])
+        self.assertEqual({cid: m.ledger for cid, m in farmer.markets.items()}, ledgers)
+        self.assertEqual(farmer.cursors, cursors)
+        self.assertEqual(farm_db.load_fill_cursors(self.ui), cursors)
+        self.read(farmer)
+        self.read(farmer)
+        self.assertEqual(self.inventory(farmer), (size, 1000.0))
+
+    def test_a_failed_inventory_save_is_made_again_with_the_next_read(self):
+        farmer = self.farming(0.0, yours=1000.0)
+        bid = self.order_id(FAV, "BUY")
+        size = float(self.resting[bid]["original_size"])
+        self.fill(bid)
+        with mock.patch.object(farm_db, "save_inventory",
+                               side_effect=sqlite3.OperationalError("locked")):
+            self.read(farmer, later=UNLISTED_GRACE_S)
+        farmer.cycle()
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 0.0)
+        self.assertIn(bid, self.recorded())
+        self.read(farmer)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], size)
+        farmer.shutdown("test", cancel=False)
+        self.assertEqual(self.inventory(self.started_farmer(client=self.client)), (size, 1000.0))
+
+    def test_a_market_approved_again_seeds_its_ledger_afresh(self):
+        farmer = self.farming(100.0)
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 100.0)
+        farm_db.reject_market(self.ui, CID, "", None, NOW)
+        farmer.cycle()
+        self.assertEqual([e["condition_id"] for e in self.events() if e["kind"] == "RETIRE"],
+                         [CID])
+        self.assertIsNone(farm_db.find_market(self.ui, CID)["farm_fav"])
+        self.assertEqual(set(farm_db.load_fill_cursors(self.ui)), {CID2})
+        self.hold(FAV, 30.0)
+        farm_db.approve_market(self.ui, CID, 0.995, 25.0, now=NOW)
+        farmer.cycle()
+        self.read(farmer, later=SEED_STILL_S)
+        self.assertEqual(self.inventory(farmer), (130.0, 0.0))
+        self.assertEqual(set(farm_db.load_fill_cursors(self.ui)), {CID, CID2})
+        self.assertEqual(farm_db.find_market(self.ui, CID)["farm_fav"], 130.0)
 
 
 class ParserTest(unittest.TestCase):

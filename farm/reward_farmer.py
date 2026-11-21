@@ -132,20 +132,64 @@ markets (retirement, baselines). Each quoting market's favorite book goes to
 farm_books.db beside farm.db every five minutes, on a thread of its own (see
 farm/farm_books.py).
 
-Stopping cancels the live orders on the managed markets, whether by a stop
-command, Ctrl+C, SIGTERM, or a crash; only a finished --once run leaves them
-resting. A stop command asking to keep orders, or Ctrl+C and SIGTERM under
---keep-orders, leaves them resting too. Until the next start they are
+The farmer acts only on the orders it placed. A listed order on a managed
+market's tokens is the farmer's when its id is in farm.db's farmer_orders or
+it expires at the second the farmer signs that market's orders with
+(expires_at); every other order there is the user's own. The user's orders
+are still taken out of the favorite book before it is priced, as the
+farmer's are, and counted in the published book's `ours`, but the farmer
+never plans around or cancels them.
+Each accepted post saves its id, and each listing saves the id of an order
+it recognised by expiration alone, so an order stays the farmer's after its
+market's expires_at moves. An id a listing no longer shows stays on record
+for UNLISTED_GRACE_S, while its market's trades are behind, and while a fill
+of it may still fail.
+
+Stopping cancels the farmer's live orders on the managed markets, whether by
+a stop command, Ctrl+C, SIGTERM, or a crash; only a finished --once run
+leaves them resting. A stop command asking to keep orders, or Ctrl+C and
+SIGTERM under --keep-orders, leaves them resting too. Until the next start they are
 unmanaged: no cooldowns, retirement, or fill handling. The next start adopts
 the ones still close to target and replaces the rest; a market no longer
 approved by then is not managed, and its orders rest until they expire.
 --heartbeat cannot keep orders: Polymarket cancels them 10s after the
 heartbeats stop.
 
-The farmer never sells shares that were in the wallet before it managed the
-market. The first time it sees an approved market it records the holdings as
-a baseline (in the database when live), lowers the baseline whenever the
-holdings drop below it, and farms only the shares above it. One
+The farmer never sells shares its own orders did not buy. A dry run has no
+trades to read: the first time it sees a market it takes the holdings as the
+baseline, lowers the baseline whenever the holdings drop below it, and farms
+the shares above it. A live farmer keeps a farm ledger for each market: the
+shares that fills of its own orders bought and have not sold. It reads a
+market's fills from the CLOB's trade listing of that market, asked without
+the account's address (polymarket/trades.py), and tells its own from the
+user's by the order ids in farmer_orders. The baseline is then the holdings
+the ledger does not explain, and the farm's inventory is the holdings above
+the baseline, so a share the user bought by hand on a managed market is
+never the farm's. Such a fill is logged as a MANUAL_FILL. A manual buy moves
+no fill event, fill mid or pause; a manual sale shows as a farm ASK fill only
+where it took farm shares, or while its trades are unread.
+
+A positions read asks the trades only of the markets that need them
+(trades_to_ask): one whose holdings are not its baseline plus its ledger,
+one with a fill the chain may still undo, and one whose trades an earlier
+read needed and did not read (behind). So a fill counts at the positions
+read that shows it, and a read whose holdings all add up makes no call. At
+most MAX_TRADE_ASKS markets are asked a read, the ones asked least lately
+first; the rest wait a read. A market whose trades are not read, failed or
+waiting, is unsynced for that read: a rise in its holdings stays the user's
+until a fill explains it, and a fall comes off the farm. A market's ledger
+seeds with the farm's inventory under the dry run's rule, without a call
+(seed_from): at once, counting its trades from then, when it has no farmer
+order on record or resting; else once its holdings have held still for
+SEED_STILL_S, counting from the first read of that span. Until then it is
+unsynced. The ledgers, the baselines and
+each market's cursor (the settings row farmer.fills) are saved together, so
+a restart counts every fill once, and holdings that moved while the farmer
+was down get their market asked from its cursor. A fill of the user's that
+sold farm shares can be missed while the positions lag the trades, so once
+a token has had no buy for QUIET_S a ledger above its holdings at two
+positions reads in a row is lowered to them. A market whose trades fail
+UNREAD_ALERT_READS asks in a row alerts, and then at most once an hour. One
 approximation remains: the data API reports one average price per token,
 blended across baseline and farm shares, and the farmer uses it as the farm
 inventory's cost for the exit floor and the capital and budget caps.
@@ -218,12 +262,11 @@ from dotenv import load_dotenv
 import data_dir
 from farm import farm_books, farm_db, fill_cost
 from farm.exit_value import TAPE_ROWS_FARMER, tape_from_json, tape_to_json
-from farm.farm_db import EventKind, stamp
+from farm.farm_db import EventKind, FillCursor, stamp
 from py_clob_client_v2.clob_types import (
     AssetType,
     BalanceAllowanceParams,
     OrderArgsV2,
-    OrderMarketCancelParams,
     OrderType,
     PartialCreateOrderOptions,
     PostOrdersV2Args,
@@ -268,7 +311,9 @@ from polymarket.books import Levels
 from polymarket.gamma import GAMMA_REQUEST_LIMIT, request_markets
 from polymarket.hosts import DATA_API_HOST
 from polymarket.http import RATE_LIMIT_RETRIES, chunks, get_pages
+from polymarket.orders import Side
 from polymarket.parse import as_float, parse_time
+from polymarket.trades import FillState, UnreadableTrade, fetch_fills
 
 BUY, SELL = "BUY", "SELL"
 
@@ -382,6 +427,20 @@ PRUNE_S = 600
 MID_SAMPLE_S = 60
 # farm_mids read back this far for the mid before a fill.
 FILL_MID_LOOKBACK_S = 600
+# A fill still unsettled after this long no longer holds the trades cursor
+# back. The chain settles or fails a match within minutes.
+SETTLE_MAX_S = 3600
+# A token no buy has matched on for this long has every buy in its positions,
+# so a ledger above the holdings counts shares the farm does not have
+# (healed_ledger).
+QUIET_S = 900
+UNLISTED_GRACE_S = QUIET_S
+MAX_TRADE_ASKS = 3
+# A market with a farmer order seeds its ledger once its holdings have held
+# still this long; the positions show a fill well within it (seed_from).
+SEED_STILL_S = 300
+UNREAD_ALERT_READS = 3
+UNREAD_ALERT_S = 3600
 HEARTBEAT_S = 5
 # Stopping waits this long for the book recorder to write its last batch.
 BOOKS_JOIN_S = 10
@@ -520,6 +579,16 @@ class LiveOrder(NamedTuple):
     size_remaining: float
 
 
+class Listed(NamedTuple):
+    """One market's open orders on the account: the farmer's and the user's."""
+    farmer: list
+    manual: list
+
+    @property
+    def account(self):
+        return self.farmer + self.manual
+
+
 NOTHING_RESTING = MappingProxyType({})
 
 
@@ -561,10 +630,64 @@ class Place(NamedTuple):
 
 
 class Baseline(NamedTuple):
-    """Shares held before the farmer managed the market; it never sells them."""
+    """The wallet's shares that are not the farm's; it never sells them."""
 
     fav: float
     long: float
+
+
+class FarmLedger(NamedTuple):
+    """Shares the farmer's own orders bought and have not sold. A fill of an
+    order in farmer_orders moves it; the user's sale past the baseline
+    (moved_ledger) and a quiet token's holdings (healed_ledger) can only
+    lower it."""
+
+    fav: float
+    long: float
+
+
+class LastBuy(NamedTuple):
+    """When the latest buy of each token matched, the farmer's or the user's.
+    Before one is read it is when this run began managing the market: an
+    earlier buy may not be in the positions yet."""
+
+    fav: datetime
+    long: datetime
+
+
+class Unread(NamedTuple):
+    """One market's asks in a row for its trades that read none, and when
+    they last alerted."""
+
+    reads: int = 0
+    alerted_at: Optional[datetime] = None
+
+
+class MarketTrades(NamedTuple):
+    condition_id: str
+    held: Position
+    baseline: Optional[Baseline]
+    ledger: Optional[FarmLedger]
+    cursor: Optional[FillCursor]
+    asked_at: Optional[datetime]
+
+
+class FillRead(NamedTuple):
+    """One market's good trades read: its fills not yet counted, split by
+    whose order filled, and the cursor that has counted them. A fill among
+    them that failed takes back its earlier count."""
+
+    mine: list
+    yours: list
+    cursor: FillCursor
+
+
+class Unlisted(NamedTuple):
+    """The market of a farmer order id on record that the listing no longer
+    shows, and since when."""
+
+    condition_id: str
+    since: datetime
 
 
 class Backoff(NamedTuple):
@@ -1571,6 +1694,271 @@ def farm_position(held, baseline):
     )
 
 
+def new_fills(fills, cursor, now):
+    """(the fills to count, the cursor that has counted them) of one
+    market's trades read asked after cursor.after.
+
+    A fill not counted before counts once, unless it failed. A counted fill
+    that has failed since comes back, still FAILED, to be taken back once.
+    The cursor waits a second before the oldest fill the chain may still
+    undo, so the next read shows whether it failed; unsettled names the
+    order of each fill the chain may still undo. With none it moves to a
+    second before the newest fill. It
+    keeps the keys of the counted fills from there on, so a fill read again
+    is not counted again, whether or not the CLOB's `after` includes the
+    second it names. A fill unsettled for over SETTLE_MAX_S holds it back no
+    longer. The read answered, so the cursor is not behind.
+    """
+    counted, count = set(cursor.counted), []
+    for fill in sorted(fills, key=lambda f: f.matched_at):
+        failed = fill.state is FillState.FAILED
+        if fill.key in counted and failed:
+            counted.discard(fill.key)
+            count.append(fill)
+        elif fill.key not in counted and not failed:
+            counted.add(fill.key)
+            count.append(fill)
+    stale = now - timedelta(seconds=SETTLE_MAX_S)
+    unsettled = [f for f in fills if f.state is FillState.PENDING and f.matched_at > stale]
+    resume = min((f.matched_at for f in unsettled),
+                 default=max((f.matched_at for f in fills), default=None))
+    after = cursor.after
+    if resume is not None:
+        after = max(after, int(resume.timestamp()) - 1)
+    matched = {f.key: f.matched_at.timestamp() for f in fills}
+
+    def read_again(key):
+        return matched[key] >= after if key in matched else after == cursor.after
+
+    return count, FillCursor(after, frozenset(filter(read_again, counted)),
+                             frozenset(f.order_id for f in unsettled))
+
+
+def fill_read(fills, cursor, fm, farmer_ids, now):
+    """The FillRead of fm's trades read asked after cursor.after: the fills of
+    its two tokens not yet counted (new_fills), a fill the farmer's when its
+    order id is in farmer_ids."""
+    tokens = (fm.fav_token_id, fm.long_token_id)
+    count, cursor = new_fills([f for f in fills if f.token_id in tokens], cursor, now)
+    return FillRead([f for f in count if f.order_id in farmer_ids],
+                    [f for f in count if f.order_id not in farmer_ids], cursor)
+
+
+def _explained(held, baseline, ledger):
+    return (_shares(baseline.fav + ledger.fav) == _shares(held.fav_shares)
+            and _shares(baseline.long + ledger.long) == _shares(held.long_shares))
+
+
+def trades_to_ask(markets, cap=MAX_TRADE_ASKS):
+    """(the condition ids a positions read asks the trades of, the ones that
+    wait for the next read) of markets, MarketTrades.
+
+    A market with a ledger is asked when its holdings are not its baseline
+    plus its ledger, so a fill the trades have not shown may have moved
+    them; when its cursor waits on a fill the chain may still undo; and when
+    it is behind, an earlier read having needed its trades and not read
+    them; or when it has no baseline. That covers a restart too: holdings
+    that moved while the farmer was down are not explained. A market with
+    no ledger is never asked: it seeds without a trades read
+    (next_inventory). At most cap are asked, the ones
+    asked least lately first, and the rest wait.
+    """
+    def wants(m):
+        if m.ledger is None or m.cursor is None:
+            return False
+        return (m.cursor.behind or bool(m.cursor.unsettled) or m.baseline is None
+                or not _explained(m.held, m.baseline, m.ledger))
+
+    never = datetime.min.replace(tzinfo=timezone.utc)
+    wanting = sorted(filter(wants, markets), key=lambda m: m.asked_at or never)
+    return ([m.condition_id for m in wanting[:cap]],
+            [m.condition_id for m in wanting[cap:]])
+
+
+def _shares(amount):
+    """A share count as the chain holds one: six decimals, never negative."""
+    return max(0.0, round(amount, 6))
+
+
+def _bought(fill):
+    """The shares the fill added to the wallet, negative for a sale. A fill
+    that failed after it was counted takes its shares back."""
+    return (fill.shares * (1 if fill.side is Side.BUY else -1)
+            * (-1 if fill.state is FillState.FAILED else 1))
+
+
+def _oversold(fills, own):
+    """The shares the user's fills of one token sold beyond their own, which
+    numbered own before the first of them: each sale in the order it matched
+    takes the user's shares first, and a buy between two sales adds to them."""
+    taken = 0.0
+    for fill in sorted(fills, key=lambda f: f.matched_at):
+        change = _bought(fill)
+        taken += max(0.0, -change - own)
+        own = max(0.0, own + change)
+    return taken
+
+
+def seed_ledger(held, baseline):
+    """The ledger of a market on its first trades read: the holdings above
+    the baseline, which is what the farm held before it had a ledger."""
+    kept = ratchet_baseline(baseline, held)
+    return FarmLedger(_shares(held.fav_shares - kept.fav),
+                      _shares(held.long_shares - kept.long))
+
+
+def moved_ledger(ledger, mine, yours, baseline, fm):
+    """The ledger after the fills of one trades read: mine of the farmer's
+    orders, yours of the user's.
+
+    A farmer buy adds its shares and a farmer sale takes them. The user's
+    fills move nothing, with one exception that only lowers it: when they
+    sold more of a token than the baseline, the user's own shares of it as
+    the last positions read left them, the rest of the sale came out of the
+    farm's.
+    """
+    def moved(farm, own, token_id):
+        bought = sum(_bought(f) for f in mine if f.token_id == token_id)
+        return _shares(farm + bought
+                       - _oversold([f for f in yours if f.token_id == token_id], own))
+
+    return FarmLedger(moved(ledger.fav, baseline.fav, fm.fav_token_id),
+                      moved(ledger.long, baseline.long, fm.long_token_id))
+
+
+def settled_baseline(baseline, held, ledger, synced):
+    """The wallet's shares that are not the farm's: the holdings the ledger
+    does not explain.
+
+    synced says the ledger has counted the trades up to this positions read.
+    When it has not, the baseline never falls: a rise in the holdings is the
+    user's until a fill explains it, and a fall comes off the farm.
+    """
+    spare = Baseline(_shares(held.fav_shares - ledger.fav),
+                     _shares(held.long_shares - ledger.long))
+    if synced or baseline is None:
+        return spare
+    return Baseline(max(baseline.fav, spare.fav), max(baseline.long, spare.long))
+
+
+def latest_buy(last_buy, fills, fm):
+    """last_buy moved on by the buys among the fills of one trades read,
+    whatever their owner or state."""
+    def latest(at, token_id):
+        return max([at, *(f.matched_at for f in fills
+                          if f.token_id == token_id and f.side is Side.BUY)])
+
+    return LastBuy(latest(last_buy.fav, fm.fav_token_id),
+                   latest(last_buy.long, fm.long_token_id))
+
+
+def healed_ledger(ledger, held, previous_held, last_buy, now):
+    """The ledger, held to the holdings of each token no buy has matched on
+    for QUIET_S.
+
+    The positions show every buy by then, and a sale they do not show yet
+    only leaves them higher. So a ledger above them counts shares the farm
+    no longer has: ones the user sold by hand while the baseline was out of
+    date (moved_ledger). A token with a later buy keeps its ledger, since a
+    farmer buy may not be in the positions yet.
+
+    The holdings are the larger of this positions read's and the one
+    before's, previous_held. One read can come back empty or partial, and a
+    ledger lowered to it would stay lowered. With no read before, the
+    market's first in this run, nothing is lowered.
+    """
+    if previous_held is None:
+        return ledger
+    quiet = now - timedelta(seconds=QUIET_S)
+
+    def healed(farm, shown, shown_before, bought_at):
+        return min(farm, _shares(max(shown, shown_before))) if bought_at <= quiet else farm
+
+    return FarmLedger(
+        healed(ledger.fav, held.fav_shares, previous_held.fav_shares, last_buy.fav),
+        healed(ledger.long, held.long_shares, previous_held.long_shares, last_buy.long))
+
+
+def still_since(previous_held, since, held, now):
+    """When the positions reads first showed the holdings as they are at now:
+    since while they equal previous_held, the read before's, and now once
+    they move."""
+    if previous_held is None or since is None:
+        return now
+    same = ((held.fav_shares, held.long_shares)
+            == (previous_held.fav_shares, previous_held.long_shares))
+    return since if same else now
+
+
+def seed_from(still, ordered, now):
+    """When the trades of a market with no ledger are counted from if its
+    ledger seeds at the positions read at now, or None while it waits.
+
+    A market with no farmer order on record or resting (ordered false)
+    seeds at once, from now: no farmer fill can predate its first order. One
+    with such an order seeds once its holdings have held still since still
+    for SEED_STILL_S, from still: a fill matched before then shows in the
+    positions within that span, and moving them starts it again.
+    """
+    if not ordered:
+        return now
+    return still if (now - still).total_seconds() >= SEED_STILL_S else None
+
+
+def next_inventory(ledger, baseline, held, farm, fills, fm, last_buy, now, previous_held):
+    """(ledger, baseline, the ledger before healed_ledger lowered it) of a
+    live market after the positions read at now.
+
+    fills is the market's (farmer's fills, user's fills) since the ledger
+    last counted, empty when the holdings needed no trades read
+    (trades_to_ask), or None when they were not read. ledger is None until
+    it seeds from the holdings, at a read seed_from allows, which passes
+    fills; it takes no fills on top. Until then the farm's last position,
+    farm, stands in for the ledger; it is None the first time the market's
+    holdings are read. last_buy has the read's fills in it already, and
+    previous_held is the holdings of the positions read before this one, or
+    None.
+    """
+    if fills is None:
+        known = ledger
+        if known is None:
+            known = (seed_ledger(held, baseline) if farm is None
+                     else FarmLedger(farm.fav_shares, farm.long_shares))
+        return ledger, settled_baseline(baseline, held, known, synced=False), ledger
+    mine, yours = fills
+    counted = (seed_ledger(held, baseline) if ledger is None
+               else moved_ledger(ledger, mine, yours, baseline, fm))
+    ledger = healed_ledger(counted, held, previous_held, last_buy, now)
+    return ledger, settled_baseline(baseline, held, ledger, synced=True), counted
+
+
+def another_unread(unread, now):
+    """(unread after one more ask of a market's trades that read none,
+    whether it alerts): the UNREAD_ALERT_READS-th ask in a row does, and
+    then one every UNREAD_ALERT_S while they stay unread."""
+    reads = unread.reads + 1
+    due = reads >= UNREAD_ALERT_READS and (
+        unread.alerted_at is None
+        or (now - unread.alerted_at).total_seconds() >= UNREAD_ALERT_S)
+    return Unread(reads, now if due else unread.alerted_at), due
+
+
+def forgettable(unlisted, cursors, now):
+    """The ids of unlisted, {order id: Unlisted}, that farm.db has no more
+    use for under cursors, {condition id: FillCursor}. An id stays for
+    UNLISTED_GRACE_S after a listing first stopped showing it, and after
+    that while its market has a cursor that is behind or names its order in
+    unsettled: a fill that fails is told as the farmer's only by this id."""
+    cutoff = now - timedelta(seconds=UNLISTED_GRACE_S)
+
+    def needed(order_id, condition_id):
+        cursor = cursors.get(condition_id)
+        return cursor is not None and (cursor.behind or order_id in cursor.unsettled)
+
+    return [order_id for order_id, (condition_id, since) in unlisted.items()
+            if since <= cutoff and not needed(order_id, condition_id)]
+
+
 def next_backoff(previous, now):
     if previous is None:
         return Backoff(now + timedelta(seconds=BACKOFF_START_S), BACKOFF_START_S)
@@ -1598,7 +1986,8 @@ def in_fav_book(order, fm):
 
 
 def strip_own(levels, orders, fm):
-    """The favorite book without our resting orders."""
+    """The favorite book without the account's resting orders, the farmer's
+    and the user's own."""
     bids, asks = [], []
     for o in orders:
         is_bid, price = in_fav_book(o, fm)
@@ -1837,6 +2226,16 @@ def parse_open_order(entry, fm):
     )
 
 
+def gtd_expiration(fm):
+    return int(fm.expires_at.timestamp())
+
+
+def placed_by_farmer(entry, fm, saved):
+    """Whether a listed order on fm's tokens is the farmer's: its id is on
+    record, or it expires at the second the farmer signs fm's orders with."""
+    return entry.get("id") in saved or as_float(entry.get("expiration")) == gtd_expiration(fm)
+
+
 # ---------------------------------------------------------------------------
 # Fetching
 # ---------------------------------------------------------------------------
@@ -1904,6 +2303,12 @@ def row_baseline(row):
     if row["baseline_fav"] is None or row["baseline_long"] is None:
         return None
     return Baseline(row["baseline_fav"], row["baseline_long"])
+
+
+def row_ledger(row):
+    if row["farm_fav"] is None or row["farm_long"] is None:
+        return None
+    return FarmLedger(row["farm_fav"], row["farm_long"])
 
 
 class TotalRates:
@@ -2054,10 +2459,12 @@ class MarketInfos:
 class Managed:
     """One approved market's runtime: its plan inputs, lifecycle, and last view."""
 
-    def __init__(self, fm, info, baseline):
+    def __init__(self, fm, info, baseline, ledger, now):
         self.fm = fm
         self.info = info
         self.baseline = baseline
+        self.ledger = ledger
+        self.last_buy = LastBuy(now, now)
         self.backoffs = {}
         self.approved = True
         self.state = State(Phase.QUOTING)
@@ -2069,7 +2476,9 @@ class Managed:
         # Since when the book has supported a favorite bid without a break,
         # on a market that opted into a sole bid (support_held).
         self.supported_since = None
-        self.held = None
+        self.held = self.held_since = None
+        self.asked_at = None
+        self.unread = Unread()
         self.position = None
         self.orders = []
         self.sim_orders = []
@@ -2088,6 +2497,7 @@ class Plan(NamedTuple):
     preview: Optional[Target]
     orders: list
     actions: list
+    account: list
 
 
 class Farmer:
@@ -2119,6 +2529,9 @@ class Farmer:
         self.saved_tapes = {}
         self.prior = fill_cost.DEFAULT_PRIOR
         self.user = os.getenv("POLYMARKET_FUNDER_ADDRESS")
+        self.cursors, self.saved_cursors = {}, {}
+        self.unsaved = set()
+        self.unlisted = {}
 
     def active(self):
         return [m for m in self.markets.values() if m.state.phase is not Phase.RETIRED]
@@ -2173,6 +2586,9 @@ class Farmer:
                   f"Reward farmer: {mode}; db {self.args.db}, every {self.args.interval:g}s",
                   data={"pid": os.getpid(), "commands_expired": expired})
         self.read_controls(now)
+        if self.live:
+            self.cursors = farm_db.load_fill_cursors(self.db)
+            self.saved_cursors = dict(self.cursors)
         # The first records are read here, before the reader thread starts, so
         # the first cycle (all of a --once run) manages the markets.
         self.infos.refresh(self.http, now)
@@ -2324,7 +2740,8 @@ class Farmer:
                 continue
             self.skips.pop(cid, None)
             if managed is None:
-                self.markets[cid] = Managed(fm, info, row_baseline(row))
+                ledger = row_ledger(row) if cid in self.cursors else None
+                self.markets[cid] = Managed(fm, info, row_baseline(row), ledger, now)
                 self.emit(EventKind.PHASE,
                           f"Managing {fm.label}: {fm.fav_outcome} "
                           f"p_true {p_true_text(fm.p_true)}, "
@@ -2366,14 +2783,59 @@ class Farmer:
         except Exception as e:
             log(f"Warning: positions fetch failed ({e}); keeping the last ones")
             return
+        helds = {m.fm.condition_id: position_for(m.fm, holdings) for m in self.active()}
+        reads, failed, waiting = self.read_trades(helds, now) if self.live else ({}, {}, ())
+        unseeded = self.live and any(m.ledger is None for m in self.active())
+        ordered = self.ordered_markets() if unseeded else set()
+        cursors, moves = dict(self.cursors), []
+        for managed in self.active():
+            fm, last_buy, held = managed.fm, managed.last_buy, helds[managed.fm.condition_id]
+            cid = fm.condition_id
+            since = still_since(managed.held, managed.held_since, held, now)
+            if self.live:
+                read = reads.get(cid)
+                if read is not None:
+                    fills = (read.mine, read.yours)
+                    last_buy = latest_buy(last_buy, [*read.mine, *read.yours], fm)
+                    cursors[cid] = read.cursor
+                elif cid in failed or cid in waiting:
+                    fills = None
+                    cursors[cid] = cursors[cid]._replace(behind=True)
+                else:
+                    fills = ((), ())
+                seeds_from = None
+                if managed.ledger is None:
+                    seeds_from = seed_from(since, cid in ordered, now)
+                    fills = fills if seeds_from is not None else None
+                ledger, baseline, counted = next_inventory(
+                    managed.ledger, managed.baseline, held, managed.position, fills, fm,
+                    last_buy, now, managed.held)
+                if managed.ledger is None and ledger is not None:
+                    cursors[cid] = FillCursor(int(seeds_from.timestamp()) - 1, frozenset())
+            else:
+                ledger, baseline = None, ratchet_baseline(managed.baseline, held)
+                counted = ledger
+            moves.append((managed, held, since, ledger, baseline, counted, last_buy))
+        for managed, held, since, ledger, baseline, _, last_buy in moves:
+            managed.held, managed.held_since, managed.last_buy = held, since, last_buy
+            if (ledger, baseline) != (managed.ledger, managed.baseline):
+                managed.ledger, managed.baseline = ledger, baseline
+                self.unsaved.add(managed.fm.condition_id)
+        if self.live:
+            self.cursors = cursors
+            self.save_inventory(now)
+            self.note_trades_reads(reads, failed, now)
+        for managed, _, _, ledger, _, counted, _ in moves:
+            if ledger != counted:
+                log(f"{managed.fm.label}: the farm ledger was over the holdings with no buy "
+                    f"for {QUIET_S // 60} minutes; lowered fav {counted.fav:g} -> "
+                    f"{ledger.fav:g}, long {counted.long:g} -> {ledger.long:g}")
         for managed in self.active():
             fm, previous = managed.fm, managed.position
-            held = managed.held = position_for(fm, holdings)
-            baseline = ratchet_baseline(managed.baseline, held)
-            if baseline != managed.baseline:
-                managed.baseline = baseline
-                if self.live:
-                    farm_db.save_baseline(self.db, fm.condition_id, baseline.fav, baseline.long)
+            held, baseline = managed.held, managed.baseline
+            read = reads.get(fm.condition_id)
+            for fill in read.yours if read else ():
+                self.note_manual(managed, fill)
             current = managed.position = farm_position(held, baseline)
             if previous is None:
                 if current.fav_shares >= ORDER_MIN_SHARES:
@@ -2398,6 +2860,119 @@ class Farmer:
                               f"ALERT {fm.label}: naked longshot fill; LONG_BID paused "
                               f"until {managed.naked_paused_until.astimezone():%H:%M:%S}",
                               fm.condition_id, slot)
+
+    def read_trades(self, helds, now):
+        """The trades of the markets this positions read asks, as
+        trades_to_ask picks them from helds, {condition id: Position}:
+        ({condition id: FillRead} of the ones that read, {condition id: why}
+        of the ones that did not, the condition ids left to wait for the
+        next read). Never raises, and moves no cursor."""
+        asked, waiting = trades_to_ask(
+            [MarketTrades(cid, held, self.markets[cid].baseline, self.markets[cid].ledger,
+                          self.cursors.get(cid), self.markets[cid].asked_at)
+             for cid, held in helds.items()])
+        if waiting:
+            log(f"Trades of {len(waiting)} markets wait for the next positions read "
+                f"(at most {MAX_TRADE_ASKS} are asked at each)")
+        if not asked:
+            return {}, {}, waiting
+        for cid in asked:
+            self.markets[cid].asked_at = now
+        try:
+            farmer_ids = farm_db.farmer_orders(self.db)
+        except sqlite3.Error as e:
+            return {}, dict.fromkeys(asked, f"the farmer's order ids are unavailable ({e})"), \
+                waiting
+        reads, failed = {}, {}
+        for cid in asked:
+            cursor = self.cursors[cid]
+            try:
+                fills = fetch_fills(self.client, self.user, cid, cursor.after)
+            except UnreadableTrade as e:
+                failed[cid] = f"a trade cannot be read ({e})"
+            except Exception as e:
+                failed[cid] = f"trades unavailable ({e})"
+            else:
+                reads[cid] = fill_read(fills, cursor, self.markets[cid].fm, farmer_ids, now)
+        return reads, failed, waiting
+
+    def ordered_markets(self):
+        """The condition ids with a farmer order on record or resting; every
+        managed market's when the ids on record cannot be read."""
+        try:
+            recorded = set(farm_db.farmer_orders(self.db).values())
+        except sqlite3.Error as e:
+            log(f"Warning: the farmer's order ids are unavailable ({e}); no ledger seeds "
+                f"before its holdings hold still")
+            return set(self.markets)
+        return recorded | {cid for cid, m in self.markets.items() if m.orders}
+
+    def note_trades_reads(self, reads, failed, now):
+        """Warn of each market whose trades were asked and not read, and
+        alert when that has lasted (another_unread); log each that reads
+        again."""
+        for cid, why in failed.items():
+            managed = self.markets[cid]
+            label = managed.fm.label
+            log(f"Warning: {label}: {why}; a rise in its holdings is yours until its trades read")
+            managed.unread, due = another_unread(managed.unread, now)
+            if due:
+                self.emit(EventKind.ALERT,
+                          f"ALERT {label}: no trades read in {managed.unread.reads} asks "
+                          f"({why}); until they read, no fill moves its farm inventory and a "
+                          f"rise in its holdings is yours", cid)
+        for cid in reads:
+            managed = self.markets[cid]
+            if managed.unread.reads:
+                log(f"{managed.fm.label}: trades read again after {managed.unread.reads} "
+                    f"asks without them")
+                managed.unread = Unread()
+
+    def save_inventory(self, now):
+        """Write the changed ledgers and baselines with the cursors in one
+        transaction, so farm.db never holds a ledger apart from the cursor it
+        was counted up to. A failed write warns and is made again with the
+        next. Only once farm.db holds what the cursors counted are the order
+        ids they leave no use for forgotten."""
+        if self.unsaved or self.cursors != self.saved_cursors:
+            rows = [(cid, self.markets[cid].ledger, self.markets[cid].baseline)
+                    for cid in self.unsaved if cid in self.markets]
+            try:
+                farm_db.save_inventory(self.db, rows, self.cursors, now)
+            except sqlite3.Error as e:
+                log(f"Warning: saving the farm inventory failed ({e}); trying again at the "
+                    f"next positions read")
+                return
+            self.unsaved.clear()
+            self.saved_cursors = dict(self.cursors)
+        gone = forgettable(self.unlisted, self.cursors, now)
+        if gone:
+            self.record_orders(gone=gone)
+            for order_id in gone:
+                del self.unlisted[order_id]
+
+    def note_manual(self, managed, fill):
+        """Log a fill of one of the user's own orders on a managed market. It
+        is never a FILL: those are the farm's."""
+        if fill.state is FillState.FAILED:
+            return
+        fm = managed.fm
+        role = fm.role_of(fill.token_id)
+        did = "bought" if fill.side is Side.BUY else "sold"
+        self.emit(EventKind.MANUAL_FILL,
+                  f"MANUAL_FILL {fm.label}: you {did} {fill.shares:g} {role.value} shares "
+                  f"@ {cents(fill.price, fm.tick)}; not farm inventory",
+                  fm.condition_id, SLOT_BY_ROLE_SIDE[(role, fill.side.value)], fill.price,
+                  fill.shares,
+                  data={"order_id": fill.order_id, "trade_id": fill.trade_id,
+                        "taker": fill.taker, "matched_at": stamp(fill.matched_at)})
+
+    def note_unlisted(self, markets_of, now):
+        """Remember when a listing first stopped showing each id on record
+        in markets_of, {order id: condition id}; an id listed again leaves
+        the map, not farmer_orders."""
+        self.unlisted = {order_id: self.unlisted.get(order_id) or Unlisted(cid, now)
+                         for order_id, cid in markets_of.items()}
 
     def fill_mid_seen(self, fm, seen_at):
         """The pre_fill_mid of a fill seen at seen_at, from farm_mids."""
@@ -2472,18 +3047,50 @@ class Farmer:
         return {token_id: cid for cid, m in self.markets.items()
                 for token_id in (m.fm.fav_token_id, m.fm.long_token_id)}
 
-    def open_orders(self):
-        """{condition_id: [LiveOrder]} for every managed market; one listing live."""
+    def open_orders(self, now):
+        """{condition_id: Listed} for every managed market. Live: one listing,
+        which also saves the ids it tells as the farmer's by expiration and
+        notes the ids on record it no longer shows."""
         if not self.live:
-            return {cid: list(m.sim_orders) for cid, m in self.markets.items()}
-        orders = {cid: [] for cid in self.markets}
+            return {cid: Listed(list(m.sim_orders), []) for cid, m in self.markets.items()}
+        try:
+            saved = farm_db.farmer_orders(self.db)
+        except sqlite3.Error as e:
+            log(f"Warning: the farmer's order ids are unavailable ({e}); "
+                f"telling its orders by expiration alone")
+            saved = None
+        entries = self.client.get_open_orders()
+        listed = {cid: Listed([], []) for cid in self.markets}
         market_of = self.market_of_token()
-        for entry in self.client.get_open_orders():
+        adopted = []
+        for entry in entries:
             cid = market_of.get(str(entry.get("asset_id") or ""))
-            order = parse_open_order(entry, self.markets[cid].fm) if cid else None
-            if order is not None:
-                orders[cid].append(order)
-        return orders
+            if cid is None:
+                continue
+            fm = self.markets[cid].fm
+            order = parse_open_order(entry, fm)
+            if order is None:
+                continue
+            if placed_by_farmer(entry, fm, saved or {}):
+                listed[cid].farmer.append(order)
+                if saved is not None and order.id not in saved:
+                    adopted.append((order.id, cid))
+            else:
+                listed[cid].manual.append(order)
+        if saved is not None:
+            if adopted:
+                log(f"Recognised {len(adopted)} orders by expiration; ids saved")
+            self.record_orders(placed=adopted)
+            listed_ids = {e.get("id") for e in entries}
+            self.note_unlisted({i: cid for i, cid in saved.items() if i not in listed_ids}, now)
+        return listed
+
+    def record_orders(self, placed=(), gone=()):
+        """Write to farmer_orders; a failed write warns and never fails the cycle."""
+        try:
+            farm_db.record_farmer_orders(self.db, placed, gone)
+        except sqlite3.Error as e:
+            log(f"Warning: recording the farmer's order ids failed ({e})")
 
     def cycle(self):
         now = self.last_cycle_at = datetime.now(timezone.utc)
@@ -2508,7 +3115,7 @@ class Farmer:
                 log(f"Warning: pruning farm.db failed ({e}); retrying next cycle")
 
         try:
-            orders = self.open_orders()
+            listed = self.open_orders(now)
         except Exception as e:
             # Planning on no orders would duplicate the ones actually resting.
             log(f"Warning: open orders unavailable ({e}); planning no market")
@@ -2520,7 +3127,7 @@ class Farmer:
         for managed in active:
             try:
                 plan = self.step_market(managed, books.get(managed.fm.fav_token_id),
-                                        orders[managed.fm.condition_id], now)
+                                        listed[managed.fm.condition_id], now)
             except Exception as e:
                 log(f"Error on {managed.fm.label}: {e}")
                 continue
@@ -2538,7 +3145,7 @@ class Farmer:
                 log(f"Error on {plan.managed.fm.label}: {e}")
         self.flush()
 
-    def step_market(self, managed, levels, orders, now):
+    def step_market(self, managed, levels, listed, now):
         """Advance the lifecycle and plan the orders; None when there is no plan."""
         fm = managed.fm
         if levels is None:
@@ -2550,8 +3157,8 @@ class Farmer:
         if levels.tick:
             fm = managed.fm = fm._replace(tick=levels.tick)
 
-        managed.orders = orders
-        book = strip_own(levels, orders, fm) if self.live else levels
+        orders = managed.orders = listed.farmer
+        book = strip_own(levels, listed.account, fm) if self.live else levels
         fm = with_book_mid(fm, book)
         book_mid = fm.book_mid
         book_ask = drop_ask(book.asks, fm.min_size)
@@ -2624,7 +3231,7 @@ class Farmer:
             now,
         )
         self.report(managed, target, orders, actions)
-        return Plan(managed, levels, book_mid, target, preview, orders, actions)
+        return Plan(managed, levels, book_mid, target, preview, orders, actions, listed.account)
 
     def settle(self, plan, placed, now):
         """Back off rejected slots, publish the market's view, and retire it if due."""
@@ -2652,12 +3259,12 @@ class Farmer:
             managed.book_sampled_at = now
             self.book_samples.append(farm_books.sample(
                 fm.condition_id, now, plan.book_mid, plan.levels.bids, plan.levels.asks,
-                [(o.slot.name, o.price, o.size_remaining) for o in plan.orders]))
+                [(o.slot.name, o.price, o.size_remaining) for o in plan.account]))
         if managed.state.phase is Phase.RETIRED:
-            self.retire(managed)
+            self.retire(managed, now)
 
     def market_state(self, plan, now):
-        managed, levels, book_mid, target, preview, orders, actions = plan
+        managed, levels, book_mid, target, preview, orders, actions, account = plan
         fm, state = managed.fm, managed.state
         q1, q2 = q_totals(target.intents)
         return farm_db.FarmState(
@@ -2675,7 +3282,7 @@ class Farmer:
             position=position_view(managed.held, managed.baseline, managed.position),
             slots=slot_views(state, orders, target, preview, actions, managed.backoffs, fm,
                              managed.position, self.cfg, self.history(fm)),
-            book=book_view(levels, orders, target.mid or book_mid, fm),
+            book=book_view(levels, account, target.mid or book_mid, fm),
             naked_paused_until=managed.naked_paused_until,
             backoff={slot.name: {"until": stamp(b.until), "attempts": b.attempts}
                      for slot, b in managed.backoffs.items()},
@@ -2773,7 +3380,7 @@ class Farmer:
             fm = p.managed.fm
             self.refresh_tick(fm, {a.intent.token_id for a in p.actions if isinstance(a, Place)})
             options = PartialCreateOrderOptions(tick_size=f"{fm.tick:g}", neg_risk=fm.neg_risk)
-            expiration = int(fm.expires_at.timestamp())
+            expiration = gtd_expiration(fm)
             for a in p.actions:
                 if isinstance(a, Place):
                     i = a.intent if a.intent.side == BUY else self.sellable(fm, a.intent)
@@ -2804,6 +3411,7 @@ class Farmer:
                               f"  post of {len(fms)} orders failed on {fms[0].label}: {e}",
                               fms[0].condition_id)
                 continue
+            placed = []
             for (fm, i, _), resp in zip(chunk, responses if isinstance(responses, list) else []):
                 if not isinstance(resp, dict) or not resp.get("success") or resp.get("errorMsg"):
                     self.emit(EventKind.REJECT,
@@ -2813,6 +3421,9 @@ class Farmer:
                               data={"response": resp if isinstance(resp, dict) else str(resp)})
                 else:
                     accepted.append((fm, i))
+                    if resp.get("orderID"):
+                        placed.append((resp["orderID"], fm.condition_id))
+            self.record_orders(placed=placed)
         return accepted
 
     def sellable(self, fm, intent):
@@ -2843,11 +3454,15 @@ class Farmer:
         except Exception as e:
             log(f"Warning: tick size of {fm.label} unavailable ({e})")
 
-    def retire(self, managed):
+    def retire(self, managed, now):
         fm, reason = managed.fm, managed.state.reason
         managed.sim_orders = []
         if self.live:
             farm_db.mark_retired(self.db, fm.condition_id, reason)
+            managed.ledger = None
+            self.cursors.pop(fm.condition_id, None)
+            self.unsaved.add(fm.condition_id)
+            self.save_inventory(now)
             line = f"{fm.label}: retired ({reason}); orders cancelled"
         else:
             line = f"{fm.label}: retired ({reason}); dry run leaves markets unchanged"
@@ -2872,42 +3487,57 @@ class Farmer:
                       data={"balance_usd": balance, "planned_usd": planned})
 
     def cancel_managed(self):
-        """Cancel every open order on a managed market: one listing, one cancel.
+        """Cancel the farmer's open orders on the managed markets: one listing,
+        one cancel.
 
         Orders left resting while the farmer is down are what stopping
-        guards against, so any failure falls back to a cancel per market.
+        guards against, so a failed listing cancels the ids on record
+        instead, and a failed cancel is tried again market by market.
         """
-        market_of = self.market_of_token()
         try:
-            entries = [e for e in self.client.get_open_orders()
-                       if str(e.get("asset_id") or "") in market_of]
-            resp = self.client.cancel_orders([e["id"] for e in entries]) if entries else None
-            failed = dict((resp or {}).get("not_canceled") or {})
+            ids = {cid: [o.id for o in listed.farmer]
+                   for cid, listed in self.open_orders(datetime.now(timezone.utc)).items()
+                   if listed.farmer}
+        except Exception as e:
+            log(f"Warning: open orders unavailable ({e}); cancelling the order ids on record")
+            ids = self.recorded_ids()
+        if not ids:
+            return
+        failed = {}
+        try:
+            resp = self.client.cancel_orders([i for order_ids in ids.values() for i in order_ids])
+            failed.update((resp or {}).get("not_canceled") or {})
         except Exception as e:
             log(f"Warning: bulk cancel failed ({e}); cancelling market by market")
-            self.cancel_by_market()
-            return
-        sent = {}
-        for e in entries:
-            sent.setdefault(market_of[str(e["asset_id"])], []).append(e["id"])
-        for cid, ids in sent.items():
+            for cid, order_ids in list(ids.items()):
+                try:
+                    resp = self.client.cancel_orders(order_ids)
+                    failed.update((resp or {}).get("not_canceled") or {})
+                except Exception as e:
+                    del ids[cid]
+                    self.emit(EventKind.ALERT,
+                              f"Warning: cancelling {len(order_ids)} orders on "
+                              f"{self.markets[cid].fm.label} failed ({e}); "
+                              f"they rest until they expire", cid)
+        for cid, order_ids in ids.items():
             label = self.markets[cid].fm.label
-            n = sum(order_id not in failed for order_id in ids)
+            n = sum(order_id not in failed for order_id in order_ids)
             self.emit(EventKind.CANCEL, f"Cancelled {n} orders on {label}", cid)
-            for order_id in ids:
+            for order_id in order_ids:
                 if order_id in failed:
                     self.emit(EventKind.ALERT,
                               f"Warning: cancelling {order_id} on {label} failed "
                               f"({failed[order_id]})", cid, data={"order_id": order_id})
 
-    def cancel_by_market(self):
-        for cid, managed in self.markets.items():
-            try:
-                self.client.cancel_market_orders(OrderMarketCancelParams(market=cid))
-                self.emit(EventKind.CANCEL, f"Cancelled all orders on {managed.fm.label}", cid)
-            except Exception as e:
-                self.emit(EventKind.ALERT,
-                          f"Warning: cancelling orders on {managed.fm.label} failed ({e})", cid)
+    def recorded_ids(self):
+        try:
+            recorded = farm_db.farmer_orders(self.db)
+        except sqlite3.Error as e:
+            log(f"Warning: the farmer's order ids are unavailable ({e}); cancelling none")
+            return {}
+        return {cid: ids for cid in self.markets
+                if (ids := [i for i, on in recorded.items()
+                            if on == cid and i not in self.unlisted])}
 
 
 def heartbeat(client, stop):

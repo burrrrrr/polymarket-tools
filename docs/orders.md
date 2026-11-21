@@ -21,15 +21,35 @@ already queued (job 12).`
 
 The worker lists every open order on the account, the farmer's and your own
 alike, and stores them with their market names. With each order it stores
-whether the order's market had the status `approved` in `farm.db` at your
-click, so that a later restore leaves the farmer's orders to the farmer
-whatever the farmer manages by then. A listing that fails stores
-nothing, and the job ends `failed` with the error. When Gamma cannot name the
-markets, the orders are stored without names and the page shows each market's
-condition id.
+whether the order was the farmer's at your click, which is whether its id was
+in the `farmer_orders` table of `farm.db`. The farmer saves there the id of
+each order it places (see
+[Positions and existing orders](farmer.md#positions-and-existing-orders)).
+A later restore leaves the farmer's orders to the farmer and places yours,
+on any market. The snapshot's page marks the farmer's orders with a
+**farmer** badge. A listing that fails stores nothing, and the job ends
+`failed` with the error. When Gamma cannot name the markets, the orders are
+stored without names and the page shows each market's condition id.
 
 The job panel shows the job's state (`queued`, `running`, `done`, or
 `failed`), its log, and a link to the snapshot once it is stored.
+
+## Hourly snapshots
+
+Click **Turn on** in the **Hourly snapshots** panel of **Orders**. Every hour
+the worker lists the open orders and keeps those whose ids are not in
+`farmer_orders`. Those are your own orders, on any market, the farmer's
+markets included. It stores them as a snapshot only when they changed since
+the last hourly snapshot, and keeps 14 days of them. **Check now** runs one
+at once.
+
+The worker reads `farm.db` itself for this, read-only. The job fails when
+`farm.db` is missing or has no `farmer_orders` table.
+
+Only a farmer that saves its order ids fills `farmer_orders`. Until such a
+farmer has listed its orders once, the table is empty or missing, every
+order reads as yours, and a snapshot taken then records the farmer's orders
+as yours.
 
 ## Import the old snapshot files
 
@@ -77,13 +97,19 @@ the first rule that fits decides.
 | Rule | Group on the page | Why |
 | --- | --- | --- |
 | Nothing of the order was left to fill when the snapshot was taken | **Skipped: nothing left to fill** | There is no size to place. |
-| The order's market has the status `approved` in `farm.db` at your click | **Skipped: the farmer's market** | The farmer cancels the orders on its markets that are not its own, and places its own. |
-| The order's market had the status `approved` when the snapshot was taken | **Skipped: the farmer's market** | The order was the farmer's, or the farmer would have cancelled it. A market the farmer has stopped managing since gets none of its old orders back. |
-| The snapshot has no record of that (an imported file, or a snapshot from before the record was kept), and the market has the status `retired` now | **Skipped: the farmer's market** | The farmer managed the market once, and nothing says whose order this was. An order you placed there by hand is skipped too: place it again by hand. |
+| The snapshot records the order as the farmer's | **Skipped: the farmer's order** | The farmer places its own orders again. A market the farmer has stopped managing since gets none of its old orders back. |
+| The order's id is in `farmer_orders` in `farm.db` at your click | **Skipped: the farmer's order** | The farmer holds the order as its own now. |
+| The snapshot has no record of whose orders were the farmer's (an imported file, or a snapshot from before the record was kept), and the market has the status `approved` or `retired` in `farm.db` now | **Skipped: the farmer's order** | The farmer manages or managed the market, and nothing says whose order this was. An order you placed there by hand is skipped too: place it again by hand. |
 | The order expires within 2 minutes from now, or has expired | **Skipped: expired** | The CLOB refuses an order that expires within a minute. The second minute is for the job to reach the order. |
 | The same order, by its id, is still open | **Skipped: already open** | It never went missing. This holds however much more of it has filled since. |
 | An open order that is not in the snapshot has the same token, side, price, and remaining size | **Skipped: already open** | It was placed again already, by you or by an earlier restore. Each such order covers one snapshot order, so two identical snapshot orders with one copy open give one skip and one place. |
-| None of the above | **Would place**, then **Placed** | The order is missing. |
+| None of the above | **Would place**, then **Placed** | The order is missing. An order you placed by hand on one of the farmer's markets is placed too: the farmer leaves it alone. |
+
+Snapshots taken before the worker read the farmer's order ids recorded every
+order on a market the farmer managed then as the farmer's, and the hourly
+snapshots of that time left your orders on those markets out. A restore from
+such a snapshot still skips your orders on those markets, under **Skipped:
+the farmer's order**. Place them again by hand.
 
 What it places:
 

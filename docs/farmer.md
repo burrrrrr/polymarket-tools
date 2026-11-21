@@ -157,7 +157,7 @@ Each market is in one of seven states:
   through the wait. If the returned bids leave the sole bid outside the
   band, there is nothing to hold and the market quotes as usual at once. A
   restart does not carry the wait over.
-- `PAUSED`: you set `paused = 1` on the market. All orders come down. When
+- `PAUSED`: you set `paused = 1` on the market. The farmer's orders come down. When
   you clear it, the market goes through the checks above again, so it can go
   straight to `COOLDOWN` or `BELOW_RANGE` instead of `QUOTING`.
 - `UNREWARDED`: the total reward listing pays the market under $1 a day, or
@@ -170,7 +170,7 @@ Each market is in one of seven states:
 - `RETIRED`: the market closed or stopped accepting orders, you no longer
   approve it, it reached its end date minus `--expiry-buffer-days`, or Gamma
   shows it is already decided (its event closed or a resolution was
-  proposed; checked once a minute). All orders are cancelled. In live mode the
+  proposed; checked once a minute). The farmer's orders are cancelled. In live mode the
   database row becomes `retired` with a note. A row you rejected keeps its
   `rejected` status. Retirement wins over a pause. If you approve a retired
   market again after the farmer has seen it unapproved, the farmer manages it
@@ -285,9 +285,10 @@ if no farmer was running when it was sent.
   `--free-cap` caps a bid in it where the budget is less, and no longshot
   bid rests where a fill would give a favorite buyer over 20% a year.
   [The longshot bid](pricing.md#the-longshot-bid) has the rules.
-- A longshot fill (your longshot shares went up) prints an `ALERT` and pauses
-  the longshot bid for `--naked-cooldown` seconds. Without it, the favorite
-  bid shrinks to whatever the covered favorite ask still balances.
+- A longshot fill (the farm's longshot shares went up) prints an `ALERT` and
+  pauses the longshot bid for `--naked-cooldown` seconds. Without it, the
+  favorite bid shrinks to whatever the covered favorite ask still balances.
+  In live mode a longshot buy of your own does not pause it.
 - An order that is still close to its target stays in place. It must sit on
   the current tick, score at least `--keep-ratio` of the target, keep a size
   within -20% and +25% of the target, and stay within the price cap or
@@ -308,8 +309,9 @@ if no farmer was running when it was sent.
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
   logged once per rejection.
-- In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels every
-  order on the managed markets before the farmer exits. A normal `--once`
+- In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels the
+  farmer's orders on the managed markets before the farmer exits. Your own
+  orders there keep resting. A normal `--once`
   exit leaves the orders resting. So do Ctrl+C and SIGTERM under
   `--keep-orders`, and a `stop` command that asks to keep the orders. Orders
   left that way rest unmanaged until the farmer starts again: no cooldowns,
@@ -320,22 +322,179 @@ if no farmer was running when it was sent.
 ## Positions and existing orders
 
 The farmer reads your positions from the public data API for
-`POLYMARKET_FUNDER_ADDRESS` in `.env`. It never sells shares that were in your
-wallet before it started managing a market:
+`POLYMARKET_FUNDER_ADDRESS` in `.env`, once a minute. It splits each token's
+holdings in two:
 
-- The first time it sees an approved market, it records your holdings of both
-  tokens as a baseline (0 when you hold none). In live mode the baseline goes
-  into the `baseline_fav` and `baseline_long` columns of `markets`, so it
-  survives restarts. A dry run keeps it in memory only.
-- On every positions refresh the baseline drops to your current holdings if
-  those are lower. A manual sale therefore does not leave shares reserved that
-  are gone.
-- The farm's inventory is your holdings above the baseline. Only those shares
-  are offered through `FAV_ASK` or `LONG_ASK`, or count against the capital
-  and budget.
+- The farm's inventory is the shares the farmer's own orders bought and have
+  not sold. Only those shares are offered through `FAV_ASK` or `LONG_ASK`, or
+  count against the capital and budget.
+- The baseline is the rest: the shares you held before the farmer managed the
+  market, and the shares you bought there by hand since. The farmer never
+  sells them.
 
 At startup it prints a `holding` line with your holdings, the baseline, and
 the farm's share for every managed market where you have a position.
+
+### Your fills and the farmer's
+
+A live farmer also reads the account's trades from the CLOB, one market at
+a time. A trade names the order it filled, so the farmer can tell its own
+fills from yours: a fill is the farmer's when the order's id is in the
+`farmer_orders` table. It asks for a market's trades without the account's
+address, because the CLOB can answer `500` to that.
+
+- Each market has a farm ledger, the `farm_fav` and `farm_long` columns of
+  `markets`. A fill of a farmer bid adds its shares to the ledger, and a fill
+  of a farmer ask takes them out.
+- After every read the baseline is your holdings minus the ledger. It goes
+  into `baseline_fav` and `baseline_long`.
+- A fill of your own order moves nothing. It adds a `MANUAL_FILL` event, and
+  it is never a `FILL`, so it sets no exit price, pauses no longshot bid, and
+  rests no ask. A buy of yours raises the baseline once the data API shows
+  the shares.
+- One exception lowers the ledger. If you sell more of a token than the
+  baseline of the last positions read, the rest of the sale came out of the
+  farm's shares.
+- The ledger counts a farmer fill when the trade is matched. If the chain
+  later fails the trade, the next read takes the fill back.
+
+A positions read asks for the trades of a market only when it needs them:
+
+- Its holdings are not its baseline plus its ledger, so a fill may have
+  moved them.
+- A fill on it may still be undone by the chain.
+- An earlier read needed its trades and did not get them.
+
+So a fill, the farmer's or yours, counts at the positions read that shows
+it, and a read where every market's holdings add up makes no call to the
+CLOB. One read asks for at most 3 markets, the ones asked least recently
+first. The rest wait for the next read, a minute later.
+
+The CLOB shows a trade at once and the data API shows the shares some
+seconds later. So a `FILL` shows when the data API shows the shares.
+
+A market's ledger seeds with the farm's inventory as it stood: your holdings
+above the saved baseline. Seeding makes no call to the CLOB.
+
+- A market with no farmer order, neither an id in `farmer_orders` nor one
+  resting, seeds at its first positions read. It counts the market's trades
+  from then on, since no farmer fill can come before its first order.
+- A market with a farmer order seeds once its holdings have stayed the same
+  across positions reads for 5 minutes. It counts the market's trades from
+  the first read of those 5 minutes on. A fill matched earlier shows in the
+  holdings within that time, and a change in the holdings starts the 5
+  minutes again. Until it seeds, the market is unsynced.
+
+A market you approve again after it retired is seeded again. So is a market
+whose ledger is saved without its cursor.
+
+A market whose trades are not read at a positions read is unsynced for that
+read: its trades failed or it waited for the cap. The farmer keeps quoting.
+Until its trades read again, a rise in its holdings counts as yours and a
+fall comes off the farm's inventory. The next good read counts the trades it
+missed, each one once. A trade laid out in a way the farmer cannot read
+does the same. Other markets are not affected.
+
+Each failed read of a market's trades logs a `Warning` that names the
+market. Three in a row add an `ALERT` for that market, and one more follows
+every hour while they keep failing. The farmer logs `trades read again`
+with the market when they return. Act on the `ALERT`: while it lasts, a
+fill of a farmer bid on that market counts as your shares, so the farmer
+rests no exit on it and does not count it against `--capital`.
+
+The ledgers, the baselines, and each market's cursor (the `farmer.fills`
+row of `settings`, keyed by market) are saved in one transaction. A restart
+or a crash therefore counts every fill once. A market whose holdings moved
+while the farmer was down is asked at the first read after a start, from
+its saved cursor. A market's cursor is deleted when it retires.
+
+The farmer also lowers a ledger that is above your holdings of the token
+down to them, once no buy of that token has matched for 15 minutes. The data
+API shows every buy by then, so the ledger was counting shares the farm no
+longer has. It takes the larger of your holdings at the last two positions
+reads, so one read that comes back empty or partial lowers nothing. The
+farmer logs the market and both numbers when it does. After a start it waits
+15 minutes before the first such check.
+
+Four cases can count shares of yours as the farm's:
+
+- A market's trades cannot be read, a farmer ask fills, and you buy the
+  same token by hand before they read again. Your buy hides the sale until
+  then.
+- A farmer bid's fill is counted and the chain then fails the trade. The
+  shares stay in the ledger until the read that shows the failure.
+- A farmer ask fills whole before its id was saved, because its post timed
+  out and no listing showed the order. The fill reads as a sale of yours.
+- You sell more of a token by hand than your own shares while the baseline
+  is still too high, because an earlier sale has not reached the data API.
+  The ledger keeps the farm shares you sold until the 15-minute check
+  lowers it. That is the second read that shows the lower holdings, when no
+  buy of the token matched in the 15 minutes before. If you buy that token by
+  hand before the check, the
+  farm counts up to that many of the new shares as its own, and the check
+  cannot tell.
+
+In every other case an error leaves farm shares with you. They show as a
+baseline above your own shares, and the farmer does not sell them. One such
+case: you buy a token by hand and sell it again before the data API shows
+the buy, and the sale reads as a sale of farm shares.
+
+A dry run reads no trades and keeps no ledger. It takes your holdings as the
+baseline the first time it sees a market, lowers the baseline when your
+holdings drop below it, and treats the shares above it as the farm's. It
+keeps all of that in memory only.
+
+### Check the trade layout
+
+Polymarket's docs show a trade your account took. They do not show a trade
+that filled one of your resting orders, which is the kind every farmer fill
+is. `polymarket/trades.py` assumes that such a trade lists your order in its
+`maker_orders`, with your address as `maker_address`, the shares as
+`matched_amount`, and the order's own `side`, `price`, and `asset_id`.
+
+Before you run a farmer with this code live, check that on real trades:
+
+```
+python -m analysis.trades_dump --hours 72 --show 3
+```
+
+It reads the wallet key as the farmer does, places and cancels nothing,
+opens `farm.db` read-only, and writes no file. It prints the trades of the
+last 72 hours as the CLOB sent them, each followed by the fills read from it.
+Addresses print as `ME` or `OTHER`, `owner` and `transaction_hash` are
+removed, and order ids are cut short, so you can paste the output.
+
+The layout holds when all of these are true:
+
+- The summary says `0 trades unreadable`.
+- Each `MAKER` trade shows a `maker_orders` entry with `"maker_address":
+  "ME"`.
+- Under a trade you recognise, such as a farmer bid that filled, the line
+  `-> maker fill` has that order's side, its price, and its size in shares.
+- The line `Maker fills on the farmer's orders` counts at least one fill, if
+  a farmer order filled in those hours. It compares each fill's order id with
+  the ids in `farmer_orders` and in the `FILL` and `CANCEL` events.
+
+If a line says `unreadable`, a fill's size is in dollars, or no fill is on a
+farmer order although the farmer filled, do not start the live farmer.
+Correct `parse_trades` first. It is the only code that knows the layout.
+
+### Restart after the update
+
+Restart the console and the farmer. No rows are dropped.
+
+- The console must run this code before the farmer writes its first
+  `MANUAL_FILL` event, or its Activity page fails on the new event kind.
+- Opening `farm.db` adds the `farm_fav` and `farm_long` columns. The first
+  read of each market seeds its ledger from the farm's inventory as it is
+  now, so shares the farm already holds stay the farm's. That includes any
+  share of yours an earlier version counted as a farm fill. To hand such
+  shares back, stop the farmer and set the market's `baseline_fav` to your
+  own share count before the first start.
+- An order id now stays in `farmer_orders` for 15 minutes after the order
+  leaves the listing, and longer while its market's trades cannot be read
+  or a fill of it can still be undone. A stop leaves the ids of the orders
+  it cancelled there, and the next start removes them.
 
 Approximation: the data API reports one average price per token, blended
 across baseline and farm shares. The farmer uses that blended average as the
@@ -343,10 +502,23 @@ farm inventory's cost, for the `FAV_ASK` exit floor and the capital and budget
 caps. When your earlier shares cost more or less than the farm's fills, the
 exit floor is off by that difference.
 
-In live mode the farmer adopts the open orders on the markets it manages. It
-keeps the ones that match a slot target and cancels the rest, including
-orders you placed there by hand. It never reads or touches orders on markets
-it does not manage.
+In live mode the farmer manages only the orders it placed. An open order on
+a managed market's tokens is the farmer's when its id is in the
+`farmer_orders` table of `farm.db`, or when it expires at the second the
+farmer signs that market's orders with: the end date (or its
+`end_date_override`) minus `--expiry-buffer-days`. The farmer saves the id of
+each order the CLOB accepts, and of each order it first recognises by that
+expiration, so an order stays its own after the market's end date or the
+buffer changes. It deletes an id 15 minutes after the order is no longer
+listed as open, once its market's trades are read and no fill of it can be
+undone.
+
+It keeps its orders that match a slot target and cancels the rest. Every
+other order on the market, such as one you placed there by hand, is yours.
+The farmer never cancels or plans around it, but it still takes your
+orders out of the favorite book before it prices, as it does its own. An
+open order the farmer cannot read (no price or no id) is not cancelled at a
+stop. It never reads or touches orders on markets it does not manage.
 
 ## Key options
 
@@ -441,8 +613,9 @@ timeout, because the farmer and the console write at the same time.
 Each column has exactly one writer process. The module docstring of
 `farm/farm_db.py` lists every table with its writer and its purpose.
 
-`farm_events` holds changes only: `PLACE`, `CANCEL`, `FILL`, `PHASE`,
-`ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and `SETTINGS`. At
+`farm_events` holds changes only: `PLACE`, `CANCEL`, `FILL`, `MANUAL_FILL`,
+`PHASE`, `ALERT`, `REJECT`, `BACKOFF`, `RETIRE`, `START`, `STOP`, and
+`SETTINGS`. At
 startup the farmer deletes the events older than 30 days and the `farm_mids`
 samples older than 7 days. A live farmer fetches `rewards_daily`, your reward
 earnings per market per day, every 10 minutes.
@@ -452,9 +625,12 @@ by changing `status` from `approved` to `retired` and writing a `note`, in a
 single conditional `UPDATE`. A status you already changed is never
 overwritten.
 
-A `FILL` event comes from a change in your positions, because the data API
-reports no fills. Its price is the price of the order that rested in that
-slot at the previous cycle, and its `data` says so.
+A `FILL` event comes from a change in the farm's inventory. Its price is the
+price of the order that rested in that slot at the previous cycle, and its
+`data` says so. A `MANUAL_FILL` event is a fill of your own order on a
+managed market, read from the CLOB's trades by a live farmer. It carries the
+trade's own price and size, and its `data` has the order id, the trade id,
+and whether your order was the taker.
 
 `scoring_pct` and `rewards_daily` come from authenticated reward endpoints
 whose response fields Polymarket does not document. The farmer reads them
