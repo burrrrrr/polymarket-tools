@@ -12,6 +12,7 @@ from polymarket.client import ConfigError
 from test_polymarket_trades import ME, THEM, made, maker_order, trade
 
 KEY = "0x" + "ab" * 32
+SIGNER = "0x" + "5a" * 20
 FARMER_ORDER = "0x" + "5e" * 32
 NOW = datetime(2026, 10, 4, 12, 0, tzinfo=timezone.utc)
 TAKEN = trade()
@@ -74,6 +75,12 @@ class ReportTests(unittest.TestCase):
 class Clob:
     def __init__(self, listing):
         self.listing, self.asked = listing, []
+
+    def get_address(self):
+        return SIGNER
+
+    def get_open_orders(self):
+        return []
 
     def get_trades(self, params, only_first_page=False):
         self.asked.append((params.maker_address, params.after))
@@ -150,6 +157,22 @@ class StartTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("With no address: not listed (500 Internal server error)", out)
         self.assertIn("MAKER trade 1 of 1 shown", out)
+
+    def test_the_probe_says_which_ways_of_asking_work_without_printing_an_address(self):
+        def listing(params):
+            if params.maker_address:
+                return RuntimeError(f"500 for {params.maker_address}")
+            return [MADE]
+
+        code, out = self.main(["--probe"], Clob(listing))
+        self.assertEqual(code, 0)
+        self.assertIn("open orders: ok, 0 orders", out)
+        self.assertIn("trades, no parameters: ok, 1 trades", out)
+        self.assertIn("trades, maker_address = funder: failed (500 for ME)", out)
+        self.assertIn("trades, maker_address = funder in lowercase: failed (500 for ME)", out)
+        self.assertIn("trades, maker_address = signer: failed (500 for SIGNER)", out)
+        self.assertNotIn(ME, out)
+        self.assertNotIn(SIGNER, out)
 
     def test_a_refused_time_bound_is_told_apart_by_a_listing_without_it(self):
         def listing(params):

@@ -112,6 +112,48 @@ def farmer_ids(explicit):
         return None
 
 
+def a_farmed_market(explicit):
+    """One condition id farm.db approves, or None. Opens the file read-only."""
+    try:
+        path = Path(data_dir.farm_db_path(explicit)).absolute()
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as conn:
+            conn.row_factory = sqlite3.Row
+            return min(farm_db.condition_ids(conn, "approved"), default=None)
+    except (data_dir.NoDataDir, sqlite3.Error):
+        return None
+
+
+def probe(client, account, market):
+    """One line for each way of asking the trades listing, first page only,
+    with the open-orders listing as a control that the key works."""
+    signer = client.get_address()
+
+    def masked(text):
+        for address, name in ((account, "ME"), (signer, "SIGNER")):
+            text = re.sub(re.escape(address), name, text, flags=re.IGNORECASE)
+        return text
+
+    asks = [("trades, no parameters", TradeParams()),
+            ("trades, maker_address = funder", TradeParams(maker_address=account)),
+            ("trades, maker_address = funder in lowercase",
+             TradeParams(maker_address=account.lower())),
+            ("trades, maker_address = signer", TradeParams(maker_address=signer))]
+    if market:
+        asks.append(("trades, market = a farmed market", TradeParams(market=market)))
+    lines = []
+    try:
+        lines.append(f"open orders: ok, {len(client.get_open_orders())} orders")
+    except Exception as e:
+        lines.append(f"open orders: failed ({masked(str(e))})")
+    for name, params in asks:
+        try:
+            lines.append(f"{name}: ok, {len(client.get_trades(params, only_first_page=True))} "
+                         f"trades")
+        except Exception as e:
+            lines.append(f"{name}: failed ({masked(str(e))})")
+    return lines
+
+
 def fill_line(fill, farmer):
     whose = ""
     if farmer is not None and not fill.taker:
@@ -166,6 +208,8 @@ def main(argv=None):
     parser.add_argument("--hours", type=float, default=72.0, help="how far back to ask")
     parser.add_argument("--show", type=int, default=3,
                         help="how many MAKER and how many TAKER trades to print")
+    parser.add_argument("--probe", action="store_true",
+                        help="only try each way of asking the trades listing and say which work")
     parser.add_argument("--db", help="the farmer's SQLite file, opened read-only (default: "
                                      f"farm.db {data_dir.LOCATION_HELP})")
     args = parser.parse_args(argv)
@@ -176,6 +220,9 @@ def main(argv=None):
         print(f"Error: {e}")
         return 1
     account = os.environ["POLYMARKET_FUNDER_ADDRESS"]
+    if args.probe:
+        print("\n".join(probe(client, account, a_farmed_market(args.db))))
+        return 0
     after = int(time.time() - args.hours * 3600)
 
     def listed(params, only_first_page=False):
