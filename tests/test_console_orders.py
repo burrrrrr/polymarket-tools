@@ -64,7 +64,7 @@ class Orders(Console):
 
     def app_kwargs(self):
         self.tools_path = os.path.join(os.path.dirname(self.path), "tools.db")
-        return {"tools_db": self.tools_path}
+        return {"tools_db": self.tools_path, "clock": lambda: self.now}
 
     def post(self, url, **fields):
         return self.client.post(url, data={"console_token": self.app.state.token, **fields},
