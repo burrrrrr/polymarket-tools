@@ -2,7 +2,10 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
+
+from farm import farm_db
 
 from test_polymarket_gamma import Gamma, cid, client
 from test_polymarket_orders import Clob, entry
@@ -317,6 +320,88 @@ class RestoreJobTests(Scratch):
         job = self.queue_restore(JobKind.PREVIEW, self.snapshot(order("0xa")))
         self.run_worker(None)
         self.assertIn("no key", db.read_job(self.db, job).error)
+
+
+class HourlyTests(Scratch):
+    def setUp(self):
+        super().setUp()
+        self.farm_path = os.path.join(os.path.dirname(self.path), "farm.db")
+        with closing(farm_db.open_db(self.farm_path)) as farm:
+            farm_db.store_scan(farm, [
+                farm_db.ScanRow(market, slug, f"{slug}?", "2027-01-01T00:00:00+00:00", 1.0, "{}")
+                for market, slug in ((cid(1), "alpha"), (cid(2), "bravo"))], [cid(1), cid(2)],
+                START)
+            farm_db.approve_market(farm, cid(2), 0.99, 25.0, now=START)
+        db.set_hourly_snapshots(self.db, True, START)
+
+    def run_hourly(self, clob, beats=1, **kwargs):
+        self.run_worker(clob, beats, **{"farm_path": self.farm_path, **kwargs})
+
+    def hourly_jobs(self):
+        return [db.read_job(self.db, row["id"]) for row in self.db.execute(
+            "SELECT id FROM jobs WHERE kind = 'hourly_snapshot' ORDER BY id")]
+
+    def listing(self):
+        return Clob([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))])
+
+    def test_hourly_snapshots_that_are_off_queue_nothing(self):
+        db.set_hourly_snapshots(self.db, False, START)
+        self.run_hourly(self.listing(), beats=3)
+        self.assertEqual((self.hourly_jobs(), db.read_snapshots(self.db)), ([], []))
+
+    def test_one_job_is_queued_an_hour_and_a_restarted_worker_keeps_the_hour(self):
+        self.run_hourly(self.listing(), beats=3)
+        self.run_hourly(self.listing(), beats=3)
+        self.assertEqual([(j.created_at, j.state) for j in self.hourly_jobs()],
+                         [(at(0), JobState.DONE)])
+        self.clock.now = at(3600)
+        self.run_hourly(self.listing())
+        self.assertEqual([j.created_at for j in self.hourly_jobs()], [at(0), at(3600)])
+
+    def test_the_job_stores_the_orders_off_the_farmers_markets_as_not_the_farmers(self):
+        self.run_hourly(self.listing())
+        (job,) = self.hourly_jobs()
+        (taken,) = db.read_snapshots(self.db)
+        self.assertEqual((taken.note, taken.job_id), ("hourly", job.id))
+        self.assertEqual([(o.order.order_id, o.farmer)
+                          for o in db.read_snapshot_orders(self.db, taken.id)], [("0xa", False)])
+        self.assertEqual(self.messages(job.id), [
+            "started", f"stored snapshot {taken.id} with 1 open orders off the farmer's markets",
+            "done"])
+        self.assertIsNone(db.latest_job(self.db, JobKind.SNAPSHOT))
+
+    def test_unchanged_orders_an_hour_later_store_nothing_and_ask_gamma_nothing(self):
+        self.run_hourly(self.listing())
+        asked = len(self.gamma.requests)
+        self.clock.now = at(3600)
+        self.run_hourly(self.listing())
+        (taken,) = db.read_snapshots(self.db)
+        self.assertEqual(self.messages(self.hourly_jobs()[1].id), [
+            "started", f"unchanged since snapshot {taken.id}", "done"])
+        self.assertEqual(len(self.gamma.requests), asked)
+
+    def test_the_job_prunes_hourly_snapshots_older_than_two_weeks(self):
+        old_at = START - timedelta(days=20)
+        old_job = db.enqueue_job(self.db, JobKind.HOURLY_SNAPSHOT, {}, old_at)
+        db.claim_job(self.db, old_at)
+        db.finish_job(self.db, old_job, old_at)
+        old = db.insert_snapshot(self.db, old_at, "hourly", [], {}, job_id=old_job)
+        self.run_hourly(self.listing())
+        self.assertNotIn(old, [s.id for s in db.read_snapshots(self.db)])
+        self.assertIn("pruned 1 hourly snapshot older than 14 days",
+                      self.messages(self.hourly_jobs()[-1].id))
+
+    def test_a_missing_farm_db_or_key_fails_the_job_saying_why(self):
+        for kwargs, says in (({"farm_path": self.farm_path + ".missing"}, "no farm.db at"),
+                             ({"farm_path": None}, "no farm.db in a data directory"),
+                             ({"clob": None}, "holds no key")):
+            with self.subTest(kwargs=kwargs):
+                self.clock.now += db.HOURLY_EVERY
+                self.run_hourly(**{"clob": self.listing(), **kwargs})
+                failed = self.hourly_jobs()[-1]
+                self.assertEqual(failed.state, JobState.FAILED)
+                self.assertIn(says, failed.error)
+        self.assertEqual(db.read_snapshots(self.db), [])
 
 
 class RecoveryTests(Scratch):

@@ -15,7 +15,8 @@ key in over SSH. --no-key starts a worker that fails every job that needs one.
 
 --db defaults to tools.db in the data directory (see data_dir.py): the
 directory POLYMARKET_DATA_DIR names, or the repo directory. DIR defaults to
-the snapshots folder of the same directory.
+the snapshots folder of the same directory. The worker reads the farmer's
+farm.db there, without writing it, for an hourly snapshot.
 """
 
 import argparse
@@ -105,13 +106,23 @@ def run_worker(args):
         print(f"Worker on {args.db}, {'keyed' if client else 'no key'}. Ctrl+C stops it.",
               flush=True)
         try:
-            worker.run(args.db, client, http, stop=stop, sniper_client=sniper_client)
+            worker.run(args.db, client, http, stop=stop, farm_path=farm_db_path(),
+                       sniper_client=sniper_client)
         except db.WorkerRunning as e:
             return fail(f"Not started: {e}.")
         print("Worker stopped.", flush=True)
         return 0
     finally:
         http.close()
+
+
+def farm_db_path():
+    """The farmer's farm.db, or None when the data directory is missing: a
+    worker given --db still starts, and its hourly snapshots fail."""
+    try:
+        return data_dir.farm_db_path()
+    except data_dir.NoDataDir:
+        return None
 
 
 def connect(args, http):

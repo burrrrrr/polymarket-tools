@@ -1,10 +1,13 @@
 import os
+import sqlite3
 import threading
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, NamedTuple
+from pathlib import Path
+from typing import Any, Callable, NamedTuple, Optional
 
+from farm import farm_db
 from tools import db, restore, snapshot
 from tools.db import JobKind
 from tools.sniper import Sniper
@@ -21,9 +24,9 @@ def utc_now():
 @dataclass(frozen=True)
 class JobRun:
     """What a handler works with: the claimed job, the worker's client and HTTP
-    client, a connection that belongs to the job's thread, and stop, an event
-    that is set once the worker is stopping or was replaced. A handler that
-    places orders checks it before each one."""
+    client, a connection that belongs to the job's thread, stop, an event that
+    is set once the worker is stopping or was replaced, and the path of the
+    farmer's farm.db. A handler that places orders checks stop before each one."""
 
     job: db.Job
     client: Any
@@ -31,6 +34,7 @@ class JobRun:
     conn: Any
     clock: Callable
     stop: Any
+    farm_path: Optional[str]
 
     def log(self, message):
         db.append_log(self.conn, self.clock(), message, job_id=self.job.id)
@@ -44,13 +48,55 @@ class Handler(NamedTuple):
     needs_key: bool
 
 
-def take_snapshot(run):
-    taken = snapshot.take(run.client, run.http, run.conn, run.clock(), run.job.params["note"],
-                          job_id=run.job.id,
-                          farmer_markets=set(run.job.params["managed_markets"]))
-    run.log(f"stored snapshot {taken.snapshot_id} with {taken.orders} open orders"
+def stored_line(taken, orders="open orders"):
+    return (f"stored snapshot {taken.snapshot_id} with {taken.orders} {orders}"
             + (f", stored without market names ({taken.names_error})" if taken.names_error
                else ""))
+
+
+def take_snapshot(run):
+    run.log(stored_line(snapshot.take(
+        run.client, run.http, run.conn, run.clock(), run.job.params["note"], job_id=run.job.id,
+        farmer_markets=set(run.job.params["managed_markets"]))))
+
+
+def managed_markets(path):
+    """The condition ids of the markets the farmer manages now, read from its
+    farm.db without writing it."""
+    if path is None or not os.path.exists(path):
+        where = f"at {path}" if path else "in a data directory: the directory is missing"
+        raise JobRefused(f"no farm.db {where}, and an hourly snapshot reads the markets the "
+                         f"farmer manages from it")
+    with closing(sqlite3.connect(Path(path).absolute().as_uri() + "?mode=ro", uri=True)) as farm:
+        return farm_db.condition_ids(farm, "approved")
+
+
+def take_hourly_snapshot(run):
+    taken = snapshot.take_hourly(run.client, run.http, run.conn, run.clock(),
+                                 managed_markets(run.farm_path), run.job.id)
+    if isinstance(taken, snapshot.Unchanged):
+        run.log(f"unchanged since snapshot {taken.snapshot_id}")
+    else:
+        run.log(stored_line(taken, "open orders off the farmer's markets"))
+    pruned = db.prune_hourly_snapshots(run.conn, run.clock() - db.HOURLY_KEEP)
+    if pruned:
+        run.log(f"pruned {pruned} hourly snapshot{'' if pruned == 1 else 's'} older than "
+                f"{db.HOURLY_KEEP.days} days")
+
+
+def queue_hourly_snapshot(conn, now):
+    """Queue an hourly snapshot job when the console turned them on and the
+    last one was queued HOURLY_EVERY ago or more. The jobs table says when that
+    was, so a restarted worker keeps the same hour."""
+    if not db.hourly_snapshots(conn):
+        return
+    last = db.latest_job(conn, JobKind.HOURLY_SNAPSHOT)
+    if last is not None and now - last.created_at < db.HOURLY_EVERY:
+        return
+    try:
+        db.enqueue_job(conn, JobKind.HOURLY_SNAPSHOT, {}, now)
+    except db.JobOpen:
+        pass
 
 
 def preview_restore(run):
@@ -65,7 +111,8 @@ def place_restore(run):
 
 HANDLERS = {JobKind.SNAPSHOT: Handler(take_snapshot, needs_key=True),
             JobKind.PREVIEW: Handler(preview_restore, needs_key=True),
-            JobKind.RESTORE: Handler(place_restore, needs_key=True)}
+            JobKind.RESTORE: Handler(place_restore, needs_key=True),
+            JobKind.HOURLY_SNAPSHOT: Handler(take_hourly_snapshot, needs_key=True)}
 
 
 class JobRefused(Exception):
@@ -76,8 +123,9 @@ class JobThread:
     """Runs the queued jobs, oldest first and one at a time, off the loop's
     thread, so a long job does not hold up the heartbeat."""
 
-    def __init__(self, db_path, client, http, clock, handlers=HANDLERS):
+    def __init__(self, db_path, client, http, clock, handlers=HANDLERS, farm_path=None):
         self.db_path = db_path
+        self.farm_path = farm_path
         self.client = client
         self.http = http
         self.clock = clock
@@ -121,18 +169,21 @@ class JobThread:
         if handler.needs_key and self.client is None:
             raise JobRefused(f"this worker holds no key, and a {job.kind.value} job needs one: "
                              f"start the worker again without --no-key")
-        handler.run(JobRun(job, self.client, self.http, conn, self.clock, self._stop))
+        handler.run(JobRun(job, self.client, self.http, conn, self.clock, self._stop,
+                           self.farm_path))
 
 
-def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=None,
-        handlers=HANDLERS, sniper_client=None, sniper=Sniper):
+def run(db_path, client, http, *, stop, farm_path=None, clock=utc_now, poll_s=db.BEAT_S,
+        pid=None, handlers=HANDLERS, sniper_client=None, sniper=Sniper):
     """Run the worker on db_path until stop is set.
 
     client is the authenticated CLOB client, or None for a worker with no key,
     which fails every job that needs one. sniper_client is the sniper's own
     client, never the jobs': presigning leaves a tick the market has not
-    reached in its cache. http reads the public APIs. Each poll_s the loop
-    beats and starts the next queued job; stop.wait(poll_s) is its only wait.
+    reached in its cache. http reads the public APIs. farm_path is the farmer's
+    farm.db, which an hourly snapshot reads. Each poll_s the loop beats,
+    queues an hourly snapshot when one is due, and starts the next queued job;
+    stop.wait(poll_s) is its only wait.
     The sniper runs on its own thread from the start, and a sniper that dies
     stops the worker, which raises its error. A stopping worker tells its
     running job and the sniper to stop, waits for them, then writes when it
@@ -146,7 +197,7 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
     with closing(db.open_db(db_path)) as conn:
         instance = db.start_worker(conn, clock(), os.getpid() if pid is None else pid,
                                    keyed=client is not None)
-        jobs = JobThread(db_path, client, http, clock, handlers)
+        jobs = JobThread(db_path, client, http, clock, handlers, farm_path)
         snipe = sniper(db_path, http, stop, client=sniper_client, clock=clock)
         failure = []
 
@@ -164,6 +215,7 @@ def run(db_path, client, http, *, stop, clock=utc_now, poll_s=db.BEAT_S, pid=Non
             while True:
                 if not db.beat(conn, instance, clock()):
                     raise db.WorkerRunning("another worker took this worker's place")
+                queue_hourly_snapshot(conn, clock())
                 jobs.tick(conn)
                 if stop.wait(poll_s):
                     break

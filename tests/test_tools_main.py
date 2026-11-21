@@ -63,9 +63,10 @@ class Fakes:
         self.clients.append(object())
         return self.clients[-1]
 
-    def run(self, db_path, client, http, *, stop, sniper_client=None):
+    def run(self, db_path, client, http, *, stop, farm_path, sniper_client=None):
         self.calls.append("run")
         self.run_args, self.sniper_client, self.stop = (db_path, client, http), sniper_client, stop
+        self.farm_path = farm_path
         if self.run_raises:
             raise self.run_raises
 
@@ -198,11 +199,12 @@ class DataDirTests(Main):
         code, _, fakes = self.main(["--no-key"], dotenv={"POLYMARKET_DATA_DIR": self.dir})
         self.assertEqual(code, 0)
         self.assertEqual(Path(fakes.run_args[0]), Path(self.db_path))
+        self.assertEqual(Path(fakes.farm_path), Path(self.dir) / "farm.db")
 
     def test_a_db_flag_wins_over_the_data_directory(self):
         _, _, fakes = self.main(["--no-key", "--db", "scratch.db"], dotenv={
             "POLYMARKET_DATA_DIR": os.path.join(self.dir, "missing")})
-        self.assertEqual(fakes.run_args[0], "scratch.db")
+        self.assertEqual((fakes.run_args[0], fakes.farm_path), ("scratch.db", None))
 
     def test_a_data_directory_that_does_not_exist_ends_the_run_before_anything_is_read(self):
         missing = os.path.join(self.dir, "missing")

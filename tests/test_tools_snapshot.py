@@ -8,6 +8,7 @@ from polymarket.orders import Side
 from test_polymarket_gamma import Gamma, cid, client
 from test_polymarket_orders import Clob, entry, without
 from tools import db, snapshot
+from tools.db import JobKind
 
 NOW = datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc)
 PACIFIC = timezone(timedelta(hours=-7))
@@ -75,6 +76,64 @@ class TakeTests(Scratch):
         self.assertEqual((taken.orders, db.read_snapshot(self.db, taken.snapshot_id).orders),
                          (0, 0))
         self.assertEqual(gamma.requests, [])
+
+
+class TakeHourlyTests(Scratch):
+    def setUp(self):
+        super().setUp()
+        self.gamma = Gamma(open_ids=[cid(1), cid(2), cid(3)])
+
+    def hourly(self, listing, managed=frozenset({cid(2)}), now=NOW):
+        job = db.enqueue_job(self.db, JobKind.HOURLY_SNAPSHOT, {}, now)
+        db.claim_job(self.db, now)
+        taken = snapshot.take_hourly(Clob(listing), client(self.gamma), self.db, now, managed, job)
+        db.finish_job(self.db, job, now)
+        return taken
+
+    def stored(self, snapshot_id):
+        return [(o.order.order_id, o.market_name, o.farmer)
+                for o in db.read_snapshot_orders(self.db, snapshot_id)]
+
+    def test_it_stores_only_the_orders_off_the_farmers_markets_as_not_the_farmers(self):
+        taken = self.hourly([entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2)),
+                             entry(id="0xc", market=cid(3))])
+        self.assertEqual((taken.orders, taken.names_error), (2, None))
+        self.assertEqual(db.read_snapshot(self.db, taken.snapshot_id).note, "hourly")
+        self.assertEqual(self.stored(taken.snapshot_id), [
+            ("0xa", f"Q {cid(1)[-4:]}", False), ("0xc", f"Q {cid(3)[-4:]}", False)])
+        self.assertEqual([p.get_list("condition_ids") for p in self.gamma.requests],
+                         [[cid(1), cid(3)]])
+
+    def test_the_same_orders_an_hour_later_store_nothing_and_ask_gamma_nothing(self):
+        listing = [entry(id="0xa", market=cid(1)), entry(id="0xb", market=cid(2))]
+        first = self.hourly(listing)
+        asked, before = len(self.gamma.requests), self.rows()
+        again = self.hourly(list(reversed(listing)) + [entry(id="0xc", market=cid(2))],
+                            now=NOW + timedelta(hours=1))
+        self.assertEqual(again, snapshot.Unchanged(first.snapshot_id))
+        self.assertEqual((self.rows(), len(self.gamma.requests)), (before, asked))
+
+    def test_a_fill_or_a_new_order_stores_a_new_snapshot(self):
+        first = self.hourly([entry(id="0xa", market=cid(1), size_matched="0")])
+        for listing in ([entry(id="0xa", market=cid(1), size_matched="20")],
+                        [entry(id="0xa", market=cid(1), size_matched="20"),
+                         entry(id="0xd", market=cid(3))],
+                        []):
+            with self.subTest(listing=listing):
+                taken = self.hourly(listing)
+                self.assertIsInstance(taken, snapshot.Taken)
+                self.assertGreater(taken.snapshot_id, first.snapshot_id)
+                self.assertEqual(taken.orders, len(listing))
+
+    def test_it_compares_with_the_last_hourly_snapshot_and_not_a_manual_one(self):
+        listing = [entry(id="0xa", market=cid(1))]
+        hourly = self.hourly(listing)
+        snapshot.take(Clob([]), client(self.gamma), self.db, NOW, "manual")
+        self.assertEqual(self.hourly(listing), snapshot.Unchanged(hourly.snapshot_id))
+
+    def test_the_first_hourly_snapshot_is_stored_even_with_no_orders(self):
+        taken = self.hourly([entry(market=cid(2))])
+        self.assertEqual(db.read_snapshot(self.db, taken.snapshot_id).orders, 0)
 
 
 def old_file(directory, name, taken, orders):

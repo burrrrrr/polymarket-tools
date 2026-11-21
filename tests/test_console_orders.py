@@ -192,6 +192,49 @@ class TakeSnapshotTest(Orders):
         self.assertEqual(self.post("/orders/snapshot", note="n" * 200).status_code, 303)
 
 
+class HourlyTest(Orders):
+    def test_hourly_snapshots_start_off_and_the_page_offers_to_turn_them_on(self):
+        text = self.client.get("/orders").text
+        self.assertIn("<h2>Hourly snapshots</h2>", text)
+        self.assertIn('<span class="badge t-n">off</span>', text)
+        self.assertIn('name="on" value="1"', text)
+        self.assertIn("Turn on", text)
+        self.assertIn("stores a new snapshot only when they changed, and keeps 14 days", text)
+        self.assertIn('hx-get="/partials/orders/hourly" hx-trigger="sse:job"', text)
+
+    def test_a_post_turns_them_on_and_another_turns_them_off(self):
+        resp = self.post("/orders/hourly", on="1")
+        self.assertEqual((resp.status_code, resp.headers["location"]), (303, "/orders"))
+        self.assertTrue(db.hourly_snapshots(self.tools))
+        text = self.client.get("/partials/orders/hourly").text
+        self.assertIn('<span class="badge t-q">on</span>', text)
+        self.assertIn('name="on" value="0"', text)
+        self.assertIn("Turn off", text)
+        self.post("/orders/hourly", on="0")
+        self.assertFalse(db.hourly_snapshots(self.tools))
+
+    def test_a_post_without_the_console_token_changes_nothing(self):
+        resp = self.client.post("/orders/hourly", data={"on": "1"})
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(db.hourly_snapshots(self.tools))
+
+    def test_the_panel_shows_the_latest_hourly_job_and_what_it_logged(self):
+        job = db.enqueue_job(self.tools, JobKind.HOURLY_SNAPSHOT, {}, self.now)
+        db.claim_job(self.tools, self.now)
+        db.append_log(self.tools, self.now, "unchanged since snapshot 7", job_id=job)
+        db.finish_job(self.tools, job, self.now)
+        text = self.client.get("/orders").text
+        self.assertIn(f"Hourly job {job} queued {views.stamp_local(self.now)}", text)
+        self.assertIn("unchanged since snapshot 7", text)
+        self.assertNotIn("Snapshot job", text, "the hourly job took the manual job's place")
+        failed = db.enqueue_job(self.tools, JobKind.HOURLY_SNAPSHOT, {}, self.now)
+        db.claim_job(self.tools, self.now)
+        db.finish_job(self.tools, failed, self.now, error="this worker holds no key")
+        text = self.client.get("/partials/orders/hourly").text
+        self.assertIn('<span class="badge t-r">failed</span>', text)
+        self.assertIn('role="alert">this worker holds no key<', text)
+
+
 class SnapshotsTest(Orders):
     def test_a_finished_job_shows_its_state_its_log_and_its_snapshot(self):
         job, snapshot, _ = self.take()
@@ -486,9 +529,13 @@ class NotConfiguredTest(Console):
         self.assertNotIn("Not running", self.client.get("/").text)
 
     def test_nothing_can_be_queued_or_read(self):
-        resp = self.client.post("/orders/snapshot", data={"console_token": self.app.state.token})
-        self.assertEqual(resp.status_code, 404)
+        for url in ("/orders/snapshot", "/orders/hourly"):
+            with self.subTest(url=url):
+                resp = self.client.post(url, data={"console_token": self.app.state.token,
+                                                   "on": "1"})
+                self.assertEqual(resp.status_code, 404)
         for url in ("/orders/snapshots/1", "/partials/orders/job", "/partials/orders/snapshots",
+                    "/partials/orders/hourly",
                     "/partials/orders/restore/1"):
             with self.subTest(url=url):
                 self.assertEqual(self.client.get(url).status_code, 404)

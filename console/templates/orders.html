@@ -20,6 +20,8 @@
   <span class="hint">The worker lists the open orders and stores them with their market names. A listing that fails stores nothing.</span>
 </form>
 
+{% call region("/partials/orders/hourly", "sse:job") %}{% include "partials/orders_hourly.html" %}{% endcall %}
+
 {% call region("/partials/orders/job", "sse:job, sse:status") %}{% include "partials/orders_job.html" %}{% endcall %}
 
 {% call region("/partials/orders/snapshots", "sse:job") %}{% include "partials/orders_snapshots.html" %}{% endcall %}

@@ -272,6 +272,91 @@ class SnapshotTests(Scratch):
         self.assertEqual(len(db.read_snapshots(self.db)), 2)
 
 
+class SettingsTests(Scratch):
+    def test_hourly_snapshots_are_off_until_turned_on_and_stay_as_last_set(self):
+        self.assertFalse(db.hourly_snapshots(self.db))
+        db.set_hourly_snapshots(self.db, True, NOW)
+        self.assertTrue(db.hourly_snapshots(self.db))
+        db.set_hourly_snapshots(self.db, False, later(1))
+        again = db.open_db(self.path)
+        self.addCleanup(again.close)
+        self.assertFalse(db.hourly_snapshots(again))
+        db.set_hourly_snapshots(again, True, later(2))
+        self.assertTrue(db.hourly_snapshots(self.db))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM settings").fetchone()[0], 1)
+
+
+class HourlySnapshotTests(Scratch):
+    def run_job(self, kind, params, at):
+        job = db.enqueue_job(self.db, kind, params, at)
+        db.claim_job(self.db, at)
+        db.append_log(self.db, at, "listed", job_id=job)
+        db.finish_job(self.db, job, at)
+        return job
+
+    def hourly(self, days_ago, orders=(order(),), store=True):
+        at = NOW - timedelta(days=days_ago)
+        job = self.run_job(JobKind.HOURLY_SNAPSHOT, {}, at)
+        if store:
+            return db.insert_snapshot(self.db, at, db.HOURLY_NOTE, list(orders), {}, job_id=job)
+        return job
+
+    def ids(self):
+        return [s.id for s in db.read_snapshots(self.db)]
+
+    def jobs(self):
+        return [r["id"] for r in self.db.execute("SELECT id FROM jobs ORDER BY id")]
+
+    def test_the_latest_hourly_snapshot_is_the_newest_an_hourly_job_took(self):
+        self.assertIsNone(db.latest_hourly_snapshot(self.db))
+        older, newer = self.hourly(2), self.hourly(1)
+        manual = self.run_job(JobKind.SNAPSHOT, {"note": ""}, NOW)
+        db.insert_snapshot(self.db, NOW, "", [], {}, job_id=manual)
+        db.insert_snapshot(self.db, NOW, "imported", [], {}, source="orders_snapshot_a.json")
+        self.assertEqual(db.latest_hourly_snapshot(self.db).id, newer)
+        self.assertLess(older, newer)
+
+    def test_pruning_deletes_old_hourly_snapshots_with_their_orders(self):
+        old, recent = self.hourly(20, [order(), order("0xo2")]), self.hourly(1)
+        self.assertEqual(db.prune_hourly_snapshots(self.db, NOW - db.HOURLY_KEEP), 1)
+        self.assertEqual(self.ids(), [recent])
+        self.assertEqual(db.read_snapshot_orders(self.db, old), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM snapshot_orders").fetchone()[0], 1)
+        self.assertEqual(db.prune_hourly_snapshots(self.db, NOW - db.HOURLY_KEEP), 0)
+
+    def test_pruning_keeps_the_newest_hourly_a_restored_one_and_every_other_snapshot(self):
+        restored, previewed, newest = self.hourly(40), self.hourly(30), self.hourly(20)
+        self.hourly(25)
+        manual = self.run_job(JobKind.SNAPSHOT, {"note": ""}, NOW - timedelta(days=50))
+        manual_snapshot = db.insert_snapshot(self.db, NOW - timedelta(days=50), "", [order()], {},
+                                             job_id=manual)
+        imported = db.insert_snapshot(self.db, NOW - timedelta(days=90), "", [order()], {},
+                                      source="orders_snapshot_a.json")
+        self.run_job(JobKind.RESTORE, {"snapshot_id": restored}, NOW)
+        self.run_job(JobKind.PREVIEW, {"snapshot_id": previewed}, NOW)
+        self.assertEqual(db.prune_hourly_snapshots(self.db, NOW - db.HOURLY_KEEP), 1)
+        self.assertEqual(sorted(self.ids()),
+                         sorted([restored, previewed, newest, manual_snapshot, imported]))
+        self.assertEqual(len(db.read_snapshot_orders(self.db, restored)), 1)
+
+    def test_pruning_drops_old_hourly_jobs_that_stored_nothing_kept_and_their_lines(self):
+        idle = self.hourly(20, store=False)
+        stored = self.hourly(19)
+        doomed_job = db.read_snapshot(self.db, self.hourly(18)).job_id
+        self.hourly(1)
+        recent_idle = self.hourly(1, store=False)
+        kept_job = db.read_snapshot(self.db, stored).job_id
+        self.run_job(JobKind.PREVIEW, {"snapshot_id": stored}, NOW)
+        db.prune_hourly_snapshots(self.db, NOW - db.HOURLY_KEEP)
+        jobs = self.jobs()
+        self.assertNotIn(idle, jobs)
+        self.assertNotIn(doomed_job, jobs)
+        self.assertIn(kept_job, jobs)
+        self.assertIn(recent_idle, jobs)
+        self.assertEqual(db.read_log(self.db, idle), [])
+        self.assertEqual(db.latest_job(self.db, JobKind.HOURLY_SNAPSHOT).id, recent_idle)
+
+
 class RestoreJobTests(Scratch):
     def test_one_job_among_preview_and_restore_is_open_at_a_time(self):
         preview = db.enqueue_job(self.db, JobKind.PREVIEW, {"snapshot_id": 1}, NOW)

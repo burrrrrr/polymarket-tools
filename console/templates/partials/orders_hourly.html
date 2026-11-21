@@ -1,0 +1,23 @@
+{%- from "_macros.html" import token_field -%}
+<form class="panel pad stack" method="post" action="/orders/hourly" style="gap: 8px">
+  {{ token_field() }}
+  <input type="hidden" name="on" value="{{ '0' if hourly_on else '1' }}">
+  <div class="page-head">
+    <h2>Hourly snapshots</h2>
+    <div class="actions">
+      <span class="badge {{ 't-q' if hourly_on else 't-n' }}">{{ 'on' if hourly_on else 'off' }}</span>
+      <button class="btn" type="submit">Turn {{ 'off' if hourly_on else 'on' }}</button>
+    </div>
+  </div>
+  <span class="hint">Every hour the worker takes your open orders outside the farmer's markets, stores a new snapshot only when they changed, and keeps {{ hourly_keep_days }} days of them.</span>
+  {%- if hourly_job %}
+  <span class="mono small c-mut">Hourly job {{ hourly_job.id }} queued {{ hourly_job.created_at | stamp_local }} · <span class="badge {{ JOB_TONE[hourly_job.state] }}">{{ hourly_job.state.value }}</span></span>
+  {%- if hourly_job.state.value == 'queued' and not chrome.worker.running %}
+  <span class="small c-warn">It waits for the worker, which is not running.</span>
+  {%- endif %}
+  {%- if hourly_job.error %}<span class="field-error" role="alert">{{ hourly_job.error }}</span>{% endif %}
+  {%- for line in hourly_log %}
+  <div class="mono feed"><span class="t">{{ line.at | clock }}</span><span>{{ line.message }}</span></div>
+  {%- endfor %}
+  {%- endif %}
+</form>

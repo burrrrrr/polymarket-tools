@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple, Optional
@@ -20,6 +21,12 @@ class Taken(NamedTuple):
     names_error: Optional[str]
 
 
+class Unchanged(NamedTuple):
+    """The open orders match hourly snapshot snapshot_id, so nothing was stored."""
+
+    snapshot_id: int
+
+
 class Imported(NamedTuple):
     """files and orders count what this run stored; skipped files were stored before."""
 
@@ -39,7 +46,31 @@ def take(client, http, conn, now, note, job_id=None, farmer_markets=None):
     The market names come from Gamma. They are for display only, so when Gamma
     cannot be read the orders are stored without them.
     """
-    orders = open_orders(client)
+    return _store(http, conn, now, note, open_orders(client), job_id, farmer_markets)
+
+
+def take_hourly(client, http, conn, now, managed_markets, job_id):
+    """Store the open orders on markets outside managed_markets as an hourly
+    snapshot, unless they are the newest hourly snapshot's orders with the
+    same sizes matched. Returns Unchanged then, having asked Gamma nothing,
+    and the Taken snapshot otherwise.
+
+    Every order stored is recorded as not the farmer's, so a restore offers it
+    whatever the farmer manages by then. Raises as take does.
+    """
+    kept = [o for o in open_orders(client) if o.market not in managed_markets]
+    last = db.latest_hourly_snapshot(conn)
+    if last is not None and _fills(kept) == _fills(
+            stored.order for stored in db.read_snapshot_orders(conn, last.id)):
+        return Unchanged(last.id)
+    return _store(http, conn, now, db.HOURLY_NOTE, kept, job_id, managed_markets)
+
+
+def _fills(orders):
+    return Counter((o.order_id, o.size_matched) for o in orders)
+
+
+def _store(http, conn, now, note, orders, job_id, farmer_markets):
     names, names_error = {}, None
     try:
         names = gamma.market_names(http, [o.market for o in orders])

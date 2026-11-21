@@ -7,8 +7,9 @@ This module owns the schema and every statement either of them runs. The file
 is opened in WAL mode with a busy timeout, and every column has one writer:
 
   worker_status    worker. A single row about the running process.
-  jobs             the console inserts a queued row; the worker moves it to
-                   running and then to done or failed.
+  jobs             the console inserts a queued row, and the worker one for
+                   an hourly snapshot; the worker moves it to running and
+                   then to done or failed.
   snapshots        worker, or the one-time import of the old JSON files.
   snapshot_orders  the same writer as its snapshot.
   restore_lines    worker. What a preview would do with each order of a
@@ -18,9 +19,11 @@ is opened in WAL mode with a busy timeout, and every column has one writer:
                    column after it. Nothing else writes state.
   log             worker. What a job or a watch did, and every change of a
                    job's state.
+  settings         console. A single row of the operator's choices.
 
-The worker never opens farm.db and the farmer never opens this file, so
-neither waits on the other's write lock.
+The worker reads farm.db, read-only, once an hour for the markets the farmer
+manages, and never writes it. The farmer never opens this file, so neither
+waits on the other's write lock.
 
 Times are ISO 8601 UTC strings to the second, as in farm_db.
 """
@@ -46,6 +49,7 @@ class JobKind(Enum):
     SNAPSHOT = "snapshot"
     PREVIEW = "preview"
     RESTORE = "restore"
+    HOURLY_SNAPSHOT = "hourly_snapshot"
 
 
 class JobState(Enum):
@@ -57,6 +61,9 @@ class JobState(Enum):
 
 RESTORE_KINDS = (JobKind.PREVIEW, JobKind.RESTORE)
 RESTORE_MAX_WAIT = timedelta(minutes=5)
+HOURLY_EVERY = timedelta(hours=1)
+HOURLY_KEEP = timedelta(days=14)
+HOURLY_NOTE = "hourly"
 
 
 class RestoreAction(Enum):
@@ -251,6 +258,12 @@ CREATE TABLE IF NOT EXISTS log (
 );
 CREATE INDEX IF NOT EXISTS log_job ON log (job_id);
 CREATE INDEX IF NOT EXISTS log_watch ON log (watch_id);
+
+CREATE TABLE IF NOT EXISTS settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    hourly_snapshots INTEGER NOT NULL DEFAULT 0 CHECK (hourly_snapshots IN (0, 1)),
+    updated_at TEXT
+);
 """
 
 # Columns added after a tools.db could already exist, as farm_db adds its own.
@@ -577,6 +590,52 @@ def read_snapshot_orders(conn, snapshot_id):
     rows = conn.execute("SELECT * FROM snapshot_orders WHERE snapshot_id = ? ORDER BY id",
                         (snapshot_id,))
     return [_snapshot_order(row) for row in rows]
+
+
+HOURLY_SNAPSHOT_IDS = (
+    "SELECT h.id FROM snapshots h JOIN jobs j ON j.id = h.job_id "
+    f"WHERE j.kind = '{JobKind.HOURLY_SNAPSHOT.value}'")
+NEWEST_HOURLY_ID = f"({HOURLY_SNAPSHOT_IDS} ORDER BY h.taken_at DESC, h.id DESC LIMIT 1)"
+
+
+def latest_hourly_snapshot(conn):
+    """The newest snapshot an hourly snapshot job took, or None."""
+    row = conn.execute(SNAPSHOTS + f"WHERE s.id = {NEWEST_HOURLY_ID}").fetchone()
+    return _snapshot(row) if row else None
+
+
+def prune_hourly_snapshots(conn, before):
+    """Delete the hourly snapshots taken before `before`, with their orders, and
+    return how many. The newest hourly snapshot stays, and so does one that a
+    preview or a restore job names. Finished hourly jobs queued before `before`
+    go too, with their log lines, unless a snapshot that is left came from one."""
+    with _write_lock_first(conn):
+        doomed = [(row["id"],) for row in conn.execute(
+            f"{HOURLY_SNAPSHOT_IDS} AND h.taken_at < ? AND h.id != {NEWEST_HOURLY_ID} "
+            "AND h.id NOT IN (SELECT json_extract(params, '$.snapshot_id') FROM jobs "
+            f"WHERE kind IN ({_values(RESTORE_KINDS)}))", (stamp(before),))]
+        conn.executemany("DELETE FROM snapshot_orders WHERE snapshot_id = ?", doomed)
+        conn.executemany("DELETE FROM snapshots WHERE id = ?", doomed)
+        idle_jobs = (f"SELECT id FROM jobs WHERE kind = '{JobKind.HOURLY_SNAPSHOT.value}' "
+                     "AND state IN ('done', 'failed') AND created_at < ? AND id NOT IN "
+                     "(SELECT job_id FROM snapshots WHERE job_id IS NOT NULL)")
+        conn.execute(f"DELETE FROM log WHERE job_id IN ({idle_jobs})", (stamp(before),))
+        conn.execute(f"DELETE FROM jobs WHERE id IN ({idle_jobs})", (stamp(before),))
+    return len(doomed)
+
+
+def hourly_snapshots(conn):
+    """Whether the console turned hourly snapshots on. They are off until it does."""
+    row = conn.execute("SELECT hourly_snapshots FROM settings WHERE id = 1").fetchone()
+    return bool(row and row["hourly_snapshots"])
+
+
+def set_hourly_snapshots(conn, on, now):
+    with conn:
+        conn.execute(
+            "INSERT INTO settings (id, hourly_snapshots, updated_at) VALUES (1, ?, ?) "
+            "ON CONFLICT (id) DO UPDATE SET hourly_snapshots = excluded.hourly_snapshots, "
+            "updated_at = excluded.updated_at", (int(on), stamp(now)))
 
 
 class RestoreLine(NamedTuple):

@@ -13,6 +13,7 @@ from .. import forms
 from ..context import form_of, region_template, see_other
 
 ORDERS_REGIONS = {"job": "partials/orders_job.html",
+                  "hourly": "partials/orders_hourly.html",
                   "snapshots": "partials/orders_snapshots.html"}
 PREVIEW_FIRST = "Preview the restore first: placing follows a finished preview of this snapshot."
 
@@ -92,7 +93,11 @@ def routes(ctx):
 
     def orders_context(conn):
         job = tools_db.latest_job(conn, JobKind.SNAPSHOT)
+        hourly = tools_db.latest_job(conn, JobKind.HOURLY_SNAPSHOT)
         return {"job": job, "log": tools_db.read_log(conn, job.id) if job else [],
+                "hourly_on": tools_db.hourly_snapshots(conn), "hourly_job": hourly,
+                "hourly_log": tools_db.read_log(conn, hourly.id) if hourly else [],
+                "hourly_keep_days": tools_db.HOURLY_KEEP.days,
                 "snapshots": tools_db.read_snapshots(conn)}
 
     def orders_response(request, status_code=200, **context):
@@ -146,6 +151,13 @@ def routes(ctx):
                 tools_db.enqueue_job(conn, JobKind.SNAPSHOT, params, ctx.clock())
             except tools_db.JobOpen as e:
                 return orders_response(request, 409, refused=str(e), note=note)
+        return see_other("/orders")
+
+    @router.post("/orders/hourly")
+    async def set_hourly(request: Request):
+        on = (await form_of(request)).get("on") == "1"
+        with closing(ctx.connect_tools()) as conn:
+            tools_db.set_hourly_snapshots(conn, on, ctx.clock())
         return see_other("/orders")
 
     @router.get("/orders/snapshots/{snapshot_id}", response_class=HTMLResponse)
