@@ -308,7 +308,10 @@ if no farmer was running when it was sent.
 - An order the CLOB rejects, such as a post-only cross or an unfunded bid,
   backs off that market's slot for 30 seconds. Each further rejection doubles
   the wait, up to 15 minutes, and an accepted order resets it. The backoff is
-  logged once per rejection.
+  logged once per rejection. While any slot is backed off, the farmer reads
+  the wallet's cash every 30 seconds. When the cash has risen, it clears every
+  backoff so the slots retry at once, and a retry the CLOB rejects backs off
+  again from 30 seconds.
 - In live mode, Ctrl+C, SIGTERM, a `stop` command, or a crash cancels the
   farmer's orders on the managed markets before the farmer exits. Your own
   orders there keep resting. A normal `--once`

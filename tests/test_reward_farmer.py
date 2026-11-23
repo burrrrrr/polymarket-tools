@@ -4127,6 +4127,39 @@ class LiveFarmerTest(FarmerHarness):
                    if e["kind"] in ("REJECT", "BACKOFF")]
         self.assertEqual(flagged, [("REJECT", CID2, "FAV_BID"), ("BACKOFF", CID2, "FAV_BID")])
 
+    def retried_after_cash_moves(self, dollars):
+        """Whether CID2's favorite bid, rejected and backed off with $127 in
+        the wallet, posts again one cycle later, inside its backoff, once the
+        wallet holds `dollars`."""
+        cash = {"usd": 127.0}
+        self.client.get_balance_allowance.side_effect = lambda params: {
+            "balance": str(int(cash["usd"] * 1e6) if params.token_id is None else 10**10)}
+        self.rejected_tokens = {FAV2}
+        farmer = self.started_farmer(client=self.client)
+        farmer.cycle()
+        self.rejected_tokens = set()
+        cash["usd"] = dollars
+        self.client.post_orders.reset_mock()
+        farmer.cycle()
+        return any(FAV2 in tokens for tokens in self.posted_tokens())
+
+    def test_a_cash_rise_retries_a_backed_off_bid_at_once(self):
+        self.assertTrue(self.retried_after_cash_moves(1600.0))
+
+    def test_flat_cash_leaves_a_backed_off_bid_waiting(self):
+        self.assertFalse(self.retried_after_cash_moves(127.0))
+
+    def test_falling_cash_leaves_a_backed_off_bid_waiting(self):
+        self.assertFalse(self.retried_after_cash_moves(100.0))
+
+    def test_a_cycle_with_no_backed_off_slot_reads_no_cash(self):
+        farmer = self.started_farmer(client=self.client)
+        self.client.get_balance_allowance.reset_mock()
+        farmer.cycle()
+        farmer.cycle()
+        self.assertEqual([c for c in self.client.get_balance_allowance.call_args_list
+                          if c.args[0].token_id is None], [])
+
     def favorite_asks_with_balance(self, balance):
         """The sizes of the favorite asks a cycle rests when the data API says
         51.76 shares are held and the CLOB's balance read does `balance`."""

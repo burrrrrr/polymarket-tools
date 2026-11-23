@@ -423,6 +423,7 @@ TAPE_SEED_S = HISTORY_S + 600
 RESOLUTION_S = 60
 TOTAL_RATES_S = 300
 REWARDS_S = 600
+CASH_S = 30
 PRUNE_S = 600
 MID_SAMPLE_S = 60
 # farm_mids read back this far for the mid before a fill.
@@ -1975,6 +1976,11 @@ def without_backed_off(actions, backoffs, now):
     return [a for a in actions if not waiting(a)]
 
 
+def collateral_usd(client):
+    resp = client.get_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    return int(resp["balance"]) / 1e6
+
+
 def in_fav_book(order, fm):
     """(is a favorite bid, favorite price) where an order shows in the favorite book.
 
@@ -2516,6 +2522,8 @@ class Farmer:
         self.book_samples = []
         self.scoring = {}
         self.positions_at = self.rewards_at = self.resolutions_at = self.prune_at = 0.0
+        self.cash_at = 0.0
+        self.cash_usd = None
         self.resolutions = {}
         self.started_at = self.last_cycle_at = datetime.now(timezone.utc)
         self.sim_ids = 0
@@ -3107,6 +3115,10 @@ class Farmer:
         if self.live and time.monotonic() >= self.rewards_at:
             self.refresh_rewards(now)
             self.rewards_at = time.monotonic() + REWARDS_S
+        if (self.live and time.monotonic() >= self.cash_at
+                and any(m.backoffs for m in self.active())):
+            self.refresh_cash()
+            self.cash_at = time.monotonic() + CASH_S
         if time.monotonic() >= self.prune_at:
             try:
                 if farm_db.prune(self.db, now):
@@ -3472,10 +3484,7 @@ class Farmer:
         planned = sum(capital_room(m.fm, m.position)
                       for m in self.active() if m.position is not None)
         try:
-            resp = self.client.get_balance_allowance(
-                BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
-            )
-            balance = int(resp["balance"]) / 1e6
+            balance = self.cash_usd = collateral_usd(self.client)
         except Exception as e:
             log(f"Warning: collateral balance check failed ({e})")
             return
@@ -3485,6 +3494,29 @@ class Farmer:
                       "Warning: collateral is short of the planned favorite bids; "
                       "the CLOB will reject the bids it cannot fund",
                       data={"balance_usd": balance, "planned_usd": planned})
+
+    def refresh_cash(self):
+        """Retry every backed-off slot at once when the wallet's cash has risen.
+
+        A rise is usually the user freeing cash for bids the CLOB rejected as
+        unfunded, which would otherwise wait out up to BACKOFF_MAX_S.
+        """
+        try:
+            cash = collateral_usd(self.client)
+        except Exception as e:
+            log(f"Warning: collateral balance check failed ({e})")
+            return
+        if self.cash_usd is not None and cash > self.cash_usd:
+            backed_off = [m for m in self.active() if m.backoffs]
+            for managed in backed_off:
+                managed.backoffs.clear()
+            if backed_off:
+                self.emit(EventKind.BACKOFF,
+                          f"Cash rose ${self.cash_usd:,.2f} -> ${cash:,.2f}; "
+                          f"retrying {len(backed_off)} backed-off markets now",
+                          data={"from_usd": self.cash_usd, "to_usd": cash,
+                                "markets": len(backed_off)})
+        self.cash_usd = cash
 
     def cancel_managed(self):
         """Cancel the farmer's open orders on the managed markets: one listing,
